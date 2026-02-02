@@ -36,7 +36,7 @@ def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
     result = add_elixhauser(result) 
     
     logger.info(f"Saving file at{result_path}")
-    result.to_pickle(result_path)
+    result.to_pickle(result_path, protocol=4)
     return result
     
 def map_data(cfg):
@@ -394,11 +394,97 @@ def create_bin_df(cfg):
     )
 
     # Save DataFrame to pickle file
-    bin_df.to_pickle(cfg["bin_df_path"])
+    bin_df.to_pickle(cfg["bin_df_path"], protocol=4)
     logger.info(f'>> Saved at {cfg["bin_df_path"]}')
 
     return bin_df
 
+
+def create_bin_df_with_mortality_masking(cfg, base):
+    """
+    Create bin_df with option to drop last bin for deceased patients.
+    
+    This is an alternative to adjusting end times.
+    """
+    logger.info("Generating bin_df with mortality masking")
+    
+    bin_list = []
+    bin_intervals = cfg["bin_intervals"]
+    
+    drop_last_bin = base.get('drop_last_bin', pd.Series([False] * len(base)))
+    
+    for idx, row in base.iterrows():
+        pid = row["PID"]
+        start_time = row["start"]
+        end_time = row["end"] + pd.Timedelta(minutes=10)
+        should_drop_last = drop_last_bin.iloc[idx] if idx < len(drop_last_bin) else False
+        
+        # Validate
+        if pd.isna(start_time) or pd.isna(end_time):
+            logger.warning(f"Patient {pid} has NULL timestamps, skipping")
+            continue
+        
+        if end_time <= start_time:
+            logger.warning(f"Patient {pid} has invalid trajectory (end <= start), skipping")
+            continue
+        
+        # Create bins
+        current_time = start_time
+        bin_counter = 1
+        patient_bins = []
+        
+        for interval, freq in bin_intervals.items():
+            if current_time >= end_time:
+                break
+            
+            if interval == "end":
+                interval_end = end_time
+            else:
+                interval_end = start_time + pd.Timedelta(interval)
+            
+            bins = pd.date_range(
+                start=current_time,
+                end=min(interval_end, end_time),
+                freq=freq,
+                inclusive="left",
+            )
+            
+            if len(bins) < 2:
+                continue
+            
+            # Create bin tuples
+            for i, (bin_start, bin_end) in enumerate(zip(bins[:-1], bins[1:])):
+                patient_bins.append((pid, bin_start, bin_end, bin_counter + i, freq))
+            
+            current_time = bins[-1]
+            bin_counter += len(bins) - 1
+        
+        # Drop last bin if patient died
+        if should_drop_last and len(patient_bins) > 1:
+            logger.debug(f"Dropping last bin for deceased patient {pid}")
+            patient_bins = patient_bins[:-1]
+        
+        bin_list.extend(patient_bins)
+    
+    # Create DataFrame
+    bin_df = pd.DataFrame(
+        bin_list, columns=["PID", "bin_start", "bin_end", "bin_counter", "bin_freq"]
+    )
+    
+    # Validation
+    base_pids = set(base['PID'].unique())
+    bin_pids = set(bin_df['PID'].unique())
+    missing = base_pids - bin_pids
+    
+    logger.info(f"Created bins for {len(bin_pids)}/{len(base_pids)} patients")
+    
+    if len(missing) > 0:
+        logger.error(f"⚠️  {len(missing)} patients missing from bin_df!")
+    
+    bin_df.to_pickle(cfg["bin_df_path"])
+    logger.info(f'Saved to {cfg["bin_df_path"]}')
+    
+    return bin_df
 
 
 ############
@@ -625,9 +711,115 @@ def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
             create_elixhauser(base)
             continue
         break
+        
+def mask_mortality(df, method='percentage', min_duration_hours=0.5):
+    logger.info(f"Masking mortality using method: {method}")
+    
+    # Convert to datetime
+    for col in ["start", "end", "DOD"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    
+    # Get patients with DOD
+    dod_mask = df["DOD"].notnull()
+    n_deaths = dod_mask.sum()
+    
+    if not dod_mask.any():
+        logger.info("No patients with DOD, skipping masking")
+        return df
+    
+    logger.info(f"Masking {n_deaths} patients with DOD")
+    
+    # Calculate duration
+    duration = df["end"] - df["start"]
+    duration_hours = duration.dt.total_seconds() / 3600
+    
+    # Store original for comparison
+    original_end = df["end"].copy()
+    
+    if method == 'percentage':
+        # Mask by percentage of trajectory duration
+        # More robust: avoids end <= start issues
+        
+        # Short trajectories (<6h): mask last 10%
+        cond_short = dod_mask & (duration_hours <= 6)
+        df.loc[cond_short, "end"] = df.loc[cond_short, "start"] + 0.9 * duration.loc[cond_short]
+        
+        # Medium trajectories (6-72h): mask last 5%
+        cond_medium = dod_mask & (duration_hours > 6) & (duration_hours <= 72)
+        df.loc[cond_medium, "end"] = df.loc[cond_medium, "start"] + 0.95 * duration.loc[cond_medium]
+        
+        # Long trajectories (>72h): mask last 2%
+        cond_long = dod_mask & (duration_hours > 72)
+        df.loc[cond_long, "end"] = df.loc[cond_long, "start"] + 0.98 * duration.loc[cond_long]
+    
+    elif method == 'absolute':
+        # Your original approach but with validation
+        
+        # <3h: minus 10 minutes
+        cond1 = dod_mask & (duration_hours < 3)
+        new_end = df.loc[cond1, "DOD"] - pd.Timedelta(minutes=10)
+        df.loc[cond1, "end"] = new_end
+        
+        # 3-72h: minus 30 minutes
+        cond2 = dod_mask & (duration_hours >= 3) & (duration_hours <= 72)
+        new_end = df.loc[cond2, "DOD"] - pd.Timedelta(minutes=30)
+        df.loc[cond2, "end"] = new_end
+        
+        # 72h-7d: minus 3 hours
+        cond3 = dod_mask & (duration_hours > 72) & (duration_hours <= 168)
+        new_end = df.loc[cond3, "DOD"] - pd.Timedelta(hours=3)
+        df.loc[cond3, "end"] = new_end
+        
+        # >7d: minus 1 day
+        cond4 = dod_mask & (duration_hours > 168)
+        new_end = df.loc[cond4, "DOD"] - pd.Timedelta(days=1)
+        df.loc[cond4, "end"] = new_end
+    
+    elif method == 'drop_last_bin':
+        # Don't adjust end time here - flag for bin_df creation
+        # Mark patients to drop last bin
+        df['drop_last_bin'] = dod_mask
+        logger.info(f"Marked {n_deaths} patients to drop last bin during bin creation")
+        return df
+    
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # CRITICAL VALIDATION: Ensure end > start
+    min_duration = pd.Timedelta(hours=min_duration_hours)
+    
+    invalid_mask = dod_mask & (df["end"] <= df["start"] + min_duration)
+    n_invalid = invalid_mask.sum()
+    
+    if n_invalid > 0:
+        logger.warning(f"⚠️  {n_invalid} patients would have end <= start after masking!")
+        logger.warning(f"   Adjusting to minimum duration: {min_duration_hours}h")
+        
+        # Force minimum duration
+        df.loc[invalid_mask, "end"] = df.loc[invalid_mask, "start"] + min_duration
+        
+        # Log examples
+        if n_invalid > 0:
+            examples = df[invalid_mask].head(3)
+            for _, row in examples.iterrows():
+                orig_dur = (original_end.loc[row.name] - row['start']).total_seconds() / 3600
+                new_dur = (row['end'] - row['start']).total_seconds() / 3600
+                logger.warning(f"   PID {row['PID']}: {orig_dur:.1f}h → {new_dur:.1f}h")
+    
+    # Report changes
+    masked_patients = df[dod_mask]
+    time_removed = (original_end - df["end"]).loc[dod_mask]
+    avg_removed_hours = time_removed.dt.total_seconds().mean() / 3600
+    
+    logger.info(f"Masking complete:")
+    logger.info(f"  Patients masked: {n_deaths}")
+    logger.info(f"  Avg time removed: {avg_removed_hours:.1f} hours")
+    logger.info(f"  Invalid trajectories fixed: {n_invalid}")
+    
+    return df
 
-
-def mask_mortality(df):
+def _mask_mortality(df):
     """Adjust end times based on DOD and trajectory duration.
     Input base_df after DOD added"""
     for col in ["start", "end", "DOD"]:

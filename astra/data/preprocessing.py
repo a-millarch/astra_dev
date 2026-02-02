@@ -1,3 +1,4 @@
+#preprocessing.py
 import pandas as pd
 import numpy as np  
 import torch
@@ -24,6 +25,8 @@ class MultiHotCategoricalEncoder:
         - 17390 patients
         - 12 medication types (channels)
         - 114 timesteps
+    
+    UPDATED: Now stores category_labels in encoding_info for SHAP visualization.
     """
     
     def __init__(self):
@@ -66,7 +69,8 @@ class MultiHotCategoricalEncoder:
             self.encoders_[feat_name] = {
                 'value_to_idx': value_to_idx,
                 'idx_to_value': {idx: val for val, idx in value_to_idx.items()},
-                'n_classes': len(sorted_values)
+                'n_classes': len(sorted_values),
+                'category_labels': sorted_values  # ADDED: Store actual labels
             }
             self.n_classes_[feat_name] = len(sorted_values)
         
@@ -85,7 +89,7 @@ class MultiHotCategoricalEncoder:
         
         Returns:
             X_multi_hot: Array of shape [n_samples, n_categories, seq_len]
-            encoding_info: Dictionary with encoding details
+            encoding_info: Dictionary with encoding details including category_labels
         """
         samples = sorted(df[sample_col].unique())
         n_samples = len(samples)
@@ -105,7 +109,11 @@ class MultiHotCategoricalEncoder:
         
         # Process each categorical feature
         dim_offset = 0
-        encoding_info = {'feature_ranges': {}, 'feature_names': cat_features}
+        encoding_info = {
+            'feature_ranges': {}, 
+            'feature_names': cat_features,
+            'category_labels': {}  # ADDED: Store labels per feature
+        }
         
         for feat_name in cat_features:
             encoder = self.encoders_[feat_name]
@@ -113,6 +121,9 @@ class MultiHotCategoricalEncoder:
             
             # Store dimension range for this feature
             encoding_info['feature_ranges'][feat_name] = (dim_offset, dim_offset + n_classes)
+            
+            # ADDED: Store category labels for this feature
+            encoding_info['category_labels'][feat_name] = encoder['category_labels']
             
             # Get data for this feature
             feat_df = df[df[cat_col] == feat_name].set_index(sample_col)
@@ -171,9 +182,19 @@ class MultiHotCategoricalEncoder:
         """Fit and transform in one step."""
         self.fit(df, sample_col, timestep_cols, cat_col, feature_names)
         return self.transform(df, sample_col, timestep_cols, cat_col)
-
-
-
+    
+    def get_category_labels(self) -> Dict[str, List[str]]:
+        """
+        Get category labels for all features.
+        
+        Returns:
+            Dict mapping feature names to list of category labels
+            e.g., {'medication': ['Aspirin', 'Ibuprofen', ...], 'procedures': ['X-ray', ...]}
+        """
+        return {
+            feat_name: encoder['category_labels'] 
+            for feat_name, encoder in self.encoders_.items()
+        }
 
 
 # ============================================================================

@@ -146,6 +146,10 @@ logger = pm.setup_logging(print_only=False)
 
 pd.options.mode.chained_assignment = None
 
+def save_figure(fig, filename, save_dir='reports/studyfigs'):
+    os.makedirs(save_dir, exist_ok=True)
+    png_path = os.path.join(save_dir, f'{filename}.png')
+    fig.savefig(png_path, dpi=1200, bbox_inches='tight')
 
 def get_cfg(cfg_path="configs/defaults.yaml"):
     with open(cfg_path) as file:

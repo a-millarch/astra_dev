@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 
 
 from astra.utils import cfg, logger
-from astra.evaluation.utils import save_figure
+from astra.utils import save_figure
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
 from astra.visualize.evaluation import plot_evaluation
 

@@ -445,11 +445,11 @@ def filter_procedures(proc):
         columns={"ProcedureCode": "VALUE", "ServiceDatetime": "TIMESTAMP"},
         inplace=True,
     )
-    proc["FEATURE"] = "procedures"
-
+    
     # Replace feature
-    proc.FEATURE = proc.FEATURE.replace(reversed_feature_map)
+    proc.VALUE = proc.VALUE.replace(reversed_feature_map)
     logger.info(f"Using {len(proc)} observations of procedures")
+    proc["FEATURE"] = "procedures"
     return proc
 
 
@@ -509,6 +509,9 @@ def filter_labs(lab):
 
     # Replace value and feature
     lab.VALUE = lab.VALUE.replace({"<": "", ">": ""}, regex=True)
+    # ensure float
+    lab["VALUE"] = pd.to_numeric(lab["VALUE"], errors="coerce")
+    lab = lab.dropna(subset=["VALUE"])
     lab.FEATURE = lab.FEATURE.replace(reversed_feature_map)
     logger.info(f"Using {len(lab)} observations of labs")
     return lab
