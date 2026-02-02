@@ -8,7 +8,7 @@ from astra.data.collectors import collect_procedures, population_filter_parquet
 from astra.data.mapper import map_concept
 
 from typing import List, Dict, Optional, Union
-
+from datetime import timedelta
 
 from azureml.core import Dataset
 
@@ -27,6 +27,7 @@ def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
     
     result = add_patient_info(merged_df, population)
     result = add_patient_id(result)
+    result = mask_mortality(result)
     result = final_cleanup(result)
 
     # Add statics
@@ -254,6 +255,7 @@ def final_cleanup(df):
     df = df.drop(columns=["Flyt_ind", "Flyt_ud", "ADT_haendelse"], errors='ignore')
     df = df.drop_duplicates(subset="PID").reset_index(drop=True)
     df = df.drop_duplicates(subset=["CPR_hash", "start", "end"]).reset_index(drop=True)
+
     return df
 
 
@@ -504,8 +506,9 @@ def prepare_height_weight(base):
         },
         inplace=True,
     )
-
     vit_raw["FEATURE"] = vit_raw["FEATURE"].replace(to_replace=hw_map)
+    vit_raw["VALUE"] = pd.to_numeric(vit_raw["VALUE"], errors="coerce")
+    vit_raw = vit_raw.dropna(subset=["VALUE"])
     vit_raw.loc[vit_raw.FEATURE == "HEIGHT", "VALUE"] = inches_to_cm(
         vit_raw[vit_raw.FEATURE == "HEIGHT"].VALUE.astype(float)
     )
@@ -623,6 +626,36 @@ def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
             continue
         break
 
+
+def mask_mortality(df):
+    """Adjust end times based on DOD and trajectory duration.
+    Input base_df after DOD added"""
+    for col in ["start", "end", "DOD"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+    dod_mask = df["DOD"].notnull()
+    if not dod_mask.any():
+        return df
+    
+    duration_hours = (df["end"] - df["start"]).dt.total_seconds() / 3600
+    print(duration_hours)
+    # < 3 hour: minus 10 minutes
+    cond1 = dod_mask & (duration_hours < 3)
+    df.loc[cond1, "end"] = df.loc[cond1, "DOD"] - pd.Timedelta(minutes=10)
+    
+    # >3 and <=72 hours: minus 1 hour
+    cond2 = dod_mask & (duration_hours > 3) & (duration_hours <= 72)
+    df.loc[cond2, "end"] = df.loc[cond2, "DOD"] - pd.Timedelta(minutes=30)
+    
+    # >72 hours: minus 6 hours
+    cond3 = dod_mask & (duration_hours > 72)
+    df.loc[cond3, "end"] = df.loc[cond3, "DOD"] - pd.Timedelta(hours=3)
+    
+    # >7 days: minus 1 day
+    cond5 = dod_mask & (duration_hours > 168)
+    df.loc[cond5, "end"] = df.loc[cond5, "DOD"] - pd.Timedelta(days=1)
+    
+    return df
 
 
 if __name__ == "__main__":

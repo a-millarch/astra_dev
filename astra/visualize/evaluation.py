@@ -19,7 +19,32 @@ from sklearn.calibration import calibration_curve
 
 from fastai.tabular.all import L
 
-from astra.evaluation.hybrid_model import get_eval_mixed_dls
+
+
+
+def plot_patient_preds(preds_df, patient_id, xlim=60*24*30, timeunit='min', xstep=60):
+    # Filter predictions for the given patient
+    patient_preds = preds_df[preds_df["PID"] == patient_id]
+
+    # Sort by time to ensure lineplot is ordered correctly
+    patient_preds = patient_preds.sort_values(by="time_min")
+
+    # Plot prediction over time
+    plt.figure(figsize=(12, 2), dpi=1200)
+    x = patient_preds[f"time_{timeunit}"]
+    plt.plot(x, patient_preds["pred"], marker='o', linestyle='-', markersize=2)
+    plt.title(f"Mortality Risk Prediction Timeline for PID: {patient_id}", fontweight='bold')
+    plt.xlabel(f"Time ({timeunit})")
+    plt.ylabel("Prediction")
+    plt.xlim(0, xlim)
+    plt.ylim(0, 1)
+    plt.grid(True)
+
+    # xticks for every step of x
+    plt.xticks(np.arange(0, xlim + xstep, xstep))
+
+    plt.show()
+    return plt
 
 
 def plot_box_kde(df, dep, y):
@@ -293,6 +318,8 @@ def create_calibration_plot(y_true, y_pred, n_bins=4):
 
 
 def plot_multiple_evaluations(df, censor_ts, learn, labels=None):
+    from astra.evaluation.predictive_performance import get_eval_mixed_dls
+    
     fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12, 5))
     
     #colors = plt.cm.tab10(np.linspace(0, 1, len(censor_ts)))
