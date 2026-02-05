@@ -9,15 +9,15 @@ from astra.utils import is_file_present, are_files_present
 from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
 from astra.data.filters import filter_subsets_inhospital
-from astra.data.mapper import map_concept
+from astra.data.mapper import map_concept, map_concept_optimized
 
 from astra.data.datasets import TSDS
 
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
     
-    pd.DataFrame.from_dict({'CPR_hash':['CENSORED'],
-    'ServiceDate':[np.datetime64('2026-0120T00:00:00.000000000')]}, orient='columns').to_csv('data/external/trauma_call.csv')
+    pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
+    'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv('data/external/trauma_call.csv')
     
    
     # saved as pickle
@@ -55,23 +55,63 @@ def map_data(cfg):
                 pass
             else:
                 logger.debug(f"Binning and mapping {concept} with agg_func: {agg_func}")
-                map_concept(cfg, concept, agg_func)
+                if concept in cfg["dataset"]["ts_cat_names"]:
+                    is_categorical = True
+                    is_multi_label =True
+                else:
+                    is_categorical = False
+                    is_multi_label =False                    
+                map_concept(cfg, concept, agg_func, is_categorical, is_multi_label)
 
+def map_data_optimized(cfg):
+    """Updated to use optimized mapper."""
+    logger.info("Mapping data to bins")
+    map_dir = "data/interim/mapped/"
+    
+    for concept in cfg["concepts"]:
+        for agg_func in cfg["agg_func"][concept]:
+            output_file = f"{map_dir}{concept}_{agg_func}.csv"
             
+            if os.path.exists(output_file):
+                logger.info(f"Skipping {concept}_{agg_func} (already exists)")
+                continue
+            
+            logger.info(f"Processing {concept} with {agg_func}")
+            
+            is_categorical = concept in cfg["dataset"]["ts_cat_names"]
+            is_multi_label = concept in cfg["dataset"]["ts_categorical_multi_label"]
+                        
+            map_concept_optimized(
+                cfg, 
+                concept, 
+                agg_func, 
+                is_categorical, 
+                is_multi_label
+            )            
 if __name__ =='__main__':
     pm = ProjectManager()
     logger = pm.setup_logging(print_only=True)
+    #Single patient loop
     #generate_base_df() #Simulates new patient drop
-  
+    #population = bpi.load_or_collect_population(cfg)
+    #proces_raw_concepts(cfg, base=population)
 
-    population = bpi.load_or_collect_population(cfg)
-    proces_raw_concepts(cfg, base=population)
-    
-    base = bpi.create_base_df(cfg)
-    bpi.create_bin_df(cfg)
+    # Cohort mode
+    if is_file_present('data/interim/base_df.pkl'):
+        pass
+    else:
+        base = bpi.create_base_df(cfg)
+    # bin_df    
+    if is_file_present('data/interim/bin_df.pkl'):   
+        pass
+    else: 
+        bpi.create_bin_df(cfg)
+
+
 
     proces_inhospital_concepts(cfg, reset=False)
-    map_data(cfg)
+    #map_data(cfg)
+    map_data_optimized(cfg)
     logger.info("Creating TSDS")
     tsds = TSDS(cfg, base)
     logger.info(tsds.concepts.keys())

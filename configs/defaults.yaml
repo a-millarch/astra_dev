@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: binary
 
-model_name: '02022026_30D'
+model_name: '05022026_30D'
    
 target: deceased_30d
 
@@ -95,6 +95,7 @@ large_load_filenames:
   - Notater
  
 bin_intervals:
+  3h: '5min'
   6h: '10min'
   12h: '20min'
   24h: '1h'
@@ -105,6 +106,7 @@ bin_intervals:
   end: '30D'
 
 bin_freq_include:
+  - '5min'
   - '10min'
   - '20min'
   - '1h'
@@ -118,6 +120,8 @@ bin_freq_include:
 agg_func: #also for datasets, split it up
   VitaleVaerdier:
       #- first # tmp on for tab
+      - min
+      - max
       - mean
       - std
   ITAOversigtsrapport:

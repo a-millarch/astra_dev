@@ -231,3 +231,6 @@ models/**
 !models/
 !models/**/
 !models/**/.gitkeep
+
+logging/
+!logging/.gitkeep
