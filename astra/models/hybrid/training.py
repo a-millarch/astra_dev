@@ -51,24 +51,25 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     Returns:
         pretrain_cfg, mlm_model, mixed_dls_ul
     """
-    if pretrain_cfg is None: #TODO: use regular config
+    if pretrain_cfg is None:
+        pc = cfg["pretrain"]
         pretrain_cfg = MLMConfig(
-            mask_prob_ts=0.15,
-            mask_prob_cat_ts=0.15,
-            mask_prob_cat=0.15,
-            mask_prob_cont=0.15,
-            epochs=100,
-            lr=5e-5,
-            warmup_epochs=3,
-            ts_loss_weight=1.5,
-            cat_ts_loss_weight=1.5,
-            cat_loss_weight=0.5,
-            cont_loss_weight=0.5,
-            contrastive_weight=0.5,
-            temperature=0.07,
-            patience=10,
-            save_best=True,
-            checkpoint_dir='./pretrain_checkpoints'
+            mask_prob_ts=pc["mask_prob_ts"],
+            mask_prob_cat_ts=pc["mask_prob_cat_ts"],
+            mask_prob_cat=pc["mask_prob_cat"],
+            mask_prob_cont=pc["mask_prob_cont"],
+            epochs=pc["epochs"],
+            lr=pc["lr"],
+            warmup_epochs=pc["warmup_epochs"],
+            ts_loss_weight=pc["ts_loss_weight"],
+            cat_ts_loss_weight=pc["cat_ts_loss_weight"],
+            cat_loss_weight=pc["cat_loss_weight"],
+            cont_loss_weight=pc["cont_loss_weight"],
+            contrastive_weight=pc["contrastive_weight"],
+            temperature=pc["temperature"],
+            patience=pc["patience"],
+            save_best=pc["save_best"],
+            checkpoint_dir=pc["checkpoint_dir"],
         )
 
     # ============================================================================
