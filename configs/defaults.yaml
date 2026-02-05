@@ -3,10 +3,10 @@ single_patient_mode: False
 population_file_path: data/raw/trauma_call_historic_population.csv 
 trauma_call_file_path: data/external/trauma_call.csv
 
-experiment_name: tranfusion
+experiment_name: hpt
 run_name: binary
 
-model_name: '23012026'
+model_name: '02022026_30D'
    
 target: deceased_30d
 
@@ -52,22 +52,21 @@ dataset:
       
 training:
     folds: 5
-    epochs: 15
-    bs: 64
+    epochs: 30
+    bs: 32
     
 model:
-    res_dropout: 0.4 #0.22
-    fc_dropout: 0.8 #0.75
-    fc_mults_1: 0.5  # 0.3
-    fc_mults_2: 0.25 # 0.1
-    n_layers: 6 #8
-    n_heads: 4 #8 
-    d_model: 32 #64
+    res_dropout: 0.22
+    fc_dropout: 0.75
+    fc_mults_1: 0.3
+    fc_mults_2: 0.1
+    n_layers: 8
+    n_heads: 8 
+    d_model: 64 
+    d_ff: None 
     d_k: None
     d_v: None
-    d_ff: None
-    
-    
+
 evaluation:
     max_f_beta: 10
     f_beta: 4
