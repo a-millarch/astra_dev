@@ -1,10 +1,13 @@
 # ============================================================================
 # CACHING: Save/Load prepared data to avoid recomputation
 # ============================================================================
-
+import pickle
 import hashlib
 import json
 import os
+
+from astra.data.dataloader import prepare_data_and_dls, get_ts_dls, get_tabular_dls, get_mixed_dls, dfwide2ts_dls
+from astra.utils import cfg, logger
 
 def _get_cache_key(cfg):
     """Generate a unique cache key based on config parameters that affect data preparation."""
@@ -238,7 +241,7 @@ def load_data_cache(cfg, cache_dir='cache/data'):
     return data
 
 
-def prepare_data_and_dls_cached(cfg, use_cache=True, cache_dir='cache/data', force_refresh=False):
+def prepare_data_and_dls_cached(cfg, use_cache=True, cache_dir='data/cache', force_refresh=False):
     """
     Wrapper for prepare_data_and_dls with caching support.
     First attempts to load from cache. If cache miss or force_refresh=True,
