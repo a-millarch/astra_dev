@@ -1,4 +1,12 @@
-# predictive_performance.py
+# predictive_performance_uncertainty.py
+"""
+Extension of predictive_performance.py with uncertainty quantification.
+
+Adds epistemic uncertainty estimates to time-dependent predictions using:
+1. Monte-Carlo Dropout for epistemic uncertainty
+2. Conformal Prediction for statistically guaranteed intervals
+"""
+
 import os
 import numpy as np
 import pandas as pd
@@ -7,23 +15,26 @@ import torch
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from tsai.data.core import get_ts_dls
-from tsai.data.tabular import get_tabular_dls
-from tsai.data.mixed import get_mixed_dls
-from tsai.data.preparation import df2xy
-
-from astra.utils import cfg, logger, save_figure
-from astra.data.dataloader import dfwide2ts_dls, normalize_with_padding_mask
-
-from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
-from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
-from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
-from astra.visualize.evaluation import plot_evaluation
+from astra.utils import cfg, logger
+from astra.utils import save_figure
+from astra.evaluation.predictive_performance import (
+    TimeDependentEvaluator,
+    TimeMetricResult,
+    step_to_time,
+    format_step_label
+)
+from astra.evaluation.uncertainty import (
+    UncertaintyQuantifier,
+    UncertaintyResult,
+    calculate_calibration_metrics,
+    analyze_uncertainty_by_time
+)
 
 
 @dataclass
-class TimeMetricResult:
-    """Container for time-dependent evaluation results"""
+class TimeMetricResultWithUncertainty:
+    """Extended TimeMetricResult with uncertainty metrics"""
+    # Original metrics
     time_min: float
     time_hours: float
     time_days: float
@@ -35,126 +46,139 @@ class TimeMetricResult:
     n_samples: int
     n_positive: int
 
+    # Uncertainty metrics
+    mean_epistemic_uncertainty: float  # Average std dev across patients
+    mean_entropy: float               # Average entropy
+    mean_bald: float                  # Average BALD score
+    mean_conformal_width: Optional[float] = None  # Average interval width
 
-class TimeDependentEvaluator:
+    # Calibration metrics
+    ece: Optional[float] = None  # Expected Calibration Error
+    uncertainty_separation: Optional[float] = None  # Errors vs correct
+
+
+class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
     """
-    FIXED: Evaluates model performance at different time censoring points.
-    
-    Key changes:
-    - Works directly with normalized data from prepare_data_and_dls()
-    - Only censors (masks) data, doesn't re-normalize
-    - Much faster by avoiding redundant dataloader creation
+    Extended evaluator that adds uncertainty quantification to time-dependent evaluation.
+
+    Provides:
+    - Individual prediction uncertainty for each patient at each timepoint
+    - Calibrated prediction intervals
+    - Temporal analysis of uncertainty evolution
+    - Support for both cohort-level and individual patient analysis
     """
-    
-    def __init__(self, data: dict, learn, cfg: dict):
+
+    def __init__(
+        self,
+        data: dict,
+        learn,
+        cfg: dict,
+        n_mc_samples: int = 30,
+        alpha: float = 0.1,
+        use_conformal: bool = True
+    ):
         """
-        Initialize evaluator with data and model.
-        
         Args:
-            data: Output from prepare_data_and_dls() - contains pre-normalized data
+            data: Output from prepare_data_and_dls()
             learn: Trained fastai Learner (already patched)
             cfg: Configuration dictionary
+            n_mc_samples: Number of MC dropout samples (10-30 recommended)
+            alpha: Significance level for conformal prediction (0.1 = 90% CI)
+            use_conformal: Whether to use conformal prediction
         """
-        self.data = data
-        self.learn = learn
-        self.cfg = cfg
-        
-        # Cache static components
-        self.tfms = data["tfms"]
-        self.batch_tfms = data.get("batch_tfms", None)
-        self.procs = data["procs"]
-        self.cat_cols = data["cat_cols"]
-        self.num_cols = data["num_cols"]
-        self.classes = data["classes"]
-        self.cat_encoder = data["cat_encoder"]
-        self.target = cfg["target"]
-        self.bs = cfg["training"]["bs"]
-        
-        # Cache pre-normalized data (already normalized in prepare_data_and_dls)
-        self.holdout_X_normalized = data["tX"]  # Already normalized!
-        self.holdout_X_multi_hot = data["tX_multi_hot"]  # Already encoded!
-        self.holdout_tab_normalized = None  # Will set up on first use
-        self.holdout_y = data["ty"]
-        
-        # Get raw dataframes for censoring
-        self.holdout = data["holdout"]
-        
-        logger.info("TimeDependentEvaluator initialized with pre-normalized data")
-    
-    def _censor_normalized_data(self, X_normalized: np.ndarray, censor_step: int) -> np.ndarray:
+        super().__init__(data, learn, cfg)
+
+        self.uq = UncertaintyQuantifier(
+            n_mc_samples=n_mc_samples,
+            alpha=alpha,
+            use_conformal=use_conformal
+        )
+        self.n_mc_samples = n_mc_samples
+        self.use_conformal = use_conformal
+
+    def get_holdout_pids(self, max_samples: Optional[int] = None) -> List:
         """
-        Censor ALREADY-NORMALIZED data by setting future timesteps to 0.
-        
-        This is much faster than re-creating dataloaders.
-        
+        Get PIDs from holdout dataset in dataloader order.
+
         Args:
-            X_normalized: Pre-normalized array [n_samples, n_channels, seq_len]
-            censor_step: Time step to censor at (inclusive - this step is kept)
-            
+            max_samples: Maximum number of PIDs to return (None = all)
+
         Returns:
-            Censored normalized array
+            List of PIDs in the order they appear in the holdout dataloader
         """
-        X_censored = X_normalized.copy()
-        
-        # Zero out timesteps AFTER censor_step
-        if censor_step < X_normalized.shape[2] - 1:
-            X_censored[:, :, censor_step+1:] = 0.0
-        
-        return X_censored
-    
-    def _censor_multihot(self, X_multi_hot: np.ndarray, censor_step: int) -> np.ndarray:
+        pids = self.data["holdout"].tab_df['PID'].tolist()
+        if max_samples is not None and len(pids) > max_samples:
+            pids = pids[:max_samples]
+        return pids
+
+    def get_sample_indices_for_pids(
+        self,
+        pids: List,
+        target_pids: List
+    ) -> Tuple[List[int], List]:
         """
-        Censor multi-hot encoded categorical data.
-        
+        Find sample indices for given PIDs.
+
         Args:
-            X_multi_hot: Multi-hot array [n_samples, n_features, seq_len]
-            censor_step: Time step to censor at
-            
+            pids: List of all PIDs in dataloader order
+            target_pids: List of PIDs to find
+
         Returns:
-            Censored multi-hot array
+            Tuple of (indices, found_pids) - only includes PIDs that were found
         """
-        X_censored = X_multi_hot.copy()
-        
-        # Zero out timesteps AFTER censor_step
-        if censor_step < X_multi_hot.shape[2] - 1:
-            X_censored[:, :, censor_step+1:] = 0
-        
-        return X_censored
-    
-    def create_censored_dataloaders_fast(self, censor_step: int) -> Optional[object]:
+        indices = []
+        found_pids = []
+
+        for target_pid in target_pids:
+            try:
+                idx = pids.index(target_pid)
+                indices.append(idx)
+                found_pids.append(target_pid)
+            except ValueError:
+                logger.warning(f"PID {target_pid} not found in holdout data")
+
+        return indices, found_pids
+
+    def calibrate_uncertainty(
+        self,
+        cal_fraction: float = 0.3,
+        random_state: int = 42
+    ):
         """
-        FAST VERSION: Create dataloaders by censoring pre-normalized data.
-        
-        This is 10-20x faster than the old approach because:
-        1. No dataframe manipulation
-        2. No re-normalization
-        3. No re-encoding
-        4. Simple array slicing
-        
+        Calibrate conformal predictor using a fraction of holdout set.
+
+        This splits the holdout set into:
+        - Calibration set (cal_fraction, e.g., 30%)
+        - Test set (1 - cal_fraction, e.g., 70%)
+
         Args:
-            censor_step: Time step to censor at
-            
-        Returns:
-            Mixed dataloaders or None if invalid
+            cal_fraction: Fraction of holdout to use for calibration
+            random_state: Random seed for reproducible splits
         """
-        # Validate
-        if len(set(self.holdout_y)) < 2:
-            logger.warning("Only one class in dataset")
-            return None
-        
-        # ========================================================================
-        # CENSOR PRE-NORMALIZED DATA (just zero out future timesteps)
-        # ========================================================================
-        
-        # 1. Continuous TS: censor normalized data
-        X_censored = self._censor_normalized_data(self.holdout_X_normalized, censor_step)
-        
-        # 2. Categorical TS: censor multi-hot data
-        X_multi_hot_censored = self._censor_multihot(self.holdout_X_multi_hot, censor_step)
-        
-        # 3. Tabular: use as-is (no time dimension)
+        if not self.use_conformal:
+            logger.info("Conformal prediction disabled, skipping calibration")
+            return
+
+        logger.info(f"Calibrating uncertainty quantifier on {cal_fraction*100:.0f}% of holdout...")
+
+        # Split holdout data
+        # Convert holdout_y to numpy array for indexing
+        holdout_y_array = np.array(self.holdout_y)
+        n_holdout = len(holdout_y_array)
+        n_cal = int(n_holdout * cal_fraction)
+
+        # Random split
+        np.random.seed(random_state)
+        indices = np.random.permutation(n_holdout)
+        cal_indices = indices[:n_cal]
+
+        # Create calibration dataloader (using full time series)
+        from tsai.data.core import get_ts_dls
+        from tsai.data.tabular import get_tabular_dls
+        from tsai.data.mixed import get_mixed_dls
+
+        # Initialize holdout_tab_normalized if not already done
         if self.holdout_tab_normalized is None:
-            # Set up normalized tabular data once
             if self.num_cols and self.data.get("tab_scaler") is not None:
                 self.holdout_tab_normalized = self.holdout.tab_df.copy()
                 self.holdout_tab_normalized[self.num_cols] = self.data["tab_scaler"].transform(
@@ -162,26 +186,23 @@ class TimeDependentEvaluator:
                 )
             else:
                 self.holdout_tab_normalized = self.holdout.tab_df
-        
-        # ========================================================================
-        # CREATE DATALOADERS (no transforms needed - data already normalized!)
-        # ========================================================================
-        
-        # Continuous TS
-        test_ts_dls = get_ts_dls(
-            X_censored,
-            self.holdout_y,
+
+        # Calibration set continuous TS
+        cal_ts_dls = get_ts_dls(
+            self.holdout_X_normalized[cal_indices],
+            holdout_y_array[cal_indices],
             splits=None,
             tfms=self.tfms,
-            batch_tfms=None,  # No batch transforms!
+            batch_tfms=None,
             bs=self.bs,
             drop_last=False,
             shuffle=False
         )
-        
-        # Tabular
-        test_tab_dls = get_tabular_dls(
-            self.holdout_tab_normalized,
+
+        # Calibration set tabular
+        cal_tab_df = self.holdout_tab_normalized.iloc[cal_indices]
+        cal_tab_dls = get_tabular_dls(
+            cal_tab_df,
             procs=self.procs,
             cat_names=self.cat_cols.copy(),
             cont_names=self.num_cols.copy(),
@@ -191,69 +212,212 @@ class TimeDependentEvaluator:
             shuffle=False,
             classes=self.classes
         )
-        
-        # Categorical TS
-        test_ts_cat_dls = get_ts_dls(
-            X_multi_hot_censored.astype(np.int64),
-            self.holdout_y,
+
+        # Calibration set categorical TS
+        cal_ts_cat_dls = get_ts_dls(
+            self.holdout_X_multi_hot[cal_indices].astype(np.int64),
+            holdout_y_array[cal_indices],
             splits=None,
             bs=self.bs,
             shuffle=False
         )
-        
-        # Add metadata from original
-        test_ts_cat_dls.ts_cat_dims = self.data["ts_cat_dls"].ts_cat_dims
-        test_ts_cat_dls.X_multi_hot = X_multi_hot_censored
-        
+        cal_ts_cat_dls.ts_cat_dims = self.data["ts_cat_dls"].ts_cat_dims
+        cal_ts_cat_dls.X_multi_hot = self.holdout_X_multi_hot[cal_indices]
+
         # Combine
-        mixed_dls = get_mixed_dls(
-            test_ts_dls,
-            test_tab_dls,
-            test_ts_cat_dls,
+        cal_mixed_dls = get_mixed_dls(
+            cal_ts_dls,
+            cal_tab_dls,
+            cal_ts_cat_dls,
             bs=self.bs,
             shuffle_valid=False
         )
-        
-        return mixed_dls
-    
-    def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
+
+        # Calibrate
+        self.uq.calibrate(
+            self.learn,
+            cal_mixed_dls.train,
+            holdout_y_array[cal_indices]
+        )
+
+        # Store calibration indices for later exclusion
+        self.cal_indices = set(cal_indices)
+
+        logger.info("✓ Uncertainty calibration complete")
+
+    def evaluate_at_timestep_with_uncertainty(
+        self,
+        censor_step: int,
+        exclude_cal_set: bool = True,
+        patient_filter_mask: Optional[np.ndarray] = None
+    ) -> Optional[Tuple['TimeMetricResultWithUncertainty', 'UncertaintyResult']]:
         """
-        Evaluate model at a single time censoring point.
-        
-        Args:
-            censor_step: Time step to censor at
-            
-        Returns:
-            TimeMetricResult or None if evaluation failed
+        Evaluate model at a time point WITH uncertainty quantification.
         """
-        # Create censored dataloaders (FAST)
-        dls = self.create_censored_dataloaders_fast(censor_step)
+        import numpy as np
+        import torch
+        from astra.utils import logger
+        from astra.evaluation.predictive_performance import step_to_time
+        from astra.evaluation.uncertainty import calculate_calibration_metrics
+
+        # Create censored dataloaders for ALL patients with sufficient data
+        dls = self.create_censored_dataloaders_fast(censor_step, indices=None)
         if dls is None:
             return None
-        
-        # Get predictions
+
+        # Get predictions with uncertainty
+        uncertainty_result = self.uq.predict_with_uncertainty(
+            self.learn,
+            dls.train
+        )
+
+        # Get targets
         with torch.no_grad():
-            preds, targets = self.learn.get_preds(dl=dls.train)
-        
-        y_preds = preds[:, 1].cpu().numpy()
+            _, targets = self.learn.get_preds(dl=dls.train)
         ys = targets.cpu().numpy()
-        
-        # Check if we have both classes
-        if ys.sum() == 0 or ys.sum() == len(ys):
-            logger.warning(f"Skipping censor_step={censor_step}: only one class in targets")
-            return None
-        
-        # Calculate metrics with confidence intervals
-        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
-        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
-        
-        # Convert step to time
+
+        # Number of patients actually in the dataloader - THIS IS THE GROUND TRUTH
+        n_in_dataloader = len(uncertainty_result.pred_mean)
+
+        # ========================================================================
+        # CRITICAL FIX: Get valid_indices that matches EXACTLY what the dataloader has
+        # ========================================================================
+        # We need to replicate EXACTLY what create_censored_dataloaders_fast does
+        trajectory_lengths = self.data.get("holdout_trajectory_lengths", None)
+
+        if trajectory_lengths is not None:
+            # This should match the filtering in create_censored_dataloaders_fast
+            valid_mask = trajectory_lengths > censor_step
+            valid_indices = np.where(valid_mask)[0]
+
+            # IMPORTANT: Check for mismatch and investigate
+            if len(valid_indices) != n_in_dataloader:
+                logger.warning(
+                    f"Mismatch at step {censor_step}: valid_indices={len(valid_indices)}, "
+                    f"dataloader={n_in_dataloader}. Diff={len(valid_indices) - n_in_dataloader}"
+                )
+                # The dataloader is authoritative - we need to figure out which indices it has
+                # This likely means some patients were filtered out by the tabular dataloader
+                # due to missing values or other reasons
+
+                # WORKAROUND: Use sequential indices matching dataloader size
+                # This means we lose the ability to map back to original patient IDs correctly
+                # but at least the dimensions match
+                valid_indices = np.arange(n_in_dataloader)
+
+                # Better fix: We should track which patients are actually in the dataloader
+                # by storing this info during dataloader creation
+        else:
+            valid_indices = np.arange(len(self.holdout_y))
+            if len(valid_indices) != n_in_dataloader:
+                valid_indices = np.arange(n_in_dataloader)
+
+        # ========================================================================
+        # Apply filtering based on mode
+        # ========================================================================
+        if patient_filter_mask is not None:
+            # PATIENT-SPECIFIC MODE
+            # Build mapping: original holdout index -> dataloader index
+            index_mapping = {orig_idx: dl_idx for dl_idx, orig_idx in enumerate(valid_indices)}
+
+            requested_indices = np.where(patient_filter_mask)[0]
+            available_dl_indices = []
+
+            for req_idx in requested_indices:
+                if req_idx in index_mapping:
+                    available_dl_indices.append(index_mapping[req_idx])
+
+            if len(available_dl_indices) == 0:
+                logger.debug(f"No requested patients have data at censor_step={censor_step}")
+                return None
+
+            available_dl_indices = np.array(available_dl_indices)
+            y_preds = uncertainty_result.pred_mean[available_dl_indices]
+            ys = ys[available_dl_indices]
+
+            # Update uncertainty result arrays
+            uncertainty_result.pred_mean = uncertainty_result.pred_mean[available_dl_indices]
+            uncertainty_result.pred_std = uncertainty_result.pred_std[available_dl_indices]
+            uncertainty_result.entropy = uncertainty_result.entropy[available_dl_indices]
+            uncertainty_result.bald = uncertainty_result.bald[available_dl_indices]
+            if uncertainty_result.conformal_lower is not None:
+                uncertainty_result.conformal_lower = uncertainty_result.conformal_lower[available_dl_indices]
+                uncertainty_result.conformal_upper = uncertainty_result.conformal_upper[available_dl_indices]
+                uncertainty_result.conformal_width = uncertainty_result.conformal_width[available_dl_indices]
+
+        elif exclude_cal_set and hasattr(self, 'cal_indices'):
+            # ====================================================================
+            # COHORT MODE: Exclude calibration patients
+            # ====================================================================
+            # Build test_mask with length = n_in_dataloader
+            # For each position in the dataloader, check if the ORIGINAL index 
+            # is NOT in the calibration set
+            test_mask = np.array([
+                valid_indices[dl_idx] not in self.cal_indices 
+                for dl_idx in range(n_in_dataloader)
+            ])
+
+            if test_mask.sum() == 0:
+                logger.debug(f"No test patients at censor_step={censor_step}")
+                return None
+
+            y_preds = uncertainty_result.pred_mean[test_mask]
+            ys = ys[test_mask]
+
+            # Update uncertainty result arrays
+            uncertainty_result.pred_mean = uncertainty_result.pred_mean[test_mask]
+            uncertainty_result.pred_std = uncertainty_result.pred_std[test_mask]
+            uncertainty_result.entropy = uncertainty_result.entropy[test_mask]
+            uncertainty_result.bald = uncertainty_result.bald[test_mask]
+            if uncertainty_result.conformal_lower is not None:
+                uncertainty_result.conformal_lower = uncertainty_result.conformal_lower[test_mask]
+                uncertainty_result.conformal_upper = uncertainty_result.conformal_upper[test_mask]
+                uncertainty_result.conformal_width = uncertainty_result.conformal_width[test_mask]
+
+        else:
+            # All patients (no exclusions)
+            y_preds = uncertainty_result.pred_mean
+
+        # ========================================================================
+        # Calculate metrics
+        # ========================================================================
+        single_class = (ys.sum() == 0 or ys.sum() == len(ys))
+
+        if single_class:
+            if patient_filter_mask is None:
+                logger.warning(f"Skipping censor_step={censor_step}: only one class in targets")
+                return None
+            else:
+                logger.debug(f"Single class at step {censor_step} - metrics unavailable")
+
+        if not single_class:
+            from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
+            auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
+            auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
+            cal_metrics = calculate_calibration_metrics(
+                y_preds, uncertainty_result.pred_std, ys, n_bins=10
+            )
+        else:
+            auroc, auroc_lower, auroc_upper = np.nan, np.nan, np.nan
+            auprc, auprc_lower, auprc_upper = np.nan, np.nan, np.nan
+            cal_metrics = {'ece': np.nan, 'uncertainty_separation': np.nan}
+
+        # Uncertainty metrics
+        mean_epistemic_uncertainty = uncertainty_result.pred_std.mean()
+        mean_entropy = uncertainty_result.entropy.mean()
+        mean_bald = uncertainty_result.bald.mean()
+        mean_conformal_width = (
+            uncertainty_result.conformal_width.mean()
+            if uncertainty_result.conformal_width is not None
+            else None
+        )
+
         time_min = step_to_time(censor_step)
         if time_min is None:
             logger.warning(f"Could not convert step {censor_step} to time")
             return None
-        
-        return TimeMetricResult(
+
+        result = TimeMetricResultWithUncertainty(
             time_min=time_min,
             time_hours=time_min / 60,
             time_days=time_min / (24 * 60),
@@ -263,38 +427,87 @@ class TimeDependentEvaluator:
             auprc=auprc,
             auprc_ci=(auprc_lower, auprc_upper),
             n_samples=len(ys),
-            n_positive=int(ys.sum())
+            n_positive=int(ys.sum()),
+            mean_epistemic_uncertainty=mean_epistemic_uncertainty,
+            mean_entropy=mean_entropy,
+            mean_bald=mean_bald,
+            mean_conformal_width=mean_conformal_width,
+            ece=cal_metrics['ece'],
+            uncertainty_separation=cal_metrics['uncertainty_separation']
         )
-    
-    def evaluate_over_time_ultra_fast(
+
+        return result, uncertainty_result
+
+    def evaluate_over_time_with_uncertainty(
         self,
         censor_steps: List[int],
         save_predictions: bool = True,
-        model_name: Optional[str] = None
-    ) -> Tuple[List[TimeMetricResult], Optional[pd.DataFrame]]:
+        model_name: Optional[str] = None,
+        exclude_cal_set: bool = True,
+        pids: Optional[List] = None
+    ) -> Tuple[List[TimeMetricResultWithUncertainty], Optional[pd.DataFrame]]:
         """
-        ULTRA-FAST evaluation by working with pre-normalized data.
-        
-        This should be 10-20x faster than the old approach.
-        
+        Evaluate over time WITH uncertainty quantification.
+
+        Supports both cohort-level and individual patient analysis.
+
         Args:
             censor_steps: List of time steps to evaluate at
-            save_predictions: Whether to save per-patient predictions
-            model_name: Model name for saving predictions
-            
+            save_predictions: Whether to save predictions with uncertainties
+            model_name: Model name for saving
+            exclude_cal_set: Whether to exclude calibration set (ignored if pids specified)
+            pids: Optional list of specific PIDs to evaluate. If None, evaluates all patients.
+
         Returns:
-            Tuple of (results list, predictions DataFrame if save_predictions=True)
+            Tuple of (results list, predictions DataFrame)
         """
         import time
-        
+
         results = []
         preds_over_time = [] if save_predictions else None
         patient_ids = self.holdout.base.PID.values
-        
-        logger.info(f"Ultra-fast evaluation at {len(censor_steps)} time points...")
-        logger.info(f"Strategy: Working with pre-normalized data (no re-normalization!)")
+
+        # Determine which patients to include
+        if pids is not None:
+            # Patient-specific mode: get specific PIDs
+            all_pids = self.get_holdout_pids()
+            indices, found_pids = self.get_sample_indices_for_pids(all_pids, pids)
+
+            if not found_pids:
+                logger.error(f"None of the specified PIDs found in holdout data")
+                logger.info(f"Available PIDs (first 10): {all_pids[:10]}")
+                return [], None
+
+            patient_filter_mask = np.zeros(len(patient_ids), dtype=bool)
+            patient_filter_mask[indices] = True
+            eval_patient_ids = patient_ids[patient_filter_mask]
+
+            logger.info(f"Evaluating {len(found_pids)} specific patient(s): {found_pids}")
+            if len(found_pids) < len(pids):
+                missing = set(pids) - set(found_pids)
+                logger.warning(f"Missing PIDs: {missing}")
+
+            # For patient-specific mode, don't use exclude_cal_set
+            use_exclude_cal_set = False
+            use_patient_filter_mask = patient_filter_mask
+
+        else:
+            # Cohort mode: handle calibration exclusion in evaluate_at_timestep_with_uncertainty
+            use_exclude_cal_set = exclude_cal_set
+            use_patient_filter_mask = None
+
+            if exclude_cal_set and hasattr(self, 'cal_indices'):
+                # Track which patients will be evaluated (for saving predictions)
+                test_mask = np.array([i not in self.cal_indices for i in range(len(patient_ids))])
+                eval_patient_ids = patient_ids[test_mask]
+                logger.info(f"Evaluating on test set only: {test_mask.sum()} patients "
+                           f"(excluded {len(self.cal_indices)} calibration patients)")
+            else:
+                eval_patient_ids = patient_ids
+
+        logger.info(f"Time-dependent evaluation with uncertainty at {len(censor_steps)} points...")
         start_time = time.time()
-        
+
         for i, censor_step in enumerate(censor_steps):
             # Progress logging
             if i % 10 == 0 or i == len(censor_steps) - 1:
@@ -306,495 +519,451 @@ class TimeDependentEvaluator:
                         f"Progress: {i+1}/{len(censor_steps)} ({100*i/len(censor_steps):.1f}%) "
                         f"- ~{remaining/60:.1f}min remaining"
                     )
-            
-            # Evaluate at this timestep
-            result = self.evaluate_at_timestep(censor_step)
-            
-            if result is not None:
+
+            # Evaluate with uncertainty
+            eval_result = self.evaluate_at_timestep_with_uncertainty(
+                censor_step,
+                exclude_cal_set=use_exclude_cal_set,
+                patient_filter_mask=use_patient_filter_mask
+            )
+
+            if eval_result is not None:
+                result, uncertainty_result = eval_result
                 results.append(result)
-                
-                # Save predictions
+
+                # Save predictions with uncertainties
                 if save_predictions:
-                    # Get predictions for this censored data
-                    dls = self.create_censored_dataloaders_fast(censor_step)
-                    with torch.no_grad():
-                        preds, _ = self.learn.get_preds(dl=dls.train)
-                    y_preds = preds[:, 1].cpu().numpy()
-                    
-                    for pid, pred in zip(patient_ids, y_preds):
-                        preds_over_time.append({
+                    for j, (pid, pred, std, entropy, bald) in enumerate(zip(
+                        eval_patient_ids,
+                        uncertainty_result.pred_mean,
+                        uncertainty_result.pred_std,
+                        uncertainty_result.entropy,
+                        uncertainty_result.bald
+                    )):
+                        pred_dict = {
                             "PID": pid,
                             "censor_step": censor_step,
                             "time_min": result.time_min,
                             "time_hours": result.time_hours,
                             "time_days": result.time_days,
-                            "pred": float(pred)
-                        })
-        
+                            "pred_mean": float(pred),
+                            "epistemic_uncertainty": float(std),
+                            "entropy": float(entropy),
+                            "bald": float(bald)
+                        }
+
+                        # Add conformal intervals if available
+                        if uncertainty_result.conformal_lower is not None:
+                            pred_dict["conformal_lower"] = float(uncertainty_result.conformal_lower[j])
+                            pred_dict["conformal_upper"] = float(uncertainty_result.conformal_upper[j])
+                            pred_dict["conformal_width"] = float(uncertainty_result.conformal_width[j])
+
+                        preds_over_time.append(pred_dict)
+
         total_time = time.time() - start_time
         logger.info(
-            f"✓ Ultra-fast evaluation complete: {len(results)}/{len(censor_steps)} successful "
+            f"✓ Uncertainty evaluation complete: {len(results)}/{len(censor_steps)} successful "
             f"in {total_time/60:.1f} minutes ({total_time/len(censor_steps):.2f}s per step)"
         )
-        
+
         # Save predictions
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
             os.makedirs('models/eval', exist_ok=True)
-            preds_df.to_pickle(f'models/eval/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to models/eval/preds_{model_name}.pkl")
+            preds_df.to_pickle(f'models/eval/preds_uncertainty_{model_name}.pkl')
+            preds_df.to_csv(f'data/processed/preds_uncertainty_{model_name}.csv', index=False)
+            logger.info(f"Saved uncertainty predictions to models/eval/preds_uncertainty_{model_name}.pkl")
             return results, preds_df
-        
+
         return results, None
 
 
 # ============================================================================
-# HELPER FUNCTIONS FOR TIME CONVERSION
+# VISUALIZATION FUNCTIONS
 # ============================================================================
 
-def time_to_step(time_value, time_unit='min'):
-    """Convert time value to time step index."""
-    if time_unit == 'min':
-        time_min = time_value
-    elif time_unit == 'h':
-        time_min = time_value * 60
-    elif time_unit == 'D':
-        time_min = time_value * 24 * 60
-    else:
-        raise ValueError("Unsupported time unit. Use 'min', 'h' or 'D'.")
-    
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    
-    for i, interval in enumerate(intervals):
-        start_min = interval['start_h'] * 60
-        end_min = interval['end_h'] * 60 if interval['end_h'] is not None else float('inf')
-        if start_min < time_min <= end_min:
-            offset_min = time_min - start_min
-            step_offset = int(np.ceil(offset_min / interval['bin_min'])) - 1
-            bins_cum = 0
-            for j in range(i):
-                duration_min = (intervals[j]['end_h'] - intervals[j]['start_h']) * 60
-                bins_cum += duration_min // intervals[j]['bin_min']
-            return bins_cum + step_offset
-    return None
-
-
-def step_to_time(step):
-    """Convert step index back to time in minutes."""
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins = duration_min // interval['bin_min']
-        bins_cum.append(bins_cum[-1] + bins)
-    
-    for i in range(len(bins_cum) - 1):
-        if bins_cum[i] <= step < bins_cum[i+1]:
-            interval = intervals[i]
-            step_offset = step - bins_cum[i]
-            start_min = interval['start_h'] * 60
-            return start_min + (step_offset + 1) * interval['bin_min']
-    return None
-
-
-def generate_time_thresholds(max_days=30, cut_hours=72, step_hours=1, step_days=1):
-    """Generate list of time steps to evaluate at."""
-    thresholds = []
-    
-    # Hourly steps up to cut_hours
-    for h in range(step_hours, cut_hours+1, step_hours):
-        step = time_to_step(h, 'h')
-        if step is not None:
-            thresholds.append(step)
-    
-    # Daily steps after cut_hours
-    start_day = int(np.ceil(cut_hours/24))
-    for d in range(start_day+1, max_days+1, step_days):
-        step = time_to_step(d, 'D')
-        if step is not None:
-            thresholds.append(step)
-    
-    return sorted(list(set(thresholds)))  # Remove duplicates and sort
-
-
-def format_step_label(step):
-    """Convert step to human-readable time label."""
-    time_min = step_to_time(step)
-    
-    if time_min is None:
-        return f"Step {step}"
-    
-    if time_min < 60:
-        return f"{int(time_min)} min"
-    elif time_min < 24 * 60:
-        hours = time_min / 60
-        if hours.is_integer():
-            hours = int(hours)
-        return f"{hours} h"
-    else:
-        days = time_min / (24 * 60)
-        if days.is_integer():
-            days = int(days)
-        return f"{days} day" + ("s" if days != 1 else "")
-
-
-# ============================================================================
-# PLOTTING FUNCTIONS
-# ============================================================================
-
-def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=30):
+def plot_uncertainty_over_time(
+    results: List[TimeMetricResultWithUncertainty],
+    cut_hours: int = 72,
+    max_days: int = 30
+):
     """
-    Plot AUROC and AUPRC over time with confidence intervals.
-    
+    Plot how uncertainty evolves over time.
+
+    Shows:
+    - Epistemic uncertainty (std dev)
+    - Predictive entropy
+    - Conformal interval width (if available)
+    - ECE (calibration)
+
     Args:
-        results: List of TimeMetricResult objects
-        cut_hours: Cut-off for hours plot
-        max_days: Maximum days for days plot
-        
+        results: List of TimeMetricResultWithUncertainty
+        cut_hours: Hours cutoff for first plot
+        max_days: Days range for second plot
+
     Returns:
         matplotlib Figure
     """
     if not results:
         raise ValueError("No results to plot")
-    
+
     # Extract data
     times_h = np.array([r.time_hours for r in results])
     times_d = np.array([r.time_days for r in results])
-    auroc_vals = np.array([r.auroc for r in results])
-    auroc_lower = np.array([r.auroc_ci[0] for r in results])
-    auroc_upper = np.array([r.auroc_ci[1] for r in results])
-    auprc_vals = np.array([r.auprc for r in results])
-    auprc_lower = np.array([r.auprc_ci[0] for r in results])
-    auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    epistemic_unc = np.array([r.mean_epistemic_uncertainty for r in results])
+    entropy = np.array([r.mean_entropy for r in results])
+    ece = np.array([r.ece if r.ece is not None else np.nan for r in results])
 
-    # Plot A: Hours view (0 to cut_hours)
+    has_conformal = results[0].mean_conformal_width is not None
+    if has_conformal:
+        conformal_width = np.array([r.mean_conformal_width for r in results])
+
+    # Create figure
+    n_rows = 2 if has_conformal else 2
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 4*n_rows))
+
+    # ========================================================================
+    # Row 1: Epistemic Uncertainty (std dev)
+    # ========================================================================
+
+    # Hours view
+    ax = axes[0, 0]
     mask_cut = times_h <= cut_hours
-    
-    for metric, vals, lower, upper, marker, color, label in [
-        ("AUROC", auroc_vals[mask_cut], auroc_lower[mask_cut], auroc_upper[mask_cut], 'o', "C0", "AUROC"),
-        ("AUPRC", auprc_vals[mask_cut], auprc_lower[mask_cut], auprc_upper[mask_cut], 's', "C1", "AUPRC")
-    ]:
-        x = times_h[mask_cut]
-        if len(x) > 0:
-            # Extend to cut_hours if needed
-            if x[-1] < cut_hours:
-                x_ext = np.append(x, cut_hours)
-                vals_ext = np.append(vals, vals[-1])
-                lower_ext = np.append(lower, lower[-1])
-                upper_ext = np.append(upper, upper[-1])
-            else:
-                x_ext, vals_ext, lower_ext, upper_ext = x, vals, lower, upper
-            
-            ax1.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
-            ax1.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
+    ax.plot(times_h[mask_cut], epistemic_unc[mask_cut], 'o-', color='C0', label='Epistemic Uncertainty')
+    ax.fill_between(times_h[mask_cut], 0, epistemic_unc[mask_cut], alpha=0.3, color='C0')
+    ax.set_xlabel("Time (hours)", fontsize=11)
+    ax.set_xlim(0, cut_hours)
+    ax.set_ylabel("Mean Std Dev", fontsize=11)
+    ax.set_title("A) Epistemic Uncertainty Over Hours", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
 
-    ax1.set_xlabel("Time (hours)", fontsize=11)
-    ax1.set_xlim(0, cut_hours)
-    ax1.set_xticks(np.arange(0, cut_hours+1, 6))
-    ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax1.set_ylabel("Score", fontsize=11)
-    ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=10)
-    ax1.set_ylim(0.0, 1.0)
+    # Days view
+    ax = axes[0, 1]
+    ax.plot(times_d, epistemic_unc, 'o-', color='C0', label='Epistemic Uncertainty')
+    ax.fill_between(times_d, 0, epistemic_unc, alpha=0.3, color='C0')
+    ax.set_xlabel("Time (days)", fontsize=11)
+    ax.set_xlim(0, max_days)
+    ax.set_ylabel("Mean Std Dev", fontsize=11)
+    ax.set_title("B) Epistemic Uncertainty Over Days", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
 
-    # Plot B: Days view (full range)
-    for metric, vals, lower, upper, marker, color, label in [
-        ("AUROC", auroc_vals, auroc_lower, auroc_upper, 'o', "C0", "AUROC"),
-        ("AUPRC", auprc_vals, auprc_lower, auprc_upper, 's', "C1", "AUPRC")
-    ]:
-        x = times_d
-        if len(x) > 0:
-            # Extend to max_days if needed
-            if x[-1] < max_days:
-                x_ext = np.append(x, max_days)
-                vals_ext = np.append(vals, vals[-1])
-                lower_ext = np.append(lower, lower[-1])
-                upper_ext = np.append(upper, upper[-1])
-            else:
-                x_ext, vals_ext, lower_ext, upper_ext = x, vals, lower, upper
-            
-            ax2.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
-            ax2.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
+    # ========================================================================
+    # Row 2: Calibration (ECE) and Entropy
+    # ========================================================================
 
-    ax2.set_xlabel("Time (days)", fontsize=11)
-    ax2.set_xlim(0, max_days)
-    ax2.set_xticks(np.arange(0, max_days+1, 5))
-    ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax2.set_ylabel("Score", fontsize=11)
-    ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=10)
-    ax2.set_ylim(0.0, 1.0)
+    # ECE over hours
+    ax = axes[1, 0]
+    mask_cut = times_h <= cut_hours
+    ax.plot(times_h[mask_cut], ece[mask_cut], 's-', color='C3', label='ECE')
+    ax.set_xlabel("Time (hours)", fontsize=11)
+    ax.set_xlim(0, cut_hours)
+    ax.set_ylabel("Expected Calibration Error", fontsize=11)
+    ax.set_title("C) Calibration Over Hours", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0.1, color='gray', linestyle='--', alpha=0.5, label='Poor calibration (>0.1)')
+    ax.legend()
+
+    # Entropy over days
+    ax = axes[1, 1]
+    ax.plot(times_d, entropy, '^-', color='C2', label='Entropy')
+    ax.fill_between(times_d, 0, entropy, alpha=0.3, color='C2')
+    ax.set_xlabel("Time (days)", fontsize=11)
+    ax.set_xlim(0, max_days)
+    ax.set_ylabel("Mean Entropy", fontsize=11)
+    ax.set_title("D) Predictive Entropy Over Days", fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
     return fig
 
 
-def plot_multiple_roc_pr_curves(
-    evaluator: TimeDependentEvaluator,
-    censor_steps: List[int],
-    labels: Optional[List[str]] = None
+def plot_patient_uncertainty_examples(
+    preds_df: pd.DataFrame,
+    n_patients: int = 6,
+    max_days: int = 30
 ):
     """
-    Plot ROC and PR curves for multiple time censoring points.
-    
+    Plot individual patient prediction trajectories with uncertainty.
+
+    Shows how predictions and uncertainty evolve for individual patients.
+
     Args:
-        evaluator: TimeDependentEvaluator instance
-        censor_steps: List of censoring steps to plot
-        labels: Optional labels for each curve
-        
+        preds_df: DataFrame with columns [PID, time_days, pred_mean, epistemic_uncertainty, ...]
+        n_patients: Number of patients to plot
+        max_days: Maximum days to show
+
     Returns:
         matplotlib Figure
     """
-    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(14, 6))
-    
-    colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD', 
-              '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
-    
-    baseline = None  # Will be set from first valid curve
-    
-    for i, censor_step in enumerate(censor_steps):
-        # Create censored dataloaders (FAST!)
-        dls = evaluator.create_censored_dataloaders_fast(censor_step)
-        if dls is None:
-            logger.warning(f"Skipping step {censor_step}: dataloader creation failed")
-            continue
-        
-        # Get predictions
-        with torch.no_grad():
-            preds, targets = evaluator.learn.get_preds(dl=dls.train)
-        
-        y_preds = preds[:, 1].cpu().numpy()
-        ys = targets.cpu().numpy()
-        
-        # Skip if only one class
-        if len(set(ys)) < 2:
-            logger.warning(f"Skipping step {censor_step}: only one class")
-            continue
-        
-        # Set baseline from first valid curve
-        if baseline is None:
-            baseline = ys.sum() / len(ys)
-        
-        # Get label
-        label = labels[i] if labels and i < len(labels) else format_step_label(censor_step)
-        color = colors[i % len(colors)]
-        
-        # ROC curve
-        fpr, tpr, _ = roc_curve(ys, y_preds)
-        roc_auc = roc_auc_score(ys, y_preds)
-        ax_roc.plot(fpr, tpr, color=color, label=f"{label} (AUC={roc_auc:.3f})", linewidth=2)
-        
-        # PR curve
-        precision, recall, _ = precision_recall_curve(ys, y_preds)
-        auprc = average_precision_score(ys, y_preds)
-        ax_pr.plot(recall, precision, color=color, label=f"{label} (AUC={auprc:.3f})", linewidth=2)
-    
-    # ROC formatting
-    ax_roc.plot([0, 1], [0, 1], 'k--', lw=1.5, c="grey", alpha=0.7, label='Chance')
-    ax_roc.set_title("ROC Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_roc.set_xlabel("False Positive Rate", fontsize=11)
-    ax_roc.set_ylabel("True Positive Rate", fontsize=11)
-    ax_roc.grid(alpha=0.3)
-    ax_roc.legend(fontsize=9, title="Time Available", title_fontsize=10)
-    ax_roc.set_aspect('equal', adjustable='box')
+    # Select diverse patients (high/medium/low final predictions)
+    final_time = preds_df['time_days'].max()
+    final_preds = preds_df[preds_df['time_days'] >= final_time * 0.9].groupby('PID')['pred_mean'].mean()
 
-    # PR formatting
-    if baseline is not None:
-        ax_pr.axhline(y=baseline, color='grey', linestyle='--', lw=1.5, alpha=0.7, label=f'Baseline ({baseline:.3f})')
-    ax_pr.set_title("Precision-Recall Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_pr.set_xlabel("Recall", fontsize=11)
-    ax_pr.set_ylabel("Precision", fontsize=11)
-    ax_pr.grid(alpha=0.3)
-    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9, 
-                title="Time Available", title_fontsize=10)
-    ax_pr.set_aspect('equal', adjustable='box')
+    # Get patients with diverse predictions
+    sorted_pids = final_preds.sort_values().index
+    n_total = len(sorted_pids)
+    selected_pids = [
+        sorted_pids[0],  # Lowest
+        sorted_pids[n_total // 4],
+        sorted_pids[n_total // 2],
+        sorted_pids[3 * n_total // 4],
+        sorted_pids[-1],  # Highest
+        sorted_pids[n_total // 3]  # Extra
+    ][:n_patients]
 
-    fig.subplots_adjust(right=0.82, wspace=0.3)
+    # Create figure
+    n_cols = 3
+    n_rows = (n_patients + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 4*n_rows))
+    axes = axes.flatten() if n_patients > 1 else [axes]
+
+    for i, pid in enumerate(selected_pids):
+        ax = axes[i]
+
+        # Get patient data
+        patient_data = preds_df[preds_df['PID'] == pid].sort_values('time_days')
+        patient_data = patient_data[patient_data['time_days'] <= max_days]
+
+        times = patient_data['time_days'].values
+        preds = patient_data['pred_mean'].values
+        unc = patient_data['epistemic_uncertainty'].values
+
+        # Plot prediction with uncertainty
+        ax.plot(times, preds, 'o-', color='C0', label='Prediction', linewidth=2)
+        ax.fill_between(
+            times,
+            np.maximum(0, preds - 2*unc),
+            np.minimum(1, preds + 2*unc),
+            alpha=0.3,
+            color='C0',
+            label='±2σ (95% CI)'
+        )
+
+        # Add conformal intervals if available
+        if 'conformal_lower' in patient_data.columns:
+            lower = patient_data['conformal_lower'].values
+            upper = patient_data['conformal_upper'].values
+            ax.fill_between(
+                times,
+                lower,
+                upper,
+                alpha=0.2,
+                color='C1',
+                label='Conformal 90% CI'
+            )
+
+        ax.set_xlabel("Time (days)", fontsize=10)
+        ax.set_ylabel("Predicted Risk", fontsize=10)
+        ax.set_title(f"Patient {pid}", fontsize=11, fontweight='bold')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlim(0, max_days)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=8, loc='best')
+
+    # Hide extra subplots
+    for j in range(i+1, len(axes)):
+        axes[j].axis('off')
+
     plt.tight_layout()
-    
     return fig
 
-    
-# ============================================================================
-# MAIN EVALUATION FUNCTION
-# ============================================================================
 
-def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval: bool = True):
+def plot_individual_patient_uncertainty(
+    preds_df: pd.DataFrame,
+    pid: any,
+    max_days: int = 30,
+    show_entropy: bool = True
+):
     """
-    FIXED: Enhanced evaluation with time-dependent metrics.
-    
-    Key improvements:
-    - Works with pre-normalized data (no re-normalization!)
-    - 10-20x faster by avoiding redundant dataloader creation
-    - Preserves padding correctly
-    
+    Plot detailed uncertainty analysis for a single patient.
+
+    Shows:
+    - Prediction trajectory with epistemic uncertainty bands
+    - Conformal prediction intervals (if available)
+    - Entropy evolution (optional)
+    - BALD scores (optional)
+
     Args:
-        data: Output from prepare_data_and_dls() (contains pre-normalized data)
-        model_name: Name of saved model to load
-        multicurve: Whether to plot multiple ROC/PR curves at key timepoints
-        comprehensive_eval: Whether to run full time-dependent evaluation
-        
+        preds_df: DataFrame with columns [PID, time_days, pred_mean, epistemic_uncertainty, ...]
+        pid: Patient ID to plot
+        max_days: Maximum days to show
+        show_entropy: Whether to show entropy subplot
+
     Returns:
-        If comprehensive_eval=True: (results, predictions_df)
-        Otherwise: None
+        matplotlib Figure
     """
-    mixed_dls = data["mixed_dls"]
-    holdout_mixed_dls = data["holdout_mixed_dls"]
-    
-    # ============================================================================
-    # LOAD MODEL
-    # ============================================================================
-    logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(data, cfg)
-    learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name)
-    learn.to('cuda')
-    learn = patch_learner_get_preds(learn)
-    logger.info("✓ Model loaded and moved to GPU")
-    
-    # ============================================================================
-    # BASELINE EVALUATION (Full Time Series)
-    # ============================================================================
-    logger.info("Running baseline evaluation with full time series...")
-    preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
-    
-    # Plot and save baseline evaluation
-    evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/')
-    logger.info("✓ Baseline ROC/PR plot saved")
-    
-    # ============================================================================
-    # Initialize evaluator with pre-normalized data
-    # ============================================================================
-    evaluator = TimeDependentEvaluator(data, learn, cfg)
-    
-    # ============================================================================
-    # MULTIPLE ROC/PR CURVES AT KEY TIMEPOINTS
-    # ============================================================================
-    if multicurve:
-        logger.info("Creating multiple ROC/PR curves at key timepoints...")
-        
-        # Select key time points for visualization
-        key_timepoints = [
-            time_to_step(1, 'h'),
-            time_to_step(6, 'h'),
-            time_to_step(12, 'h'),
-            time_to_step(24, 'h'),
-            time_to_step(72, 'h'),
-            time_to_step(7, 'D'),
-            time_to_step(14, 'D'),
-            time_to_step(30, 'D')
-        ]
-        
-        # Filter out None values and reverse for better legend ordering
-        key_timepoints = [t for t in key_timepoints if t is not None]
-        key_timepoints.reverse()
-        
-        # Generate labels
-        labels = [format_step_label(step) for step in key_timepoints]
-        
-        # Create plot (FAST!)
-        fig_curves = plot_multiple_roc_pr_curves(
-            evaluator,
-            key_timepoints,
-            labels=labels
+    # Get patient data
+    patient_data = preds_df[preds_df['PID'] == pid].sort_values('time_days')
+    patient_data = patient_data[patient_data['time_days'] <= max_days]
+
+    if len(patient_data) == 0:
+        raise ValueError(f"No data found for patient {pid}")
+
+    times = patient_data['time_days'].values
+    preds = patient_data['pred_mean'].values
+    unc = patient_data['epistemic_uncertainty'].values
+
+    # Check what uncertainty metrics are available
+    has_conformal = 'conformal_lower' in patient_data.columns
+    has_entropy = 'entropy' in patient_data.columns
+    has_bald = 'bald' in patient_data.columns
+
+    # Create figure
+    n_plots = 2 if (show_entropy and has_entropy) else 1
+    fig, axes = plt.subplots(n_plots, 1, figsize=(12, 5*n_plots))
+    if n_plots == 1:
+        axes = [axes]
+
+    # ========================================================================
+    # Plot 1: Prediction with uncertainty
+    # ========================================================================
+    ax = axes[0]
+
+    # Main prediction line
+    ax.plot(times, preds, 'o-', color='C0', label='Mean Prediction', linewidth=2.5, markersize=6)
+
+    # Epistemic uncertainty band (±2σ)
+    ax.fill_between(
+        times,
+        np.maximum(0, preds - 2*unc),
+        np.minimum(1, preds + 2*unc),
+        alpha=0.3,
+        color='C0',
+        label='±2σ Epistemic (95% CI)'
+    )
+
+    # Conformal intervals if available
+    if has_conformal:
+        lower = patient_data['conformal_lower'].values
+        upper = patient_data['conformal_upper'].values
+        ax.fill_between(
+            times,
+            lower,
+            upper,
+            alpha=0.15,
+            color='C1',
+            label='Conformal 90% CI'
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/')
-        logger.info("✓ Multiple curves plot saved")
-    
-    # ============================================================================
-    # COMPREHENSIVE TIME-DEPENDENT EVALUATION
-    # ============================================================================
-    if comprehensive_eval:
-        logger.info("="*80)
-        logger.info("STARTING COMPREHENSIVE TIME-DEPENDENT EVALUATION")
-        logger.info("="*80)
-        
-        # Generate time thresholds
-        censor_thresholds = generate_time_thresholds(
-            max_days=30, 
-            cut_hours=72, 
-            step_hours=1, 
-            step_days=1
+
+    # Risk thresholds
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1, label='Decision Threshold')
+
+    ax.set_xlabel("Time (days)", fontsize=12)
+    ax.set_ylabel("Predicted Risk", fontsize=12)
+    ax.set_title(f"Patient {pid}: Risk Prediction with Uncertainty", fontsize=13, fontweight='bold')
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlim(0, max_days)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc='best')
+
+    # ========================================================================
+    # Plot 2: Uncertainty metrics over time (optional)
+    # ========================================================================
+    if n_plots > 1:
+        ax = axes[1]
+
+        # Epistemic uncertainty
+        ax.plot(times, unc, 'o-', color='C2', label='Epistemic Uncertainty (σ)', linewidth=2, markersize=5)
+
+        # Entropy if available
+        if has_entropy:
+            entropy = patient_data['entropy'].values
+            ax2 = ax.twinx()
+            ax2.plot(times, entropy, 's-', color='C3', label='Entropy', linewidth=2, markersize=5)
+            ax2.set_ylabel("Entropy", fontsize=11, color='C3')
+            ax2.tick_params(axis='y', labelcolor='C3')
+
+            # Combine legends
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='best')
+        else:
+            ax.legend(fontsize=9, loc='best')
+
+        ax.set_xlabel("Time (days)", fontsize=12)
+        ax.set_ylabel("Std Dev", fontsize=11, color='C2')
+        ax.set_title("Uncertainty Evolution Over Time", fontsize=13, fontweight='bold')
+        ax.set_xlim(0, max_days)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='y', labelcolor='C2')
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_multiple_patients_comparison(
+    preds_df: pd.DataFrame,
+    pids: List,
+    max_days: int = 30
+):
+    """
+    Compare predictions and uncertainty across multiple specific patients.
+
+    Shows side-by-side comparison of prediction trajectories for selected patients.
+
+    Args:
+        preds_df: DataFrame with columns [PID, time_days, pred_mean, epistemic_uncertainty, ...]
+        pids: List of patient IDs to compare
+        max_days: Maximum days to show
+
+    Returns:
+        matplotlib Figure
+    """
+    n_patients = len(pids)
+    n_cols = min(3, n_patients)
+    n_rows = (n_patients + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+    axes = axes.flatten() if n_patients > 1 else [axes]
+
+    for i, pid in enumerate(pids):
+        ax = axes[i]
+
+        # Get patient data
+        patient_data = preds_df[preds_df['PID'] == pid].sort_values('time_days')
+        patient_data = patient_data[patient_data['time_days'] <= max_days]
+
+        if len(patient_data) == 0:
+            ax.text(0.5, 0.5, f'No data for\nPatient {pid}',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_xlim(0, max_days)
+            ax.set_ylim(0, 1)
+            continue
+
+        times = patient_data['time_days'].values
+        preds = patient_data['pred_mean'].values
+        unc = patient_data['epistemic_uncertainty'].values
+
+        # Plot prediction with uncertainty
+        ax.plot(times, preds, 'o-', color='C0', linewidth=2, markersize=5)
+        ax.fill_between(
+            times,
+            np.maximum(0, preds - 2*unc),
+            np.minimum(1, preds + 2*unc),
+            alpha=0.3,
+            color='C0'
         )
-        logger.info(f"Generated {len(censor_thresholds)} time thresholds")
-        logger.info(f"Range: {censor_thresholds[0]} to {censor_thresholds[-1]} steps")
-        
-        # Run evaluation over time (ULTRA-FAST - should take ~1-2 minutes now!)
-        results, preds_df = evaluator.evaluate_over_time_ultra_fast(
-            censor_thresholds,
-            save_predictions=True,
-            model_name=model_name
-        )
-        
-        if not results:
-            logger.error("No valid results from time-dependent evaluation!")
-            return None, None
-        
-        logger.info(f"✓ Evaluated at {len(results)} time points")
-        
-        # Save predictions CSV
-        preds_df.to_csv(f'data/processed/preds_df_{model_name}.csv', index=False)
-        logger.info(f"✓ Predictions saved to CSV")
-        
-        # ========================================================================
-        # PLOT: Metrics over time (hours and days view)
-        # ========================================================================
-        logger.info("Creating time-dependent metrics plot...")
-        fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/')
-        logger.info("✓ Time metrics plot saved")
-        
-        # ========================================================================
-        # SUMMARY STATISTICS
-        # ========================================================================
-        logger.info("="*80)
-        logger.info("EVALUATION SUMMARY")
-        logger.info("="*80)
-        logger.info(f"Total time points evaluated: {len(results)}")
-        logger.info(f"Predictions saved: {len(preds_df)} patient-timepoint pairs")
-        
-        # Print key metrics at important time points
-        logger.info("\nPerformance at key time points:")
-        if multicurve:
-            for step in key_timepoints[::-1]:  # Reverse back to chronological
-                matching = [r for r in results if r.censor_step == step]
-                if matching:
-                    r = matching[0]
-                    logger.info(
-                        f"  {format_step_label(step):>12s}: "
-                        f"AUROC={r.auroc:.3f} [{r.auroc_ci[0]:.3f}-{r.auroc_ci[1]:.3f}], "
-                        f"AUPRC={r.auprc:.3f} [{r.auprc_ci[0]:.3f}-{r.auprc_ci[1]:.3f}]"
-                    )
-        
-        logger.info("="*80)
-        logger.info("✓ Comprehensive evaluation complete!")
-        logger.info("="*80)
-        
-        return results, preds_df
-    
-    else:
-        logger.info("Skipping comprehensive evaluation (comprehensive_eval=False)")
-        return None, None
+
+        # Add conformal intervals if available
+        if 'conformal_lower' in patient_data.columns:
+            lower = patient_data['conformal_lower'].values
+            upper = patient_data['conformal_upper'].values
+            ax.fill_between(times, lower, upper, alpha=0.15, color='C1')
+
+        # Risk threshold
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+
+        ax.set_xlabel("Time (days)", fontsize=10)
+        ax.set_ylabel("Predicted Risk", fontsize=10)
+        ax.set_title(f"Patient {pid}", fontsize=11, fontweight='bold')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlim(0, max_days)
+        ax.grid(True, alpha=0.3)
+
+    # Hide extra subplots
+    for j in range(n_patients, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
+    return fig

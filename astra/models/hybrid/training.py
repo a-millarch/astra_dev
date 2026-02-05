@@ -31,8 +31,8 @@ def get_backbone(data, cfg): #TODO: use cfg model parameters
     n_heads=cfg["model"]["n_heads"],
     fc_dropout=cfg["model"]["fc_dropout"] ,
     res_dropout=cfg["model"]["res_dropout"] ,
-    fc_mults=(cfg["model"]["fc_mult_1"],cfg["model"]["fc_mult_2"]),
-    d_ff= cfg["model"]["d_ff"],
+    fc_mults=(cfg["model"]["fc_mults_1"],cfg["model"]["fc_mults_2"]),
+   # d_ff= cfg["model"]["d_ff"],
 
     cat_ts_combine='add',
     use_count_normalization=False
