@@ -352,6 +352,40 @@ class TimeDependentEvaluator:
 # HELPER FUNCTIONS FOR TIME CONVERSION
 # ============================================================================
 
+def _parse_timedelta_to_minutes(s):
+    """Parse a time string like '3h', '5min', '14D' to minutes."""
+    s = s.strip()
+    if s.endswith('min'):
+        return int(s[:-3])
+    elif s.endswith('h'):
+        return int(s[:-1]) * 60
+    elif s.endswith('D'):
+        return int(s[:-1]) * 24 * 60
+    else:
+        raise ValueError(f"Cannot parse time string: {s}")
+
+
+def _get_intervals_from_cfg():
+    """
+    Parse cfg['bin_intervals'] into a list of (start_min, end_min, bin_min) tuples.
+
+    cfg['bin_intervals'] keys are interval endpoints (e.g. '3h', '6h', '14D', 'end'),
+    values are bin frequencies (e.g. '5min', '10min', '1h').
+    """
+    bin_intervals = cfg["bin_intervals"]
+    intervals = []
+    start_min = 0
+
+    for end_str, freq_str in bin_intervals.items():
+        end_min = None if end_str == "end" else _parse_timedelta_to_minutes(end_str)
+        bin_min = _parse_timedelta_to_minutes(freq_str)
+        intervals.append((start_min, end_min, bin_min))
+        if end_min is not None:
+            start_min = end_min
+
+    return intervals
+
+
 def time_to_step(time_value, time_unit='min'):
     """Convert time value to time step index."""
     if time_unit == 'min':
@@ -362,56 +396,38 @@ def time_to_step(time_value, time_unit='min'):
         time_min = time_value * 24 * 60
     else:
         raise ValueError("Unsupported time unit. Use 'min', 'h' or 'D'.")
-    
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    
-    for i, interval in enumerate(intervals):
-        start_min = interval['start_h'] * 60
-        end_min = interval['end_h'] * 60 if interval['end_h'] is not None else float('inf')
-        if start_min < time_min <= end_min:
+
+    intervals = _get_intervals_from_cfg()
+
+    for i, (start_min, end_min, bin_min) in enumerate(intervals):
+        eff_end = end_min if end_min is not None else float('inf')
+        if start_min < time_min <= eff_end:
             offset_min = time_min - start_min
-            step_offset = int(np.ceil(offset_min / interval['bin_min'])) - 1
+            step_offset = int(np.ceil(offset_min / bin_min)) - 1
             bins_cum = 0
             for j in range(i):
-                duration_min = (intervals[j]['end_h'] - intervals[j]['start_h']) * 60
-                bins_cum += duration_min // intervals[j]['bin_min']
+                s, e, b = intervals[j]
+                if e is not None:
+                    bins_cum += (e - s) // b
             return bins_cum + step_offset
     return None
 
 
 def step_to_time(step):
     """Convert step index back to time in minutes."""
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
+    intervals = _get_intervals_from_cfg()
+
     bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins = duration_min // interval['bin_min']
-        bins_cum.append(bins_cum[-1] + bins)
-    
+    for start_min, end_min, bin_min in intervals[:-1]:
+        if end_min is not None:
+            duration = end_min - start_min
+            bins_cum.append(bins_cum[-1] + duration // bin_min)
+
     for i in range(len(bins_cum) - 1):
-        if bins_cum[i] <= step < bins_cum[i+1]:
-            interval = intervals[i]
+        if bins_cum[i] <= step < bins_cum[i + 1]:
+            start_min, end_min, bin_min = intervals[i]
             step_offset = step - bins_cum[i]
-            start_min = interval['start_h'] * 60
-            return start_min + (step_offset + 1) * interval['bin_min']
+            return start_min + (step_offset + 1) * bin_min
     return None
 
 

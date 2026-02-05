@@ -1,7 +1,7 @@
 import argparse
 
 from astra.utils import logger, cfg, logger
-from astra.evaluation.hybrid_model import run_eval
+from astra.evaluation.predictive_performance import run_eval
 
 from astra.data.dataloader import prepare_data_and_dls, save_normalization_artifacts
 from astra.models.hybrid.training import run_pretrain, run_finetune, run_finetune_early_prediction_optimized
@@ -37,7 +37,7 @@ def main():
             mask_prob_cat_ts=0.10,
             mask_prob_cat=0.15,
             mask_prob_cont=0.15,
-            epochs=50,
+            epochs=100,
             lr=1e-5,
             warmup_epochs=3,
             ts_loss_weight=1.0,
@@ -80,8 +80,8 @@ def main():
     if args.eval:
         logger.info("=== Running Evaluation ===")
         results, preds_df = run_eval(data, cfg["model_name"], args.multicurve,args.comprehensive_eval)
-        if args.comprehensive_eval:
-            logger.info(f"Generated {len(results[0])} time points with CIs")
+       # if args.comprehensive_eval:
+        #    logger.info(f"Generated {len(results[0])} time points with CIs")
 
 if __name__ == "__main__":
     main()
