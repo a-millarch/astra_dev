@@ -64,3 +64,95 @@ flowchart TB
     G --> G1["Timeseries dataloader<br>(FastAI)"]
     F1 --> M["Mixed dataloader<br>(TSAI)"]
     G1 --> M
+```
+
+
+### Single patient lifecycle state diagram
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> AwaitingTraumaCall
+    AwaitingTraumaCall : Awaiting Trauma Call
+
+    AwaitingTraumaCall --> TraumaCallReceived : DAP ETL writes trauma_call.csv
+
+    TraumaCallReceived : Trauma Call Received
+    TraumaCallReceived --> PatientIngestion
+
+    state PatientIngestion {
+        direction TB
+
+        state BuildBaseDF {
+            direction LR
+            load_pop : load_or_collect_population
+            build_traj : build_trajectories
+            match_traj : match_population_to_trajectories
+            add_info : add_patient_info
+            compute_hist : compute_historic_features
+            load_pop --> build_traj
+            build_traj --> match_traj
+            match_traj --> add_info
+            add_info --> compute_hist
+        }
+
+        BuildBaseDF --> BuildBinDF
+
+        state BuildBinDF {
+            direction LR
+            apply_intervals : apply bin_intervals config
+            gen_bins : generate time bins
+            save_bins : save bin_df
+            apply_intervals --> gen_bins
+            gen_bins --> save_bins
+        }
+    }
+
+    PatientIngestion --> MonitoringLoop
+
+    state MonitoringLoop {
+        direction TB
+
+        [*] --> PreProcessing
+        PreProcessing : Update tabular features and aggregate into bin_df
+
+        PreProcessing --> ConstructDatasets
+
+        state ConstructDatasets {
+            direction LR
+            tabular_ds : tabular_ds
+            timeseries_ds : timeseries_ds
+            mixed_dl : Mixed DataLoaders
+            tabular_ds --> mixed_dl
+            timeseries_ds --> mixed_dl
+        }
+
+        ConstructDatasets --> Predict
+        Predict : Model forward pass to predictions.csv
+
+        Predict --> ServeAPI
+        ServeAPI : GUI API endpoint serves prediction
+
+        ServeAPI --> WaitInterval
+        WaitInterval : Wait configured interval
+    }
+
+    state end_check <<choice>>
+
+    MonitoringLoop --> end_check : check for end trigger
+
+    end_check --> MonitoringLoop : patient still active
+    end_check --> EndTrajectory : discharge or death
+
+    state EndTrajectory {
+        direction TB
+        final_update : Final build_patient_info update
+        final_predict : Final prediction cycle
+        archive : Archive to historic_base_df
+
+        final_update --> final_predict
+        final_predict --> archive
+    }
+
+    EndTrajectory --> AwaitingTraumaCall : return to idle
+```

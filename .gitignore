@@ -2,6 +2,10 @@ docs/
 examples/
 notebooks/
 
+# Azure
+.amlignore
+.amlignore.amltmp
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
