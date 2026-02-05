@@ -212,14 +212,22 @@ __marimo__/
 
 # Project-specific directories
 # Keep folder structure but ignore contents
-data/**/*
+data/**
+!data/
+!data/**/
 !data/**/.gitkeep
 
-pretrain_checkpoints/**/*
+pretrain_checkpoints/**
+!pretrain_checkpoints/
+!pretrain_checkpoints/**/
 !pretrain_checkpoints/**/.gitkeep
 
-reports/**/*
+reports/**
+!reports/
+!reports/**/
 !reports/**/.gitkeep
 
-models/**/*
+models/**
+!models/
+!models/**/
 !models/**/.gitkeep
