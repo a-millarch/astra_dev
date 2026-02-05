@@ -97,7 +97,9 @@ def filter_inhospital(
 ### CONCEPT SPECIFICS
 
 def filter_vitals(vit):
-       
+    # Create a copy to avoid SettingWithCopyWarning
+    vit = vit.copy()
+
     # Fix temp in fahrenheit first
     vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
     
@@ -518,6 +520,8 @@ def filter_labs(lab):
 
 
 def filter_ita(ita):
+    # Create a copy to avoid SettingWithCopyWarning
+    ita = ita.copy()
     ita.rename(
         columns={
             "ITAOversigt_Måling": "FEATURE",
@@ -572,7 +576,7 @@ def filter_medicin(med):
         "Selvmedicinering",
         "Status, indgift",
     ]
-    med = med[med.Handling.isin(action_list)]
+    med = med[med.Handling.isin(action_list)].copy()
     # reduce ATC code
     med["ATC3"] = med.ATC.str[:3]
     med["ATC4"] = med.ATC.str[:4]
@@ -597,8 +601,8 @@ def filter_medicin(med):
 
     med3 = reverse_dict_replace(lvl3_map, med.copy(deep=True), 3)
     med4 = reverse_dict_replace(lvl4_map, med.copy(deep=True), 4)
-    med = pd.concat([med3, med4]).drop_duplicates()
-    med = med[med["FEATURE"].notnull()]
+    med = pd.concat([med3, med4]).drop_duplicates().copy()
+    med = med[med["FEATURE"].notnull()].copy()
     # set value to binary, consider changing to actual values of daily dosage or smth
     med["VALUE"] = med["FEATURE"] #CHANGED!
     med["FEATURE"] = "medication" #CHANGED!

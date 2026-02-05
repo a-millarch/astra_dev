@@ -1,13 +1,11 @@
 from astra.utils import logger, cfg
-from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
-
 import numpy as np
 from scipy import stats
-
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 def prepare_learner(data, model_name=None):
+    from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+
     if model_name is None:
         logger.info(f"Using default model name from cfg: {cfg['model_name']}")
         model_name = cfg["model_name"]

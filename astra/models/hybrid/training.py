@@ -26,12 +26,13 @@ def get_backbone(data, cfg): #TODO: use cfg model parameters
     classes= data["classes"],
     cont_names=data["num_cols"],
     ts_cat_dims=data["ts_cat_dls"].ts_cat_dims,
-    d_model=64,
-    n_layers=8,
-    n_heads=8,
-    fc_dropout=0.75,
-    res_dropout=0.22,
-    fc_mults=(0.3, 0.1),
+    d_model=cfg["model"]["d_model"],
+    n_layers=cfg["model"]["n_layers"],
+    n_heads=cfg["model"]["n_heads"],
+    fc_dropout=cfg["model"]["fc_dropout"] ,
+    res_dropout=cfg["model"]["res_dropout"] ,
+    fc_mults=(cfg["model"]["fc_mult_1"],cfg["model"]["fc_mult_2"]),
+    d_ff= cfg["model"]["d_ff"],
 
     cat_ts_combine='add',
     use_count_normalization=False
@@ -52,18 +53,20 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     """
     if pretrain_cfg is None: #TODO: use regular config
         pretrain_cfg = MLMConfig(
-            mask_prob_ts=0.10,
-            mask_prob_cat_ts=0.10,
+            mask_prob_ts=0.15,
+            mask_prob_cat_ts=0.15,
             mask_prob_cat=0.15,
             mask_prob_cont=0.15,
-            epochs=50,
-            lr=1e-5,
+            epochs=100,
+            lr=5e-5,
             warmup_epochs=3,
-            ts_loss_weight=1.0,
-            cat_loss_weight=1.0,
-            cont_loss_weight=1.0,
-            contrastive_weight=1.0,
-            patience=5,
+            ts_loss_weight=1.5,
+            cat_ts_loss_weight=1.5,
+            cat_loss_weight=0.5,
+            cont_loss_weight=0.5,
+            contrastive_weight=0.5,
+            temperature=0.07,
+            patience=10,
             save_best=True,
             checkpoint_dir='./pretrain_checkpoints'
         )
@@ -216,25 +219,6 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     
     backbone = get_backbone(data, cfg)
     logger.info(f"  Backbone: {type(backbone).__name__}")
-    
-    # Default pretraining config
-    if pretrain_cfg is None:
-        pretrain_cfg = MLMConfig(
-            mask_prob_ts=0.10,
-            mask_prob_cat_ts=0.10,
-            mask_prob_cat=0.15,
-            mask_prob_cont=0.15,
-            epochs=500,
-            lr=1e-5,
-            warmup_epochs=3,
-            ts_loss_weight=1.0,
-            cat_loss_weight=1.0,
-            cont_loss_weight=1.0,
-            contrastive_weight=1.0,
-            patience=10,
-            save_best=True,
-            checkpoint_dir='./pretrain_checkpoints'
-        )
     
     mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
     logger.info(f"  MLM model created")
@@ -594,12 +578,12 @@ def run_finetune_early_prediction_optimized(
     use_pretrained: bool = True,
     pretrain_cfg = None,
     skip_valid: bool = True,
-    lr: float = 4.7863e-4,
-    n_epochs: int = 22,
+    lr: float = 1e-4,
+    n_epochs: int = 40,
     # Early prediction parameters
     enable_time_masking: bool = True,
     enable_sample_weighting: bool = True,
-    masking_prob: float = 0.5,
+    masking_prob: float = 0.4,
     early_weight: float = 2.0,
     min_timesteps: int = 6
 ):

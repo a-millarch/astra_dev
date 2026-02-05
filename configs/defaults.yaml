@@ -56,14 +56,17 @@ training:
     bs: 64
     
 model:
-    res_dropout: 0.4
-    fc_dropout: 0.8
-    n_layers: 6
-    n_heads: 4 
-    d_model: 64
+    res_dropout: 0.4 #0.22
+    fc_dropout: 0.8 #0.75
+    fc_mults_1: 0.5  # 0.3
+    fc_mults_2: 0.25 # 0.1
+    n_layers: 6 #8
+    n_heads: 4 #8 
+    d_model: 32 #64
     d_k: None
     d_v: None
     d_ff: None
+    
     
 evaluation:
     max_f_beta: 10
@@ -171,7 +174,8 @@ drop_features:
 
 
 holdout_fraction: 0.2
-holdout_type: random #temporal
+holdout_type: temporal  # temporal or random
+holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
 seed: 2024
 
 Medicin: 

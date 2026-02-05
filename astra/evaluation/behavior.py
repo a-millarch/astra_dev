@@ -311,23 +311,28 @@ def extract_data_from_dataloader(dataloader, max_samples=None, device='cpu'):
             x_cont_full.to(device), y_full.to(device))
 
 
-def get_holdout_pids(data, max_samples=None):
+def get_holdout_pids(data, max_samples=None, specific_pids: List = None):
     """
     Extract PIDs from holdout dataset in the order they appear in the dataloader.
-    
+
     Args:
         data: Data dict containing 'holdout' TSDS object
         max_samples: Maximum number of samples (should match what was used in SHAP calculation)
-    
+        specific_pids: List of specific PIDs to include. If provided, returns only these PIDs
+                       in the order they appear in the holdout set.
+
     Returns:
         List of PIDs in dataloader order
     """
     # Get PIDs from holdout tab_df (which is used by the dataloader)
     holdout_pids = data["holdout"].tab_df['PID'].tolist()
-    
-    if max_samples is not None and len(holdout_pids) > max_samples:
+
+    if specific_pids is not None:
+        # Return only specific PIDs, preserving their order in holdout set
+        holdout_pids = [pid for pid in holdout_pids if pid in specific_pids]
+    elif max_samples is not None and len(holdout_pids) > max_samples:
         holdout_pids = holdout_pids[:max_samples]
-    
+
     return holdout_pids
 
 
@@ -370,14 +375,19 @@ def get_pid_for_sample_idx(pids: List, sample_idx: int) -> Optional[Union[int, s
 
 def calculate_shap_from_dataloaders(model, background_loader, test_loader, encoding_info,
                                      device='cuda', max_background_samples=200, max_test_samples=100,
-                                     compute_per_category_shap=True):
+                                     compute_per_category_shap=True, specific_pids: List = None,
+                                     all_pids: List = None):
     """
     Calculate SHAP values for all model inputs.
-    
+
     Args:
         compute_per_category_shap: If True, compute SHAP on raw multi-hot categorical TS
                                    to get per-category attributions. If False, compute on
                                    embedded representation (faster but less granular).
+        specific_pids: List of specific PIDs to include. If provided, only these samples
+                       will be used for SHAP calculation.
+        all_pids: List of all PIDs in the test loader (in order). Required if specific_pids
+                  is provided, to map PIDs to sample indices.
     """
     print("Extracting background data...")
     bg_ts, bg_ts_cat, bg_cat, bg_cont, bg_y = extract_data_from_dataloader(
@@ -390,10 +400,30 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     print(f"    Static continuous: {bg_cont.shape}")
     
     print("Extracting test data...")
+    # If specific_pids provided, extract enough samples to include them all
+    extraction_max = None if specific_pids is not None else max_test_samples
     test_ts, test_ts_cat, test_cat, test_cont, test_y = extract_data_from_dataloader(
-        test_loader, max_samples=max_test_samples, device=device)
-    print(f"  Test samples: {test_ts.shape[0]}")
-    
+        test_loader, max_samples=extraction_max, device=device)
+    print(f"  Test samples extracted: {test_ts.shape[0]}")
+
+    # Filter to specific PIDs if provided
+    if specific_pids is not None and all_pids is not None:
+        # Find indices of specific PIDs in the all_pids list
+        pid_indices = [i for i, pid in enumerate(all_pids) if pid in specific_pids]
+        # Ensure indices are within extracted data range
+        pid_indices = [i for i in pid_indices if i < test_ts.shape[0]]
+        if not pid_indices:
+            raise ValueError("No valid indices found for specific PIDs")
+        pid_indices = torch.tensor(pid_indices, device=device)
+        test_ts = test_ts[pid_indices]
+        test_ts_cat = test_ts_cat[pid_indices]
+        test_cat = test_cat[pid_indices]
+        test_cont = test_cont[pid_indices]
+        test_y = test_y[pid_indices]
+        print(f"  Filtered to {len(pid_indices)} specific PIDs")
+
+    print(f"  Final test samples: {test_ts.shape[0]}")
+
     model.eval()
     model = model.to(device)
     
@@ -1037,10 +1067,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
 
 
 def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_category_shap=True,
-                  max_test_samples=90, visualize=True) -> Dict:
+                  max_test_samples=90, visualize=True, specific_pids: List = None) -> Dict:
     """
     Run full SHAP analysis.
-    
+
     Args:
         data: Prepared data dict
         learn: Trained learner
@@ -1050,7 +1080,10 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
                                    medications/procedures matter). If False, faster but
                                    only shows aggregate categorical TS importance.
         max_test_samples: Maximum number of test samples for SHAP calculation
-    
+        specific_pids: List of specific PIDs to include in analysis. If provided,
+                       only these PIDs will be analyzed (must exist in holdout set).
+                       This ensures specific patients are available for individual plotting.
+
     Returns:
         dict with 'shap_results', 'holdout_pids', 'channel2feature', 'static_cat_names'
     """
@@ -1058,7 +1091,20 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
         data = prepare_data_and_dls()
     if learn is None:
         learn = prepare_learner(data, model_name)
-    
+
+    # Get all holdout PIDs first (needed for filtering by specific_pids)
+    all_holdout_pids = data["holdout"].tab_df['PID'].tolist()
+
+    # Validate specific_pids if provided
+    if specific_pids is not None:
+        missing_pids = [pid for pid in specific_pids if pid not in all_holdout_pids]
+        if missing_pids:
+            print(f"Warning: PIDs not found in holdout set: {missing_pids}")
+        specific_pids = [pid for pid in specific_pids if pid in all_holdout_pids]
+        if not specific_pids:
+            raise ValueError("None of the specified PIDs were found in holdout set")
+        print(f"Analyzing {len(specific_pids)} specific PIDs: {specific_pids}")
+
     shap_results = calculate_shap_from_dataloaders(
         model=learn.model,
         background_loader=data["mixed_dls"].train,
@@ -1067,13 +1113,15 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
         max_background_samples=600,
         max_test_samples=max_test_samples,
         encoding_info=data["encoding_info"],
-        compute_per_category_shap=compute_per_category_shap
+        compute_per_category_shap=compute_per_category_shap,
+        specific_pids=specific_pids,
+        all_pids=all_holdout_pids
     )
-    
+
     channel2feature, _ = create_channel_mapping(data)
-    
-    # Get holdout PIDs for individual plots
-    holdout_pids = get_holdout_pids(data, max_samples=max_test_samples)
+
+    # Get holdout PIDs for individual plots (filtered if specific_pids provided)
+    holdout_pids = get_holdout_pids(data, max_samples=max_test_samples, specific_pids=specific_pids)
     print(f"\nExtracted {len(holdout_pids)} holdout PIDs")
     print(f"First 5 PIDs: {holdout_pids[:5]}")
     

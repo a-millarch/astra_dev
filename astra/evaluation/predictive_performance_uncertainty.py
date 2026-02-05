@@ -248,41 +248,95 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
     def evaluate_at_timestep_with_uncertainty(
         self,
         censor_step: int,
-        exclude_cal_set: bool = True
+        exclude_cal_set: bool = True,
+        patient_filter_mask: Optional[np.ndarray] = None
     ) -> Optional[Tuple[TimeMetricResultWithUncertainty, UncertaintyResult]]:
         """
         Evaluate model at a time point WITH uncertainty quantification.
 
         Args:
             censor_step: Time step to censor at
-            exclude_cal_set: Whether to exclude calibration set from evaluation
+            exclude_cal_set: Whether to exclude calibration set from evaluation (ignored if patient_filter_mask provided)
+            patient_filter_mask: Optional boolean mask to filter patients AFTER getting predictions
+                              (avoids dataloader filtering issues by getting ALL predictions then filtering)
 
         Returns:
             Tuple of (TimeMetricResultWithUncertainty, UncertaintyResult) or None
         """
-        # Create censored dataloaders
-        dls = self.create_censored_dataloaders_fast(censor_step)
+        # Create censored dataloaders for ALL patients with sufficient data
+        # Don't pass indices - this avoids empty dataloader errors
+        dls = self.create_censored_dataloaders_fast(censor_step, indices=None)
         if dls is None:
             return None
 
-        # Get predictions with uncertainty
+        # Get predictions with uncertainty for ALL patients
         uncertainty_result = self.uq.predict_with_uncertainty(
             self.learn,
             dls.train
         )
 
-        # Get targets
+        # Get targets for ALL patients
         with torch.no_grad():
             _, targets = self.learn.get_preds(dl=dls.train)
         ys = targets.cpu().numpy()
 
-        # Exclude calibration set if requested
-        if exclude_cal_set and hasattr(self, 'cal_indices'):
-            test_mask = np.array([i not in self.cal_indices for i in range(len(ys))])
+        # Build mapping from original indices to dataloader indices
+        # The dataloader only contains patients with trajectory_length > censor_step
+        trajectory_lengths = self.data.get("holdout_trajectory_lengths", None)
+        if trajectory_lengths is not None:
+            valid_mask = trajectory_lengths > censor_step
+            # Map from full dataset indices to filtered dataloader indices
+            valid_indices = np.where(valid_mask)[0]
+            index_mapping = {orig_idx: dl_idx for dl_idx, orig_idx in enumerate(valid_indices)}
+        else:
+            # No filtering by trajectory, all patients in dataloader
+            valid_mask = np.ones(len(self.holdout_y), dtype=bool)
+            index_mapping = {i: i for i in range(len(self.holdout_y))}
+
+        # Apply filtering based on mode
+        if patient_filter_mask is not None:
+            # PATIENT-SPECIFIC MODE: Filter to specific requested patients
+            requested_indices = np.where(patient_filter_mask)[0]
+            available_dl_indices = []
+
+            for req_idx in requested_indices:
+                if req_idx in index_mapping:
+                    available_dl_indices.append(index_mapping[req_idx])
+                else:
+                    logger.debug(f"Patient at index {req_idx} doesn't have data at step {censor_step}")
+
+            if len(available_dl_indices) == 0:
+                logger.debug(f"No requested patients have data at censor_step={censor_step}")
+                return None
+
+            # Filter predictions to only requested patients
+            available_dl_indices = np.array(available_dl_indices)
+            y_preds = uncertainty_result.pred_mean[available_dl_indices]
+            ys = ys[available_dl_indices]
+
+            # Update uncertainty result
+            uncertainty_result.pred_mean = uncertainty_result.pred_mean[available_dl_indices]
+            uncertainty_result.pred_std = uncertainty_result.pred_std[available_dl_indices]
+            uncertainty_result.entropy = uncertainty_result.entropy[available_dl_indices]
+            uncertainty_result.bald = uncertainty_result.bald[available_dl_indices]
+            if uncertainty_result.conformal_lower is not None:
+                uncertainty_result.conformal_lower = uncertainty_result.conformal_lower[available_dl_indices]
+                uncertainty_result.conformal_upper = uncertainty_result.conformal_upper[available_dl_indices]
+                uncertainty_result.conformal_width = uncertainty_result.conformal_width[available_dl_indices]
+
+        elif exclude_cal_set and hasattr(self, 'cal_indices'):
+            # COHORT MODE: Exclude calibration set
+            # Build mask for non-calibration patients that are in dataloader
+            test_mask = np.array([orig_idx not in self.cal_indices for orig_idx in valid_indices])
+
+            if test_mask.sum() == 0:
+                logger.debug(f"No test patients at censor_step={censor_step}")
+                return None
+
             y_preds = uncertainty_result.pred_mean[test_mask]
             ys = ys[test_mask]
 
-            # Update uncertainty result to only include test set
+            # Update uncertainty result
             uncertainty_result.pred_mean = uncertainty_result.pred_mean[test_mask]
             uncertainty_result.pred_std = uncertainty_result.pred_std[test_mask]
             uncertainty_result.entropy = uncertainty_result.entropy[test_mask]
@@ -291,20 +345,46 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
                 uncertainty_result.conformal_lower = uncertainty_result.conformal_lower[test_mask]
                 uncertainty_result.conformal_upper = uncertainty_result.conformal_upper[test_mask]
                 uncertainty_result.conformal_width = uncertainty_result.conformal_width[test_mask]
+
         else:
+            # COHORT MODE: All patients (no exclusions)
             y_preds = uncertainty_result.pred_mean
 
         # Check if we have both classes
-        if ys.sum() == 0 or ys.sum() == len(ys):
-            logger.warning(f"Skipping censor_step={censor_step}: only one class in targets")
-            return None
+        single_class = (ys.sum() == 0 or ys.sum() == len(ys))
 
-        # Calculate performance metrics
-        from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
-        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
-        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
+        if single_class:
+            if patient_filter_mask is None:
+                # Cohort-level: this is an error
+                logger.warning(f"Skipping censor_step={censor_step}: only one class in targets")
+                return None
+            else:
+                # Individual patient: expected, metrics will be None
+                logger.debug(f"Single class at step {censor_step} - predictions available, metrics unavailable")
 
-        # Calculate uncertainty metrics
+        # Calculate performance metrics (if possible)
+        if not single_class:
+            from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
+            auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
+            auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
+
+            # Calculate calibration metrics
+            cal_metrics = calculate_calibration_metrics(
+                y_preds,
+                uncertainty_result.pred_std,
+                ys,
+                n_bins=10
+            )
+        else:
+            # Single class: metrics unavailable
+            auroc, auroc_lower, auroc_upper = np.nan, np.nan, np.nan
+            auprc, auprc_lower, auprc_upper = np.nan, np.nan, np.nan
+            cal_metrics = {
+                'ece': np.nan,
+                'uncertainty_separation': np.nan
+            }
+
+        # Calculate uncertainty metrics (always available)
         mean_epistemic_uncertainty = uncertainty_result.pred_std.mean()
         mean_entropy = uncertainty_result.entropy.mean()
         mean_bald = uncertainty_result.bald.mean()
@@ -312,14 +392,6 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
             uncertainty_result.conformal_width.mean()
             if uncertainty_result.conformal_width is not None
             else None
-        )
-
-        # Calculate calibration metrics
-        cal_metrics = calculate_calibration_metrics(
-            y_preds,
-            uncertainty_result.pred_std,
-            ys,
-            n_bins=10
         )
 
         # Convert step to time
@@ -380,7 +452,7 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
 
         # Determine which patients to include
         if pids is not None:
-            # Individual patient mode
+            # Patient-specific mode: get specific PIDs
             all_pids = self.get_holdout_pids()
             indices, found_pids = self.get_sample_indices_for_pids(all_pids, pids)
 
@@ -389,25 +461,32 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
                 logger.info(f"Available PIDs (first 10): {all_pids[:10]}")
                 return [], None
 
-            test_mask = np.zeros(len(patient_ids), dtype=bool)
-            test_mask[indices] = True
-            eval_patient_ids = patient_ids[test_mask]
+            patient_filter_mask = np.zeros(len(patient_ids), dtype=bool)
+            patient_filter_mask[indices] = True
+            eval_patient_ids = patient_ids[patient_filter_mask]
 
             logger.info(f"Evaluating {len(found_pids)} specific patient(s): {found_pids}")
             if len(found_pids) < len(pids):
                 missing = set(pids) - set(found_pids)
                 logger.warning(f"Missing PIDs: {missing}")
 
-        elif exclude_cal_set and hasattr(self, 'cal_indices'):
-            # Cohort mode, exclude calibration set
-            test_mask = np.array([i not in self.cal_indices for i in range(len(patient_ids))])
-            eval_patient_ids = patient_ids[test_mask]
-            logger.info(f"Evaluating on test set only: {test_mask.sum()} patients "
-                       f"(excluded {len(self.cal_indices)} calibration patients)")
+            # For patient-specific mode, don't use exclude_cal_set
+            use_exclude_cal_set = False
+            use_patient_filter_mask = patient_filter_mask
+
         else:
-            # Cohort mode, all patients
-            test_mask = np.ones(len(patient_ids), dtype=bool)
-            eval_patient_ids = patient_ids
+            # Cohort mode: handle calibration exclusion in evaluate_at_timestep_with_uncertainty
+            use_exclude_cal_set = exclude_cal_set
+            use_patient_filter_mask = None
+
+            if exclude_cal_set and hasattr(self, 'cal_indices'):
+                # Track which patients will be evaluated (for saving predictions)
+                test_mask = np.array([i not in self.cal_indices for i in range(len(patient_ids))])
+                eval_patient_ids = patient_ids[test_mask]
+                logger.info(f"Evaluating on test set only: {test_mask.sum()} patients "
+                           f"(excluded {len(self.cal_indices)} calibration patients)")
+            else:
+                eval_patient_ids = patient_ids
 
         logger.info(f"Time-dependent evaluation with uncertainty at {len(censor_steps)} points...")
         start_time = time.time()
@@ -427,7 +506,8 @@ class TimeDependentEvaluatorWithUncertainty(TimeDependentEvaluator):
             # Evaluate with uncertainty
             eval_result = self.evaluate_at_timestep_with_uncertainty(
                 censor_step,
-                exclude_cal_set=exclude_cal_set
+                exclude_cal_set=use_exclude_cal_set,
+                patient_filter_mask=use_patient_filter_mask
             )
 
             if eval_result is not None:
@@ -666,6 +746,206 @@ def plot_patient_uncertainty_examples(
 
     # Hide extra subplots
     for j in range(i+1, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_individual_patient_uncertainty(
+    preds_df: pd.DataFrame,
+    pid: any,
+    max_days: int = 30,
+    show_entropy: bool = True
+):
+    """
+    Plot detailed uncertainty analysis for a single patient.
+
+    Shows:
+    - Prediction trajectory with epistemic uncertainty bands
+    - Conformal prediction intervals (if available)
+    - Entropy evolution (optional)
+    - BALD scores (optional)
+
+    Args:
+        preds_df: DataFrame with columns [PID, time_days, pred_mean, epistemic_uncertainty, ...]
+        pid: Patient ID to plot
+        max_days: Maximum days to show
+        show_entropy: Whether to show entropy subplot
+
+    Returns:
+        matplotlib Figure
+    """
+    # Get patient data
+    patient_data = preds_df[preds_df['PID'] == pid].sort_values('time_days')
+    patient_data = patient_data[patient_data['time_days'] <= max_days]
+
+    if len(patient_data) == 0:
+        raise ValueError(f"No data found for patient {pid}")
+
+    times = patient_data['time_days'].values
+    preds = patient_data['pred_mean'].values
+    unc = patient_data['epistemic_uncertainty'].values
+
+    # Check what uncertainty metrics are available
+    has_conformal = 'conformal_lower' in patient_data.columns
+    has_entropy = 'entropy' in patient_data.columns
+    has_bald = 'bald' in patient_data.columns
+
+    # Create figure
+    n_plots = 2 if (show_entropy and has_entropy) else 1
+    fig, axes = plt.subplots(n_plots, 1, figsize=(12, 5*n_plots))
+    if n_plots == 1:
+        axes = [axes]
+
+    # ========================================================================
+    # Plot 1: Prediction with uncertainty
+    # ========================================================================
+    ax = axes[0]
+
+    # Main prediction line
+    ax.plot(times, preds, 'o-', color='C0', label='Mean Prediction', linewidth=2.5, markersize=6)
+
+    # Epistemic uncertainty band (±2σ)
+    ax.fill_between(
+        times,
+        np.maximum(0, preds - 2*unc),
+        np.minimum(1, preds + 2*unc),
+        alpha=0.3,
+        color='C0',
+        label='±2σ Epistemic (95% CI)'
+    )
+
+    # Conformal intervals if available
+    if has_conformal:
+        lower = patient_data['conformal_lower'].values
+        upper = patient_data['conformal_upper'].values
+        ax.fill_between(
+            times,
+            lower,
+            upper,
+            alpha=0.15,
+            color='C1',
+            label='Conformal 90% CI'
+        )
+
+    # Risk thresholds
+    ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1, label='Decision Threshold')
+
+    ax.set_xlabel("Time (days)", fontsize=12)
+    ax.set_ylabel("Predicted Risk", fontsize=12)
+    ax.set_title(f"Patient {pid}: Risk Prediction with Uncertainty", fontsize=13, fontweight='bold')
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlim(0, max_days)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10, loc='best')
+
+    # ========================================================================
+    # Plot 2: Uncertainty metrics over time (optional)
+    # ========================================================================
+    if n_plots > 1:
+        ax = axes[1]
+
+        # Epistemic uncertainty
+        ax.plot(times, unc, 'o-', color='C2', label='Epistemic Uncertainty (σ)', linewidth=2, markersize=5)
+
+        # Entropy if available
+        if has_entropy:
+            entropy = patient_data['entropy'].values
+            ax2 = ax.twinx()
+            ax2.plot(times, entropy, 's-', color='C3', label='Entropy', linewidth=2, markersize=5)
+            ax2.set_ylabel("Entropy", fontsize=11, color='C3')
+            ax2.tick_params(axis='y', labelcolor='C3')
+
+            # Combine legends
+            lines1, labels1 = ax.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax.legend(lines1 + lines2, labels1 + labels2, fontsize=9, loc='best')
+        else:
+            ax.legend(fontsize=9, loc='best')
+
+        ax.set_xlabel("Time (days)", fontsize=12)
+        ax.set_ylabel("Std Dev", fontsize=11, color='C2')
+        ax.set_title("Uncertainty Evolution Over Time", fontsize=13, fontweight='bold')
+        ax.set_xlim(0, max_days)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='y', labelcolor='C2')
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_multiple_patients_comparison(
+    preds_df: pd.DataFrame,
+    pids: List,
+    max_days: int = 30
+):
+    """
+    Compare predictions and uncertainty across multiple specific patients.
+
+    Shows side-by-side comparison of prediction trajectories for selected patients.
+
+    Args:
+        preds_df: DataFrame with columns [PID, time_days, pred_mean, epistemic_uncertainty, ...]
+        pids: List of patient IDs to compare
+        max_days: Maximum days to show
+
+    Returns:
+        matplotlib Figure
+    """
+    n_patients = len(pids)
+    n_cols = min(3, n_patients)
+    n_rows = (n_patients + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5*n_cols, 4*n_rows))
+    axes = axes.flatten() if n_patients > 1 else [axes]
+
+    for i, pid in enumerate(pids):
+        ax = axes[i]
+
+        # Get patient data
+        patient_data = preds_df[preds_df['PID'] == pid].sort_values('time_days')
+        patient_data = patient_data[patient_data['time_days'] <= max_days]
+
+        if len(patient_data) == 0:
+            ax.text(0.5, 0.5, f'No data for\nPatient {pid}',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_xlim(0, max_days)
+            ax.set_ylim(0, 1)
+            continue
+
+        times = patient_data['time_days'].values
+        preds = patient_data['pred_mean'].values
+        unc = patient_data['epistemic_uncertainty'].values
+
+        # Plot prediction with uncertainty
+        ax.plot(times, preds, 'o-', color='C0', linewidth=2, markersize=5)
+        ax.fill_between(
+            times,
+            np.maximum(0, preds - 2*unc),
+            np.minimum(1, preds + 2*unc),
+            alpha=0.3,
+            color='C0'
+        )
+
+        # Add conformal intervals if available
+        if 'conformal_lower' in patient_data.columns:
+            lower = patient_data['conformal_lower'].values
+            upper = patient_data['conformal_upper'].values
+            ax.fill_between(times, lower, upper, alpha=0.15, color='C1')
+
+        # Risk threshold
+        ax.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=1)
+
+        ax.set_xlabel("Time (days)", fontsize=10)
+        ax.set_ylabel("Predicted Risk", fontsize=10)
+        ax.set_title(f"Patient {pid}", fontsize=11, fontweight='bold')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlim(0, max_days)
+        ax.grid(True, alpha=0.3)
+
+    # Hide extra subplots
+    for j in range(n_patients, len(axes)):
         axes[j].axis('off')
 
     plt.tight_layout()

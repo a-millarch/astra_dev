@@ -171,6 +171,84 @@ def get_bin_df(bin_df_path=cfg["bin_df_path"]):
     return pd.read_pickle(bin_df_path)
 
 
+def get_train_test_split(cfg, base_df=None, return_indices=False):
+    """
+    Get train/test split using the same strategy as the hybrid model.
+
+    This ensures both EBM and hybrid models use the exact same patients for evaluation.
+
+    Args:
+        cfg: Configuration dictionary
+        base_df: Base dataframe (if None, will load using get_base_df())
+        return_indices: If True, return indices instead of dataframes
+
+    Returns:
+        If return_indices=False: (train_df, test_df)
+        If return_indices=True: (train_indices, test_indices)
+    """
+    if base_df is None:
+        base_df = get_base_df()
+
+    # Apply exclusion if specified
+    if cfg["dataset"]["exclusion"] == "lvl1tc":
+        base_df = base_df[base_df.LVL1TC == 1]
+
+    # Sort by date to ensure temporal ordering
+    base_df = base_df.sort_values('ServiceDate').reset_index(drop=True)
+
+    # Get split strategy from config
+    holdout_type = cfg.get("holdout_type", "temporal")
+
+    if holdout_type == "temporal":
+        # Use temporal split based on date
+        split_date = pd.to_datetime(cfg["holdout_split_date"])
+
+        train_mask = base_df.ServiceDate <= split_date
+        test_mask = base_df.ServiceDate > split_date
+
+        if return_indices:
+            train_indices = np.where(train_mask)[0]
+            test_indices = np.where(test_mask)[0]
+            return train_indices, test_indices
+        else:
+            train_df = base_df[train_mask].copy()
+            test_df = base_df[test_mask].copy()
+            return train_df, test_df
+
+    elif holdout_type == "random":
+        # Random split (stratified by target if possible)
+        holdout_fraction = cfg.get("holdout_fraction", 0.2)
+        seed = cfg.get("seed", 2024)
+
+        try:
+            # Try stratified split
+            train_df, test_df = train_test_split(
+                base_df,
+                test_size=holdout_fraction,
+                random_state=seed,
+                stratify=base_df[cfg["target"]],
+                shuffle=True
+            )
+        except ValueError:
+            # Fall back to non-stratified if not enough samples
+            train_df, test_df = train_test_split(
+                base_df,
+                test_size=holdout_fraction,
+                random_state=seed,
+                shuffle=True
+            )
+
+        if return_indices:
+            train_indices = train_df.index.values
+            test_indices = test_df.index.values
+            return train_indices, test_indices
+        else:
+            return train_df, test_df
+
+    else:
+        raise ValueError(f"Unknown holdout_type: {holdout_type}. Use 'temporal' or 'random'.")
+
+
 def align_dataframes(df_a, df_b, fill_value=0.0):
     """
     Aligns two dataframes by adding missing columns to both and ensuring the same column order.

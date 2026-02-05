@@ -103,46 +103,45 @@ def main(cfg):
 
     ebm.fit(X_train_proc, y_train)
 
+    # Get predictions (assuming you have ebm_clf fitted)
+    y_proba = ebm.predict_proba(X_test_proc)[:, 1]  # Probability of positive class
+    y_pred = ebm.predict(X_test_proc)
 
-# Get predictions (assuming you have ebm_clf fitted)
-y_proba = ebm.predict_proba(X_test_proc)[:, 1]  # Probability of positive class
-y_pred = ebm.predict(X_test_proc)
+    # Binarize y_test (ensure 0/1 format)
+    y_test_bin = np.array(y_val).round().astype(int)
 
-# Binarize y_test (ensure 0/1 format)
-y_test_bin = np.array(y_val).round().astype(int)
+    # ROC Curve
+    fpr, tpr, _ = roc_curve(y_test_bin, y_proba)
+    roc_auc = auc(fpr, tpr)
 
-# ROC Curve
-fpr, tpr, _ = roc_curve(y_test_bin, y_proba)
-roc_auc = auc(fpr, tpr)
+    plt.figure(figsize=(12, 5))
 
-plt.figure(figsize=(12, 5))
+    # ROC subplot
+    plt.subplot(1, 2, 1)
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC)')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
 
-# ROC subplot
-plt.subplot(1, 2, 1)
-plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.3f})')
-plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-plt.xlim([0.0, 1.0])
-plt.ylim([0.0, 1.05])
-plt.xlabel('False Positive Rate')
-plt.ylabel('True Positive Rate')
-plt.title('Receiver Operating Characteristic (ROC)')
-plt.legend(loc="lower right")
-plt.grid(True, alpha=0.3)
+    # Precision-Recall Curve
+    precision, recall, _ = precision_recall_curve(y_test_bin, y_proba)
+    pr_auc = average_precision_score(y_test_bin, y_proba)
 
-# Precision-Recall Curve
-precision, recall, _ = precision_recall_curve(y_test_bin, y_proba)
-pr_auc = average_precision_score(y_test_bin, y_proba)
+    plt.subplot(1, 2, 2)
+    plt.plot(recall, precision, color='blue', lw=2, label=f'PR curve (AP = {pr_auc:.3f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend(loc="lower left")
+    plt.grid(True, alpha=0.3)
 
-plt.subplot(1, 2, 2)
-plt.plot(recall, precision, color='blue', lw=2, label=f'PR curve (AP = {pr_auc:.3f})')
-plt.xlabel('Recall')
-plt.ylabel('Precision')
-plt.title('Precision-Recall Curve')
-plt.legend(loc="lower left")
-plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
-plt.tight_layout()
-plt.show()
-
-print(f"ROC AUC: {roc_auc:.3f}")
-print(f"PR AUC (AP): {pr_auc:.3f}")
+    print(f"ROC AUC: {roc_auc:.3f}")
+    print(f"PR AUC (AP): {pr_auc:.3f}")
