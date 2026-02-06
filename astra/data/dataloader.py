@@ -230,33 +230,29 @@ def prepare_data_and_dls(cfg):
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
         tsds.complete_cat.timestep_cols = tsds.timestep_cols
     
-    # Align dataframes (ensure trainval and holdout have same columns)
+    # Align continuous dataframes (string column names)
     trainval.complete, holdout.complete = align_dataframes(
         trainval.complete,
         holdout.complete
     )
-    # Also align categorical TS between trainval and holdout
-    trainval.complete_cat, holdout.complete_cat = align_dataframes(
-        trainval.complete_cat,
-        holdout.complete_cat
+    # Align categorical TS to match continuous TS timestep columns.
+    # align_dataframes expects string columns but categorical DFs use integer columns,
+    # so we pad missing timestep columns directly.
+    cont_ts_ints = sorted(
+        int(str(c)) for c in trainval.complete.columns if str(c).isdigit()
     )
-    # Cross-align continuous and categorical TS to ensure same timestep columns
-    # (continuous alignment may have added timesteps not present in categorical, or vice versa)
-    trainval.complete, trainval.complete_cat = align_dataframes(
-        trainval.complete,
-        trainval.complete_cat
-    )
-    holdout.complete, holdout.complete_cat = align_dataframes(
-        holdout.complete,
-        holdout.complete_cat
-    )
-    # Update timestep_cols on categorical dataframes to reflect aligned columns
-    aligned_ts_cols = sorted(
-        [c for c in trainval.complete.columns if str(c).isdigit()],
-        key=lambda x: int(str(x))
-    )
-    trainval.complete_cat.timestep_cols = aligned_ts_cols
-    holdout.complete_cat.timestep_cols = aligned_ts_cols
+    for tsds_obj in [trainval, holdout]:
+        df = tsds_obj.complete_cat
+        cat_ts_ints = set(c for c in df.columns if isinstance(c, int))
+        missing = set(cont_ts_ints) - cat_ts_ints
+        if missing:
+            for col in missing:
+                df[col] = np.nan
+        # Reorder: non-timestep columns first, then sorted timestep columns
+        non_ts = [c for c in df.columns if not isinstance(c, int)]
+        ts = sorted(c for c in df.columns if isinstance(c, int))
+        tsds_obj.complete_cat = df[non_ts + ts]
+        tsds_obj.complete_cat.timestep_cols = ts
     
     cat_cols = cfg["dataset"]["cat_cols"]
     num_cols = cfg["dataset"]["num_cols"]
