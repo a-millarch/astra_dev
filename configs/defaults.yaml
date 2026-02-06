@@ -95,7 +95,7 @@ evaluation:
     
 base_df_path: data/interim/base_df.pkl
 raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
-bin_df_path: data/interim/bin_df.pkl
+bin_df_path: data/interim/mapped/bin_df.pkl
 
 
 
@@ -132,15 +132,14 @@ bin_freq_include:
   - '5min'
   - '10min'
   - '20min'
+  - '30min'
   - '1h'
-  - '2h'
   - '4h'
-  - '12h'
   - '1D'
+  - '2D'
   - '3D'
   - '7D'
-  #- '7D'
-  #- '30D'
+  - '30D'
 
 temporal_features:
   enabled: true

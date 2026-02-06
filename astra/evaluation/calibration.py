@@ -68,7 +68,7 @@ def run_eval_with_calibration(
     
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/')
+    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
     logger.info("✓ Baseline ROC/PR plot saved")
     
     # ============================================================================
@@ -84,10 +84,10 @@ def run_eval_with_calibration(
             learn,
             holdout_mixed_dls,
             model_name=model_name,
-            save_dir='reports/'
+            save_dir='reports/calibration'
         )
-        
-        logger.info(f"✓ Calibration plot saved to reports/calibration_{model_name}.png")
+
+        logger.info(f"✓ Calibration plot saved to reports/calibration/calibration_{model_name}.png")
         logger.info(f"  ECE: {cal_metrics['ece']:.4f}")
         logger.info(f"  Brier Score: {cal_metrics['brier_score']:.4f}")
     
@@ -120,7 +120,7 @@ def run_eval_with_calibration(
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/')
+        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
         logger.info("✓ Multiple curves plot saved")
     
     if comprehensive_eval:
@@ -173,7 +173,7 @@ def run_eval_with_calibration(
             fig_cal_time = plot_calibration_over_time(
                 preds_df,
                 n_bins=4,
-                save_path=f'reports/calibration_over_time_{model_name}.png'
+                save_path=f'reports/calibration/calibration_over_time_{model_name}.png'
             )
             logger.info(f"✓ Calibration over time plot saved")
         
@@ -183,7 +183,7 @@ def run_eval_with_calibration(
         
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/')
+        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("✓ Time metrics plot saved")
         
         # ========================================================================
@@ -263,9 +263,9 @@ def analyze_calibration_only(data, model_name: str):
         learn,
         holdout_mixed_dls,
         model_name=model_name,
-        save_dir='reports/'
+        save_dir='reports/calibration'
     )
-    
+
     return cal_metrics
 
 
@@ -802,7 +802,7 @@ def add_calibration_to_eval(
     learn,
     holdout_mixed_dls,
     model_name: str,
-    save_dir: str = 'reports/'
+    save_dir: str = 'reports/calibration'
 ):
     """
     Add calibration plots to existing evaluation workflow.

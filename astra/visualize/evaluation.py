@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -139,7 +140,8 @@ def plot_evaluation(y_preds, ys, target):
     ax[1].plot([0, 1], [ys.sum() / len(ys), ys.sum() / len(ys)], "k--", lw=1, c="grey")
     ax[1].set_title("Holdout:\nPrecision Recall (PR)")
     ax[1].grid()
-    plt.savefig("models/figs/holdout_evaluation.png", dpi=1200)
+    os.makedirs("reports/eval", exist_ok=True)
+    plt.savefig("reports/eval/holdout_evaluation.png", dpi=1200)
     plt.plot()
     return fig
 
@@ -167,15 +169,13 @@ def plot_loss(learn, fold=None):
     ax.legend()
     ax.set_xlabel("Iterations")
     ax.set_ylabel("Loss")
+    os.makedirs("reports/training", exist_ok=True)
     if fold is None:
         ax.set_title("Loss Plot")
-        plt.savefig("models/figs/loss_plot.png")
+        plt.savefig("reports/training/loss_plot.png")
     else:
         ax.set_title(f"Loss Plot for Fold {fold}")
-        # Save the figure
-        plt.savefig(
-            f"models/figs/{fold}_fold_loss_plot.png"
-        )  # Ensure to specify file extension
+        plt.savefig(f"reports/training/{fold}_fold_loss_plot.png")
 
     # Show the plot
     plt.show()
@@ -224,7 +224,8 @@ def plot_fold_evaluation(metrics, target):
     ax[1].grid(True)
 
     plt.tight_layout()
-    plt.savefig(f"models/figs/{target}_evaluation_plots")
+    os.makedirs("reports/eval", exist_ok=True)
+    plt.savefig(f"reports/eval/{target}_evaluation_plots.png")
     plt.show()
     return fig
 
@@ -279,7 +280,8 @@ def evaluate_detection_rate(y_preds, y_true, threshold=0.5):
     ax[1].set_title("Confusion Matrix (Normalized)")
 
     plt.tight_layout()
-    plt.savefig("models/figs/cm")
+    os.makedirs("reports/eval", exist_ok=True)
+    plt.savefig("reports/eval/cm.png")
     plt.show()
     return fig
 
@@ -309,7 +311,8 @@ def create_calibration_plot(y_true, y_pred, n_bins=4):
     ax.text(0.1, 0.9, f"Brier Score: {brier_score:.4f}", transform=ax.transAxes)
 
     # Save the figure
-    plt.savefig("models/figs/calibration.png")  # Ensure to specify file extension
+    os.makedirs("reports/calibration", exist_ok=True)
+    plt.savefig("reports/calibration/calibration.png")
 
     # Show the plot
     plt.show()
@@ -374,7 +377,8 @@ def plot_multiple_evaluations(df, censor_ts, learn, labels=None):
     # Adjust spacing to prevent overlap with PR legend
     fig.subplots_adjust(right=0.75)
     
-    plt.savefig("models/figs/holdout_evaluation_multiple.png", dpi=1200)
+    os.makedirs("reports/eval", exist_ok=True)
+    plt.savefig("reports/eval/holdout_evaluation_multiple.png", dpi=1200)
     plt.show()
     return fig
 

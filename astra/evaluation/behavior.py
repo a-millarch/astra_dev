@@ -892,9 +892,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     plt.tight_layout()
     if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
-    
+
     return {'sample_idx': sample_idx, 'pid': display_pid}
 
 
@@ -1140,7 +1141,7 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
             feature_names_cat=static_cat_names,
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
-            save_path='reports/shap_summary_cohort.png'
+            save_path='reports/shap/shap_summary_cohort.png'
         )
         
         # Use first PID for individual plot
@@ -1153,7 +1154,7 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
             feature_names_cat=static_cat_names,
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1,
-            save_path='reports/shap_individual_sample_0.png'
+            save_path='reports/shap/shap_individual_sample_0.png'
         )
     
     # Return comprehensive results for further analysis
@@ -2479,7 +2480,7 @@ class TemporalSHAPAnalyzer:
 # ============================================================================
 
 def run_temporal_shap_analysis(data, learn, pid=None, sample_idx=None, timeframes=None,
-                               max_background_samples=200, save_dir='reports/', verbose=False):
+                               max_background_samples=200, save_dir='reports/shap', verbose=False):
     """
     Run complete temporal SHAP analysis with all visualizations.
     

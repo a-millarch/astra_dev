@@ -97,12 +97,12 @@ if __name__ =='__main__':
     #proces_raw_concepts(cfg, base=population)
 
     # Cohort mode
-    if is_file_present('data/interim/base_df.pkl'):
+    if is_file_present(cfg['base_df_path']):
         pass
     else:
         base = bpi.create_base_df(cfg)
     # bin_df    
-    if is_file_present('data/interim/bin_df.pkl'):   
+    if is_file_present(cfg['bin_df_path']):
         pass
     else: 
         bpi.create_bin_df(cfg)

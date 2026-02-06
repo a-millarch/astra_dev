@@ -315,7 +315,7 @@ def plot_ebm_vs_hybrid_comparison(
     hybrid_results_path: Optional[str] = None,
     cut_hours: int = 72,
     max_days: int = 30,
-    save_dir: str = 'reports'
+    save_dir: str = 'reports/eval'
 ):
     """
     Plot EBM performance over time and compare with hybrid model if available.
@@ -456,7 +456,7 @@ def _align_X_to_ebm(X: pd.DataFrame, ebm) -> pd.DataFrame:
 def plot_global_importance_heatmap(
     models_dir: str = "models/ebm",
     top_n: int = 25,
-    save_dir: str = "reports",
+    save_dir: str = "reports/eval",
 ):
     """
     Heatmap of global feature importances across all timepoints.
@@ -524,7 +524,7 @@ def plot_local_importance_heatmap(
     base_df: pd.DataFrame,
     models_dir: str = "models/ebm",
     top_n: int = 25,
-    save_dir: str = "reports",
+    save_dir: str = "reports/eval",
 ):
     """
     Heatmap of local feature contributions for specific PIDs across timepoints.
@@ -677,7 +677,7 @@ def main():
                         help='Hours cutoff for visualization')
     parser.add_argument('--max_days', type=int, default=30,
                         help='Maximum days for visualization')
-    parser.add_argument('--save_dir', type=str, default='reports',
+    parser.add_argument('--save_dir', type=str, default='reports/eval',
                         help='Directory to save plots')
 
     args = parser.parse_args()

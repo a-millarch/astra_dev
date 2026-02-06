@@ -12,7 +12,9 @@ from datetime import timedelta
 
 from azureml.core import Dataset
 
-def create_base_df(cfg, result_path = "data/interim/base_df.pkl"):
+def create_base_df(cfg, result_path=None):
+    if result_path is None:
+        result_path = cfg["base_df_path"]
     logger.info("Creating base dataframe")
 
     population = load_or_collect_population(cfg)

@@ -340,9 +340,9 @@ class TimeDependentEvaluator:
         # Save predictions
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
-            os.makedirs('models/eval', exist_ok=True)
-            preds_df.to_pickle(f'models/eval/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to models/eval/preds_{model_name}.pkl")
+            os.makedirs('reports/predictions', exist_ok=True)
+            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
             return results, preds_df
         
         return results, None
@@ -698,7 +698,7 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
     
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/')
+    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
     logger.info("✓ Baseline ROC/PR plot saved")
     
     # ============================================================================
@@ -737,7 +737,7 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/')
+        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
         logger.info("✓ Multiple curves plot saved")
     
     # ============================================================================
@@ -772,7 +772,8 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
         logger.info(f"✓ Evaluated at {len(results)} time points")
         
         # Save predictions CSV
-        preds_df.to_csv(f'data/processed/preds_df_{model_name}.csv', index=False)
+        os.makedirs('reports/predictions', exist_ok=True)
+        preds_df.to_csv(f'reports/predictions/preds_df_{model_name}.csv', index=False)
         logger.info(f"✓ Predictions saved to CSV")
         
         # ========================================================================
@@ -780,7 +781,7 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
         # ========================================================================
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/')
+        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("✓ Time metrics plot saved")
         
         # ========================================================================
