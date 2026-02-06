@@ -229,6 +229,22 @@ def prepare_data_and_dls(cfg):
         tsds.complete = pd.concat(tsds.cont_concepts).fillna(0.0)
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
         tsds.complete_cat.timestep_cols = tsds.timestep_cols
+
+        # Ensure complete_cat covers all PIDs from complete (patients with no
+        # categorical data get all-zero multi-hot vectors)
+        cont_pids = set(tsds.complete['PID'].unique())
+        cat_pids = set(tsds.complete_cat['PID'].unique())
+        missing_pids = cont_pids - cat_pids
+        if missing_pids:
+            logger.warning(f"{len(missing_pids)} PIDs in continuous data but not in categorical — adding zero placeholder rows")
+            feat_name = tsds.complete_cat['FEATURE'].dropna().iloc[0]
+            placeholder = pd.DataFrame({
+                'PID': list(missing_pids),
+                'FEATURE': feat_name,
+                **{col: np.nan for col in tsds.timestep_cols}
+            })
+            tsds.complete_cat = pd.concat([tsds.complete_cat, placeholder], ignore_index=True)
+            tsds.complete_cat.timestep_cols = tsds.timestep_cols
     
     # Align dataframes
     trainval.complete, holdout.complete = align_dataframes(
