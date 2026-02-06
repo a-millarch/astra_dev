@@ -137,7 +137,7 @@ def pretrain(cfg):
         patience=3,
         
         save_best=True,
-        checkpoint_dir='./pretrain_checkpoints'
+        checkpoint_dir=f'./pretrain_checkpoints/{cfg["model_name"]}'
     )
 
     # Save config
@@ -194,7 +194,7 @@ def pretrain(cfg):
     )
     logger.info('pretrained model saved')
 
-def load_pretrained_backbone(path='pretrain_checkpoints/best_model.pt'):
+def load_pretrained_backbone(path=f'pretrain_checkpoints/{cfg["model_name"]}/best_model.pt'):
     checkpoint = torch.load(path)
     return mlm_model.load_state_dict(checkpoint['model_state_dict'])
  

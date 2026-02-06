@@ -46,7 +46,7 @@ def main():
             contrastive_weight=1.0,
             patience=5,
             save_best=True,
-            checkpoint_dir='./pretrain_checkpoints'
+            checkpoint_dir=f'./pretrain_checkpoints/{cfg["model_name"]}'
         )
     
     if args.pretrain:

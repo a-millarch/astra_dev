@@ -69,7 +69,7 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
             temperature=pc["temperature"],
             patience=pc["patience"],
             save_best=pc["save_best"],
-            checkpoint_dir=pc["checkpoint_dir"],
+            checkpoint_dir=f'{pc["checkpoint_dir"]}/{cfg["model_name"]}',
         )
 
     # ============================================================================
@@ -284,7 +284,7 @@ def run_finetune(
     
     if use_pretrained:
         if pretrain_cfg is None:
-            checkpoint_dir = './pretrain_checkpoints'
+            checkpoint_dir = f'./pretrain_checkpoints/{cfg["model_name"]}'
         else:
             checkpoint_dir = pretrain_cfg.checkpoint_dir
         checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pt'))
@@ -608,7 +608,7 @@ def run_finetune_early_prediction_optimized(
     
     # Load pretrained weights
     if use_pretrained:
-        checkpoint_dir = pretrain_cfg.checkpoint_dir if pretrain_cfg else './pretrain_checkpoints'
+        checkpoint_dir = pretrain_cfg.checkpoint_dir if pretrain_cfg else f'./pretrain_checkpoints/{cfg["model_name"]}'
         checkpoint_path = os.path.join(checkpoint_dir, 'best_model.pt')
         
         if os.path.exists(checkpoint_path):
