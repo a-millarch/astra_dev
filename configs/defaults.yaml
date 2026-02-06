@@ -4,9 +4,9 @@ population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: hpt
-run_name: binary
+run_name: lowres
 
-model_name: '05022026_30D'
+model_name: '06022026_30D'
    
 target: deceased_30d
 
@@ -60,11 +60,11 @@ pretrain:
     warmup_epochs: 3
     ts_loss_weight: 1.5
     cat_ts_loss_weight: 1.5
-    cat_loss_weight: 0.5
-    cont_loss_weight: 0.5
+    cat_loss_weight: 1.0
+    cont_loss_weight: 1.0
     contrastive_weight: 0.5
     temperature: 0.07
-    patience: 10
+    patience: 3
     save_best: True
     checkpoint_dir: './pretrain_checkpoints'
 
@@ -113,10 +113,10 @@ large_load_filenames:
   - Notater
  
 bin_intervals:
-  3h: '5min'
-  6h: '10min'
-  12h: '20min'
-  24h: '1h'
+#  3h: '10min'
+  6h: '20min'
+  12h: '1h'
+  24h: '2h'
   72h: '4h'
   14D: '12h'
   30D: '1D'
@@ -124,10 +124,11 @@ bin_intervals:
   end: '30D'
 
 bin_freq_include:
-  - '5min'
-  - '10min'
+#  - '5min'
+#  - '10min'
   - '20min'
   - '1h'
+  - '2h'
   - '4h'
   - '12h'
   - '1D'
