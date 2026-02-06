@@ -3,7 +3,7 @@ import numpy as np
 from typing import List, Dict, Optional, Union
 import warnings
 
-from astra.utils import logger
+from astra.utils import logger, get_bin_df
 from astra.data.filters import collect_filter
 
 class AggregatedDS:
@@ -568,6 +568,14 @@ class TSDS:
                     self._base_pids,
                 )
 
+        # Add temporal features if enabled
+        if self.cfg.get('temporal_features', {}).get('enabled', False):
+            temporal_df = _create_temporal_features_df(
+                self.cfg, self.base, self.cfg["target"], self.cfg["bin_freq_include"]
+            )
+            if temporal_df is not None:
+                concepts['_temporal'] = temporal_df
+
         self.concepts = concepts
         self.concepts_raw = concepts_raw
 
@@ -580,6 +588,99 @@ class TSDS:
             self.vitals.iloc[:, :-1] = self.vitals.iloc[:, :-1].ffill(axis=1)
             # for target and if ffill not available
             self.vitals = self.vitals.fillna(0.0)
+
+
+def _create_temporal_features_df(
+    cfg: Dict,
+    base: pd.DataFrame,
+    target: str,
+    bin_freq_include: List[str],
+) -> pd.DataFrame:
+    """
+    Create temporal features (elapsed_hours, bin_width_hours) as a wide-format
+    DataFrame matching the schema of _get_long_concept_df_single_label output.
+
+    Each patient gets temporal values at bin positions within their trajectory,
+    with 0.0 padding beyond their trajectory length.
+    """
+    bin_df = get_bin_df()
+
+    # Filter to base PIDs and included frequencies
+    base_pids = set(base['PID'].unique())
+    bf = bin_df[
+        (bin_df['PID'].isin(base_pids)) &
+        (bin_df['bin_freq'].isin(bin_freq_include))
+    ].copy()
+
+    # Merge patient start times
+    bf = bf.merge(base[['PID', 'start']], on='PID', how='left')
+
+    # Sort and assign sequential position per patient (0-indexed)
+    bf = bf.sort_values(['PID', 'bin_counter'])
+    bf['position'] = bf.groupby('PID').cumcount()
+
+    # Compute temporal features
+    bf['elapsed_hours'] = (
+        (bf['bin_start'] - bf['start']).dt.total_seconds() / 3600
+        + (bf['bin_end'] - bf['bin_start']).dt.total_seconds() / 7200  # midpoint
+    )
+    bf['bin_width_hours'] = (
+        (bf['bin_end'] - bf['bin_start']).dt.total_seconds() / 3600
+    )
+
+    # Select which features to include from config
+    enabled_features = cfg.get('temporal_features', {}).get('features', [])
+    available = {'elapsed_hours', 'bin_width_hours'}
+    features_to_add = [f for f in enabled_features if f in available]
+
+    if not features_to_add:
+        return None
+
+    max_pos = bf['position'].max()
+
+    # Build wide-format rows for each feature
+    rows = []
+    for feat_name in features_to_add:
+        # Pivot: PID × position → value
+        feat_wide = bf.pivot(index='PID', columns='position', values=feat_name)
+        feat_wide = feat_wide.reindex(columns=range(max_pos + 1), fill_value=0.0)
+        feat_wide = feat_wide.fillna(0.0)
+        feat_wide = feat_wide.reset_index()
+        feat_wide.insert(1, 'FEATURE', feat_name)
+        # Rename position columns to string indices
+        feat_wide.columns = ['PID', 'FEATURE'] + [
+            str(i) for i in range(max_pos + 1)
+        ]
+        rows.append(feat_wide)
+
+    result = pd.concat(rows, ignore_index=True)
+
+    # Ensure all base PIDs are present (fill missing with 0)
+    all_pids = base['PID'].unique()
+    existing_pids = set(result['PID'].unique())
+    missing_pids = [p for p in all_pids if p not in existing_pids]
+
+    if missing_pids:
+        ts_cols = [str(i) for i in range(max_pos + 1)]
+        missing_rows = []
+        for feat_name in features_to_add:
+            for pid in missing_pids:
+                row = {'PID': pid, 'FEATURE': feat_name}
+                row.update({col: 0.0 for col in ts_cols})
+                missing_rows.append(row)
+        result = pd.concat([result, pd.DataFrame(missing_rows)], ignore_index=True)
+
+    # Merge target
+    result = result.merge(base[['PID', target]], on='PID', how='left')
+    result[target] = result[target].astype(int)
+    result = result.sort_values(['PID', 'FEATURE']).reset_index(drop=True)
+
+    logger.info(
+        f"Created temporal features: {features_to_add} "
+        f"({len(result)} rows, {max_pos + 1} timesteps)"
+    )
+
+    return result
 
 
 def _get_long_concept_df_single_label(
