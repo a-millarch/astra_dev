@@ -799,6 +799,12 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
     df_long = df_long[['PID', 'bin_counter','FEATURE', 'VALUE']].rename(columns={'bin_counter':'TIMESTEP'})
     df_long["TIMESTEP"] = df_long["TIMESTEP"]-1 # matching df2xy function index 0
 
+    # Re-index to contiguous 0-based positions (matching single-label behavior)
+    # After bin_freq_include filtering, TIMESTEP values may have gaps
+    unique_ts = sorted(df_long["TIMESTEP"].unique())
+    ts_remap = {old: new for new, old in enumerate(unique_ts)}
+    df_long["TIMESTEP"] = df_long["TIMESTEP"].map(ts_remap)
+
     # Filter to relevant PIDs BEFORE expensive pivot
     df_long = df_long[df_long.PID.isin(base_pids)]
     logger.debug(f">>after PID filter: {df_long.PID.nunique()}")
@@ -815,7 +821,7 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
     feat_name = df_wide.FEATURE.dropna().unique()
     assert len(feat_name) == 1
     df_wide['FEATURE'] = feat_name[0]
-    timestep_cols = [i for i in range(0,df_long.TIMESTEP.max())]
+    timestep_cols = list(range(df_long.TIMESTEP.max() + 1))
 
     # Ensure ALL base PIDs are present (matching _get_long_concept_df_single_label)
     missing_pids = base_pids - set(df_wide['PID'].unique())
