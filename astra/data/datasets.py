@@ -714,7 +714,20 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
     feat_name = df_wide.FEATURE.dropna().unique()
     assert len(feat_name) == 1
     df_wide['FEATURE'] = feat_name[0]
-    df_wide.timestep_cols = [i for i in range(0,df_long.TIMESTEP.max())]
+    timestep_cols = [i for i in range(0,df_long.TIMESTEP.max())]
+
+    # Ensure ALL base PIDs are present (matching _get_long_concept_df_single_label)
+    missing_pids = base_pids - set(df_wide['PID'].unique())
+    if missing_pids:
+        logger.debug(f"{len(missing_pids)} PIDs have no {feat_name[0]} data — adding empty rows")
+        placeholder = pd.DataFrame({
+            'PID': list(missing_pids),
+            'FEATURE': feat_name[0],
+            **{col: np.nan for col in timestep_cols}
+        })
+        df_wide = pd.concat([df_wide, placeholder], ignore_index=True)
+
+    df_wide.timestep_cols = timestep_cols
     logger.debug(f">>> after wide: {df_wide.PID.nunique()}")
     return df_wide
 
