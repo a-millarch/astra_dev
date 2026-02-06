@@ -6,6 +6,71 @@ from typing import List, Dict, Optional, Union
 from astra.utils import get_bin_df
 from astra.data.filters import collect_filter
 
+def expand_interval_to_bins(
+    events_df: pd.DataFrame,
+    bin_df: pd.DataFrame,
+    chunk_size: int = 500,
+) -> pd.DataFrame:
+    """Expand interval-based events to one row per overlapping bin.
+
+    Events must have TIMESTAMP (start) and END_TIMESTAMP (end).
+    For each event, creates a row for every bin where the event is active:
+        event_start < bin_end AND event_end > bin_start
+
+    Returns a DataFrame with standard columns (PID, FEATURE, VALUE, TIMESTAMP)
+    where TIMESTAMP is set to the bin_start of each overlapping bin.
+    """
+    events_df = events_df.copy()
+    bin_df = bin_df.copy()
+    events_df["PID"] = events_df["PID"].astype("int32")
+    bin_df["PID"] = bin_df["PID"].astype("int32")
+
+    # Pre-filter to matching PIDs
+    bin_pids = set(bin_df["PID"].unique())
+    events_df = events_df[events_df["PID"].isin(bin_pids)]
+
+    if len(events_df) == 0:
+        logger.warning("No interval events match any bin PIDs")
+        return events_df.drop(columns=["END_TIMESTAMP"], errors="ignore")
+
+    unique_pids = events_df["PID"].unique()
+    results = []
+
+    for i in range(0, len(unique_pids), chunk_size):
+        chunk_pids = set(unique_pids[i : i + chunk_size])
+        chunk_events = events_df[events_df["PID"].isin(chunk_pids)]
+        chunk_bins = bin_df[bin_df["PID"].isin(chunk_pids)]
+
+        # Merge on PID (creates event x bin pairs within each patient)
+        merged = chunk_events.merge(
+            chunk_bins[["PID", "bin_start", "bin_end"]],
+            on="PID",
+        )
+
+        # Keep only overlapping bins
+        overlap = merged[
+            (merged["TIMESTAMP"] < merged["bin_end"])
+            & (merged["END_TIMESTAMP"] > merged["bin_start"])
+        ].copy()
+
+        results.append(overlap)
+
+    if len(results) == 0:
+        logger.warning("No interval events overlap any bins")
+        return events_df.drop(columns=["END_TIMESTAMP"], errors="ignore").iloc[0:0]
+
+    result = pd.concat(results, ignore_index=True)
+
+    # Set TIMESTAMP to bin_start so downstream searchsorted assigns the correct bin
+    result["TIMESTAMP"] = result["bin_start"]
+    result = result.drop(columns=["END_TIMESTAMP", "bin_start", "bin_end"])
+
+    logger.info(
+        f"Interval expansion: {len(events_df)} events -> {len(result)} bin-aligned rows"
+    )
+    return result
+
+
 def merge_and_aggregate(
     bin_df: pd.DataFrame,
     subset_df: pd.DataFrame,
@@ -815,11 +880,18 @@ def map_concept_optimized(
     filter_function = collect_filter(concept)
     concept_df = filter_function(concept_df)
     logger.info(f"[{time.time()-t0:.1f}s] Loaded concept: {len(concept_df)} rows, {concept_df['PID'].nunique()} patients")
-    
+
+    # Expand interval events (e.g., ADT with start+end timestamps) to per-bin rows
+    if 'END_TIMESTAMP' in concept_df.columns:
+        logger.info("Expanding interval events to per-bin rows...")
+        t1 = time.time()
+        concept_df = expand_interval_to_bins(concept_df, bin_df)
+        logger.info(f"[{time.time()-t1:.1f}s] Expanded to {len(concept_df)} rows")
+
     # Validate columns
     if 'TIMESTAMP' not in concept_df.columns:
         raise ValueError(f"Concept {concept} missing TIMESTAMP column. Available: {concept_df.columns.tolist()}")
-    
+
     # Process each feature
     dfs = []
     features = concept_df.FEATURE.unique()

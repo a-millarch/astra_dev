@@ -66,7 +66,7 @@ stateDiagram-v2
         }
 
         MapData --> BuildTSDS
-        BuildTSDS : TSDS(cfg, base)
+        BuildTSDS : TSDS - cfg, base
     }
 
     DataProcessing --> TrainingPipeline
@@ -80,12 +80,12 @@ stateDiagram-v2
         state finetune_method <<choice>>
 
         [*] --> PrepareData
-        PrepareData : prepare_data_and_dls (temporal split, normalize, create dataloaders)
+        PrepareData : prepare_data_and_dls - temporal split, normalize, create dataloaders
 
         PrepareData --> pretrain_flag
 
         pretrain_flag --> Pretrain : pretrain ON
-        pretrain_flag --> finetune_flag : pretrain OFF (default)
+        pretrain_flag --> finetune_flag : pretrain OFF - default
 
         state Pretrain {
             direction LR
@@ -98,15 +98,15 @@ stateDiagram-v2
 
         Pretrain --> finetune_flag
 
-        finetune_flag --> finetune_method : finetune ON (default)
+        finetune_flag --> finetune_method : finetune ON - default
         finetune_flag --> eval_flag : no-finetune
 
-        finetune_method --> FineTuneStandard : standard (default)
+        finetune_method --> FineTuneStandard : standard - default
         finetune_method --> FineTuneEarlyOpt : alternative-fine-tune
 
         state FineTuneStandard {
             direction LR
-            ft_learn : Learner (5-fold CV)
+            ft_learn : Learner 5-fold CV
             ft_train : fit_one_cycle
             ft_save : save model
             ft_learn --> ft_train
@@ -125,7 +125,7 @@ stateDiagram-v2
         FineTuneStandard --> eval_flag
         FineTuneEarlyOpt --> eval_flag
 
-        eval_flag --> Evaluation : eval ON (default)
+        eval_flag --> Evaluation : eval ON - default
         eval_flag --> [*] : no-eval
 
         state Evaluation {

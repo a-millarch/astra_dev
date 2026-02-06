@@ -6,17 +6,18 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: lowres
 
-model_name: '06022026_30D'
+model_name: '06022026_30D_dynres'
    
 target: deceased_30d
 
 mapped_dir: data/interim/mapped
-concepts: 
+concepts:
   - ITAOversigtsrapport
   - VitaleVaerdier
   - Labsvar
   - Medicin
   - Procedurer
+  - ADTHaendelser
   #- IndUd
   #- ITARespirator
   
@@ -37,9 +38,11 @@ dataset:
   ts_cat_names:
       - Medicin
       - Procedurer
+      - ADTHaendelser
   ts_categorical_multi_label:
       - Medicin
       - Procedurer
+      - ADTHaendelser
   cat_cols:
       - SEX
       - FIRST_HOSPITAL
@@ -113,25 +116,28 @@ large_load_filenames:
   - Notater
  
 bin_intervals:
-#  3h: '10min'
-  6h: '20min'
-  12h: '1h'
-  24h: '2h'
+  3h: '5min'
+  6h: '10min'
+  12h: '20min'
+  24h: '1h'
   72h: '4h'
-  14D: '12h'
-  30D: '1D'
+  7D: '1Dh'
+  14D: '2D'
+  30D: '3D'
   90D: '7D'
   end: '30D'
 
 bin_freq_include:
-#  - '5min'
-#  - '10min'
+  - '5min'
+  - '10min'
   - '20min'
   - '1h'
   - '2h'
   - '4h'
   - '12h'
   - '1D'
+  - '3D'
+  - '7D'
   #- '7D'
   #- '30D'
   
@@ -156,7 +162,9 @@ agg_func: #also for datasets, split it up
      # - sum
   Procedurer:
       - max
-      
+  ADTHaendelser:
+      - max
+
 # Mapping
 npartitions:
   bin_df: 8
@@ -192,6 +200,8 @@ drop_features:
   Procedurer:
     - nan
   IndUd:
+    - nan
+  ADTHaendelser:
     - nan
 
 

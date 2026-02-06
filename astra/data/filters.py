@@ -621,6 +621,90 @@ def filter_medicin(med):
 
 
 
+def filter_adt(adt):
+    """Filter ADT events: classify department types and prepare interval timestamps."""
+    adt = adt.copy()
+
+    # Ensure datetime
+    adt["Flyt_ind"] = pd.to_datetime(adt["Flyt_ind"], errors="coerce")
+    adt["Flyt_ud"] = pd.to_datetime(adt["Flyt_ud"], errors="coerce")
+
+    # Classify department (Afsnit) into location categories
+    adt["VALUE"] = np.select(
+        [
+            # TC - Trauma Center
+            adt["Afsnit"].str.contains("traumecenter", case=False, na=False),
+
+            # OR - Operating Room
+            adt["Afsnit"].str.contains("operationsgang", case=False, na=False)
+            | adt["Afsnit"].str.contains("operationsklinik", case=False, na=False)
+            | adt["Afsnit"].str.contains("operationsafsnit", case=False, na=False)
+            | adt["Afsnit"].str.contains("dagkirurgi", case=False, na=False)
+            | adt["Afsnit"].str.contains("op afs", case=False, na=False)
+            | adt["Afsnit"].str.contains("op-afsnit", case=False, na=False)
+            | adt["Afsnit"].str.contains("centraloperation", case=False, na=False)
+            | adt["Afsnit"].str.contains("operationsanæstesi", case=False, na=False)
+            | adt["Afsnit"].str.contains(r"\bBEDØVELSE OG OPERATION\b", case=False, na=False)
+            | (
+                adt["Afsnit"].str.contains("øjenkl", case=False, na=False)
+                & adt["Afsnit"].str.contains("operation", case=False, na=False)
+            )
+            | adt["Afsnit"].str.contains(r"\bREUM/RYG OP\b", case=False, na=False)
+            | adt["Afsnit"].str.contains("kirurgisk endo", case=False, na=False),
+
+            # ICU - Intensive Care Unit
+            adt["Afsnit"].str.contains(r"\bintensiv\b", case=False, na=False)
+            | adt["Afsnit"].str.contains(r"\bita\s", case=False, na=False)
+            | adt["Afsnit"].str.contains(r"\bita,", case=False, na=False),
+
+            # BED - Bed ward
+            adt["Afsnit"].str.contains("seng", case=False, na=False),
+
+            # AMB - Ambulatory
+            adt["Afsnit"].str.contains("amb", case=False, na=False),
+        ],
+        ["TC", "OR", "ICU", "BED", "AMB"],
+        default=None,
+    ).astype(object)
+
+    adt["FEATURE"] = "ADT"
+
+    # Drop unrecognized departments
+    adt = adt[adt["VALUE"] != None].copy()
+    adt = adt[adt["VALUE"].notna()].copy()
+    logger.info(f"ADT: {len(adt)} events after department classification")
+
+    # Sort for forward-fill logic
+    adt = adt.sort_values(["PID", "Flyt_ind"]).reset_index(drop=True)
+
+    # Handle missing Flyt_ud: fill from next event's Flyt_ind per patient
+    adt["next_flyt_ind"] = adt.groupby("PID")["Flyt_ind"].shift(-1)
+    mask_missing_end = adt["Flyt_ud"].isna()
+    adt.loc[mask_missing_end, "Flyt_ud"] = adt.loc[mask_missing_end, "next_flyt_ind"]
+
+    # For remaining NaN (last event per patient), fill from base_df end time
+    if mask_missing_end.any() and adt["Flyt_ud"].isna().any():
+        base_df = get_base_df()
+        end_map = base_df.set_index("PID")["end"]
+        still_missing = adt["Flyt_ud"].isna()
+        adt.loc[still_missing, "Flyt_ud"] = adt.loc[still_missing, "PID"].map(end_map).values
+
+    adt = adt.drop(columns=["next_flyt_ind"])
+
+    # Drop any rows still missing end timestamp
+    n_before = len(adt)
+    adt = adt.dropna(subset=["Flyt_ud"])
+    if len(adt) < n_before:
+        logger.warning(f"ADT: dropped {n_before - len(adt)} events with missing Flyt_ud")
+
+    # Set standard timestamp columns
+    adt["TIMESTAMP"] = adt["Flyt_ind"]
+    adt["END_TIMESTAMP"] = adt["Flyt_ud"]
+
+    logger.info(f"Using {len(adt)} ADT observations")
+    return adt
+
+
 def collect_filter(concept: str):
     filter_funcs = {
         "VitaleVaerdier": filter_vitals,
@@ -628,6 +712,7 @@ def collect_filter(concept: str):
         "Labsvar": filter_labs,
         "Medicin": filter_medicin,
         "Procedurer": filter_procedures,
+        "ADTHaendelser": filter_adt,
     }
 
     return filter_funcs[concept]

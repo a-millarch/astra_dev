@@ -88,10 +88,15 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     # VALIDATE NORMALIZATION
     # ============================================================================
     logger.info("Validating data normalization for pretraining...")
-    logger.info(f"  X mean: {X.mean():.4f}, std: {X.std():.4f}")
-    
-    if abs(X.mean()) > 1.0 or not (0.5 < X.std() < 2.0):
-        logger.warning(f"⚠️  X normalization looks suspicious! mean={X.mean():.4f}, std={X.std():.4f}")
+    non_padding_mask = ~np.isclose(X, 0.0, atol=1e-8).all(axis=1)  # [n_samples, seq_len]
+    non_padding_vals = X[non_padding_mask.any(axis=0)]
+    # Compute stats on non-padding values only
+    non_pad_flat = X[~np.isclose(X, 0.0, atol=1e-8)]
+    logger.info(f"  X overall mean: {X.mean():.4f}, std: {X.std():.4f} (includes {np.isclose(X, 0.0, atol=1e-8).mean()*100:.0f}% padding)")
+    logger.info(f"  X non-padding mean: {non_pad_flat.mean():.4f}, std: {non_pad_flat.std():.4f}")
+
+    if abs(non_pad_flat.mean()) > 1.0 or not (0.5 < non_pad_flat.std() < 2.0):
+        logger.warning(f"⚠️  X normalization looks suspicious! non-padding mean={non_pad_flat.mean():.4f}, std={non_pad_flat.std():.4f}")
         logger.warning("    Expected: mean ≈ 0, std ≈ 1")
     else:
         logger.info("  ✓ Time series normalization looks good")
