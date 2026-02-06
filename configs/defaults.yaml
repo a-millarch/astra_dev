@@ -58,8 +58,8 @@ pretrain:
     mask_prob_cat_ts: 0.15
     mask_prob_cat: 0.15
     mask_prob_cont: 0.15
-    epochs: 100
-    lr: 5e-5
+    epochs: 10
+    lr: 5.0e-5
     warmup_epochs: 3
     ts_loss_weight: 1.5
     cat_ts_loss_weight: 1.5
@@ -138,8 +138,8 @@ bin_freq_include:
   - '1D'
   - '2D'
   - '3D'
-  - '7D'
-  - '30D'
+  #- '7D'
+  #- '30D'
 
 temporal_features:
   enabled: true

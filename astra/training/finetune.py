@@ -321,7 +321,7 @@ def train_one_epoch(
     for batch in dataloader:
         inputs, targets = batch
         inputs = _to_device(inputs, device)
-        targets = targets.to(device)
+        targets = _to_device(targets, device)
 
         # Optionally apply progressive time masking (Phase 4)
         if enable_masking and torch.rand(1).item() < masking_prob:

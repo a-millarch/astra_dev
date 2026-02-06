@@ -720,8 +720,8 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
             time_to_step(24, 'h'),
             time_to_step(72, 'h'),
             time_to_step(7, 'D'),
-            time_to_step(14, 'D'),
-            time_to_step(30, 'D')
+            time_to_step(13, 'D'),
+            time_to_step(29, 'D')
         ]
         
         # Filter out None values and reverse for better legend ordering

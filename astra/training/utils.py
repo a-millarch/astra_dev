@@ -98,7 +98,7 @@ def compute_auroc(
         inputs, targets = batch
         # Move inputs to device (nested tuple)
         inputs = _to_device(inputs, device)
-        targets = targets.to(device)
+        targets = _to_device(targets, device)
 
         logits = model(inputs)
         probs = F.softmax(logits, dim=-1)[:, 1]  # probability of class 1
@@ -118,9 +118,17 @@ def compute_auroc(
 
 
 def _to_device(obj, device: str):
-    """Recursively move tensors in nested tuples/lists to device."""
+    """Recursively move tensors to device, stripping TSAI/FastAI custom types.
+
+    TSAI dataloaders return TSTensor and TensorCategory subclasses that break
+    F.cross_entropy's __torch_function__ dispatch.  Converting to plain
+    torch.Tensor avoids this.
+    """
     if isinstance(obj, torch.Tensor):
-        return obj.to(device)
+        t = obj.to(device)
+        if type(t) is not torch.Tensor:
+            t = t.as_subclass(torch.Tensor)
+        return t
     elif isinstance(obj, (tuple, list)):
         return type(obj)(_to_device(item, device) for item in obj)
     return obj
