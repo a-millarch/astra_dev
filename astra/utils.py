@@ -168,7 +168,16 @@ def get_base_df(base_df_path=cfg["base_df_path"]):
 
 
 def get_bin_df(bin_df_path=cfg["bin_df_path"]):
-    return pd.read_pickle(bin_df_path)
+    bin_df = pd.read_pickle(bin_df_path)
+    expected_freqs = set(cfg["bin_intervals"].values())
+    actual_freqs = set(bin_df["bin_freq"].unique())
+    if expected_freqs != actual_freqs:
+        raise ValueError(
+            f"bin_df is stale — frequencies don't match cfg['bin_intervals']. "
+            f"Expected: {sorted(expected_freqs)}, Got: {sorted(actual_freqs)}. "
+            f"Regenerate bin_df with the current bin_intervals config."
+        )
+    return bin_df
 
 
 def get_train_test_split(cfg, base_df=None, return_indices=False):
