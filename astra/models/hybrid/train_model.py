@@ -32,22 +32,9 @@ def parse_args():
 def main():
     args = parse_args()
     data = prepare_data_and_dls(cfg)
-    pretrain_cfg = MLMConfig(
-            mask_prob_ts=0.10,
-            mask_prob_cat_ts=0.10,
-            mask_prob_cat=0.15,
-            mask_prob_cont=0.15,
-            epochs=100,
-            lr=1e-5,
-            warmup_epochs=3,
-            ts_loss_weight=1.0,
-            cat_loss_weight=1.0,
-            cont_loss_weight=1.0,
-            contrastive_weight=1.0,
-            patience=5,
-            save_best=True,
-            checkpoint_dir=f'./pretrain_checkpoints/{cfg["model_name"]}'
-        )
+    pretrain_params = dict(cfg["pretrain"])
+    pretrain_params["checkpoint_dir"] = f'{pretrain_params.get("checkpoint_dir", "./pretrain_checkpoints")}/{cfg["model_name"]}'
+    pretrain_cfg = MLMConfig(**pretrain_params)
     
     if args.pretrain:
         logger.info("=== Running Pretraining ===")
