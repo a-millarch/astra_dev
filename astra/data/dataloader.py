@@ -230,11 +230,33 @@ def prepare_data_and_dls(cfg):
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
         tsds.complete_cat.timestep_cols = tsds.timestep_cols
     
-    # Align dataframes
+    # Align dataframes (ensure trainval and holdout have same columns)
     trainval.complete, holdout.complete = align_dataframes(
-        trainval.complete, 
+        trainval.complete,
         holdout.complete
     )
+    # Also align categorical TS between trainval and holdout
+    trainval.complete_cat, holdout.complete_cat = align_dataframes(
+        trainval.complete_cat,
+        holdout.complete_cat
+    )
+    # Cross-align continuous and categorical TS to ensure same timestep columns
+    # (continuous alignment may have added timesteps not present in categorical, or vice versa)
+    trainval.complete, trainval.complete_cat = align_dataframes(
+        trainval.complete,
+        trainval.complete_cat
+    )
+    holdout.complete, holdout.complete_cat = align_dataframes(
+        holdout.complete,
+        holdout.complete_cat
+    )
+    # Update timestep_cols on categorical dataframes to reflect aligned columns
+    aligned_ts_cols = sorted(
+        [c for c in trainval.complete.columns if str(c).isdigit()],
+        key=lambda x: int(str(x))
+    )
+    trainval.complete_cat.timestep_cols = aligned_ts_cols
+    holdout.complete_cat.timestep_cols = aligned_ts_cols
     
     cat_cols = cfg["dataset"]["cat_cols"]
     num_cols = cfg["dataset"]["num_cols"]

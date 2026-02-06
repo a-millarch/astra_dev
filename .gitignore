@@ -65,6 +65,7 @@ cover/
 
 # Claude
 CLAUDE.md
+.claude
 
 # Django stuff:
 *.log

@@ -59,10 +59,29 @@ train:
 eval:
 	python $(PROJECT_NAME)/models/hybrid/train_model.py --no-pretrain --no-finetune --eval --comprehensive-eval
 fold:
-	python $(PROJECT_NAME)/train_fold.py 
-	
+	python $(PROJECT_NAME)/train_fold.py
 
-	 
+## v2: Finetune with transfer learning (pretrain + 4-phase finetune + eval)
+train_v2:
+	python -m $(PROJECT_NAME).training.train --pretrain --finetune --eval --comprehensive-eval
+
+## v2: Finetune only (no pretrain, uses existing checkpoint)
+finetune_v2:
+	python -m $(PROJECT_NAME).training.train --finetune --eval --comprehensive-eval
+
+## v2: Two-stage HP sweep (architecture + training)
+sweep:
+	python -m $(PROJECT_NAME).training.train --sweep-arch --sweep-train --eval --comprehensive-eval
+
+## v2: Architecture sweep only
+sweep_arch:
+	python -m $(PROJECT_NAME).training.train --sweep-arch --n-arch-trials 30
+
+## v2: Training HP sweep only (requires pretrained checkpoint)
+sweep_train:
+	python -m $(PROJECT_NAME).training.train --sweep-train --n-train-trials 50 --eval
+
+
 #################################################################################
 # Documentation RULES                                                           #
 #################################################################################
