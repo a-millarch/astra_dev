@@ -78,6 +78,8 @@ def save_data_cache(data, cfg, cache_dir='cache/data'):
         # Categorical TS data (needed to recreate ts_cat_dls)
         'trainval_complete_cat': data['trainval'].complete_cat,
         'holdout_complete_cat': data['holdout'].complete_cat,
+        'trainval_timestep_cols': data['trainval'].complete_cat.timestep_cols,
+        'holdout_timestep_cols': data['holdout'].complete_cat.timestep_cols,
 
         # Base dataframe and TSDS objects (for downstream use)
         'base': data['base'],
@@ -102,7 +104,7 @@ def save_data_cache(data, cfg, cache_dir='cache/data'):
     return cache_path
 
 
-def load_data_cache(cfg, cache_dir='cache/data'):
+def load_data_cache(cfg, cache_dir='data/cache'):
     """
     Load cached data and recreate dataloaders.
     Args:
@@ -160,6 +162,10 @@ def load_data_cache(cfg, cache_dir='cache/data'):
         drop_last=False,
         shuffle=False
     )
+
+    # Restore timestep_cols attribute lost during pickle serialization
+    cache_data['trainval_complete_cat'].timestep_cols = cache_data['trainval_timestep_cols']
+    cache_data['holdout_complete_cat'].timestep_cols = cache_data['holdout_timestep_cols']
 
     # Recreate ts_cat_dls using cached encoder
     ts_cat_dls, _, _ = dfwide2ts_dls(

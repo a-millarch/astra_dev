@@ -28,7 +28,7 @@ from astra.training.finetune import (
 from astra.training.param_groups import set_dropout_rates
 
 
-SWEEP_RESULTS_DIR = Path("cfg/sweep_results")
+SWEEP_RESULTS_DIR = Path("configs/sweep_results")
 
 
 def _save_best_callback(study_name: str, save_path: Path):

@@ -58,7 +58,7 @@ pretrain:
     mask_prob_cat_ts: 0.15
     mask_prob_cat: 0.15
     mask_prob_cont: 0.15
-    epochs: 10
+    epochs: 50
     lr: 5.0e-5
     warmup_epochs: 3
     ts_loss_weight: 1.5
