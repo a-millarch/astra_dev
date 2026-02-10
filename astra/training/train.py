@@ -128,13 +128,13 @@ def main():
     # ========================================================================
     logger.info("Loading data...")
     data = prepare_data_and_dls(cfg)
-    pretrain_cfg = _get_pretrain_cfg()
     model_name = cfg["model_name"]
 
     # ========================================================================
-    # Stage 0: Pretraining (optional, reuses existing code)
+    # Stage 0: Pretraining (if no arch sweep — otherwise pretrain after sweep)
     # ========================================================================
-    if args.pretrain:
+    if args.pretrain and not args.sweep_arch:
+        pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Pretraining ===")
         pretrain_cfg, _, _ = run_pretrain(data, pretrain_cfg=pretrain_cfg, device="cuda")
 
@@ -151,7 +151,7 @@ def main():
         )
         report_sweep_results(arch_result["study"])
 
-        # Update cfg with best architecture for subsequent pretraining
+        # Update cfg with best architecture
         best_arch = arch_result["best_params"]
         cfg["model"]["d_model"] = best_arch["d_model"]
         cfg["model"]["n_layers"] = best_arch["n_layers"]
@@ -163,8 +163,9 @@ def main():
 
         logger.info(f"Updated model config with best architecture: {best_arch}")
 
-        # If also doing training sweep, pretrain with the best architecture first
-        if args.sweep_train and not args.pretrain:
+        # Pretrain with the best architecture
+        if args.pretrain:
+            pretrain_cfg = _get_pretrain_cfg()
             logger.info("=== Pretraining with best architecture ===")
             pretrain_cfg, _, _ = run_pretrain(data, pretrain_cfg=pretrain_cfg, device="cuda")
 
@@ -173,6 +174,7 @@ def main():
     # ========================================================================
     best_finetune_cfg = None
     if args.sweep_train:
+        pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Training HP Sweep (Stage 2) ===")
         train_result = run_training_sweep(
             data, cfg,
@@ -189,6 +191,7 @@ def main():
     # Finetuning
     # ========================================================================
     if args.finetune:
+        pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Finetuning (v2) ===")
 
         if best_finetune_cfg is not None:

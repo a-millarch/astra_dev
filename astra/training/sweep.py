@@ -8,6 +8,8 @@ Stage 2 (Training HPs): Fix architecture, pretrain once, sweep finetuning
 """
 
 import os
+import yaml
+from pathlib import Path
 from typing import Dict, Any, Optional
 
 import optuna
@@ -24,6 +26,37 @@ from astra.training.finetune import (
     create_split_dataloaders,
 )
 from astra.training.param_groups import set_dropout_rates
+
+
+SWEEP_RESULTS_DIR = Path("cfg/sweep_results")
+
+
+def _save_best_callback(study_name: str, save_path: Path):
+    """Return an Optuna callback that saves best params to YAML after each trial."""
+
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+        if trial.value is None or trial.value < study.best_value:
+            return  # Not a new best
+
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        result = {
+            "study_name": study_name,
+            "best_trial": study.best_trial.number,
+            "best_value": study.best_value,
+            "best_params": study.best_params,
+            "completed_trials": len([
+                t for t in study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ]),
+        }
+        with open(save_path, "w") as f:
+            yaml.dump(result, f, default_flow_style=False)
+        logger.info(f"Saved best params (trial {study.best_trial.number}, "
+                     f"AUROC {study.best_value:.4f}) → {save_path}")
+
+    return callback
 
 
 # ============================================================================
@@ -156,9 +189,11 @@ def run_arch_sweep(
         load_if_exists=True,
     )
 
+    save_path = SWEEP_RESULTS_DIR / f"{study_name}_best.yaml"
     study.optimize(
         lambda trial: arch_objective(trial, data, cfg_dict, device),
         n_trials=n_trials,
+        callbacks=[_save_best_callback(study_name, save_path)],
     )
 
     best = study.best_params
@@ -276,11 +311,13 @@ def run_training_sweep(
         load_if_exists=True,
     )
 
+    save_path = SWEEP_RESULTS_DIR / f"{study_name}_best.yaml"
     study.optimize(
         lambda trial: training_objective(
             trial, data, cfg_dict, device, pretrain_cfg, pretrain_checkpoint_dir,
         ),
         n_trials=n_trials,
+        callbacks=[_save_best_callback(study_name, save_path)],
     )
 
     best = study.best_params

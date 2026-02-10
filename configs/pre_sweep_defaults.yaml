@@ -1,0 +1,221 @@
+single_patient_mode: False
+
+population_file_path: data/raw/trauma_call_historic_population.csv 
+trauma_call_file_path: data/external/trauma_call.csv
+
+experiment_name: hpt
+run_name: lowres
+
+model_name: '06022026_30D_dynres'
+   
+target: deceased_30d
+
+mapped_dir: data/interim/mapped
+concepts:
+  - ITAOversigtsrapport
+  - VitaleVaerdier
+  - Labsvar
+  - Medicin
+  - Procedurer
+  - ADTHaendelser
+  #- IndUd
+  #- ITARespirator
+  
+
+dataset:
+  exclusion: 0 #lvl1tc
+  overwrite: True 
+  max_duration_days: 365 #now cut off using bins 
+  min_bin_seq_len: 1
+  
+  start_year: 2017
+  end_year: 2024
+  
+  age_min: 0
+  age_max: 90
+
+  id_col: PID
+  ts_cat_names:
+      - Medicin
+      - Procedurer
+      - ADTHaendelser
+  ts_categorical_multi_label:
+      - Medicin
+      - Procedurer
+      - ADTHaendelser
+  cat_cols:
+      - SEX
+      - FIRST_HOSPITAL
+
+  num_cols:
+      - AGE
+      - ASMT_ELIX
+      - HEIGHT
+      - WEIGHT
+      
+pretrain:
+    mask_prob_ts: 0.15
+    mask_prob_cat_ts: 0.15
+    mask_prob_cat: 0.15
+    mask_prob_cont: 0.15
+    epochs: 10
+    lr: 5.0e-5
+    warmup_epochs: 3
+    ts_loss_weight: 1.5
+    cat_ts_loss_weight: 1.5
+    cat_loss_weight: 1.0
+    cont_loss_weight: 1.0
+    contrastive_weight: 0.5
+    temperature: 0.07
+    patience: 3
+    save_best: True
+    checkpoint_dir: './pretrain_checkpoints'
+
+training:
+    folds: 5
+    epochs: 30
+    bs: 32
+    
+model:
+    res_dropout: 0.22
+    fc_dropout: 0.75
+    fc_mults_1: 0.3
+    fc_mults_2: 0.1
+    n_layers: 8
+    n_heads: 8 
+    d_model: 64 
+    d_ff: None 
+    d_k: None
+    d_v: None
+
+evaluation:
+    max_f_beta: 10
+    f_beta: 4
+    threshold_mode: f1 #fbeta
+    
+base_df_path: data/interim/base_df.pkl
+raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
+bin_df_path: data/interim/mapped/bin_df.pkl
+
+
+
+default_load_filenames:
+  - ADTHaendelser
+  - Diagnoser
+  - Procedurer
+  #- ITA'
+  - VitaleVaerdier
+  - Cases
+  - ITAOversigtsrapport
+  - IndUd
+  - ITARespirator
+  
+large_load_filenames:
+  - Labsvar
+  - Medicin
+  - Notater
+ 
+bin_intervals:
+  2h: '5min'
+  4h: '10min'
+  8h: '20min'
+  12h: '30min'
+  24h: '1h'
+  72h: '4h'
+  7D: '1D'
+  14D: '2D'
+  30D: '3D'
+  90D: '7D'
+  end: '30D'
+
+bin_freq_include:
+  - '5min'
+  - '10min'
+  - '20min'
+  - '30min'
+  - '1h'
+  - '4h'
+  - '1D'
+  - '2D'
+  - '3D'
+  #- '7D'
+  #- '30D'
+
+temporal_features:
+  enabled: true
+  features:
+    - elapsed_hours
+    - bin_width_hours
+
+agg_func: #also for datasets, split it up
+  VitaleVaerdier:
+      #- first # tmp on for tab
+      - min
+      - max
+      - mean
+      - std
+  ITAOversigtsrapport:
+     # - first
+     # - max
+      - min
+  Labsvar:
+      - max
+      #- min
+  Medicin:
+      - max
+     # - count
+     # - sum
+  Procedurer:
+      - max
+  ADTHaendelser:
+      - max
+
+# Mapping
+npartitions:
+  bin_df: 8
+  VitaleVaerdier: 16
+  ITAOversigtsrapport: 1
+  Diagnoser: 4
+  Labsvar: 4
+  Medicin: 4
+  
+mapping:
+ Diagnoser: cat
+ 
+# timeseries 
+
+  
+drop_features:
+  VitaleVaerdier:
+    - nan
+    - MAP
+    - DBP
+  ITAOversigtsrapport:
+   - SAPS3
+   - SOFA
+   - SOFA total score # TODO: purge, reload files and remove these
+   - SAPS 3 SCORE
+  Labsvar:
+   - nan
+   - B-GROUP-LEUKOCYTES
+  Medicin:
+  - nan
+  #- blood
+  #- infusion
+  Procedurer:
+    - nan
+  IndUd:
+    - nan
+  ADTHaendelser:
+    - nan
+
+
+holdout_fraction: 0.2
+holdout_type: temporal  # temporal or random
+holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
+seed: 2024
+
+Medicin: 
+    ATC_keep_len: 3
+ 
+ 
