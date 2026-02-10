@@ -284,7 +284,7 @@ def prepare_data_and_dls(cfg):
         trainval.complete,
         sample_col='PID',
         feat_col='FEATURE',
-        data_cols=trainval.complete.columns[2:-1],
+        data_cols=trainval.complete.columns[3:],
         target_col=cfg["target"]
     )
     y = list(y[:, 0].flatten())
@@ -388,7 +388,7 @@ def prepare_data_and_dls(cfg):
         holdout.complete,
         sample_col='PID',
         feat_col='FEATURE',
-        data_cols=holdout.complete.columns[2:-1],
+        data_cols=holdout.complete.columns[3:],
         target_col=holdout.target
     )
     ty = list(ty[:, 0].flatten())
