@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: lowres
 
-model_name: '06022026_30D_dynres'
+model_name: '10022026_30D_dynres'
    
 target: deceased_30d
 
