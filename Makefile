@@ -81,7 +81,10 @@ sweep_arch:
 sweep_train:
 	python -m $(PROJECT_NAME).training.train --sweep-train --n-train-trials 50 --eval
 
-
+### Convenience
+stash cfg:
+	git stash push -m "cfg conflict" configs/defaults.yaml
+    
 #################################################################################
 # Documentation RULES                                                           #
 #################################################################################
