@@ -370,6 +370,40 @@ def predict_holdout(
 
     return {pid: float(prob) for pid, prob in zip(pids, all_proba)}
 
+def train_final_ebm_at_timepoint(
+    train_df: pd.DataFrame,
+    cfg_dict: dict,
+    masking_hours: float,
+    ebm_params: dict,
+):
+    """
+    Train ONE final EBM on full trainval data for deployment.
+    """
+    X_full, y_full, cat_feats, cont_feats = _create_aggregated_dataset(
+        train_df, cfg_dict, masking_hours
+    )
+
+    id_col = cfg_dict["dataset"]["id_col"]
+    X_features = X_full.drop(columns=[id_col])
+
+    X_processed, encoder, feature_names = preprocess_features(
+        X_features, cat_feats, cont_feats, encoder=None, fit=True
+    )
+
+    ebm = ExplainableBoostingClassifier(
+        feature_names=feature_names,
+        **ebm_params,
+    )
+    ebm.fit(X_processed, y_full)
+
+    return {
+        "model": ebm,
+        "encoder": encoder,
+        "expected_cat_feats": cat_feats,
+        "expected_cont_feats": cont_feats,
+        "feature_names": feature_names,
+    }
+
 
 def generate_ebm_feature(
     cfg_dict: dict,
@@ -377,25 +411,7 @@ def generate_ebm_feature(
     n_folds: Optional[int] = None,
     ebm_params: Optional[dict] = None,
 ) -> dict:
-    """
-    Main orchestration: train EBMs at all intervals and generate predictions.
 
-    Saves predictions as pickle with structure:
-    {
-        "intervals_hours": [0.167, 0.5, 1.0, ...],
-        "trainval": {pid: {hours: pred, ...}, ...},
-        "holdout": {pid: {hours: pred, ...}, ...},
-    }
-
-    Args:
-        cfg_dict: Configuration dictionary.
-        save_dir: Directory to save predictions.
-        n_folds: Number of CV folds (default: from config or 5).
-        ebm_params: EBM hyperparameters (default: standard params).
-
-    Returns:
-        The predictions dict.
-    """
     if n_folds is None:
         n_folds = cfg_dict.get("ebm_feature", {}).get("n_folds", 5)
     if ebm_params is None:
@@ -405,21 +421,21 @@ def generate_ebm_feature(
     logger.info("GENERATING EBM FEATURE PREDICTIONS")
     logger.info("=" * 80)
 
-    # Load and split data (same split as hybrid model)
     base_df_full = get_base_df()
     trainval_df, holdout_df = get_train_test_split(cfg_dict, base_df_full)
 
     logger.info(f"Trainval: {len(trainval_df)} patients")
     logger.info(f"Holdout:  {len(holdout_df)} patients")
 
-    # Generate intervals
     intervals = generate_ebm_intervals(cfg_dict)
     logger.info(f"EBM intervals: {len(intervals)} time points")
     logger.info(f"  Range: {intervals[0]:.2f}h to {intervals[-1]:.1f}h")
 
-    # Initialize prediction storage
-    trainval_preds = {}  # {pid: {hours: pred}}
-    holdout_preds = {}   # {pid: {hours: pred}}
+    trainval_preds = {}
+    holdout_preds = {}
+
+    # === NEW ===
+    deployment_models = {}
 
     failed_intervals = []
 
@@ -428,19 +444,27 @@ def generate_ebm_feature(
         logger.info(f"\n[{i + 1}/{len(intervals)}] Training EBMs at {label}...")
 
         try:
-            # K-fold OOF predictions for trainval
-            oof_preds, fold_models, expected_cat_feats, expected_cont_feats = train_ebm_kfold_at_timepoint(
-                trainval_df, cfg_dict, masking_hours,
-                n_folds=n_folds, ebm_params=ebm_params,
-            )
+            oof_preds, fold_models, expected_cat_feats, expected_cont_feats = \
+                train_ebm_kfold_at_timepoint(
+                    trainval_df, cfg_dict, masking_hours,
+                    n_folds=n_folds, ebm_params=ebm_params,
+                )
 
-            # Averaged predictions for holdout
             hold_preds = predict_holdout(
-                holdout_df, cfg_dict, masking_hours, fold_models, 
+                holdout_df, cfg_dict, masking_hours, fold_models,
                 expected_cat_feats, expected_cont_feats,
             )
 
-            # Store predictions
+            # === NEW ===
+            # Train final deployment model on full trainval
+            final_model_dict = train_final_ebm_at_timepoint(
+                trainval_df,
+                cfg_dict,
+                masking_hours,
+                ebm_params,
+            )
+            deployment_models[masking_hours] = final_model_dict
+
             for pid, prob in oof_preds.items():
                 trainval_preds.setdefault(pid, {})[masking_hours] = prob
             for pid, prob in hold_preds.items():
@@ -458,8 +482,8 @@ def generate_ebm_feature(
             failed_intervals.append(masking_hours)
             continue
 
-    # Save
     os.makedirs(save_dir, exist_ok=True)
+
     result = {
         "intervals_hours": intervals,
         "trainval": trainval_preds,
@@ -470,12 +494,15 @@ def generate_ebm_feature(
     with open(save_path, "wb") as f:
         pickle.dump(result, f)
 
+    # === NEW ===
+    model_save_path = os.path.join(save_dir, "ebm_deployment_models.pkl")
+    with open(model_save_path, "wb") as f:
+        pickle.dump(deployment_models, f)
+
     logger.info(f"\n{'=' * 80}")
     logger.info(f"EBM feature generation complete")
-    logger.info(f"  Successful: {len(intervals) - len(failed_intervals)}/{len(intervals)}")
-    logger.info(f"  Saved to: {save_path}")
-    if failed_intervals:
-        logger.info(f"  Failed intervals: {[_format_hours(h) for h in failed_intervals]}")
+    logger.info(f"  Saved predictions to: {save_path}")
+    logger.info(f"  Saved deployment models to: {model_save_path}")
     logger.info("=" * 80)
 
     return result
