@@ -119,32 +119,37 @@ def preprocess_features(
     cont_feats: list,
     encoder: Optional[OneHotEncoder] = None,
     fit: bool = True,
+    expected_cat_feats: Optional[list] = None,
 ) -> Tuple[pd.DataFrame, Optional[OneHotEncoder], list]:
     """
     Preprocess features with explicit one-hot encoding for categoricals.
     
+    **KEY FIX**: Handles missing categorical columns in holdout/validation data
+    by adding them as zero columns to maintain consistent feature space.
+    
     Args:
         X: Feature dataframe (no ID column)
-        cat_feats: Categorical feature names
+        cat_feats: Categorical feature names PRESENT in this dataset
         cont_feats: Continuous feature names
         encoder: Fitted encoder (for transform-only mode)
         fit: Whether to fit encoder (True for train, False for val/test)
+        expected_cat_feats: Expected categorical feature names (for validation/holdout)
     
     Returns:
         X_processed: DataFrame with all continuous features
         encoder: Fitted encoder (if fit=True) or None
         feature_names: List of all feature names
     """
-    # Separate categorical and continuous
-    X_cat = X[cat_feats] if cat_feats else pd.DataFrame(index=X.index)
+    # Separate continuous features (always present)
     X_cont = X[cont_feats] if cont_feats else pd.DataFrame(index=X.index)
     
-    if len(cat_feats) > 0:
-        if fit:
-            # Fit encoder on full data
+    if fit:
+        # TRAINING MODE: Fit encoder on available categorical features
+        if len(cat_feats) > 0:
+            X_cat = X[cat_feats]
             encoder = OneHotEncoder(
                 sparse_output=False,
-                handle_unknown='ignore',  # Critical: ignore unknown categories
+                handle_unknown='ignore',  # Ignore unknown categories
                 dtype=np.float64,
             )
             X_cat_encoded = encoder.fit_transform(X_cat)
@@ -161,22 +166,76 @@ def preprocess_features(
                 index=X.index,
                 columns=cat_feature_names,
             )
+            
+            # Combine categorical and continuous
+            X_processed = pd.concat([X_cat_df, X_cont], axis=1)
+            feature_names = cat_feature_names + cont_feats
         else:
-            # Transform using fitted encoder
-            if encoder is None:
-                raise ValueError("Encoder must be provided when fit=False")
+            # No categorical features
+            X_processed = X_cont.copy()
+            feature_names = cont_feats
+            encoder = None
+    else:
+        # VALIDATION/HOLDOUT MODE: Transform with missing feature handling
+        if encoder is None or expected_cat_feats is None:
+            raise ValueError("Encoder and expected_cat_feats must be provided when fit=False")
+        
+        # Identify which categorical features are present vs missing
+        present_cat_feats = [f for f in expected_cat_feats if f in X.columns]
+        missing_cat_feats = [f for f in expected_cat_feats if f not in X.columns]
+        
+        if len(present_cat_feats) > 0:
+            # Transform only the present categorical features
+            X_cat = X[present_cat_feats]
             
-            X_cat_encoded = encoder.transform(X_cat)
+            # Create a temporary encoder with only present features
+            # by finding their indices in the original encoder
+            present_indices = [expected_cat_feats.index(f) for f in present_cat_feats]
             
-            # Use same feature names from encoder
+            # Build mapping of which encoded columns correspond to which original features
             cat_feature_names = []
-            for i, cat_feat in enumerate(cat_feats):
+            encoded_col_to_original_idx = []
+            col_idx = 0
+            for i, cat_feat in enumerate(expected_cat_feats):
+                categories = encoder.categories_[i]
+                for cat in categories:
+                    cat_feature_names.append(f"{cat_feat}_{cat}")
+                    encoded_col_to_original_idx.append(i)
+                    col_idx += 1
+            
+            # Transform present features
+            if len(present_cat_feats) == len(expected_cat_feats):
+                # All features present - simple case
+                X_cat_encoded = encoder.transform(X_cat)
+            else:
+                # Some features missing - need to handle this carefully
+                # Create a DataFrame with all expected categorical features
+                X_cat_full = pd.DataFrame(index=X.index)
+                for feat in expected_cat_feats:
+                    if feat in present_cat_feats:
+                        X_cat_full[feat] = X[feat]
+                    else:
+                        # Add missing feature with NaN (encoder will handle it)
+                        X_cat_full[feat] = np.nan
+                
+                X_cat_encoded = encoder.transform(X_cat_full)
+            
+            X_cat_df = pd.DataFrame(
+                X_cat_encoded,
+                index=X.index,
+                columns=cat_feature_names,
+            )
+        else:
+            # No categorical features present at all
+            cat_feature_names = []
+            for i, cat_feat in enumerate(expected_cat_feats):
                 categories = encoder.categories_[i]
                 for cat in categories:
                     cat_feature_names.append(f"{cat_feat}_{cat}")
             
+            # Create all-zero dataframe
             X_cat_df = pd.DataFrame(
-                X_cat_encoded,
+                np.zeros((len(X), len(cat_feature_names))),
                 index=X.index,
                 columns=cat_feature_names,
             )
@@ -184,11 +243,6 @@ def preprocess_features(
         # Combine categorical and continuous
         X_processed = pd.concat([X_cat_df, X_cont], axis=1)
         feature_names = cat_feature_names + cont_feats
-    else:
-        # No categorical features
-        X_processed = X_cont.copy()
-        feature_names = cont_feats
-        encoder = None
     
     return X_processed, encoder, feature_names
 
@@ -199,7 +253,7 @@ def train_ebm_kfold_at_timepoint(
     masking_hours: float,
     n_folds: int = 5,
     ebm_params: Optional[dict] = None,
-) -> Tuple[Dict[int, float], list]:
+) -> Tuple[Dict[int, float], list, list]:
     """
     Train K-fold EBMs at one masking point to generate OOF predictions.
     
@@ -214,7 +268,8 @@ def train_ebm_kfold_at_timepoint(
 
     Returns:
         oof_preds: {PID: predicted_probability} for all training patients.
-        fold_models: List of (model, encoder) tuples for holdout prediction.
+        fold_models: List of (model, encoder, expected_cat_feats) tuples for holdout prediction.
+        expected_cat_feats: List of categorical feature names from training.
     """
     if ebm_params is None:
         ebm_params = _get_default_ebm_params()
@@ -273,10 +328,10 @@ def train_ebm_kfold_at_timepoint(
         for pid, prob in zip(val_pids, y_proba):
             oof_preds[pid] = float(prob)
 
-        # Store model with encoder for holdout prediction
-        fold_models.append((ebm, global_encoder))
+        # Store model with encoder and expected categorical features for holdout prediction
+        fold_models.append((ebm, global_encoder, cat_feats))
 
-    return oof_preds, fold_models
+    return oof_preds, fold_models, cat_feats
 
 
 def predict_holdout(
@@ -284,11 +339,20 @@ def predict_holdout(
     cfg_dict: dict,
     masking_hours: float,
     fold_models: list,
+    expected_cat_feats: list,
 ) -> Dict[int, float]:
     """
     Generate averaged predictions for holdout patients across K fold models.
     
-    **FIX**: Uses stored encoders from training to ensure consistent features.
+    **FIX**: Uses stored encoders from training to ensure consistent features,
+    handling missing categorical columns by adding zero-filled columns.
+
+    Args:
+        holdout_df: Holdout patients base_df.
+        cfg_dict: Configuration dictionary.
+        masking_hours: Time point in hours.
+        fold_models: List of (model, encoder, expected_cat_feats) tuples.
+        expected_cat_feats: Categorical features expected from training.
 
     Returns:
         {PID: averaged_probability}
@@ -307,10 +371,12 @@ def predict_holdout(
     # Average predictions across fold models
     all_proba = np.zeros(len(X_features))
     
-    for model, encoder in fold_models:
+    for model, encoder, _ in fold_models:
         # **FIX**: Use the encoder from training to preprocess holdout data
+        # Pass expected_cat_feats so missing features can be handled
         X_processed, _, _ = preprocess_features(
-            X_features, cat_feats, cont_feats, encoder=encoder, fit=False
+            X_features, cat_feats, cont_feats, 
+            encoder=encoder, fit=False, expected_cat_feats=expected_cat_feats
         )
         
         all_proba += model.predict_proba(X_processed)[:, 1]
@@ -378,14 +444,14 @@ def generate_ebm_feature(
 
         try:
             # K-fold OOF predictions for trainval
-            oof_preds, fold_models = train_ebm_kfold_at_timepoint(
+            oof_preds, fold_models, expected_cat_feats = train_ebm_kfold_at_timepoint(
                 trainval_df, cfg_dict, masking_hours,
                 n_folds=n_folds, ebm_params=ebm_params,
             )
 
             # Averaged predictions for holdout
             hold_preds = predict_holdout(
-                holdout_df, cfg_dict, masking_hours, fold_models,
+                holdout_df, cfg_dict, masking_hours, fold_models, expected_cat_feats,
             )
 
             # Store predictions
