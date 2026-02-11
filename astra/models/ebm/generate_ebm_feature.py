@@ -405,9 +405,26 @@ def train_final_ebm_at_timepoint(
     }
 
 
+def _model_filename(masking_hours: float) -> str:
+    """Generate a stable filename for a given interval's deployment model."""
+    label = _format_hours(masking_hours)
+    return f"ebm_model_{label}.pkl"
+
+
+def _completed_intervals(preds: dict) -> set:
+    """Return the set of masking_hours that have predictions for at least one PID."""
+    if not preds:
+        return set()
+    all_intervals: set = set()
+    for pid_dict in preds.values():
+        all_intervals.update(pid_dict.keys())
+    return all_intervals
+
+
 def generate_ebm_feature(
     cfg_dict: dict,
     save_dir: str = "data/interim/ebm_features",
+    models_dir: str = "models/ebm",
     n_folds: Optional[int] = None,
     ebm_params: Optional[dict] = None,
 ) -> dict:
@@ -431,16 +448,40 @@ def generate_ebm_feature(
     logger.info(f"EBM intervals: {len(intervals)} time points")
     logger.info(f"  Range: {intervals[0]:.2f}h to {intervals[-1]:.1f}h")
 
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+    predictions_path = os.path.join(save_dir, "ebm_predictions.pkl")
+
+    # Load existing progress if available
     trainval_preds = {}
     holdout_preds = {}
 
-    # === NEW ===
-    deployment_models = {}
+    if os.path.exists(predictions_path):
+        with open(predictions_path, "rb") as f:
+            existing = pickle.load(f)
+        trainval_preds = existing.get("trainval", {})
+        holdout_preds = existing.get("holdout", {})
+        logger.info(f"Loaded existing predictions with {len(_completed_intervals(trainval_preds))} intervals")
+
+    # Determine which intervals are already done (predictions + model file both exist)
+    pred_intervals = _completed_intervals(trainval_preds)
+    model_intervals = {
+        h for h in intervals
+        if os.path.exists(os.path.join(models_dir, _model_filename(h)))
+    }
+    completed = pred_intervals & model_intervals
+    if completed:
+        logger.info(f"Found {len(completed)} completed intervals, will resume from where we left off")
 
     failed_intervals = []
 
     for i, masking_hours in enumerate(intervals):
         label = _format_hours(masking_hours)
+
+        if masking_hours in completed:
+            logger.info(f"[{i + 1}/{len(intervals)}] Skipping {label} (already done)")
+            continue
+
         logger.info(f"\n[{i + 1}/{len(intervals)}] Training EBMs at {label}...")
 
         try:
@@ -455,7 +496,6 @@ def generate_ebm_feature(
                 expected_cat_feats, expected_cont_feats,
             )
 
-            # === NEW ===
             # Train final deployment model on full trainval
             final_model_dict = train_final_ebm_at_timepoint(
                 trainval_df,
@@ -463,7 +503,10 @@ def generate_ebm_feature(
                 masking_hours,
                 ebm_params,
             )
-            deployment_models[masking_hours] = final_model_dict
+            # Save deployment model as individual file
+            model_path = os.path.join(models_dir, _model_filename(masking_hours))
+            with open(model_path, "wb") as f:
+                pickle.dump(final_model_dict, f)
 
             for pid, prob in oof_preds.items():
                 trainval_preds.setdefault(pid, {})[masking_hours] = prob
@@ -475,6 +518,18 @@ def generate_ebm_feature(
                 f"holdout mean={np.mean(list(hold_preds.values())):.3f}"
             )
 
+            # Save predictions progress
+            result = {
+                "intervals_hours": intervals,
+                "trainval": trainval_preds,
+                "holdout": holdout_preds,
+            }
+            with open(predictions_path, "wb") as f:
+                pickle.dump(result, f)
+
+            n_done = len([h for h in intervals if os.path.exists(os.path.join(models_dir, _model_filename(h)))])
+            logger.info(f"  Progress saved ({n_done}/{len(intervals)} intervals)")
+
         except Exception as e:
             logger.error(f"  Failed at {label}: {e}")
             import traceback
@@ -482,27 +537,20 @@ def generate_ebm_feature(
             failed_intervals.append(masking_hours)
             continue
 
-    os.makedirs(save_dir, exist_ok=True)
-
+    # Final save (ensures intervals_hours is up to date)
     result = {
         "intervals_hours": intervals,
         "trainval": trainval_preds,
         "holdout": holdout_preds,
     }
-
-    save_path = os.path.join(save_dir, "ebm_predictions.pkl")
-    with open(save_path, "wb") as f:
+    with open(predictions_path, "wb") as f:
         pickle.dump(result, f)
 
-    # === NEW ===
-    model_save_path = os.path.join(save_dir, "ebm_deployment_models.pkl")
-    with open(model_save_path, "wb") as f:
-        pickle.dump(deployment_models, f)
-
+    n_models = len([h for h in intervals if os.path.exists(os.path.join(models_dir, _model_filename(h)))])
     logger.info(f"\n{'=' * 80}")
     logger.info(f"EBM feature generation complete")
-    logger.info(f"  Saved predictions to: {save_path}")
-    logger.info(f"  Saved deployment models to: {model_save_path}")
+    logger.info(f"  Saved predictions to: {predictions_path}")
+    logger.info(f"  Saved {n_models} deployment models to: {models_dir}/")
     logger.info("=" * 80)
 
     return result
@@ -537,6 +585,12 @@ def main():
         help="Directory to save predictions",
     )
     parser.add_argument(
+        "--models_dir",
+        type=str,
+        default="models/ebm",
+        help="Directory to save deployment models",
+    )
+    parser.add_argument(
         "--n_folds",
         type=int,
         default=5,
@@ -544,7 +598,7 @@ def main():
     )
     args = parser.parse_args()
 
-    generate_ebm_feature(cfg, save_dir=args.save_dir, n_folds=args.n_folds)
+    generate_ebm_feature(cfg, save_dir=args.save_dir, models_dir=args.models_dir, n_folds=args.n_folds)
 
 
 if __name__ == "__main__":
