@@ -332,12 +332,17 @@ def prepare_data_and_dls(cfg):
     # FIXED: Normalize while preserving padding
     X_normalized = normalize_with_padding_mask(X, ts_scaler, padding_value=0.0, fit=True)
 
-    # Restore raw EBM channel values (no normalization — already 0-1)
+    # EBM channel is now standardized like all other channels by
+    # normalize_with_padding_mask (padding zeros preserved).  Previously raw
+    # [0,1] values were restored here, but that left the channel with ~30x
+    # less dynamic range than other standardized channels, making it invisible
+    # to W_P.
     if cfg.get('ebm_feature', {}).get('enabled', False):
-        X_normalized[:, ebm_channel_idx, :] = X_raw[:, ebm_channel_idx, :]
-        logger.info(f'EBM channel restored to raw values (range '
-                    f'[{X_raw[:, ebm_channel_idx, :].min():.3f}, '
-                    f'{X_raw[:, ebm_channel_idx, :].max():.3f}])')
+        ebm_norm = X_normalized[:, ebm_channel_idx, :]
+        ebm_nonzero = ebm_norm[ebm_norm != 0]
+        logger.info(f'EBM channel after standardization: '
+                    f'mean={ebm_nonzero.mean():.3f}, std={ebm_nonzero.std():.3f}, '
+                    f'range=[{ebm_nonzero.min():.3f}, {ebm_nonzero.max():.3f}]')
 
     logger.info(f'Train/val X shape (after normalization): {X_normalized.shape}')
     
@@ -435,9 +440,13 @@ def prepare_data_and_dls(cfg):
     # FIXED: Use masked normalization for holdout too
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, padding_value=0.0, fit=False)
 
-    # Restore raw EBM channel for holdout
+    # EBM channel standardized using trainval-fitted scaler (same as other channels)
     if cfg.get('ebm_feature', {}).get('enabled', False):
-        tX_normalized[:, ebm_channel_idx, :] = tX_raw[:, ebm_channel_idx, :]
+        ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
+        ebm_nz_h = ebm_norm_h[ebm_norm_h != 0]
+        logger.info(f'Holdout EBM after standardization: '
+                    f'mean={ebm_nz_h.mean():.3f}, std={ebm_nz_h.std():.3f}, '
+                    f'range=[{ebm_nz_h.min():.3f}, {ebm_nz_h.max():.3f}]')
 
     # Verify
     holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0)
