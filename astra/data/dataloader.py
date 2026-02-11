@@ -1,6 +1,7 @@
 # dataloader.py
 
 
+import os
 import pandas as pd
 import numpy as np
 
@@ -229,6 +230,22 @@ def prepare_data_and_dls(cfg):
         tsds.complete = pd.concat(tsds.cont_concepts).fillna(0.0)
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
         tsds.complete_cat.timestep_cols = tsds.timestep_cols
+
+    # Inject EBM prediction channel if enabled
+    ebm_channel_idx = None
+    if cfg.get('ebm_feature', {}).get('enabled', False):
+        from astra.data.ebm_features import create_ebm_feature_df
+        from astra.models.ebm.generate_ebm_feature import load_ebm_predictions
+        logger.info("Injecting EBM prediction channel...")
+        ebm_save_dir = cfg['ebm_feature'].get('save_dir', 'data/interim/ebm_features')
+        ebm_predictions = load_ebm_predictions(ebm_save_dir)
+        for tsds, split_name in [(trainval, 'trainval'), (holdout, 'holdout')]:
+            ebm_df = create_ebm_feature_df(
+                cfg, tsds.base, split=split_name,
+                ebm_predictions=ebm_predictions, save_dir=ebm_save_dir,
+            )
+            tsds.cont_concepts['_ebm'] = ebm_df
+            tsds.complete = pd.concat(tsds.cont_concepts).fillna(0.0)
     
     # Align continuous dataframes (string column names)
     trainval.complete, holdout.complete = align_dataframes(
@@ -289,7 +306,13 @@ def prepare_data_and_dls(cfg):
     )
     y = list(y[:, 0].flatten())
     logger.info(f'Train/val X shape (before normalization): {X.shape}')
-    
+
+    # Compute EBM channel index (df2xy sorts by FEATURE → channel order)
+    if cfg.get('ebm_feature', {}).get('enabled', False):
+        features_sorted = sorted(trainval.complete['FEATURE'].unique())
+        ebm_channel_idx = features_sorted.index("_ebm_pred")
+        logger.info(f'EBM channel "_ebm_pred" at index {ebm_channel_idx}/{len(features_sorted)}')
+
     # Store raw X for debugging
     X_raw = X.copy()
 
@@ -308,7 +331,14 @@ def prepare_data_and_dls(cfg):
     
     # FIXED: Normalize while preserving padding
     X_normalized = normalize_with_padding_mask(X, ts_scaler, padding_value=0.0, fit=True)
-    
+
+    # Restore raw EBM channel values (no normalization — already 0-1)
+    if cfg.get('ebm_feature', {}).get('enabled', False):
+        X_normalized[:, ebm_channel_idx, :] = X_raw[:, ebm_channel_idx, :]
+        logger.info(f'EBM channel restored to raw values (range '
+                    f'[{X_raw[:, ebm_channel_idx, :].min():.3f}, '
+                    f'{X_raw[:, ebm_channel_idx, :].max():.3f}])')
+
     logger.info(f'Train/val X shape (after normalization): {X_normalized.shape}')
     
     # Verify padding is preserved
@@ -404,7 +434,11 @@ def prepare_data_and_dls(cfg):
     
     # FIXED: Use masked normalization for holdout too
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, padding_value=0.0, fit=False)
-    
+
+    # Restore raw EBM channel for holdout
+    if cfg.get('ebm_feature', {}).get('enabled', False):
+        tX_normalized[:, ebm_channel_idx, :] = tX_raw[:, ebm_channel_idx, :]
+
     # Verify
     holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0)
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
@@ -510,6 +544,7 @@ def prepare_data_and_dls(cfg):
         "ts_feature_names": trainval.complete.columns[2:-1].tolist(),
         "trajectory_lengths": traj_lengths,  # NEW: trainval trajectory lengths
         "holdout_trajectory_lengths": holdout_traj_lengths,  # NEW: holdout trajectory lengths
+        "ebm_channel_idx": ebm_channel_idx,
     }
 
 

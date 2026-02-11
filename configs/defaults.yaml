@@ -147,6 +147,12 @@ temporal_features:
     - elapsed_hours
     - bin_width_hours
 
+ebm_feature:
+  enabled: true
+  save_dir: data/interim/ebm_features
+  n_folds: 5
+  default_value: 0.0
+
 agg_func: #also for datasets, split it up
   VitaleVaerdier:
       #- first # tmp on for tab

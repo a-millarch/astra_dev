@@ -180,6 +180,11 @@ def load_pretrained_backbone(
     Create a backbone and load pretrained weights from MLM checkpoint.
 
     Follows the same pattern as run_finetune() in training.py:288-297.
+
+    When EBM feature is enabled, the current backbone has c_in+1 channels
+    while the pretrained checkpoint has c_in. Handles this by loading all
+    weights except W_P, then expanding W_P with Xavier-initialized weights
+    for the new EBM channel.
     """
     backbone = get_backbone(data, cfg_dict)
 
@@ -204,12 +209,77 @@ def load_pretrained_backbone(
             mask_prob_cont=pc["mask_prob_cont"],
         )
 
-    mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
-    mlm_model.load_state_dict(checkpoint["model_state_dict"])
-    backbone = mlm_model.backbone
-    logger.info(f"Pretrained weights loaded from {checkpoint_path}")
+    # Check for c_in mismatch (EBM feature adds a channel)
+    full_c_in = backbone.W_P.in_channels
+    pretrain_W_P_weight = checkpoint["model_state_dict"]["backbone.W_P.weight"]
+    pretrain_c_in = pretrain_W_P_weight.shape[1]
+
+    if pretrain_c_in != full_c_in:
+        logger.info(
+            f"W_P channel mismatch: checkpoint has {pretrain_c_in}, "
+            f"current model has {full_c_in} — expanding W_P"
+        )
+        # Load all weights except W_P via MLM wrapper
+        mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
+        filtered_state = {
+            k: v for k, v in checkpoint["model_state_dict"].items()
+            if "W_P" not in k
+        }
+        mlm_model.load_state_dict(filtered_state, strict=False)
+        backbone = mlm_model.backbone
+
+        # Expand W_P: copy pretrained weights, Xavier-init new channel(s)
+        _expand_w_p(backbone, pretrain_W_P_weight,
+                     checkpoint["model_state_dict"]["backbone.W_P.bias"],
+                     data.get("ebm_channel_idx"))
+        logger.info(f"Pretrained weights loaded with W_P expansion from {checkpoint_path}")
+    else:
+        mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
+        mlm_model.load_state_dict(checkpoint["model_state_dict"])
+        backbone = mlm_model.backbone
+        logger.info(f"Pretrained weights loaded from {checkpoint_path}")
 
     return backbone
+
+
+def _expand_w_p(
+    backbone: nn.Module,
+    old_weight: torch.Tensor,
+    old_bias: torch.Tensor,
+    ebm_channel_idx: Optional[int] = None,
+):
+    """
+    Expand W_P Conv1d to accommodate additional input channel(s).
+
+    Copies pretrained weights for existing channels to their correct
+    positions and Xavier-initializes the new EBM channel.
+
+    W_P is nn.Conv1d(c_in, continuous_dim, kernel_size=1):
+        weight shape: [out_channels, in_channels, 1]
+        bias shape: [out_channels]
+    """
+    new_c_in = backbone.W_P.in_channels
+    old_c_in = old_weight.shape[1]
+
+    with torch.no_grad():
+        backbone.W_P.bias.data.copy_(old_bias)
+
+        old_idx = 0
+        for new_idx in range(new_c_in):
+            if new_idx == ebm_channel_idx:
+                nn.init.xavier_uniform_(
+                    backbone.W_P.weight.data[:, new_idx : new_idx + 1, :]
+                )
+            else:
+                backbone.W_P.weight.data[:, new_idx : new_idx + 1, :] = (
+                    old_weight[:, old_idx : old_idx + 1, :]
+                )
+                old_idx += 1
+
+    logger.info(
+        f"W_P expanded: {old_c_in} → {new_c_in} channels "
+        f"(EBM at idx {ebm_channel_idx}, Xavier-initialized)"
+    )
 
 
 def _apply_progressive_time_masking(
