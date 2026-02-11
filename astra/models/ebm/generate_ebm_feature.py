@@ -1,14 +1,3 @@
-"""
-Generate EBM predictions as a sequential feature for the hybrid model.
-
-Trains EBMs at specified time intervals using K-fold cross-validation to produce
-out-of-fold (OOF) predictions for trainval patients (avoids stacking leakage)
-and averaged predictions for holdout patients.
-
-Usage:
-    python -m astra.models.ebm.generate_ebm_feature [--save_dir data/interim/ebm_features]
-"""
-
 import os
 import pickle
 import argparse
@@ -17,6 +6,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import OneHotEncoder
 from interpret.glassbox import ExplainableBoostingClassifier
 
 from astra.utils import get_base_df, get_train_test_split, cfg, logger
@@ -43,13 +33,6 @@ def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
     bin_intervals = cfg_dict.get("bin_intervals", {})
     bin_freq_include = set(cfg_dict.get("bin_freq_include", []))
 
-    # Post-72h: each bin_intervals key is the END of its interval.
-    # E.g. "7D": "1D" means from 72h to 7D (168h), use 1D resolution.
-    #   → EBM points at 96h(4D), 120h(5D), 144h(6D), 168h(7D)
-    # "14D": "2D" means from 7D (168h) to 14D (336h), use 2D resolution.
-    #   → EBM points at 216h(9D), 264h(11D), 312h(13D)
-    # "30D": "3D" means from 14D (336h) to 30D (720h), use 3D resolution.
-    #   → EBM points at 408h(17D), 480h(20D), 552h(23D), 624h(26D), 696h(29D)
     sorted_keys = sorted(
         [k for k in bin_intervals.keys() if k != "end"],
         key=lambda k: float(k[:-1]) * (24 if k.endswith("D") else 1),
@@ -61,24 +44,20 @@ def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
     for i, key in enumerate(sorted_keys):
         end_h = _key_to_hours(key)
 
-        # Find start boundary (previous key)
         if i > 0:
             start_h = _key_to_hours(sorted_keys[i - 1])
         else:
             start_h = 0
 
         if end_h <= 72:
-            continue  # already covered by the explicit 0-72h schedule
+            continue
 
-        # Clamp start to 72h (we handle 0-72h above)
         start_h = max(start_h, 72)
 
-        # Check resolution is in bin_freq_include
         resolution_str = bin_intervals[key]
         if resolution_str not in bin_freq_include:
             continue
 
-        # Parse resolution to hours
         if resolution_str.endswith("min"):
             res_h = float(resolution_str[:-3]) / 60
         elif resolution_str.endswith("h"):
@@ -88,7 +67,6 @@ def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
         else:
             continue
 
-        # Generate points from start to end at this resolution
         t = start_h + res_h
         while t <= end_h:
             intervals.append(t)
@@ -135,6 +113,86 @@ def _create_aggregated_dataset(
     return X, np.asarray(y), agg_ds.categorical_features, agg_ds.continuous_features
 
 
+def preprocess_features(
+    X: pd.DataFrame,
+    cat_feats: list,
+    cont_feats: list,
+    encoder: Optional[OneHotEncoder] = None,
+    fit: bool = True,
+) -> Tuple[pd.DataFrame, Optional[OneHotEncoder], list]:
+    """
+    Preprocess features with explicit one-hot encoding for categoricals.
+    
+    Args:
+        X: Feature dataframe (no ID column)
+        cat_feats: Categorical feature names
+        cont_feats: Continuous feature names
+        encoder: Fitted encoder (for transform-only mode)
+        fit: Whether to fit encoder (True for train, False for val/test)
+    
+    Returns:
+        X_processed: DataFrame with all continuous features
+        encoder: Fitted encoder (if fit=True) or None
+        feature_names: List of all feature names
+    """
+    # Separate categorical and continuous
+    X_cat = X[cat_feats] if cat_feats else pd.DataFrame(index=X.index)
+    X_cont = X[cont_feats] if cont_feats else pd.DataFrame(index=X.index)
+    
+    if len(cat_feats) > 0:
+        if fit:
+            # Fit encoder on full data
+            encoder = OneHotEncoder(
+                sparse_output=False,
+                handle_unknown='ignore',  # Critical: ignore unknown categories
+                dtype=np.float64,
+            )
+            X_cat_encoded = encoder.fit_transform(X_cat)
+            
+            # Generate feature names
+            cat_feature_names = []
+            for i, cat_feat in enumerate(cat_feats):
+                categories = encoder.categories_[i]
+                for cat in categories:
+                    cat_feature_names.append(f"{cat_feat}_{cat}")
+            
+            X_cat_df = pd.DataFrame(
+                X_cat_encoded,
+                index=X.index,
+                columns=cat_feature_names,
+            )
+        else:
+            # Transform using fitted encoder
+            if encoder is None:
+                raise ValueError("Encoder must be provided when fit=False")
+            
+            X_cat_encoded = encoder.transform(X_cat)
+            
+            # Use same feature names from encoder
+            cat_feature_names = []
+            for i, cat_feat in enumerate(cat_feats):
+                categories = encoder.categories_[i]
+                for cat in categories:
+                    cat_feature_names.append(f"{cat_feat}_{cat}")
+            
+            X_cat_df = pd.DataFrame(
+                X_cat_encoded,
+                index=X.index,
+                columns=cat_feature_names,
+            )
+        
+        # Combine categorical and continuous
+        X_processed = pd.concat([X_cat_df, X_cont], axis=1)
+        feature_names = cat_feature_names + cont_feats
+    else:
+        # No categorical features
+        X_processed = X_cont.copy()
+        feature_names = cont_feats
+        encoder = None
+    
+    return X_processed, encoder, feature_names
+
+
 def train_ebm_kfold_at_timepoint(
     train_df: pd.DataFrame,
     cfg_dict: dict,
@@ -144,6 +202,8 @@ def train_ebm_kfold_at_timepoint(
 ) -> Tuple[Dict[int, float], list]:
     """
     Train K-fold EBMs at one masking point to generate OOF predictions.
+    
+    **FIX**: Uses explicit preprocessing to ensure consistent features across folds.
 
     Args:
         train_df: Training patients base_df (no holdout).
@@ -154,7 +214,7 @@ def train_ebm_kfold_at_timepoint(
 
     Returns:
         oof_preds: {PID: predicted_probability} for all training patients.
-        fold_models: List of (model, preprocessor) tuples for holdout prediction.
+        fold_models: List of (model, encoder) tuples for holdout prediction.
     """
     if ebm_params is None:
         ebm_params = _get_default_ebm_params()
@@ -166,17 +226,21 @@ def train_ebm_kfold_at_timepoint(
     id_col = cfg_dict["dataset"]["id_col"]
     pids = X_full[id_col].values
     X_features = X_full.drop(columns=[id_col])
-    feature_names = cat_feats + cont_feats
+
+    # **FIX**: Fit encoder on FULL dataset to ensure all categories are known
+    X_processed, global_encoder, feature_names = preprocess_features(
+        X_features, cat_feats, cont_feats, encoder=None, fit=True
+    )
 
     oof_preds = {}
     fold_models = []
 
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_features, y_full)):
-        X_train = X_features.iloc[train_idx]
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_processed, y_full)):
+        X_train = X_processed.iloc[train_idx]
         y_train = y_full[train_idx]
-        X_val = X_features.iloc[val_idx]
+        X_val = X_processed.iloc[val_idx]
         y_val = y_full[val_idx]
         val_pids = pids[val_idx]
 
@@ -184,6 +248,15 @@ def train_ebm_kfold_at_timepoint(
         if len(set(y_train)) < 2:
             logger.warning(
                 f"  Fold {fold_idx}: insufficient class diversity in train, skipping"
+            )
+            for pid in val_pids:
+                oof_preds[pid] = 0.0
+            continue
+
+        # Verify shapes match
+        if X_train.shape[1] != X_val.shape[1]:
+            logger.error(
+                f"  Fold {fold_idx}: Shape mismatch! Train={X_train.shape}, Val={X_val.shape}"
             )
             for pid in val_pids:
                 oof_preds[pid] = 0.0
@@ -200,7 +273,8 @@ def train_ebm_kfold_at_timepoint(
         for pid, prob in zip(val_pids, y_proba):
             oof_preds[pid] = float(prob)
 
-        fold_models.append(ebm)
+        # Store model with encoder for holdout prediction
+        fold_models.append((ebm, global_encoder))
 
     return oof_preds, fold_models
 
@@ -213,6 +287,8 @@ def predict_holdout(
 ) -> Dict[int, float]:
     """
     Generate averaged predictions for holdout patients across K fold models.
+    
+    **FIX**: Uses stored encoders from training to ensure consistent features.
 
     Returns:
         {PID: averaged_probability}
@@ -230,8 +306,15 @@ def predict_holdout(
 
     # Average predictions across fold models
     all_proba = np.zeros(len(X_features))
-    for model in fold_models:
-        all_proba += model.predict_proba(X_features)[:, 1]
+    
+    for model, encoder in fold_models:
+        # **FIX**: Use the encoder from training to preprocess holdout data
+        X_processed, _, _ = preprocess_features(
+            X_features, cat_feats, cont_feats, encoder=encoder, fit=False
+        )
+        
+        all_proba += model.predict_proba(X_processed)[:, 1]
+    
     all_proba /= len(fold_models)
 
     return {pid: float(prob) for pid, prob in zip(pids, all_proba)}
@@ -318,6 +401,8 @@ def generate_ebm_feature(
 
         except Exception as e:
             logger.error(f"  Failed at {label}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             failed_intervals.append(masking_hours)
             continue
 
