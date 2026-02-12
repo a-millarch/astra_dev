@@ -654,6 +654,182 @@ def plot_multiple_roc_pr_curves(
 
     
 # ============================================================================
+# TEMPORAL EVALUATOR (PER-TIMESTEP MODELS)
+# ============================================================================
+
+class TemporalEvaluator:
+    """
+    Evaluator for per-timestep prediction models.
+
+    Key advantage: ONE forward pass gives predictions at ALL timesteps.
+    No censoring loop, no repeated dataloader creation.
+    """
+
+    def __init__(self, data: dict, model: torch.nn.Module, cfg: dict,
+                 device: str = 'cuda'):
+        self.data = data
+        self.model = model
+        self.cfg = cfg
+        self.device = device
+        self.model.eval()
+
+        self._holdout_preds = None  # Lazy computed
+        self._holdout_traj_lengths = np.array(
+            data.get("holdout_trajectory_lengths",
+                      data.get("traj_lengths_holdout", []))
+        )
+        self.holdout = data["holdout"]
+
+    def _get_all_predictions(self) -> np.ndarray:
+        """
+        Run single forward pass on full holdout data.
+
+        Returns:
+            predictions: [n_holdout, seq_len] -- sigmoid probabilities per timestep
+        """
+        if self._holdout_preds is not None:
+            return self._holdout_preds
+
+        holdout_dls = self.data["holdout_mixed_dls"]
+        all_preds = []
+
+        with torch.no_grad():
+            for batch in holdout_dls.train:
+                inputs, targets = batch
+                inputs = self._to_device(inputs)
+                logits = self.model(inputs)  # [batch, seq_len]
+                probs = torch.sigmoid(logits)
+                all_preds.append(probs.cpu().numpy())
+
+        self._holdout_preds = np.concatenate(all_preds, axis=0)
+        return self._holdout_preds
+
+    def _to_device(self, obj):
+        """Recursively move tensors to device."""
+        if isinstance(obj, torch.Tensor):
+            t = obj.to(self.device)
+            if type(t) is not torch.Tensor:
+                t = t.as_subclass(torch.Tensor)
+            return t
+        elif isinstance(obj, (tuple, list)):
+            return type(obj)(self._to_device(item) for item in obj)
+        return obj
+
+    def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
+        """
+        Evaluate at a specific timestep by slicing pre-computed predictions.
+
+        For each patient:
+        - If trajectory_length > censor_step: use prediction at censor_step
+        - If trajectory_length <= censor_step: use prediction at trajectory_length - 1
+        """
+        preds_all = self._get_all_predictions()  # [n_holdout, seq_len]
+        ys = np.array(self.data["ty"])
+
+        # Select prediction at censor_step (or last valid step)
+        if len(self._holdout_traj_lengths) > 0:
+            effective_steps = np.minimum(censor_step, self._holdout_traj_lengths - 1)
+            effective_steps = np.maximum(effective_steps, 0).astype(int)
+        else:
+            # Fallback: use censor_step for all
+            effective_steps = np.full(len(preds_all), censor_step, dtype=int)
+            effective_steps = np.minimum(effective_steps, preds_all.shape[1] - 1)
+
+        y_preds = preds_all[np.arange(len(preds_all)), effective_steps]
+
+        # Check class balance
+        if ys.sum() == 0 or ys.sum() == len(ys):
+            return None
+
+        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
+        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
+
+        time_min = step_to_time(censor_step)
+        if time_min is None:
+            return None
+
+        return TimeMetricResult(
+            time_min=time_min,
+            time_hours=time_min / 60,
+            time_days=time_min / (24 * 60),
+            censor_step=censor_step,
+            auroc=auroc,
+            auroc_ci=(auroc_lower, auroc_upper),
+            auprc=auprc,
+            auprc_ci=(auprc_lower, auprc_upper),
+            n_samples=len(ys),
+            n_positive=int(ys.sum()),
+        )
+
+    def evaluate_over_time(
+        self,
+        censor_steps: List[int],
+        save_predictions: bool = True,
+        model_name: Optional[str] = None,
+    ) -> Tuple[List[TimeMetricResult], Optional[pd.DataFrame]]:
+        """
+        Evaluate at multiple time points using pre-computed predictions.
+
+        This is essentially free after the single forward pass.
+        """
+        import time as time_module
+
+        # Force compute all predictions
+        preds_all = self._get_all_predictions()
+        patient_ids = self.holdout.base.PID.values
+
+        results = []
+        preds_over_time = [] if save_predictions else None
+
+        logger.info(f"Temporal evaluation at {len(censor_steps)} time points "
+                     f"(single forward pass, {preds_all.shape[0]} patients)...")
+        start_time = time_module.time()
+
+        for censor_step in censor_steps:
+            result = self.evaluate_at_timestep(censor_step)
+            if result is None:
+                continue
+            results.append(result)
+
+            if save_predictions:
+                if len(self._holdout_traj_lengths) > 0:
+                    effective_steps = np.minimum(
+                        censor_step, self._holdout_traj_lengths - 1
+                    )
+                    effective_steps = np.maximum(effective_steps, 0).astype(int)
+                else:
+                    effective_steps = np.minimum(
+                        censor_step, preds_all.shape[1] - 1
+                    )
+                y_preds = preds_all[np.arange(len(preds_all)), effective_steps]
+
+                for pid, pred in zip(patient_ids, y_preds):
+                    preds_over_time.append({
+                        "PID": pid,
+                        "censor_step": censor_step,
+                        "time_min": result.time_min,
+                        "time_hours": result.time_hours,
+                        "time_days": result.time_days,
+                        "pred": float(pred),
+                    })
+
+        total_time = time_module.time() - start_time
+        logger.info(
+            f"Temporal evaluation complete: {len(results)}/{len(censor_steps)} "
+            f"in {total_time:.1f}s"
+        )
+
+        if save_predictions and preds_over_time and model_name:
+            preds_df = pd.DataFrame(preds_over_time)
+            os.makedirs('reports/predictions', exist_ok=True)
+            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
+            return results, preds_df
+
+        return results, pd.DataFrame(preds_over_time) if preds_over_time else (results, None)
+
+
+# ============================================================================
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
@@ -678,24 +854,121 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
     """
     mixed_dls = data["mixed_dls"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
-    
+
+    # Detect temporal head config
+    model_cfg = cfg.get("model", {})
+    is_temporal = model_cfg.get("temporal_head", False)
+
     # ============================================================================
     # LOAD MODEL
     # ============================================================================
     logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(data, cfg)
+    backbone = get_backbone(
+        data, cfg,
+        temporal_head=is_temporal,
+        causal=model_cfg.get("causal", False),
+        temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+    )
     learn = Learner(mixed_dls, backbone, metrics=None)
     learn.load(model_name)
     learn.to('cuda')
     learn = patch_learner_get_preds(learn)
-    logger.info("✓ Model loaded and moved to GPU")
-    
+    logger.info(f"Model loaded (temporal_head={is_temporal})")
+
     # ============================================================================
-    # BASELINE EVALUATION (Full Time Series)
+    # TEMPORAL MODEL: single-forward-pass evaluation
+    # ============================================================================
+    if is_temporal:
+        backbone_loaded = learn.model
+        backbone_loaded.eval()
+
+        # Baseline: use prediction at last valid timestep per patient
+        logger.info("Running temporal baseline evaluation (last timestep)...")
+        temporal_eval = TemporalEvaluator(data, backbone_loaded, cfg, device='cuda')
+        preds_all = temporal_eval._get_all_predictions()  # [n, seq_len]
+
+        # For baseline plot: use last-timestep prediction
+        traj_lens = temporal_eval._holdout_traj_lengths
+        if len(traj_lens) > 0:
+            last_steps = np.minimum(preds_all.shape[1] - 1, traj_lens - 1).astype(int)
+            last_steps = np.maximum(last_steps, 0)
+        else:
+            last_steps = np.full(len(preds_all), preds_all.shape[1] - 1, dtype=int)
+        baseline_preds = preds_all[np.arange(len(preds_all)), last_steps]
+        targs = np.array(data["ty"])
+        evalplt = plot_evaluation(
+            torch.tensor(baseline_preds), torch.tensor(targs), cfg["target"]
+        )
+        save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+        logger.info("Baseline temporal evaluation saved")
+
+        # Multicurve and comprehensive eval via TemporalEvaluator
+        key_timepoints = None
+        if multicurve:
+            key_timepoints = [
+                time_to_step(1, 'h'), time_to_step(6, 'h'),
+                time_to_step(12, 'h'), time_to_step(24, 'h'),
+                time_to_step(72, 'h'), time_to_step(7, 'D'),
+                time_to_step(13, 'D'), time_to_step(30, 'D'),
+            ]
+            key_timepoints = [t for t in key_timepoints if t is not None]
+
+            # Log key-timepoint metrics
+            logger.info("Performance at key time points (temporal model):")
+            for step in key_timepoints:
+                result = temporal_eval.evaluate_at_timestep(step)
+                if result:
+                    logger.info(
+                        f"  {format_step_label(step):>12s}: "
+                        f"AUROC={result.auroc:.3f} [{result.auroc_ci[0]:.3f}-{result.auroc_ci[1]:.3f}], "
+                        f"AUPRC={result.auprc:.3f} [{result.auprc_ci[0]:.3f}-{result.auprc_ci[1]:.3f}]"
+                    )
+
+        if comprehensive_eval:
+            censor_thresholds = generate_time_thresholds(
+                max_days=30, cut_hours=72, step_hours=1, step_days=1
+            )
+            results, preds_df = temporal_eval.evaluate_over_time(
+                censor_thresholds, save_predictions=True, model_name=model_name,
+            )
+
+            if not results:
+                logger.error("No valid results from temporal evaluation!")
+                return None, None
+
+            # Save CSV
+            os.makedirs('reports/predictions', exist_ok=True)
+            if preds_df is not None:
+                preds_df.to_csv(
+                    f'reports/predictions/preds_df_{model_name}.csv', index=False
+                )
+
+            # Plot
+            fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
+            save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+
+            # Summary
+            logger.info("="*80)
+            logger.info("TEMPORAL EVALUATION SUMMARY")
+            logger.info("="*80)
+            if key_timepoints:
+                for step in key_timepoints:
+                    matching = [r for r in results if r.censor_step == step]
+                    if matching:
+                        r = matching[0]
+                        logger.info(
+                            f"  {format_step_label(step):>12s}: "
+                            f"AUROC={r.auroc:.3f}, AUPRC={r.auprc:.3f}"
+                        )
+            return results, preds_df
+        return None, None
+
+    # ============================================================================
+    # NON-TEMPORAL MODEL: existing evaluation path
     # ============================================================================
     logger.info("Running baseline evaluation with full time series...")
     preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
-    
+
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
     save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')

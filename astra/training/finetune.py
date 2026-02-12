@@ -100,6 +100,13 @@ class FinetuneConfig:
     use_pretrained: bool = True
     pretrain_checkpoint_dir: Optional[str] = None
 
+    # Per-timestep prediction head
+    temporal_head: bool = False
+    causal: bool = False
+    temporal_head_dropout: float = 0.3
+    time_weighting: str = "uniform"     # 'uniform' or 'early'
+    early_weight_factor: float = 2.0
+
 
 def create_split_dataloaders(data: dict, splits, cfg_dict: dict):
     """
@@ -175,6 +182,9 @@ def load_pretrained_backbone(
     cfg_dict: dict,
     pretrain_cfg: Optional[MLMConfig] = None,
     checkpoint_dir: Optional[str] = None,
+    temporal_head: bool = False,
+    causal: bool = False,
+    temporal_head_dropout: float = 0.3,
 ) -> nn.Module:
     """
     Create a backbone and load pretrained weights from MLM checkpoint.
@@ -185,8 +195,15 @@ def load_pretrained_backbone(
     while the pretrained checkpoint has c_in. Handles this by loading all
     weights except W_P, then expanding W_P with Xavier-initialized weights
     for the new EBM channel.
+
+    When temporal_head=True, the checkpoint won't have temporal_pred_head
+    weights (pretraining doesn't use classification head). We load with
+    strict=False so the new head gets random initialization.
     """
-    backbone = get_backbone(data, cfg_dict)
+    backbone = get_backbone(data, cfg_dict,
+                            temporal_head=temporal_head,
+                            causal=causal,
+                            temporal_head_dropout=temporal_head_dropout)
 
     if checkpoint_dir is None:
         checkpoint_dir = f'./pretrain_checkpoints/{cfg_dict["model_name"]}'
@@ -235,7 +252,10 @@ def load_pretrained_backbone(
         logger.info(f"Pretrained weights loaded with W_P expansion from {checkpoint_path}")
     else:
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
-        mlm_model.load_state_dict(checkpoint["model_state_dict"])
+        # Use strict=False when temporal head is enabled — the checkpoint won't
+        # have temporal_pred_head weights (or old head weights differ)
+        mlm_model.load_state_dict(checkpoint["model_state_dict"],
+                                  strict=not temporal_head)
         backbone = mlm_model.backbone
         logger.info(f"Pretrained weights loaded from {checkpoint_path}")
 
@@ -349,6 +369,81 @@ def _compute_weighted_loss(
     return (loss_per_sample * weights).mean()
 
 
+def _infer_trajectory_lengths_from_batch(x_ts: torch.Tensor) -> torch.Tensor:
+    """
+    Infer trajectory lengths from a batch of time series data.
+
+    A timestep is padding if ALL channels are zero (or near-zero).
+    After normalization, measured values are ~N(0,1) and padding/missing = 0.0.
+
+    Args:
+        x_ts: [batch, c_in, seq_len] -- already normalized
+
+    Returns:
+        traj_lengths: [batch] -- last non-padding timestep index + 1
+    """
+    has_data = (x_ts.abs() > 1e-6).any(dim=1)  # [batch, seq_len]
+    seq_len = x_ts.shape[2]
+    positions = torch.arange(seq_len, device=x_ts.device).unsqueeze(0)  # [1, seq_len]
+    masked_positions = torch.where(has_data, positions, torch.tensor(-1, device=x_ts.device))
+    traj_lengths = masked_positions.max(dim=1).values + 1  # [batch]
+    return traj_lengths.clamp(min=1)
+
+
+def compute_temporal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    traj_lengths: torch.Tensor,
+    pos_weight: Optional[torch.Tensor] = None,
+    time_weighting: str = "uniform",
+    early_weight_factor: float = 2.0,
+) -> torch.Tensor:
+    """
+    Per-timestep BCE loss with padding mask and optional time weighting.
+
+    Args:
+        logits: [batch, seq_len] -- raw logits from temporal head
+        targets: [batch] -- binary labels (0/1)
+        traj_lengths: [batch] -- number of valid timesteps per sample
+        pos_weight: Scalar tensor for class imbalance (ratio of neg/pos)
+        time_weighting: 'uniform' or 'early' (weight earlier predictions more)
+        early_weight_factor: Maximum weight for earliest timesteps (early mode)
+
+    Returns:
+        Scalar loss
+    """
+    batch_size, seq_len = logits.shape
+    device = logits.device
+
+    # Expand targets to [batch, seq_len] — same label at every timestep
+    targets_expanded = targets.float().unsqueeze(1).expand_as(logits)
+
+    # Padding mask: True = valid position
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)
+    valid_mask = positions < traj_lengths.unsqueeze(1)  # [batch, seq_len]
+
+    # Per-element BCE loss
+    loss_per_element = F.binary_cross_entropy_with_logits(
+        logits, targets_expanded,
+        pos_weight=pos_weight,
+        reduction="none",
+    )  # [batch, seq_len]
+
+    # Apply padding mask
+    loss_per_element = loss_per_element * valid_mask.float()
+
+    # Optional time weighting
+    if time_weighting == "early":
+        time_weights = torch.linspace(
+            early_weight_factor, 1.0, seq_len, device=device
+        )
+        loss_per_element = loss_per_element * time_weights.unsqueeze(0)
+
+    # Average over valid positions
+    n_valid = valid_mask.float().sum().clamp(min=1.0)
+    return loss_per_element.sum() / n_valid
+
+
 def train_one_epoch(
     model: nn.Module,
     dataloader,
@@ -363,6 +458,11 @@ def train_one_epoch(
     min_timesteps: int = 2,
     enable_weighting: bool = False,
     early_weight: float = 2.0,
+    # Per-timestep prediction options
+    temporal_head: bool = False,
+    pos_weight: Optional[torch.Tensor] = None,
+    time_weighting: str = "uniform",
+    early_weight_factor: float = 2.0,
 ) -> float:
     """
     Single epoch training loop for the TSAI mixed dataloader format.
@@ -380,6 +480,10 @@ def train_one_epoch(
         min_timesteps: Minimum timesteps to keep when masking.
         enable_weighting: Whether to weight loss by data availability.
         early_weight: Weight multiplier for sparse-data samples.
+        temporal_head: Whether model has per-timestep prediction head.
+        pos_weight: Class imbalance weight for BCE (temporal mode).
+        time_weighting: 'uniform' or 'early' (temporal mode).
+        early_weight_factor: Max weight for early timesteps (temporal mode).
 
     Returns:
         Average training loss for the epoch.
@@ -403,7 +507,16 @@ def train_one_epoch(
         logits = model(inputs)
 
         # Compute loss
-        if enable_weighting:
+        if temporal_head:
+            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+            traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
+            loss = compute_temporal_loss(
+                logits, targets, traj_lengths,
+                pos_weight=pos_weight,
+                time_weighting=time_weighting,
+                early_weight_factor=early_weight_factor,
+            )
+        elif enable_weighting:
             x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
             loss = _compute_weighted_loss(
                 logits, targets, x_ts,
@@ -443,6 +556,11 @@ def _run_phase(
     global_epoch: int = 0,
     enable_masking: bool = False,
     enable_weighting: bool = False,
+    # Per-timestep prediction options (passed through from run_finetune_v2)
+    temporal_head: bool = False,
+    pos_weight: Optional[torch.Tensor] = None,
+    time_weighting: str = "uniform",
+    early_weight_factor: float = 2.0,
 ) -> int:
     """
     Run a single training phase.
@@ -478,8 +596,13 @@ def _run_phase(
             min_timesteps=finetune_cfg.min_timesteps,
             enable_weighting=enable_weighting,
             early_weight=finetune_cfg.early_weight,
+            temporal_head=temporal_head,
+            pos_weight=pos_weight,
+            time_weighting=time_weighting,
+            early_weight_factor=early_weight_factor,
         )
-        val_auroc = compute_auroc(model, valid_dl, device=device)
+        val_auroc = compute_auroc(model, valid_dl, device=device,
+                                  temporal_head=temporal_head)
 
         tracker.update(phase_name, global_epoch, train_loss=train_loss, val_auroc=val_auroc)
         logger.info(
@@ -528,14 +651,25 @@ def run_finetune_v2(
     # ========================================================================
     # 1. Load backbone (pretrained or fresh)
     # ========================================================================
+    temporal_kwargs = dict(
+        temporal_head=finetune_cfg.temporal_head,
+        causal=finetune_cfg.causal,
+        temporal_head_dropout=finetune_cfg.temporal_head_dropout,
+    )
+    # Propagate temporal config to global cfg for save_model_fastai_compatible
+    if finetune_cfg.temporal_head:
+        cfg.setdefault("model", {})["temporal_head"] = True
+        cfg["model"]["causal"] = finetune_cfg.causal
+        cfg["model"]["temporal_head_dropout"] = finetune_cfg.temporal_head_dropout
     if finetune_cfg.use_pretrained:
         backbone = load_pretrained_backbone(
             data, cfg,
             pretrain_cfg=pretrain_cfg,
             checkpoint_dir=finetune_cfg.pretrain_checkpoint_dir,
+            **temporal_kwargs,
         )
     else:
-        backbone = get_backbone(data, cfg)
+        backbone = get_backbone(data, cfg, **temporal_kwargs)
         logger.info("Using randomly initialized backbone (no pretraining)")
 
     # Apply dropout overrides if specified
@@ -579,6 +713,22 @@ def run_finetune_v2(
         n_params = sum(p.numel() for _, p in params)
         logger.info(f"  {name}: {n_params:,} params")
 
+    # Temporal head: compute pos_weight for class imbalance in BCE
+    temporal_phase_kwargs = {}
+    if finetune_cfg.temporal_head:
+        y_arr = np.array(y)
+        n_pos = y_arr.sum()
+        n_neg = len(y_arr) - n_pos
+        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+        temporal_phase_kwargs = dict(
+            temporal_head=True,
+            pos_weight=pos_weight,
+            time_weighting=finetune_cfg.time_weighting,
+            early_weight_factor=finetune_cfg.early_weight_factor,
+        )
+        logger.info(f"Temporal head: pos_weight={pos_weight.item():.2f}, "
+                     f"time_weighting={finetune_cfg.time_weighting}")
+
     # ========================================================================
     # 4. Phase 1: Head-only training
     # ========================================================================
@@ -596,6 +746,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        **temporal_phase_kwargs,
     )
 
     # ========================================================================
@@ -615,6 +766,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        **temporal_phase_kwargs,
     )
 
     # ========================================================================
@@ -634,6 +786,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        **temporal_phase_kwargs,
     )
 
     # ========================================================================
@@ -655,6 +808,7 @@ def run_finetune_v2(
             global_epoch=global_epoch,
             enable_masking=True,
             enable_weighting=True,
+            **temporal_phase_kwargs,
         )
 
     # ========================================================================

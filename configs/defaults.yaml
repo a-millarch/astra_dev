@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: lowres
 
-model_name: '10022026_30D_dynres'
+model_name: '12022026_dynres_perstep'
    
 target: deceased_30d
 
@@ -82,11 +82,14 @@ model:
     fc_mults_1: 0.3
     fc_mults_2: 0.1
     n_layers: 8
-    n_heads: 8 
-    d_model: 64 
-    d_ff: None 
+    n_heads: 8
+    d_model: 64
+    d_ff: None
     d_k: None
     d_v: None
+    temporal_head: false
+    causal: false
+    temporal_head_dropout: 0.3
 
 evaluation:
     max_f_beta: 10

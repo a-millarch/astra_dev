@@ -18,24 +18,25 @@ from astra.models.callbacks import SkipValidationCallback, ProgressiveTimeMaskin
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.data.dataloader import dfwide2ts_dls, tscatdfwide2x
 
-def get_backbone(data, cfg): #TODO: use cfg model parameters
+def get_backbone(data, cfg, temporal_head=False, causal=False, temporal_head_dropout=0.3):
     backbone = TSTabFusionTransformerMultiHot(
-    c_in=data["ts_dls"].vars,
-    c_out=2,
-    seq_len=data["mixed_dls"].len,
-    classes= data["classes"],
-    cont_names=data["num_cols"],
-    ts_cat_dims=data["ts_cat_dls"].ts_cat_dims,
-    d_model=cfg["model"]["d_model"],
-    n_layers=cfg["model"]["n_layers"],
-    n_heads=cfg["model"]["n_heads"],
-    fc_dropout=cfg["model"]["fc_dropout"] ,
-    res_dropout=cfg["model"]["res_dropout"] ,
-    fc_mults=(cfg["model"]["fc_mults_1"],cfg["model"]["fc_mults_2"]),
-   # d_ff= cfg["model"]["d_ff"],
-
-    cat_ts_combine='add',
-    use_count_normalization=False
+        c_in=data["ts_dls"].vars,
+        c_out=2,
+        seq_len=data["mixed_dls"].len,
+        classes=data["classes"],
+        cont_names=data["num_cols"],
+        ts_cat_dims=data["ts_cat_dls"].ts_cat_dims,
+        d_model=cfg["model"]["d_model"],
+        n_layers=cfg["model"]["n_layers"],
+        n_heads=cfg["model"]["n_heads"],
+        fc_dropout=cfg["model"]["fc_dropout"],
+        res_dropout=cfg["model"]["res_dropout"],
+        fc_mults=(cfg["model"]["fc_mults_1"], cfg["model"]["fc_mults_2"]),
+        cat_ts_combine='add',
+        use_count_normalization=False,
+        temporal_head=temporal_head,
+        causal=causal,
+        temporal_head_dropout=temporal_head_dropout,
     )
     return backbone
 

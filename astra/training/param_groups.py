@@ -56,7 +56,7 @@ def get_layer_groups(model: nn.Module) -> OrderedDict:
     # --- Head group ---
     head_params = []
     for name, param in model.named_parameters():
-        if name.startswith("head."):
+        if name.startswith("head.") or name.startswith("temporal_pred_head."):
             head_params.append((name, param))
     groups["head"] = head_params
 

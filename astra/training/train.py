@@ -74,6 +74,12 @@ def parse_args():
     parser.add_argument("--comprehensive-eval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--multicurve", action="store_true", default=False)
 
+    # Per-timestep prediction head
+    parser.add_argument("--temporal-head", action="store_true", default=False,
+                        help="Use per-timestep prediction head (enables causal masking)")
+    parser.add_argument("--no-causal", action="store_true", default=False,
+                        help="Disable causal masking even with temporal head")
+
     # Config override
     parser.add_argument("--finetune-config", type=str, default=None,
                         help="Path to finetune YAML config (overrides defaults)")
@@ -188,6 +194,13 @@ def main():
         best_finetune_cfg = train_result["best_finetune_cfg"]
 
     # ========================================================================
+    # Apply temporal head to global config (for eval compatibility)
+    # ========================================================================
+    if args.temporal_head:
+        cfg.setdefault("model", {})["temporal_head"] = True
+        cfg["model"]["causal"] = not args.no_causal
+
+    # ========================================================================
     # Finetuning
     # ========================================================================
     if args.finetune:
@@ -207,6 +220,10 @@ def main():
 
         if args.early_prediction:
             finetune_cfg.enable_early_prediction = True
+
+        if args.temporal_head:
+            finetune_cfg.temporal_head = True
+            finetune_cfg.causal = not args.no_causal
 
         result = run_finetune_v2(
             data, finetune_cfg,

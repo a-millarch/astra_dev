@@ -39,6 +39,13 @@ finetune:
   # Pretrained weights
   use_pretrained: true
 
+  # Per-timestep prediction head
+  temporal_head: false
+  causal: false
+  temporal_head_dropout: 0.3
+  time_weighting: uniform        # 'uniform' or 'early'
+  early_weight_factor: 2.0
+
 sweep:
   # Stage 1: Architecture search
   arch:

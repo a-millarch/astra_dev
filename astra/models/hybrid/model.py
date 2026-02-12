@@ -13,6 +13,65 @@ def ifnone(a, b):
     return b if a is None else a
 
 
+def _build_causal_mask(seq_len: int, n_static: int, device: torch.device) -> torch.Tensor:
+    """
+    Build causal attention mask for temporal positions with unmasked static positions.
+
+    Temporal position t can only attend to positions 0..t (causal).
+    Static positions (categorical + continuous features) are always visible to all positions.
+
+    Args:
+        seq_len: Number of temporal positions.
+        n_static: Number of static positions (n_cat + n_cont).
+        device: Target device.
+
+    Returns:
+        Boolean mask [total_len, total_len] where True = blocked.
+    """
+    total_len = seq_len + n_static
+    mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
+    # Upper-triangular on temporal-temporal block: block future positions
+    mask[:seq_len, :seq_len] = torch.triu(
+        torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+        diagonal=1,
+    )
+    # All other blocks (temporal-to-static, static-to-temporal, static-to-static)
+    # remain False (unmasked) — static features are global context
+    return mask
+
+
+class TemporalPredictionHead(nn.Module):
+    """
+    Per-timestep prediction head: shared MLP applied to each temporal position.
+
+    Takes transformer output [batch, total_len, d_model], slices the first seq_len
+    positions (temporal only), applies a shared MLP to each, outputs [batch, seq_len].
+    """
+
+    def __init__(self, d_model: int, seq_len: int, dropout: float = 0.3):
+        super().__init__()
+        self.seq_len = seq_len
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, total_len, d_model] -- transformer output
+        Returns:
+            logits: [batch, seq_len] -- one logit per timestep
+        """
+        x_temporal = x[:, :self.seq_len, :]  # [batch, seq_len, d_model]
+        logits = self.mlp(x_temporal).squeeze(-1)  # [batch, seq_len]
+        return logits
+
+
 class _Flatten(nn.Module):
     def __init__(self, full=False):
         super().__init__()
@@ -312,7 +371,10 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         init: bool = True,
         key_padding_mask: str = 'auto',
         cat_ts_combine: str = 'add',           # 'add' or 'concat'
-        use_count_normalization: bool = False  # NEW: Normalize counts
+        use_count_normalization: bool = False,  # NEW: Normalize counts
+        temporal_head: bool = False,            # Per-timestep prediction head
+        causal: bool = False,                   # Causal attention masking
+        temporal_head_dropout: float = 0.3,     # Dropout for temporal head MLP
     ):
         """
         Args:
@@ -382,15 +444,39 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         )
         
         # === HEAD ===
-        mlp_input_size = (d_model * (n_cat + n_cont + seq_len))
-        hidden_dimensions = list(map(lambda t: int(mlp_input_size * t), fc_mults))
-        all_dimensions = [mlp_input_size, *hidden_dimensions, c_out]
-        self.head_nf = mlp_input_size
-        self.head = nn.Sequential(
-            _Flatten(),
-            _MLP(all_dimensions, act=fc_act, skip=fc_skip, bn=fc_bn,
-                 dropout=fc_dropout, bn_final=bn_final)
-        )
+        self.temporal_head_enabled = temporal_head
+        self.causal = causal
+        self.seq_len = seq_len
+
+        if temporal_head:
+            # Per-timestep prediction head (~2K params)
+            self.temporal_pred_head = TemporalPredictionHead(
+                d_model, seq_len, dropout=temporal_head_dropout
+            )
+            self.head = None  # Skip 12M-param flatten+MLP
+            self.head_nf = d_model
+        else:
+            # Original flatten + MLP head
+            mlp_input_size = (d_model * (n_cat + n_cont + seq_len))
+            hidden_dimensions = list(map(lambda t: int(mlp_input_size * t), fc_mults))
+            all_dimensions = [mlp_input_size, *hidden_dimensions, c_out]
+            self.head_nf = mlp_input_size
+            self.head = nn.Sequential(
+                _Flatten(),
+                _MLP(all_dimensions, act=fc_act, skip=fc_skip, bn=fc_bn,
+                     dropout=fc_dropout, bn_final=bn_final)
+            )
+            self.temporal_pred_head = None
+
+        # Causal mask (registered as buffer for device tracking)
+        if causal:
+            n_static = n_cat + n_cont
+            self.register_buffer(
+                'causal_mask',
+                _build_causal_mask(seq_len, n_static, torch.device('cpu'))
+            )
+        else:
+            self.causal_mask = None
     
     def forward(self, *x):
         """
@@ -531,17 +617,21 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         
         # === TRANSFORMER ===
         x += self.pos_enc
-        
+
         if self.res_drop is not None:
             x = self.res_drop(x)
-        
-        x = self.transformer(x, key_padding_mask=key_padding_mask)
-        
+
+        attn_mask = self.causal_mask if self.causal else None
+        x = self.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
         if key_padding_mask is not None:
             x = x * torch.logical_not(key_padding_mask.unsqueeze(1))
-        
+
         # === HEAD ===
-        x = self.head(x)
+        if self.temporal_head_enabled and self.temporal_pred_head is not None:
+            x = self.temporal_pred_head(x)  # [batch, seq_len]
+        else:
+            x = self.head(x)  # [batch, c_out]
         return x
     
     def _key_padding_mask(self, x):

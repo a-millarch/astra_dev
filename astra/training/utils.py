@@ -84,11 +84,13 @@ def compute_auroc(
     model: nn.Module,
     dataloader,
     device: str = "cuda",
+    temporal_head: bool = False,
 ) -> float:
     """
     Compute AUROC on a dataloader.
 
     Handles the TSAI mixed dataloader batch format: ((x_ts, x_tab, x_ts_cat), y).
+    For temporal models, uses prediction at the last valid timestep per sample.
     """
     model.eval()
     all_probs = []
@@ -96,12 +98,24 @@ def compute_auroc(
 
     for batch in dataloader:
         inputs, targets = batch
-        # Move inputs to device (nested tuple)
         inputs = _to_device(inputs, device)
         targets = _to_device(targets, device)
 
         logits = model(inputs)
-        probs = F.softmax(logits, dim=-1)[:, 1]  # probability of class 1
+
+        if temporal_head:
+            # logits: [batch, seq_len] — use prediction at last valid timestep
+            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+            has_data = (x_ts.abs() > 1e-6).any(dim=1)  # [batch, seq_len]
+            seq_len = x_ts.shape[2]
+            positions = torch.arange(seq_len, device=x_ts.device).unsqueeze(0)
+            masked_pos = torch.where(has_data, positions,
+                                     torch.tensor(-1, device=x_ts.device))
+            last_step = masked_pos.max(dim=1).values.clamp(min=0).long()
+            logits_last = logits[torch.arange(logits.size(0), device=device), last_step]
+            probs = torch.sigmoid(logits_last)
+        else:
+            probs = F.softmax(logits, dim=-1)[:, 1]  # probability of class 1
 
         all_probs.append(probs.cpu().numpy())
         all_targets.append(targets.cpu().numpy())
@@ -112,7 +126,6 @@ def compute_auroc(
     try:
         return roc_auc_score(all_targets, all_probs)
     except ValueError:
-        # Only one class present in targets
         logger.warning("AUROC undefined (only one class in targets)")
         return 0.0
 
@@ -192,8 +205,14 @@ def save_model_fastai_compatible(
     from fastai.learner import Learner as FastAILearner
     from astra.models.hybrid.training import get_backbone
 
-    # Build a fresh backbone with identical architecture
-    backbone = get_backbone(data, cfg)
+    # Build a fresh backbone with identical architecture (including temporal config)
+    model_cfg = cfg.get("model", {})
+    backbone = get_backbone(
+        data, cfg,
+        temporal_head=model_cfg.get("temporal_head", False),
+        causal=model_cfg.get("causal", False),
+        temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+    )
     backbone.load_state_dict(model.state_dict())
 
     mixed_dls = data["mixed_dls"]
