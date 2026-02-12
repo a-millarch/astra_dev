@@ -870,7 +870,7 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
     )
     learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name)
+    learn.load(model_name, strict=False)
     learn.to('cuda')
     learn = patch_learner_get_preds(learn)
     logger.info(f"Model loaded (temporal_head={is_temporal})")
