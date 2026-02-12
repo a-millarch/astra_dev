@@ -26,109 +26,110 @@ from astra.data.datasets import TSDS
 # FIXED: Masked Normalization Functions
 # ============================================================================
 
-def normalize_with_padding_mask(X, scaler, padding_value=0.0, fit=True):
+def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
     """
-    Normalize time series data while preserving padding zeros.
-    
-    The standard approach (StandardScaler) transforms ALL values including padding:
-        0 → (0 - mean) / std = -mean/std ≠ 0
-    
-    This creates false signal in padding regions, causing incorrect SHAP attributions.
-    
-    This function:
-    1. Identifies padding positions (where value == padding_value)
-    2. Fits scaler only on non-padding values
-    3. Transforms only non-padding values
-    4. Restores padding positions to padding_value
-    
+    Normalize time series data per-channel, using trajectory_lengths for padding
+    and NaN for missing measurements.
+
+    After normalization:
+      - Measured values  → standardized per-channel (≈zero mean, unit variance)
+      - Missing measurements within trajectory → 0.0
+      - Padding beyond trajectory end         → 0.0
+
     Args:
-        X: Array of shape [n_samples, n_channels, seq_len]
-        scaler: sklearn scaler (StandardScaler, RobustScaler, etc.)
-        padding_value: Value used for padding (typically 0.0)
-        fit: If True, fit the scaler. If False, only transform.
-    
+        X: Array [n_samples, n_channels, seq_len]. May contain NaN for
+           positions where no clinical measurement was recorded.
+        scaler: sklearn StandardScaler (stores mean_/scale_ per channel).
+        trajectory_lengths: Array [n_samples] — number of real timesteps
+           per sample.  Positions >= trajectory_lengths[i] are padding.
+        fit: If True, compute and store per-channel statistics.
+
     Returns:
-        X_normalized: Normalized array with padding preserved as padding_value
+        X_normalized: Array of same shape.  0.0 at missing/padding positions.
     """
     n_samples, n_channels, seq_len = X.shape
-    
-    # Create mask for non-padding values
-    non_padding_mask = ~np.isclose(X, padding_value, atol=1e-8)
-    
-    # Reshape for scaler: [samples*seq_len, n_channels]
-    X_reshaped = X.reshape(-1, n_channels)
-    mask_reshaped = non_padding_mask.reshape(-1, n_channels)
-    
+
+    # --- build padding mask from trajectory_lengths [n_samples, seq_len] ---
+    pos = np.arange(seq_len)[np.newaxis, :]                   # [1, seq_len]
+    tl  = trajectory_lengths[:, np.newaxis]                    # [n_samples, 1]
+    padding_2d = pos >= tl                                     # True = padding
+
+    # expand to [n_samples, n_channels, seq_len]
+    padding_3d = np.broadcast_to(
+        padding_2d[:, np.newaxis, :], (n_samples, n_channels, seq_len)
+    )
+
+    # measured = has a real value (not NaN) AND within trajectory
+    measured_mask = ~np.isnan(X) & ~padding_3d
+
+    # ------------------------------------------------------------------
     if fit:
-        # Compute statistics only on non-padding values (per feature)
         means = np.zeros(n_channels)
-        stds = np.zeros(n_channels)
-        
+        stds  = np.zeros(n_channels)
+
         for ch in range(n_channels):
-            ch_data = X_reshaped[:, ch]
-            ch_mask = mask_reshaped[:, ch]
-            valid_data = ch_data[ch_mask]
-            
-            if len(valid_data) > 0:
-                means[ch] = valid_data.mean()
-                stds[ch] = valid_data.std()
+            vals = X[:, ch, :][measured_mask[:, ch, :]]
+            if len(vals) > 0:
+                means[ch] = vals.mean()
+                stds[ch]  = vals.std()
                 if stds[ch] == 0 or np.isnan(stds[ch]):
-                    stds[ch] = 1.0  # Avoid division by zero
+                    stds[ch] = 1.0
             else:
                 means[ch] = 0.0
-                stds[ch] = 1.0
-        
-        # Store in scaler-compatible format
-        scaler.mean_ = means
-        scaler.scale_ = stds
-        scaler.var_ = stds ** 2
+                stds[ch]  = 1.0
+
+        scaler.mean_          = means
+        scaler.scale_         = stds
+        scaler.var_           = stds ** 2
         scaler.n_features_in_ = n_channels
-        
-        logger.info(f"Fitted scaler on non-padding data:")
+
+        logger.info("Fitted per-channel scaler on measured data:")
         logger.info(f"  Mean range: [{means.min():.4f}, {means.max():.4f}]")
-        logger.info(f"  Std range: [{stds.min():.4f}, {stds.max():.4f}]")
-    
-    # Transform: (x - mean) / std, but only for non-padding
-    X_normalized = np.zeros_like(X_reshaped)
-    
+        logger.info(f"  Std range:  [{stds.min():.4f}, {stds.max():.4f}]")
+
+    # ------------------------------------------------------------------
+    # normalise: only measured positions get values; rest stays 0.0
+    X_normalized = np.zeros((n_samples, n_channels, seq_len), dtype=np.float64)
+
     for ch in range(n_channels):
-        ch_data = X_reshaped[:, ch]
-        ch_mask = mask_reshaped[:, ch]
-        
-        # Normalize non-padding values
-        X_normalized[ch_mask, ch] = (ch_data[ch_mask] - scaler.mean_[ch]) / scaler.scale_[ch]
-        
-        # Keep padding as padding_value (already 0 from np.zeros_like)
-        X_normalized[~ch_mask, ch] = padding_value
-    
-    # Reshape back
-    X_normalized = X_normalized.reshape(n_samples, n_channels, seq_len)
-    
+        m = measured_mask[:, ch, :]
+        if m.any():
+            X_normalized[:, ch, :][m] = (
+                (X[:, ch, :][m] - scaler.mean_[ch]) / scaler.scale_[ch]
+            )
+
     return X_normalized
 
 
 def get_trajectory_lengths(X, padding_value=0.0):
     """
     Get the actual trajectory length for each sample (last timestep with data).
-    
+
+    A timestep is padding if ALL channels are either NaN or equal to
+    padding_value.  This handles both legacy (all-zero padding) and the
+    NaN-for-missing convention.
+
     Args:
         X: Array of shape [n_samples, n_channels, seq_len]
-        padding_value: Value used for padding
-    
+        padding_value: Value used for padding (typically 0.0)
+
     Returns:
         trajectory_lengths: Array [n_samples] with length of each trajectory
     """
     n_samples, n_channels, seq_len = X.shape
-    
-    # A timestep has data if ANY channel has non-padding value
-    has_data = ~np.isclose(X, padding_value, atol=1e-8).all(axis=1)  # [n_samples, seq_len]
-    
+
+    # A value is "absent" if NaN or equal to padding_value
+    is_absent = np.isnan(X) | np.isclose(X, padding_value, atol=1e-8)
+
+    # A timestep has data if at least one channel is present
+    has_data = ~is_absent.all(axis=1)  # [n_samples, seq_len]
+
     trajectory_lengths = np.zeros(n_samples, dtype=int)
     for i in range(n_samples):
-        nonzero_idx = np.where(has_data[i])[0]
-        if len(nonzero_idx) > 0:
-            trajectory_lengths[i] = nonzero_idx[-1] + 1
-    
+        data_idx = np.where(has_data[i])[0]
+        if len(data_idx) > 0:
+            trajectory_lengths[i] = data_idx[-1] + 1
+
     return trajectory_lengths
 
 
@@ -227,7 +228,7 @@ def prepare_data_and_dls(cfg):
             for k, v in tsds.concepts.items() 
             if k not in cfg["dataset"]["ts_cat_names"]
         }
-        tsds.complete = pd.concat(tsds.cont_concepts).fillna(0.0)
+        tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
         tsds.complete_cat.timestep_cols = tsds.timestep_cols
 
@@ -245,7 +246,7 @@ def prepare_data_and_dls(cfg):
                 ebm_predictions=ebm_predictions, save_dir=ebm_save_dir,
             )
             tsds.cont_concepts['_ebm'] = ebm_df
-            tsds.complete = pd.concat(tsds.cont_concepts).fillna(0.0)
+            tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
     
     # Align continuous dataframes (string column names)
     trainval.complete, holdout.complete = align_dataframes(
@@ -321,46 +322,47 @@ def prepare_data_and_dls(cfg):
     # ============================================================================
     logger.info("Fitting normalization scalers on trainval data (excluding padding)...")
     
-    # 1. CONTINUOUS TIME SERIES SCALER - FIXED
+    # 1. CONTINUOUS TIME SERIES SCALER
     ts_scaler = StandardScaler()
-    
-    # Get trajectory lengths to understand padding
+
+    # Get trajectory lengths (works with NaN for missing measurements)
     traj_lengths = get_trajectory_lengths(X, padding_value=0.0)
     logger.info(f'Trajectory lengths - min: {traj_lengths.min()}, max: {traj_lengths.max()}, '
                f'mean: {traj_lengths.mean():.1f}')
-    
-    # FIXED: Normalize while preserving padding
-    X_normalized = normalize_with_padding_mask(X, ts_scaler, padding_value=0.0, fit=True)
 
-    # EBM channel is now standardized like all other channels by
-    # normalize_with_padding_mask (padding zeros preserved).  Previously raw
-    # [0,1] values were restored here, but that left the channel with ~30x
-    # less dynamic range than other standardized channels, making it invisible
-    # to W_P.
+    # Per-channel normalization using trajectory_lengths + NaN awareness
+    X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
+
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm = X_normalized[:, ebm_channel_idx, :]
         ebm_nonzero = ebm_norm[ebm_norm != 0]
-        logger.info(f'EBM channel after standardization: '
-                    f'mean={ebm_nonzero.mean():.3f}, std={ebm_nonzero.std():.3f}, '
-                    f'range=[{ebm_nonzero.min():.3f}, {ebm_nonzero.max():.3f}]')
+        if len(ebm_nonzero) > 0:
+            logger.info(f'EBM channel after standardization: '
+                        f'mean={ebm_nonzero.mean():.3f}, std={ebm_nonzero.std():.3f}, '
+                        f'range=[{ebm_nonzero.min():.3f}, {ebm_nonzero.max():.3f}]')
 
     logger.info(f'Train/val X shape (after normalization): {X_normalized.shape}')
     
-    # Verify padding is preserved
-    padding_mask = np.isclose(X_raw, 0.0, atol=1e-8)
-    padding_after = X_normalized[padding_mask]
+    # Verify padding is preserved (use trajectory_lengths, not zero-detection)
+    s_len = X_normalized.shape[2]
+    pos_arr = np.arange(s_len)[np.newaxis, :]
+    is_padding = pos_arr >= traj_lengths[:, np.newaxis]  # [n_samples, seq_len]
+    is_padding_3d = np.broadcast_to(is_padding[:, np.newaxis, :], X_normalized.shape)
+    padding_vals = X_normalized[is_padding_3d]
+    non_padding_vals = X_normalized[~is_padding_3d]
     logger.info(f'Padding verification:')
-    logger.info(f'  Padding positions: {padding_mask.sum()}')
-    logger.info(f'  Padding values after norm - mean: {padding_after.mean():.6f}, std: {padding_after.std():.6f}')
-    
-    if np.abs(padding_after.mean()) > 0.001:
-        logger.warning(f'⚠️ Padding was not preserved! Mean should be ~0, got {padding_after.mean():.6f}')
+    logger.info(f'  Padding positions: {is_padding_3d.sum()}, non-padding: {(~is_padding_3d).sum()}')
+    logger.info(f'  Padding values after norm - mean: {padding_vals.mean():.6f}, std: {padding_vals.std():.6f}')
+    if np.abs(padding_vals.mean()) > 0.001:
+        logger.warning(f'Padding was not preserved! Mean should be ~0, got {padding_vals.mean():.6f}')
     else:
-        logger.info(f'✓ Padding preserved correctly (mean ≈ 0)')
-    
-    # Stats on non-padding data
-    non_padding_data = X_normalized[~padding_mask]
-    logger.info(f'Non-padding data stats: mean={non_padding_data.mean():.4f}, std={non_padding_data.std():.4f}')
+        logger.info(f'Padding preserved correctly (mean = 0)')
+    logger.info(f'Non-padding data stats: mean={non_padding_vals.mean():.4f}, std={non_padding_vals.std():.4f}')
+    # Count measured vs missing within non-padding
+    n_measured = np.sum(non_padding_vals != 0)
+    n_missing = np.sum(non_padding_vals == 0)
+    logger.info(f'  Within trajectory: {n_measured} measured ({100*n_measured/(n_measured+n_missing):.1f}%), '
+               f'{n_missing} missing ({100*n_missing/(n_measured+n_missing):.1f}%)')
     
     # 2. TABULAR DATA SCALER (unchanged - no padding issue)
     tab_scaler = StandardScaler()
@@ -437,26 +439,21 @@ def prepare_data_and_dls(cfg):
     # ============================================================================
     logger.info("Applying normalization to holdout (preserving padding)...")
     
-    # FIXED: Use masked normalization for holdout too
-    tX_normalized = normalize_with_padding_mask(tX, ts_scaler, padding_value=0.0, fit=False)
-
-    # EBM channel standardized using trainval-fitted scaler (same as other channels)
-    if cfg.get('ebm_feature', {}).get('enabled', False):
-        ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
-        ebm_nz_h = ebm_norm_h[ebm_norm_h != 0]
-        logger.info(f'Holdout EBM after standardization: '
-                    f'mean={ebm_nz_h.mean():.3f}, std={ebm_nz_h.std():.3f}, '
-                    f'range=[{ebm_nz_h.min():.3f}, {ebm_nz_h.max():.3f}]')
-
-    # Verify
+    # Holdout trajectory lengths (computed before normalization)
     holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0)
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
                f'max: {holdout_traj_lengths.max()}, mean: {holdout_traj_lengths.mean():.1f}')
-    
-    holdout_padding_mask = np.isclose(tX_raw, 0.0, atol=1e-8)
-    holdout_padding_after = tX_normalized[holdout_padding_mask]
-    logger.info(f'Holdout padding verification:')
-    logger.info(f'  Padding values after norm - mean: {holdout_padding_after.mean():.6f}')
+
+    # Per-channel normalization using trainval-fitted scaler
+    tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
+
+    if cfg.get('ebm_feature', {}).get('enabled', False):
+        ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
+        ebm_nz_h = ebm_norm_h[ebm_norm_h != 0]
+        if len(ebm_nz_h) > 0:
+            logger.info(f'Holdout EBM after standardization: '
+                        f'mean={ebm_nz_h.mean():.3f}, std={ebm_nz_h.std():.3f}, '
+                        f'range=[{ebm_nz_h.min():.3f}, {ebm_nz_h.max():.3f}]')
     
     # Tabular
     if num_cols:
@@ -509,15 +506,10 @@ def prepare_data_and_dls(cfg):
     # ============================================================================
     # VALIDATION
     # ============================================================================
-    # Check non-padding data is normalized
-    trainval_non_padding = X_normalized[~padding_mask]
-    assert abs(trainval_non_padding.mean()) < 0.5, f"Non-padding data not centered! mean={trainval_non_padding.mean():.4f}"
-    
-    # Check padding is preserved
-    assert abs(X_normalized[padding_mask].mean()) < 0.001, "Padding not preserved!"
-    
-    logger.info("✓ Normalization validation passed!")
-    logger.info("✓ Padding preserved correctly!")
+    # Padding must be zero
+    pad_check = X_normalized[is_padding_3d]
+    assert abs(pad_check.mean()) < 0.001, f"Padding not preserved! mean={pad_check.mean():.6f}"
+    logger.info("Normalization validation passed — padding preserved correctly")
     
     # ============================================================================
     # RETURN
@@ -602,12 +594,12 @@ def normalize_new_patient(patient_ts_data, patient_tab_data, artifacts):
     """
     if patient_ts_data.ndim == 2:
         patient_ts_data = patient_ts_data[np.newaxis, ...]
-    
-    # Use masked normalization to preserve padding
+
+    traj_lens = get_trajectory_lengths(patient_ts_data, padding_value=0.0)
     ts_normalized = normalize_with_padding_mask(
-        patient_ts_data, 
-        artifacts['ts_scaler'], 
-        padding_value=0.0, 
+        patient_ts_data,
+        artifacts['ts_scaler'],
+        traj_lens,
         fit=False
     )
     

@@ -751,10 +751,10 @@ def _get_long_concept_df_single_label(
         
         merged_df = complete_df.merge(pivoted_df, on=["PID", "FEATURE"], how="left")
         
-        # Fill missing values
+        # NaN intentionally preserved for missing measurements.
+        # Normalization in dataloader.py uses trajectory_lengths + NaN detection
+        # to distinguish "no measurement" from "padding beyond trajectory".
         numeric_cols = [col for col in merged_df.columns if col.isdigit()]
-        if len(numeric_cols) > 0 and pd.api.types.is_numeric_dtype(merged_df[numeric_cols[0]]):
-            merged_df[numeric_cols] = merged_df[numeric_cols].fillna(0)
         
         merged_df = merged_df.sort_values(["PID", "FEATURE"])
         
@@ -773,11 +773,10 @@ def _get_long_concept_df_single_label(
     # Concat all aggregation functions
     complete = pd.concat(pivoted, ignore_index=True)
     
-    # Fill NaN in numeric columns
+    # NaN intentionally preserved for missing measurements.
+    # Normalization in dataloader.py uses trajectory_lengths + NaN detection
+    # to distinguish "no measurement" from "padding beyond trajectory".
     numeric_cols = [col for col in complete.columns if col.isdigit()]
-    for col in numeric_cols:
-        if pd.api.types.is_numeric_dtype(complete[col]):
-            complete[col] = complete[col].fillna(0.0)
     
     # Merge target
     prelen = len(complete)
