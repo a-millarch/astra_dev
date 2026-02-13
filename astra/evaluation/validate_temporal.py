@@ -158,6 +158,88 @@ def _to_device(obj, device):
     return obj
 
 
+def diagnose_causal_mask(model, data, device="cuda"):
+    """
+    Definitive test: does the causal mask actually change model output?
+
+    Takes one batch, runs with mask on vs off, compares predictions
+    at early positions. Also tests censored input vs full input with mask.
+    """
+    holdout_dls = data["holdout_mixed_dls"]
+    batch = next(iter(holdout_dls.train))
+    inputs, targets = batch
+    inputs = _to_device(inputs, device)
+
+    model.eval()
+    with torch.no_grad():
+        # Run 1: WITH causal mask
+        model.causal = True
+        if not hasattr(model, '_orig_causal_mask') and model.causal_mask is not None:
+            model._orig_causal_mask = model.causal_mask
+        from astra.models.hybrid.model import _build_causal_mask
+        n_cat = len(data["classes"])
+        n_cont = len(data["num_cols"])
+        seq_len = model.seq_len
+        model.causal_mask = _build_causal_mask(seq_len, n_cat + n_cont, device)
+        model.causal = True
+        logits_causal = model(inputs)  # [batch, seq_len]
+
+        # Run 2: WITHOUT causal mask
+        model.causal = False
+        saved_mask = model.causal_mask
+        model.causal_mask = None
+        logits_no_causal = model(inputs)  # [batch, seq_len]
+
+        # Restore
+        model.causal = True
+        model.causal_mask = saved_mask
+
+    # Compare at key positions
+    logger.info("=" * 70)
+    logger.info("CAUSAL MASK DIAGNOSTIC (single batch)")
+    logger.info("=" * 70)
+    logger.info(f"  Batch size: {logits_causal.shape[0]}, Seq len: {logits_causal.shape[1]}")
+    logger.info(f"  Causal mask shape: {model.causal_mask.shape}")
+    logger.info(f"  Causal mask True count: {model.causal_mask.sum().item()} "
+                f"(of {model.causal_mask.numel()})")
+
+    probs_causal = torch.sigmoid(logits_causal).cpu().numpy()
+    probs_no_causal = torch.sigmoid(logits_no_causal).cpu().numpy()
+
+    for pos in [0, 5, 11, 30, 50, 80, 90]:
+        if pos >= probs_causal.shape[1]:
+            continue
+        diff = np.abs(probs_causal[:, pos] - probs_no_causal[:, pos])
+        logger.info(
+            f"  Position {pos:>3d}: "
+            f"causal={probs_causal[:, pos].mean():.4f}, "
+            f"no_causal={probs_no_causal[:, pos].mean():.4f}, "
+            f"mean_abs_diff={diff.mean():.6f}, "
+            f"max_abs_diff={diff.max():.6f}"
+        )
+
+    total_diff = np.abs(probs_causal - probs_no_causal)
+    logger.info(f"  Overall: mean_diff={total_diff.mean():.6f}, max_diff={total_diff.max():.6f}")
+
+    if total_diff.max() < 1e-5:
+        logger.info("  VERDICT: Causal mask has NO effect on outputs!")
+        logger.info("  Possible causes:")
+        logger.info("    1. Mask not reaching _ScaledDotProductAttention")
+        logger.info("    2. attn_mask parameter name mismatch in forward chain")
+        logger.info("    3. Model was saved without mask and load overwrites it")
+    elif total_diff.mean() < 0.01:
+        logger.info("  VERDICT: Causal mask has minimal effect")
+    else:
+        logger.info("  VERDICT: Causal mask IS changing outputs")
+
+    # Also check: does position 0 differ? It should NOT (it's causal either way)
+    pos0_diff = np.abs(probs_causal[:, 0] - probs_no_causal[:, 0]).mean()
+    logger.info(f"  Position 0 diff (should be ~0): {pos0_diff:.8f}")
+
+    logger.info("=" * 70)
+    return total_diff.mean()
+
+
 def run_validation(
     data: dict,
     model_name: str,
@@ -195,13 +277,14 @@ def run_validation(
         key_steps = [s for s in key_steps if s is not None]
 
     # ========================================================================
-    # Load temporal model
+    # Load temporal model (FORCE causal=True for validation)
     # ========================================================================
     logger.info(f"Loading temporal model: {model_name}")
+    logger.info(f"  cfg model.causal = {model_cfg.get('causal', 'NOT SET')}")
     backbone = get_backbone(
         data, cfg,
         temporal_head=True,
-        causal=model_cfg.get("causal", True),
+        causal=True,  # Force True regardless of config
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
     )
 
@@ -216,7 +299,13 @@ def run_validation(
 
     logger.info(f"Model loaded. causal={model.causal}, "
                 f"temporal_head_enabled={model.temporal_head_enabled}")
-    logger.info(f"Causal mask shape: {model.causal_mask.shape if model.causal_mask is not None else 'None'}")
+    logger.info(f"Causal mask: shape={model.causal_mask.shape if model.causal_mask is not None else 'None'}, "
+                f"device={model.causal_mask.device if model.causal_mask is not None else 'N/A'}")
+
+    # ========================================================================
+    # DIAGNOSTIC: verify causal mask actually changes model output
+    # ========================================================================
+    diagnose_causal_mask(model, data, device)
 
     # ========================================================================
     # Setup evaluators

@@ -15,10 +15,14 @@ def ifnone(a, b):
 
 def _build_causal_mask(seq_len: int, n_static: int, device: torch.device) -> torch.Tensor:
     """
-    Build causal attention mask for temporal positions with unmasked static positions.
+    Build causal attention mask for temporal positions with static tokens as read-only context.
 
-    Temporal position t can only attend to positions 0..t (causal).
-    Static positions (categorical + continuous features) are always visible to all positions.
+    Temporal position t can only attend to positions 0..t (causal) and all statics.
+    Static positions can only attend to other statics (NOT to temporal positions).
+
+    This prevents an information bridge: without blocking static→temporal attention,
+    statics absorb future temporal info through attention, then early temporal positions
+    read those contaminated statics — bypassing the causal constraint entirely.
 
     Args:
         seq_len: Number of temporal positions.
@@ -30,13 +34,17 @@ def _build_causal_mask(seq_len: int, n_static: int, device: torch.device) -> tor
     """
     total_len = seq_len + n_static
     mask = torch.zeros(total_len, total_len, dtype=torch.bool, device=device)
-    # Upper-triangular on temporal-temporal block: block future positions
+    # Temporal→temporal: causal (position t attends only to ≤t)
     mask[:seq_len, :seq_len] = torch.triu(
         torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
         diagonal=1,
     )
-    # All other blocks (temporal-to-static, static-to-temporal, static-to-static)
-    # remain False (unmasked) — static features are global context
+    # Temporal→static: unmasked (temporal tokens CAN read statics)
+    # mask[:seq_len, seq_len:] remains False
+    # Static→temporal: BLOCKED (statics must NOT absorb temporal info)
+    mask[seq_len:, :seq_len] = True
+    # Static→static: unmasked (statics can attend to each other)
+    # mask[seq_len:, seq_len:] remains False
     return mask
 
 
