@@ -41,7 +41,7 @@ finetune:
 
   # Per-timestep prediction head
   temporal_head: false
-  causal: false
+  causal: true                     # auto-enabled when temporal_head=true; prevents future info leakage
   temporal_head_dropout: 0.3
   time_weighting: uniform        # 'uniform' or 'early'
   early_weight_factor: 2.0

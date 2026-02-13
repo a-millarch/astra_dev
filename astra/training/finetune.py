@@ -651,6 +651,12 @@ def run_finetune_v2(
     # ========================================================================
     # 1. Load backbone (pretrained or fresh)
     # ========================================================================
+    # Auto-enable causal masking when temporal head is on (prevents silent leakage)
+    if finetune_cfg.temporal_head and not finetune_cfg.causal:
+        logger.warning("temporal_head=True but causal=False! Auto-enabling causal masking. "
+                       "Pass causal=False explicitly only if you intend to allow future info leakage.")
+        finetune_cfg.causal = True
+
     temporal_kwargs = dict(
         temporal_head=finetune_cfg.temporal_head,
         causal=finetune_cfg.causal,

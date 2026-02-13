@@ -79,6 +79,8 @@ def parse_args():
                         help="Use per-timestep prediction head (enables causal masking)")
     parser.add_argument("--no-causal", action="store_true", default=False,
                         help="Disable causal masking even with temporal head")
+    parser.add_argument("--validate-temporal", action="store_true", default=False,
+                        help="Cross-validate temporal eval vs censored-dataloader eval")
 
     # Config override
     parser.add_argument("--finetune-config", type=str, default=None,
@@ -240,6 +242,14 @@ def main():
         results, preds_df = run_eval(
             data, model_name, args.multicurve, args.comprehensive_eval,
         )
+
+    # ========================================================================
+    # Temporal validation (cross-check eval methods)
+    # ========================================================================
+    if args.validate_temporal:
+        from astra.evaluation.validate_temporal import run_validation
+        logger.info("=== Running Temporal Validation ===")
+        run_validation(data, model_name, device="cuda")
 
 
 if __name__ == "__main__":
