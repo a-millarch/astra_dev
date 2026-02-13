@@ -18,7 +18,6 @@ Usage:
 import argparse
 import numpy as np
 import torch
-import time as time_module
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
@@ -26,7 +25,6 @@ from astra.utils import cfg, logger
 from astra.data.dataloader import prepare_data_and_dls
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
 from astra.evaluation.predictive_performance import (
-    TimeDependentEvaluator,
     TemporalEvaluator,
     time_to_step,
     step_to_time,
@@ -53,44 +51,71 @@ class ValidationResult:
 
 def _run_temporal_model_on_censored_data(
     model: torch.nn.Module,
-    evaluator: TimeDependentEvaluator,
+    data: dict,
     censor_step: int,
     device: str = "cuda",
 ) -> Tuple[Optional[np.ndarray], np.ndarray]:
     """
     Run temporal model on censored (future-zeroed) input data.
 
-    Uses TimeDependentEvaluator's censored dataloader creation,
-    then runs the temporal model forward pass and extracts the
-    prediction at censor_step.
+    Iterates over holdout_mixed_dls (same dataloaders as Methods A and C),
+    manually zeros future positions in each batch, runs the forward pass,
+    and clips predictions per-patient by trajectory_length.
 
     Returns:
         (y_preds, ys) or (None, ys) if failed
     """
-    dls = evaluator.create_censored_dataloaders_fast(censor_step)
-    if dls is None:
-        return None, np.array([])
+    from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
+    holdout_dls = data["holdout_mixed_dls"]
     all_preds = []
     all_targets = []
+    all_traj_lengths = []
 
     model.eval()
     with torch.no_grad():
-        for batch in dls.train:
+        for batch in holdout_dls.train:
             inputs, targets = batch
             inputs = _to_device(inputs, device)
+
+            # Unpack: (x_ts, x_tab, x_ts_cat) or (x_ts, x_tab)
+            if isinstance(inputs, (tuple, list)):
+                inputs = list(inputs)
+                x_ts = inputs[0]
+
+                # Infer trajectory lengths from UNCENSORED data
+                traj_lens = _infer_trajectory_lengths_from_batch(x_ts)
+                all_traj_lengths.append(traj_lens.cpu().numpy())
+
+                # Censor: zero out future positions in x_ts
+                if censor_step < x_ts.shape[2]:
+                    x_ts_censored = x_ts.clone()
+                    x_ts_censored[:, :, censor_step:] = 0.0
+                    inputs[0] = x_ts_censored
+
+                # Censor: zero out future positions in x_ts_cat (if present)
+                if len(inputs) >= 3 and inputs[2] is not None:
+                    x_ts_cat = inputs[2]
+                    if censor_step < x_ts_cat.shape[2]:
+                        x_ts_cat_censored = x_ts_cat.clone()
+                        x_ts_cat_censored[:, :, censor_step:] = 0.0
+                        inputs[2] = x_ts_cat_censored
+
+                inputs = tuple(inputs)
+
             logits = model(inputs)  # [batch, seq_len]
-            probs = torch.sigmoid(logits)  # [batch, seq_len]
+            probs = torch.sigmoid(logits)
             all_preds.append(probs.cpu().numpy())
             all_targets.append(targets.cpu().numpy())
 
     preds_all = np.concatenate(all_preds, axis=0)  # [n, seq_len]
     ys = np.concatenate(all_targets, axis=0)
+    traj_lengths = np.concatenate(all_traj_lengths, axis=0)
 
-    # Extract prediction at censor_step (or last valid if shorter)
-    seq_len = preds_all.shape[1]
-    effective_step = min(censor_step, seq_len - 1)
-    y_preds = preds_all[:, effective_step]
+    # Extract prediction at min(censor_step, trajectory_length - 1) per patient
+    effective_steps = np.minimum(censor_step, traj_lengths - 1)
+    effective_steps = np.maximum(effective_steps, 0).astype(int)
+    y_preds = preds_all[np.arange(len(preds_all)), effective_steps]
 
     return y_preds, ys
 
@@ -315,9 +340,6 @@ def run_validation(
     # Method A: TemporalEvaluator (single forward pass)
     temporal_eval = TemporalEvaluator(data, model, cfg, device=device)
 
-    # Method B: Censored dataloaders (needs TimeDependentEvaluator)
-    censored_eval = TimeDependentEvaluator(data, learn, cfg)
-
     # ========================================================================
     # Run validation at each timepoint
     # ========================================================================
@@ -345,7 +367,7 @@ def run_validation(
 
         # --- Method B: Censored input (gold standard) ---
         y_preds_b, ys_b = _run_temporal_model_on_censored_data(
-            model, censored_eval, censor_step, device=device,
+            model, data, censor_step, device=device,
         )
         if y_preds_b is not None and len(ys_b) > 0 and 0 < ys_b.sum() < len(ys_b):
             auroc_b, _, _ = calculate_roc_auc_ci(ys_b, y_preds_b)
