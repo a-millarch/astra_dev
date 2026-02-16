@@ -22,6 +22,8 @@ def _get_cache_key(cfg):
         "holdout_split_date": cfg.get("holdout_split_date", "2023-06-01"),
         "training_bs": cfg.get("training", {}).get("bs"),
         "bin_intervals": cfg.get("bin_intervals", {}),
+        "bin_freq_include": cfg.get("bin_freq_include", []),
+        "ebm_enabled": cfg.get("ebm_feature", {}).get("enabled", False)
     }
     # Create deterministic hash
     config_str = json.dumps(key_params, sort_keys=True, default=str)
