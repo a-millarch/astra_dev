@@ -553,7 +553,7 @@ def prepare_data_and_dls(cfg):
         "cat_encoder": cat_encoder,
         "ts_scaler": ts_scaler,
         "tab_scaler": tab_scaler,
-        "ts_feature_names": trainval.complete.columns[2:-1].tolist(),
+        "ts_feature_names": trainval.complete.columns[3:].tolist(),
         "trajectory_lengths": traj_lengths,  # NEW: trainval trajectory lengths
         "holdout_trajectory_lengths": holdout_traj_lengths,  # NEW: holdout trajectory lengths
         "ebm_channel_idx": ebm_channel_idx,

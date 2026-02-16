@@ -236,11 +236,13 @@ def load_pretrained_backbone(
             f"W_P channel mismatch: checkpoint has {pretrain_c_in}, "
             f"current model has {full_c_in} — expanding W_P"
         )
-        # Load all weights except W_P via MLM wrapper
+        # Load only backbone weights (except W_P) via MLM wrapper.
+        # MLM heads (ts_head, cat_heads, etc.) may also have c_in-dependent
+        # shapes, so we skip all non-backbone keys.
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
         filtered_state = {
             k: v for k, v in checkpoint["model_state_dict"].items()
-            if "W_P" not in k
+            if k.startswith("backbone.") and "W_P" not in k
         }
         mlm_model.load_state_dict(filtered_state, strict=False)
         backbone = mlm_model.backbone

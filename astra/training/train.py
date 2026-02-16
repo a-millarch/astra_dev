@@ -26,7 +26,7 @@ import yaml
 from pathlib import Path
 
 from astra.utils import logger, cfg
-from astra.data.dataloader import prepare_data_and_dls
+from astra.data.caching import prepare_data_and_dls_cached
 from astra.models.hybrid.training import run_pretrain
 from astra.models.hybrid.mlm import MLMConfig
 from astra.evaluation.predictive_performance import run_eval
@@ -135,7 +135,7 @@ def main():
     # Load data (shared across all stages)
     # ========================================================================
     logger.info("Loading data...")
-    data = prepare_data_and_dls(cfg)
+    data = prepare_data_and_dls_cached(cfg)
     model_name = cfg["model_name"]
 
     # ========================================================================

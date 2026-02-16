@@ -3,7 +3,8 @@ import argparse
 from astra.utils import logger, cfg, logger
 from astra.evaluation.predictive_performance import run_eval
 
-from astra.data.dataloader import prepare_data_and_dls, save_normalization_artifacts
+from astra.data.caching import prepare_data_and_dls_cached
+from astra.data.dataloader import save_normalization_artifacts
 from astra.models.hybrid.training import run_pretrain, run_finetune, run_finetune_early_prediction_optimized
 from astra.models.hybrid.mlm import MLMConfig
 
@@ -31,7 +32,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    data = prepare_data_and_dls(cfg)
+    data = prepare_data_and_dls_cached(cfg)
     pretrain_params = dict(cfg["pretrain"])
     pretrain_params["checkpoint_dir"] = f'{pretrain_params.get("checkpoint_dir", "./pretrain_checkpoints")}/{cfg["model_name"]}'
     pretrain_cfg = MLMConfig(**pretrain_params)

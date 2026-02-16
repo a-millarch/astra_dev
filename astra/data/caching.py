@@ -6,9 +6,10 @@ import hashlib
 import json
 import os
 
+import numpy as np
 import pandas as pd
 
-from astra.data.dataloader import prepare_data_and_dls, get_ts_dls, get_tabular_dls, get_mixed_dls, dfwide2ts_dls
+from astra.data.dataloader import prepare_data_and_dls, get_ts_dls, get_tabular_dls, get_mixed_dls
 from astra.utils import cfg, logger
 
 def _get_cache_key(cfg):
@@ -20,6 +21,7 @@ def _get_cache_key(cfg):
         "target": cfg.get("target"),
         "holdout_split_date": cfg.get("holdout_split_date", "2023-06-01"),
         "training_bs": cfg.get("training", {}).get("bs"),
+        "bin_intervals": cfg.get("bin_intervals", {}),
     }
     # Create deterministic hash
     config_str = json.dumps(key_params, sort_keys=True, default=str)
@@ -165,17 +167,21 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         shuffle=False
     )
 
-    # Restore timestep_cols attribute lost during pickle serialization
-    cache_data['trainval_complete_cat'].timestep_cols = cache_data['trainval_timestep_cols']
-    cache_data['holdout_complete_cat'].timestep_cols = cache_data['holdout_timestep_cols']
-
-    # Recreate ts_cat_dls using cached encoder
-    ts_cat_dls, _, _ = dfwide2ts_dls(
-        cache_data['trainval_complete_cat'],
+    # Build ts_cat_dls directly from cached multi-hot arrays (avoids re-encoding)
+    ts_cat_dls = get_ts_dls(
+        cache_data['X_multi_hot'].astype(np.int64),
         cache_data['y'],
-        cfg,
-        encoder=cache_data['cat_encoder']
+        splits=None,
+        bs=bs,
+        shuffle=False
     )
+    encoding_info = cache_data['encoding_info']
+    ts_cat_dims = {
+        feat_name: end - start
+        for feat_name, (start, end) in encoding_info['feature_ranges'].items()
+    }
+    ts_cat_dls.ts_cat_dims = ts_cat_dims
+    ts_cat_dls.X_multi_hot = cache_data['X_multi_hot']
 
     mixed_dls = get_mixed_dls(ts_dls, tab_dls, ts_cat_dls, bs=bs)
 
@@ -202,12 +208,15 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         shuffle=False
     )
 
-    test_ts_cat_dls, _, _ = dfwide2ts_dls(
-        cache_data['holdout_complete_cat'],
+    test_ts_cat_dls = get_ts_dls(
+        cache_data['tX_multi_hot'].astype(np.int64),
         cache_data['ty'],
-        cfg,
-        encoder=cache_data['cat_encoder']
+        splits=None,
+        bs=bs,
+        shuffle=False
     )
+    test_ts_cat_dls.ts_cat_dims = ts_cat_dims
+    test_ts_cat_dls.X_multi_hot = cache_data['tX_multi_hot']
 
     holdout_mixed_dls = get_mixed_dls(test_ts_dls, test_tab_dls, test_ts_cat_dls, bs=bs)
 

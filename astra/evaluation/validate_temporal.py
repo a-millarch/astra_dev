@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from astra.utils import cfg, logger
-from astra.data.dataloader import prepare_data_and_dls
+from astra.data.caching import prepare_data_and_dls_cached
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
 from astra.evaluation.predictive_performance import (
     TemporalEvaluator,
@@ -457,7 +457,7 @@ def main():
     cfg["model"]["causal"] = not args.no_causal
 
     logger.info("Loading data...")
-    data = prepare_data_and_dls(cfg)
+    data = prepare_data_and_dls_cached(cfg)
     model_name = cfg["model_name"]
 
     results = run_validation(data, model_name, device="cuda")

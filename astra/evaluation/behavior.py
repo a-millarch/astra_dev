@@ -16,7 +16,7 @@ import os
 
 from astra.utils import logger, cfg
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
-from astra.data.dataloader import prepare_data_and_dls
+from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_learner
 
 def get_centered_norm(data, center=0.0):
@@ -1093,7 +1093,7 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
         dict with 'shap_results', 'holdout_pids', 'channel2feature', 'static_cat_names'
     """
     if data is None:
-        data = prepare_data_and_dls()
+        data = prepare_data_and_dls_cached(cfg)
     if learn is None:
         learn = prepare_learner(data, model_name)
 

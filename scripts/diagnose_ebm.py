@@ -503,9 +503,9 @@ def main():
         print("ERROR: ebm_feature.enabled is False in config.")
         sys.exit(1)
 
-    print("Loading data with prepare_data_and_dls(cfg)...")
-    from astra.data.dataloader import prepare_data_and_dls
-    data = prepare_data_and_dls(cfg)
+    print("Loading data with prepare_data_and_dls_cached(cfg)...")
+    from astra.data.caching import prepare_data_and_dls_cached
+    data = prepare_data_and_dls_cached(cfg)
 
     idx = data.get("ebm_channel_idx")
     print(f"EBM channel index: {idx}")
