@@ -46,6 +46,7 @@ from astra.training.utils import (
     save_model_fastai_compatible,
     _to_device,
 )
+from astra.data.dataloader import save_deployment_bundle
 
 
 @dataclass
@@ -827,9 +828,10 @@ def run_finetune_v2(
     best_auroc = early_stopper.best_score or 0.0
     logger.info(f"Best validation AUROC: {best_auroc:.4f}")
 
-    # Save in FastAI-compatible format
+    # Save in FastAI-compatible format + deployment bundle
     if finetune_cfg.model_name:
         save_model_fastai_compatible(backbone, data, finetune_cfg.model_name, cfg)
+        save_deployment_bundle(data, cfg, finetune_cfg.model_name)
 
     clear_mem()
 

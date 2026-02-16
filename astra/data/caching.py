@@ -32,7 +32,7 @@ def _get_cache_key(cfg):
     return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
 
-def save_data_cache(data, cfg, cache_dir='cache/data'):
+def save_data_cache(data, cfg, cache_dir='data/cache'):
     """
     Save prepared data to disk for faster subsequent loads.
     Saves all arrays, scalers, encoders, and metadata needed to recreate

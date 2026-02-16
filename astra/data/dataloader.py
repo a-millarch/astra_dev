@@ -613,7 +613,7 @@ def normalize_new_patient(patient_ts_data, patient_tab_data, artifacts):
         traj_lens,
         fit=False
     )
-    
+
     # Tabular (no padding issue)
     num_cols = artifacts['tab_feature_names']
     if num_cols:
@@ -623,5 +623,104 @@ def normalize_new_patient(patient_ts_data, patient_tab_data, artifacts):
         tab_normalized[num_cols] = artifacts['tab_scaler'].transform(patient_tab_data[num_cols])
     else:
         tab_normalized = patient_tab_data
-    
+
     return ts_normalized, tab_normalized
+
+
+# ============================================================================
+# DEPLOYMENT BUNDLE: Save/Load everything needed for standalone inference
+# ============================================================================
+
+def extract_shap_background(data, max_samples=200):
+    """
+    Extract background data tensors from training dataloader for SHAP.
+
+    Returns dict with numpy arrays {ts, ts_cat, cat, cont} ready for
+    later conversion to tensors.
+    """
+    all_ts, all_ts_cat, all_cat, all_cont = [], [], [], []
+    n = 0
+    for batch in data["mixed_dls"].train:
+        if n >= max_samples:
+            break
+        inputs, _ = batch
+        x_ts, x_tab, x_ts_cat = inputs[0], inputs[1], inputs[2]
+        all_ts.append(x_ts.cpu().numpy())
+        all_ts_cat.append(x_ts_cat.cpu().numpy())
+        all_cat.append(x_tab[0].cpu().numpy())
+        all_cont.append(x_tab[1].cpu().numpy())
+        n += x_ts.shape[0]
+
+    return {
+        'ts': np.concatenate(all_ts)[:max_samples],
+        'ts_cat': np.concatenate(all_ts_cat)[:max_samples],
+        'cat': np.concatenate(all_cat)[:max_samples],
+        'cont': np.concatenate(all_cont)[:max_samples],
+    }
+
+
+def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
+                           max_bg_samples=200):
+    """
+    Save all artifacts needed for standalone single-patient inference.
+
+    Includes normalization scalers, model construction params, channel ordering,
+    and pre-extracted SHAP background data.
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    # Channel names: df2xy sorts by FEATURE ascending — this IS the channel order
+    ts_channel_names = sorted(
+        data["trainval"].complete.sort_values(['PID', 'FEATURE'])['FEATURE'].unique()
+    )
+
+    bundle = {
+        # --- Normalization artifacts ---
+        'ts_scaler': data['ts_scaler'],
+        'tab_scaler': data['tab_scaler'],
+        'encoding_info': data['encoding_info'],
+        'cat_encoder': data['cat_encoder'],
+        'tab_feature_names': data['num_cols'],
+        'cat_feature_names': data['cat_cols'],
+        'ts_channel_names': ts_channel_names,
+
+        # --- Model construction params (replaces get_backbone + data dict) ---
+        'model_params': {
+            'c_in': data["ts_dls"].vars,
+            'seq_len': data["mixed_dls"].len,
+            'classes': {k: list(v) for k, v in data["classes"].items()},
+            'cont_names': list(data["num_cols"]),
+            'ts_cat_dims': dict(data["ts_cat_dls"].ts_cat_dims),
+            'd_model': cfg["model"]["d_model"],
+            'n_layers': cfg["model"]["n_layers"],
+            'n_heads': cfg["model"]["n_heads"],
+            'fc_dropout': cfg["model"]["fc_dropout"],
+            'res_dropout': cfg["model"]["res_dropout"],
+            'fc_mults': (cfg["model"]["fc_mults_1"], cfg["model"]["fc_mults_2"]),
+            'temporal_head': cfg.get("model", {}).get("temporal_head", False),
+            'causal': cfg.get("model", {}).get("causal", False),
+            'temporal_head_dropout': cfg.get("model", {}).get("temporal_head_dropout", 0.3),
+        },
+
+        # --- SHAP background data ---
+        'shap_background': extract_shap_background(data, max_bg_samples),
+
+        # --- Metadata ---
+        'model_name': model_name,
+    }
+
+    save_path = os.path.join(save_dir, f'deployment_{model_name}.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(bundle, f)
+
+    logger.info(f"Saved deployment bundle to {save_path}")
+    return save_path
+
+
+def load_deployment_bundle(model_name, load_dir='models/deployment'):
+    """Load a saved deployment bundle."""
+    load_path = os.path.join(load_dir, f'deployment_{model_name}.pkl')
+    with open(load_path, 'rb') as f:
+        bundle = pickle.load(f)
+    logger.info(f"Loaded deployment bundle from {load_path}")
+    return bundle

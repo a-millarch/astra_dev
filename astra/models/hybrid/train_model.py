@@ -4,7 +4,7 @@ from astra.utils import logger, cfg, logger
 from astra.evaluation.predictive_performance import run_eval
 
 from astra.data.caching import prepare_data_and_dls_cached
-from astra.data.dataloader import save_normalization_artifacts
+from astra.data.dataloader import save_normalization_artifacts, save_deployment_bundle
 from astra.models.hybrid.training import run_pretrain, run_finetune, run_finetune_early_prediction_optimized
 from astra.models.hybrid.mlm import MLMConfig
 
@@ -64,6 +64,10 @@ def main():
             run_finetune(data, cfg["model_name"], args.use_pretrained, pretrain_cfg,
                     args.skip_valid, args.lr, args.finetune_epochs)
     
+
+    if args.finetune:
+        logger.info("=== Saving deployment bundle ===")
+        save_deployment_bundle(data, cfg, cfg["model_name"])
 
     if args.eval:
         logger.info("=== Running Evaluation ===")
