@@ -88,7 +88,7 @@ model:
     d_k: None
     d_v: None
     temporal_head: false
-    causal: true   # auto-enabled when temporal_head=true
+    causal: false  # auto-enabled when temporal_head=true
     temporal_head_dropout: 0.3
 
 evaluation:

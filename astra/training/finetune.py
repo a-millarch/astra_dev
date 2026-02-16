@@ -252,10 +252,11 @@ def load_pretrained_backbone(
         logger.info(f"Pretrained weights loaded with W_P expansion from {checkpoint_path}")
     else:
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
-        # Use strict=False when temporal head is enabled — the checkpoint won't
-        # have temporal_pred_head weights (or old head weights differ)
+        # Use strict=False when temporal head or causal masking is enabled —
+        # the checkpoint won't have temporal_pred_head or causal_mask
+        needs_strict_false = temporal_head or causal
         mlm_model.load_state_dict(checkpoint["model_state_dict"],
-                                  strict=not temporal_head)
+                                  strict=not needs_strict_false)
         backbone = mlm_model.backbone
         logger.info(f"Pretrained weights loaded from {checkpoint_path}")
 
