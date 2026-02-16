@@ -277,9 +277,13 @@ def embed_categorical_features(model, x_cat):
 # ============================================================================
 
 def extract_data_from_dataloader(dataloader, max_samples=None, device='cpu'):
+    # Handle DataLoaders (has .train/.valid) vs single DataLoader
+    if hasattr(dataloader, 'train'):
+        dataloader = dataloader.train
+
     all_ts, all_ts_cat, all_cat, all_cont, all_y = [], [], [], [], []
     n_samples = 0
-    
+
     for batch in dataloader:
         if max_samples is not None and n_samples >= max_samples:
             break

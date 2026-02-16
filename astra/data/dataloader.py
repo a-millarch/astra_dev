@@ -293,7 +293,18 @@ def prepare_data_and_dls(cfg):
         shuffle=False
     )
     classes = complete_tab_dls.classes
-    
+
+    # Ensure classes includes _na columns added by FillMissing.
+    # FillMissing creates {col}_na boolean indicators for numeric columns
+    # with NaN values. These become categorical features in the model, but
+    # depending on FastAI/TSAI version, .classes may not include them.
+    df_combined = pd.concat([trainval.tab_df, holdout.tab_df])
+    for col in num_cols:
+        na_name = f'{col}_na'
+        if df_combined[col].isna().any() and na_name not in classes:
+            classes[na_name] = ['#na#', False, True]
+            logger.info(f'  Added missing indicator to classes: {na_name}')
+
     # ============================================================================
     # TRAINVAL DATA EXTRACTION
     # ============================================================================

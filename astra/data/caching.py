@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 
+import pandas as pd
+
 from astra.data.dataloader import prepare_data_and_dls, get_ts_dls, get_tabular_dls, get_mixed_dls, dfwide2ts_dls
 from astra.utils import cfg, logger
 
@@ -243,7 +245,20 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         "holdout_trajectory_lengths": cache_data['holdout_trajectory_lengths'],
     }
 
-    logger.info("✓ Data loaded from cache successfully")
+    # Ensure classes includes _na columns from FillMissing (old caches may lack them)
+    classes = data["classes"]
+    if isinstance(classes, dict):
+        num_cols = data["num_cols"]
+        trainval_tab_df = cache_data['trainval_tab_df']
+        holdout_tab_df = cache_data['holdout_tab_df']
+        df_combined = pd.concat([trainval_tab_df, holdout_tab_df])
+        for col in num_cols:
+            na_name = f'{col}_na'
+            if df_combined[col].isna().any() and na_name not in classes:
+                classes[na_name] = ['#na#', False, True]
+                logger.info(f'  Added missing indicator to classes: {na_name}')
+
+    logger.info("Data loaded from cache successfully")
     return data
 
 

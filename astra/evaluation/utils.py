@@ -3,21 +3,28 @@ import numpy as np
 from scipy import stats
 from sklearn.metrics import roc_auc_score, average_precision_score
 
-def prepare_learner(data, model_name=None):
+def prepare_learner(data, cfg):
     from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+    model_name = cfg["model_name"]
+    # Detect temporal head config
+    model_cfg = cfg.get("model", {})
+    is_temporal = model_cfg.get("temporal_head", False)
 
-    if model_name is None:
-        logger.info(f"Using default model name from cfg: {cfg['model_name']}")
-        model_name = cfg["model_name"]
-
+    # ============================================================================
+    # LOAD MODEL
+    # ============================================================================
     logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(data, cfg)
-    learn = Learner(data["mixed_dls"], backbone, metrics=None)
-    learn.load(model_name)
+    backbone = get_backbone(
+        data, cfg,
+        temporal_head=is_temporal,
+        causal=model_cfg.get("causal", False),
+        temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+    )
+    learn = Learner(data["holdout_mixed_dls"], backbone, metrics=None)
+    learn.load(model_name, strict=False)
     learn.to('cuda')
     learn = patch_learner_get_preds(learn)
-    logger.info("Model loaded")
-    return learn
+    logger.info(f"Model loaded (temporal_head={is_temporal})")
 
 
 def delong_roc_variance(ground_truth, predictions):
