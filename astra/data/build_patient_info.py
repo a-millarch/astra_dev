@@ -4,13 +4,24 @@ import subprocess
 
 from astra.utils import logger, cfg, get_base_df, create_enumerated_id, is_file_present
 from astra.utils import ensure_datetime,count_csv_rows, inches_to_cm, ounces_to_kg
-from astra.data.collectors import collect_procedures, population_filter_parquet
+try:
+    from astra.data.collectors import collect_procedures, population_filter_parquet
+except ImportError:
+    collect_procedures = None
+    population_filter_parquet = None
 from astra.data.mapper import map_concept
+from astra.data.mappings import (
+    standardize_hospital as _standardize_hospital,
+    first_hospital as _first_hospital,
+)
 
 from typing import List, Dict, Optional, Union
 from datetime import timedelta
 
-from azureml.core import Dataset
+try:
+    from azureml.core import Dataset
+except ImportError:
+    Dataset = None
 
 def create_base_df(cfg, result_path=None):
     if result_path is None:
@@ -192,36 +203,9 @@ def add_first_contacts(df, df_adt):
 
 
 
-def standardize_hospital(name ,valid_hospitals = ["RH", "AHH", "HGH", "NOH", "BFH", "BOH", "RHP", "SJ KØGE", 
-                   "SJ HOLBÆK", "SJ NYKØBING", "SJ ROSKILDE", "SJ VORDINGBORG", 
-                   "SJ NÆSTVED", "SJ SLAGELSE"]):
-    if pd.isna(name):
-        return np.nan
-    name = str(name).strip().upper()
-    
-    # Special cases for partial matches
-    if name.startswith('SJ HOL'):
-        return 'SJ HOLBÆK'
-    if name.startswith('SJ ROS'):
-        return 'SJ ROSKILDE'
-    
-    # Exact match check (case-insensitive)
-    if name in [h.upper() for h in valid_hospitals]:
-        for h in valid_hospitals:
-            if name == h.upper():
-                return h  # Preserve original casing
-    
-    return 'MISC'
-
-def first_hospital(name):
-    if pd.isna(name):
-        return name
-    words = str(name).strip().split()
-    if words and words[0] == 'SJ':
-        return ' '.join(words[:2])
-    elif words:
-        return words[0]
-    return ''
+# Delegated to astra.data.mappings (single source of truth)
+standardize_hospital = _standardize_hospital
+first_hospital = _first_hospital
 
 def add_first_hospital(df):
     # First, remove commas from FIRST_HOSPITAL (or source column before extraction)

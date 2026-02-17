@@ -659,6 +659,63 @@ def extract_shap_background(data, max_samples=200):
     }
 
 
+def _build_channel_map(ts_channel_names, cfg):
+    """
+    Build a definitive mapping from each channel name to its source.
+
+    Resolves ambiguous names like BASE_EXCESS_max at save time when all
+    config information is available.
+
+    Returns:
+        dict: {channel_name: {'concept': str, 'feature': str, 'agg_func': str|None, 'type': str}}
+    """
+    channel_map = {}
+
+    # 1. Temporal features (elapsed_hours, bin_width_hours)
+    temporal_features = cfg.get('temporal_features', {}).get('features', [])
+    for ch in ts_channel_names:
+        if ch in temporal_features:
+            channel_map[ch] = {
+                'concept': '_temporal', 'feature': ch,
+                'agg_func': None, 'type': 'temporal',
+            }
+
+    # 2. EBM feature
+    for ch in ts_channel_names:
+        if ch == '_ebm_pred':
+            channel_map[ch] = {
+                'concept': '_ebm', 'feature': '_ebm_pred',
+                'agg_func': None, 'type': 'ebm',
+            }
+
+    # 3. Continuous features: {FEATURE}_{agg_func}
+    # For each non-categorical concept, try to match channel names
+    ts_cat_names = cfg['dataset'].get('ts_cat_names', [])
+    for concept in cfg['concepts']:
+        if concept in ts_cat_names:
+            continue
+        for agg_func in cfg['agg_func'].get(concept, []):
+            suffix = f'_{agg_func}'
+            for ch in ts_channel_names:
+                if ch in channel_map:
+                    continue
+                if ch.endswith(suffix):
+                    raw_feature = ch[:-len(suffix)]
+                    channel_map[ch] = {
+                        'concept': concept,
+                        'feature': raw_feature,
+                        'agg_func': agg_func,
+                        'type': 'continuous',
+                    }
+
+    # Warn about unmapped channels
+    unmapped = [ch for ch in ts_channel_names if ch not in channel_map]
+    if unmapped:
+        logger.warning(f"Channel map: {len(unmapped)} unmapped channels: {unmapped}")
+
+    return channel_map
+
+
 def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
                            max_bg_samples=200):
     """
@@ -704,6 +761,15 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
 
         # --- SHAP background data ---
         'shap_background': extract_shap_background(data, max_bg_samples),
+
+        # --- Data processing config (for inference data_prep) ---
+        'data_config': {
+            'bin_intervals': dict(cfg['bin_intervals']),
+            'bin_freq_include': list(cfg['bin_freq_include']),
+            'channel_map': _build_channel_map(ts_channel_names, cfg),
+            'ts_cat_names': list(cfg['dataset'].get('ts_cat_names', [])),
+            'temporal_features': cfg.get('temporal_features', {}),
+        },
 
         # --- Metadata ---
         'model_name': model_name,

@@ -141,8 +141,16 @@ class ProjectManager:
                     print(f"Log directory: {log_dir}")
                     break #Stop after first rotating file handler
 
-pm = ProjectManager('andreas.skov.millarch/repos/ASTRA')
-logger = pm.setup_logging(print_only=False)
+try:
+    pm = ProjectManager('andreas.skov.millarch/repos/ASTRA')
+    logger = pm.setup_logging(print_only=False)
+except (IndexError, FileNotFoundError, OSError):
+    # Outside Azure ML compute: use basic logging
+    logger = logging.getLogger('astra')
+    if not logger.handlers:
+        logger.setLevel(logging.INFO)
+        logger.addHandler(RichHandler(markup=True))
+    pm = None
 
 pd.options.mode.chained_assignment = None
 
