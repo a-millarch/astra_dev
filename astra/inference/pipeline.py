@@ -546,8 +546,9 @@ class InferenceSession:
         channel_names = self.bundle['ts_channel_names']
 
         # --- ts_shap: [1, n_channels, seq_len] ---
+        seq_len = x_ts.shape[-1]
         ts_shap = np.stack(
-            [shap_result.ts_shap.get(ch, np.zeros(x_ts.shape[-1]))
+            [np.asarray(shap_result.ts_shap.get(ch, np.zeros(seq_len))).squeeze()
              for ch in channel_names]
         )[np.newaxis, ...]
 
@@ -572,7 +573,8 @@ class InferenceSession:
             per_cat = np.zeros((n_cats, seq_len))
             for i, label in enumerate(all_labels):
                 if label in shap_result.cat_ts_shap:
-                    per_cat[i] = shap_result.cat_ts_shap[label]
+                    val = np.asarray(shap_result.cat_ts_shap[label]).squeeze()
+                    per_cat[i] = val
 
             cat_ts_shap_per_category = per_cat[np.newaxis, ...]  # [1, n_cats, seq_len]
             cat_ts_shap = np.abs(per_cat).mean(axis=0)[np.newaxis, ...]  # [1, seq_len]
