@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from cstar import ProjectManager
+from astra.utils import ProjectManager
 import os 
 
 from astra.utils import cfg

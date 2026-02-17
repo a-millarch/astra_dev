@@ -526,6 +526,119 @@ class InferenceSession:
         shap_result = self.explain(x_ts, x_ts_cat, tab_df, censor_step, pid)
         return pred, shap_result
 
+    def shap_to_viz_dict(self, shap_result, x_ts, x_ts_cat, tab_df):
+        """
+        Convert a SHAPResult into the dict format expected by
+        visualize_shap_individual() from astra.evaluation.behavior.
+
+        Args:
+            shap_result: SHAPResult from self.explain().
+            x_ts: np.ndarray [n_channels, seq_len] — raw continuous TS
+                  (same array passed to explain()).
+            x_ts_cat: np.ndarray [n_cat_dims, seq_len] — multi-hot categorical TS.
+            tab_df: pd.DataFrame with one row — static demographics.
+
+        Returns:
+            (shap_dict, channel2feature, feature_names_cat, feature_names_cont)
+            suitable for visualize_shap_individual(shap_dict, sample_idx=0,
+                channel2feature=channel2feature, ...).
+        """
+        channel_names = self.bundle['ts_channel_names']
+
+        # --- ts_shap: [1, n_channels, seq_len] ---
+        ts_shap = np.stack(
+            [shap_result.ts_shap.get(ch, np.zeros(x_ts.shape[-1]))
+             for ch in channel_names]
+        )[np.newaxis, ...]
+
+        # --- channel2feature mapping ---
+        channel2feature = {i: name for i, name in enumerate(channel_names)}
+
+        # --- Categorical TS ---
+        encoding_info = self.bundle.get('encoding_info')
+        cat_ts_shap = None
+        cat_ts_shap_per_category = None
+        if shap_result.cat_ts_shap and encoding_info:
+            # Rebuild per-category array in feature_ranges order
+            all_labels = []
+            for feat, (start, end) in encoding_info.get('feature_ranges', {}).items():
+                labels = encoding_info.get('category_labels', {}).get(
+                    feat, [f'{feat}_{i}' for i in range(end - start)]
+                )
+                all_labels.extend(labels)
+
+            seq_len = x_ts_cat.shape[-1]
+            n_cats = len(all_labels)
+            per_cat = np.zeros((n_cats, seq_len))
+            for i, label in enumerate(all_labels):
+                if label in shap_result.cat_ts_shap:
+                    per_cat[i] = shap_result.cat_ts_shap[label]
+
+            cat_ts_shap_per_category = per_cat[np.newaxis, ...]  # [1, n_cats, seq_len]
+            cat_ts_shap = np.abs(per_cat).mean(axis=0)[np.newaxis, ...]  # [1, seq_len]
+
+        # --- Static categorical ---
+        classes = self.bundle['model_params'].get('classes', {})
+        cat_shap = None
+        cat_indices = None
+        feature_names_cat = list(classes.keys()) if classes else []
+        if shap_result.static_cat_shap and classes:
+            cat_vals = [shap_result.static_cat_shap.get(c, 0.0) for c in classes]
+            cat_shap = np.array(cat_vals)[np.newaxis, ...]  # [1, n_features]
+
+            # Reconstruct raw cat index for test_data display
+            cat_idx_list = []
+            for col in classes:
+                class_list = list(classes[col])
+                if col in tab_df.columns:
+                    val = tab_df[col].iloc[0]
+                    idx = class_list.index(val) if val in class_list else 0
+                else:
+                    idx = 0
+                cat_idx_list.append(idx)
+            cat_indices = np.array(cat_idx_list)[np.newaxis, ...]
+
+        # --- Static continuous ---
+        num_cols = self.bundle.get('tab_feature_names', [])
+        cont_shap = None
+        cont_vals = None
+        feature_names_cont = list(num_cols) if num_cols else []
+        if shap_result.static_cont_shap and num_cols:
+            cont_vals_list = [
+                shap_result.static_cont_shap.get(c, 0.0) for c in num_cols
+            ]
+            cont_shap = np.array(cont_vals_list)[np.newaxis, ...]
+            cont_vals = tab_df[num_cols].values.astype(np.float32) if all(
+                c in tab_df.columns for c in num_cols
+            ) else np.full((1, len(num_cols)), np.nan)
+
+        # --- Build the dict ---
+        if x_ts.ndim == 2:
+            x_ts = x_ts[np.newaxis, ...]
+        if x_ts_cat.ndim == 2:
+            x_ts_cat = x_ts_cat[np.newaxis, ...]
+
+        shap_dict = {
+            'ts_shap': ts_shap,
+            'cat_ts_shap': cat_ts_shap,
+            'cat_ts_shap_per_category': cat_ts_shap_per_category,
+            'cat_ts_shap_embedded': None,
+            'cat_shap': cat_shap,
+            'cat_shap_embedded': None,
+            'cont_shap': cont_shap,
+            'n_static_cat': len(classes),
+            'test_data': {
+                'ts': x_ts,
+                'ts_cat': x_ts_cat,
+                'cat': cat_indices if cat_indices is not None else np.zeros((1, 0)),
+                'cont': cont_vals if cont_vals is not None else np.zeros((1, 0)),
+                'y': np.array([0]),
+            },
+            'encoding_info': encoding_info,
+        }
+
+        return shap_dict, channel2feature, feature_names_cat, feature_names_cont
+
 
 # ============================================================================
 # HELPER: Extract a patient from existing data dict (for testing)
