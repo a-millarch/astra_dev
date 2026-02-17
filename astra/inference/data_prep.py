@@ -800,6 +800,7 @@ def prepare_patient_from_csv(
     bundle: dict,
     cfg: dict = None,
     data_dir: str = 'data/raw',
+    ebm_models_dir: str = 'models/ebm',
 ) -> dict:
     """
     Full pipeline from raw CSV files to model-ready tensors for a single patient.
@@ -807,6 +808,9 @@ def prepare_patient_from_csv(
     Reads EHR CSVs from data_dir, applies the same filtering and processing
     as the batch training pipeline (build_patient_info → filters → binning →
     aggregation), then produces tensors via prepare_single_patient().
+
+    If the deployed model expects EBM predictions (_ebm_pred channel),
+    computes them on-the-fly at relevant time intervals and injects into x_ts.
 
     Args:
         cpr_hash: Patient identifier (hashed CPR number).
@@ -816,6 +820,7 @@ def prepare_patient_from_csv(
         bundle: Deployment bundle from load_deployment_bundle().
         cfg: Config dict. Defaults to loading configs/defaults.yaml.
         data_dir: Directory containing raw CSV files.
+        ebm_models_dir: Directory containing trained EBM deployment models.
 
     Returns:
         Same as prepare_single_patient(): dict with x_ts, x_ts_cat, tab_df,
@@ -848,7 +853,21 @@ def prepare_patient_from_csv(
     raw_data = _filtered_dfs_to_raw_data(base_df, filtered_concepts, current_time)
 
     # Phase 4: Build tensors via existing prepare_single_patient
-    return prepare_single_patient(raw_data, bundle)
+    result = prepare_single_patient(raw_data, bundle)
+
+    # Phase 5: Inject EBM predictions if model expects them
+    if '_ebm_pred' in bundle.get('ts_channel_names', []):
+        from astra.inference.ebm import compute_ebm_predictions, inject_ebm_into_x_ts
+
+        ebm_preds = compute_ebm_predictions(
+            raw_data, filtered_concepts, base_df, cfg, ebm_models_dir
+        )
+        result['x_ts'] = inject_ebm_into_x_ts(
+            result['x_ts'], ebm_preds, result['bin_df'],
+            raw_data['admission_time'], bundle
+        )
+
+    return result
 
 
 # ---- Phase 1: Build base_df ------------------------------------------------
