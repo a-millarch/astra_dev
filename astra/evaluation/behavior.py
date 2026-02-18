@@ -794,7 +794,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     ts_shap = shap_results['ts_shap'][sample_idx]
     if ts_shap.ndim == 3:
-        ts_shap = ts_shap[:, :, class_idx]
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
     n_channels, n_steps = ts_shap.shape
     
     time_labels = [step_to_time(i) for i in range(n_steps)]
@@ -814,7 +814,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     if shap_results['cat_ts_shap'] is not None:
         cat_ts = shap_results['cat_ts_shap'][sample_idx]
         if cat_ts.ndim == 2:
-            cat_ts = cat_ts[:, class_idx]
+            cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
         ax1.plot(cat_ts, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_ts)), cat_ts, alpha=0.2, color='#00d4aa')
     
@@ -856,7 +856,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax3 = fig.add_subplot(gs[2, :])
         cat_ts_shap_data = shap_results['cat_ts_shap_per_category'][sample_idx]  # [n_cats, seq_len]
         if cat_ts_shap_data.ndim == 3:
-            cat_ts_shap_data = cat_ts_shap_data[:, :, class_idx]
+            cat_ts_shap_data = cat_ts_shap_data[..., min(class_idx, cat_ts_shap_data.shape[-1] - 1)]
         
         enc_info = shap_results['encoding_info']
         cat_names = get_category_names_from_encoding_info(enc_info)
@@ -952,7 +952,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         cat_shap = shap_results['cat_shap'][sample_idx]
         cat_data = shap_results['test_data']['cat'][sample_idx]
         if cat_shap.ndim == 2:
-            cat_shap = cat_shap[:, class_idx]
+            cat_shap = cat_shap[..., min(class_idx, cat_shap.shape[-1] - 1)]
         
         n_feats = len(cat_shap)
         names = list(feature_names_cat)[:n_feats] if feature_names_cat else []
@@ -987,7 +987,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         cont_shap = shap_results['cont_shap'][sample_idx]
         cont_data = shap_results['test_data']['cont'][sample_idx]
         if cont_shap.ndim == 2:
-            cont_shap = cont_shap[:, class_idx]
+            cont_shap = cont_shap[..., min(class_idx, cont_shap.shape[-1] - 1)]
         
         n_feats = len(cont_shap)
         names = list(feature_names_cont)[:n_feats] if feature_names_cont else []
@@ -1341,7 +1341,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     ts_shap = shap_results['ts_shap']
     if ts_shap.ndim == 4:
-        ts_shap = ts_shap[:, :, :, class_idx]
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
     n_samples, n_channels, n_steps = ts_shap.shape
     
     time_labels = [step_to_time(i) for i in range(n_steps)]
@@ -1358,7 +1358,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     if shap_results['cat_ts_shap'] is not None:
         cat_ts = shap_results['cat_ts_shap']
         if cat_ts.ndim == 3:
-            cat_ts = cat_ts[:, :, class_idx]
+            cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
         cat_imp = np.abs(cat_ts).mean(axis=0)
         ax1.plot(cat_imp, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_imp)), cat_imp, alpha=0.2, color='#00d4aa')
@@ -1398,7 +1398,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax3 = fig.add_subplot(gs[1, 1])
         cat_ts_shap = shap_results['cat_ts_shap_per_category']  # [n_samples, n_cats, seq_len]
         if cat_ts_shap.ndim == 4:
-            cat_ts_shap = cat_ts_shap[:, :, :, class_idx]
+            cat_ts_shap = cat_ts_shap[..., min(class_idx, cat_ts_shap.shape[-1] - 1)]
         cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
         
         enc_info = shap_results['encoding_info']
@@ -1476,7 +1476,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax5 = fig.add_subplot(gs[3, 0])
         cat_shap = shap_results['cat_shap']
         if cat_shap.ndim == 3:
-            cat_shap = cat_shap[:, :, class_idx]
+            cat_shap = cat_shap[..., min(class_idx, cat_shap.shape[-1] - 1)]
         cat_imp = np.abs(cat_shap).mean(axis=0) if cat_shap.ndim > 1 else np.abs(cat_shap)
         n_feats = len(cat_imp)
         
@@ -1496,7 +1496,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax6 = fig.add_subplot(gs[3, 1])
         cont_shap = shap_results['cont_shap']
         if cont_shap.ndim == 3:
-            cont_shap = cont_shap[:, :, class_idx]
+            cont_shap = cont_shap[..., min(class_idx, cont_shap.shape[-1] - 1)]
         cont_imp = np.abs(cont_shap).mean(axis=0) if cont_shap.ndim > 1 else np.abs(cont_shap)
         n_feats = len(cont_imp)
         
@@ -2031,7 +2031,7 @@ class TemporalSHAPAnalyzer:
             
             ts_shap = shap_res['ts_shap']
             if ts_shap.ndim == 3:
-                ts_shap = ts_shap[:, :, self.class_idx]
+                ts_shap = ts_shap[..., min(self.class_idx, ts_shap.shape[-1] - 1)]
             
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,

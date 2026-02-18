@@ -28,7 +28,7 @@ def prepare_learner(data, cfg):
     learn.to(device)
     learn = patch_learner_get_preds(learn)
     logger.info(f"Model loaded (temporal_head={is_temporal})")
-
+    return learn
 
 def delong_roc_variance(ground_truth, predictions):
     order = np.argsort(predictions)
