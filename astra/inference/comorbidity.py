@@ -203,14 +203,41 @@ CATEGORY_NAMES: Dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Hierarchical exclusion rules (matches R comorbidity::assign0 = TRUE)
+# ---------------------------------------------------------------------------
+# When a more specific/severe category is present, the less specific one is
+# suppressed.  These rules come from the original Elixhauser definition and
+# are enforced by the R `comorbidity` package when `assign0 = TRUE`.
+
+ELIXHAUSER_EXCLUSIONS: Dict[str, str] = {
+    # If present → remove
+    "metacanc": "solidtum",   # metastatic cancer  → suppress solid tumor
+    "diabc":    "diabunc",    # complicated DM      → suppress uncomplicated DM
+    "hypc":     "hypunc",     # complicated HTN     → suppress uncomplicated HTN
+}
+
+
 def _normalize_icd10(code: str) -> str:
     """Strip dots and whitespace, uppercase."""
     return code.replace(".", "").replace(" ", "").upper()
 
 
+def _apply_exclusions(categories: Set[str]) -> Set[str]:
+    """Apply hierarchical exclusion rules (assign0 logic)."""
+    for present, suppress in ELIXHAUSER_EXCLUSIONS.items():
+        if present in categories:
+            categories.discard(suppress)
+    return categories
+
+
 def map_elixhauser_categories(diagnoses: List[str]) -> Set[str]:
     """
     Map a list of ICD-10 diagnosis codes to Elixhauser comorbidity categories.
+
+    Applies hierarchical exclusion rules (matching R's ``assign0 = TRUE``):
+    metastatic cancer suppresses solid tumor, complicated diabetes suppresses
+    uncomplicated, complicated hypertension suppresses uncomplicated.
 
     Args:
         diagnoses: List of ICD-10 codes (dots optional, case-insensitive).
@@ -227,7 +254,7 @@ def map_elixhauser_categories(diagnoses: List[str]) -> Set[str]:
                 matched.add(category)
                 break  # One match per category is enough
 
-    return matched
+    return _apply_exclusions(matched)
 
 
 def compute_elixhauser_vw(diagnoses: List[str]) -> float:
