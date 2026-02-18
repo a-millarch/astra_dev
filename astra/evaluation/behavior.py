@@ -4,7 +4,8 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
+from matplotlib.colors import TwoSlopeNorm, ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
 import seaborn as sns
 from typing import Dict, List, Optional, Union
 from dataclasses import dataclass
@@ -106,6 +107,92 @@ def create_channel_mapping(data):
     channel2feature = {i: feat for i, feat in enumerate(feature_values)}
     feature2channel = {feat: i for i, feat in enumerate(feature_values)}
     return channel2feature, feature2channel
+
+
+# ============================================================================
+# Channel Classification & Grouping
+# ============================================================================
+
+_TEMPORAL_CHANNELS = {'elapsed_hours', 'bin_width_hours'}
+_EBM_CHANNELS = {'_ebm_pred'}
+_AUXILIARY_CHANNELS = {'_data_present'}
+_GROUP_COLORS = {
+    'Clinical': '#008bfb',
+    'EBM': '#FF9800',
+    'Temporal': '#9C27B0',
+}
+
+
+def classify_channels(channel2feature: Dict[int, str]) -> OrderedDict:
+    """
+    Classify continuous TS channels into groups: Clinical, EBM, Temporal.
+    Auxiliary channels (_data_present) are excluded.
+    """
+    groups = OrderedDict([
+        ('Clinical', []),
+        ('EBM', []),
+        ('Temporal', []),
+    ])
+
+    for ch_idx in sorted(channel2feature.keys()):
+        feat_name = channel2feature[ch_idx]
+        if feat_name in _TEMPORAL_CHANNELS:
+            groups['Temporal'].append((ch_idx, feat_name))
+        elif feat_name in _EBM_CHANNELS:
+            groups['EBM'].append((ch_idx, feat_name))
+        elif feat_name in _AUXILIARY_CHANNELS:
+            continue
+        else:
+            groups['Clinical'].append((ch_idx, feat_name))
+
+    return OrderedDict((k, v) for k, v in groups.items() if v)
+
+
+def _get_grouped_channel_order(channel2feature: Dict[int, str]):
+    """
+    Get channel indices reordered by group (Clinical, EBM, Temporal).
+    Auxiliary channels are excluded.
+
+    Returns:
+        ordered_indices, ordered_labels, group_boundaries
+    """
+    groups = classify_channels(channel2feature)
+    ordered_indices = []
+    ordered_labels = []
+    group_boundaries = OrderedDict()
+
+    row = 0
+    for group_name, channels in groups.items():
+        start = row
+        for ch_idx, feat_name in channels:
+            ordered_indices.append(ch_idx)
+            ordered_labels.append(feat_name)
+            row += 1
+        if row > start:
+            group_boundaries[group_name] = (start, row)
+
+    return ordered_indices, ordered_labels, group_boundaries
+
+
+def _draw_group_separators(ax, group_boundaries: OrderedDict):
+    """Draw horizontal separator lines between channel groups on axes."""
+    for group_name, (start, end) in group_boundaries.items():
+        if start > 0:
+            ax.axhline(y=start - 0.5, color='white', linewidth=3, zorder=5)
+            ax.axhline(y=start - 0.5, color='black', linewidth=1.2,
+                       linestyle='--', zorder=6)
+
+
+def _get_channel_color(channel2feature, ch_idx):
+    """Get display color for a channel based on its group."""
+    if channel2feature is None:
+        return _GROUP_COLORS['Clinical']
+    name = channel2feature.get(ch_idx, '')
+    if name in _EBM_CHANNELS:
+        return _GROUP_COLORS['EBM']
+    elif name in _TEMPORAL_CHANNELS:
+        return _GROUP_COLORS['Temporal']
+    return _GROUP_COLORS['Clinical']
 
 
 def get_static_cat_names_from_classes(classes: Dict) -> List[str]:
@@ -723,22 +810,32 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Continuous TS heatmap - with centered colormap
+    # Plot 2: Continuous TS heatmap - grouped by channel type
     ax2 = fig.add_subplot(gs[1, :])
-    norm2 = get_centered_norm(ts_shap, center=0.0)
-    im = ax2.imshow(ts_shap, aspect='auto', cmap='RdBu_r', interpolation='nearest', norm=norm2)
-    ax2.set_xlabel('Time'); ax2.set_ylabel('Channel')
-    ax2.set_title('Continuous TS SHAP Heatmap', fontweight='bold')
     if channel2feature:
-        labels = [channel2feature.get(i, f'Ch{i}') for i in range(n_channels)]
-        if n_channels > 20:
-            step = n_channels // 20
-            yticks = list(range(0, n_channels, step))
-            ax2.set_yticks(yticks); ax2.set_yticklabels([labels[i] for i in yticks], fontsize=8)
-        else:
-            ax2.set_yticks(range(n_channels)); ax2.set_yticklabels(labels, fontsize=9)
+        ordered_idx, ordered_labels, group_bounds = _get_grouped_channel_order(channel2feature)
+        ts_shap_display = ts_shap[ordered_idx]
+        n_display = len(ordered_idx)
+    else:
+        ts_shap_display = ts_shap
+        ordered_labels = [f'Ch{i}' for i in range(n_channels)]
+        n_display = n_channels
+        group_bounds = OrderedDict()
+    norm2 = get_centered_norm(ts_shap_display, center=0.0)
+    im = ax2.imshow(ts_shap_display, aspect='auto', cmap='RdBu_r', interpolation='nearest', norm=norm2)
+    ax2.set_xlabel('Time'); ax2.set_ylabel('Channel')
+    ax2.set_title('Continuous TS SHAP Heatmap (grouped)', fontweight='bold')
+    if n_display <= 40:
+        ax2.set_yticks(range(n_display))
+        ax2.set_yticklabels(ordered_labels, fontsize=7 if n_display > 25 else 9)
+    else:
+        step = max(1, n_display // 30)
+        yticks = list(range(0, n_display, step))
+        ax2.set_yticks(yticks)
+        ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=7)
     ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     plt.colorbar(im, ax=ax2, label='SHAP Value')
+    _draw_group_separators(ax2, group_bounds)
     
     # Plot 3: Categorical TS heatmap - SHAP values with centered colormap
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
@@ -810,19 +907,31 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             if start > 0:
                 ax3.axhline(y=start - 0.5, color='white', linewidth=2)
     
-    # Plot 4: Channel importance
+    # Plot 4: Channel importance (color-coded by group)
     ax4 = fig.add_subplot(gs[3, :])
     ch_imp = np.abs(ts_shap).mean(axis=1)
     sorted_idx = np.argsort(ch_imp)[::-1]
     n_show = min(20, len(ch_imp))
     if channel2feature:
         names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx[:n_show]]
+        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx[:n_show]]
     else:
         names = [f'Channel {i}' for i in sorted_idx[:n_show]]
-    ax4.barh(range(n_show), ch_imp[sorted_idx[:n_show]], color='#008bfb', alpha=0.7)
+        bar_colors = ['#008bfb'] * n_show
+    ax4.barh(range(n_show), ch_imp[sorted_idx[:n_show]], color=bar_colors, alpha=0.7)
     ax4.set_yticks(range(n_show)); ax4.set_yticklabels(names, fontsize=9)
     ax4.set_xlabel('Mean |SHAP|'); ax4.set_title(f'Top {n_show} Channels', fontweight='bold')
     ax4.grid(True, alpha=0.3, axis='x'); ax4.invert_yaxis()
+    if channel2feature:
+        used_groups = set()
+        for i in sorted_idx[:n_show]:
+            name = channel2feature.get(int(i), '')
+            if name in _EBM_CHANNELS: used_groups.add('EBM')
+            elif name in _TEMPORAL_CHANNELS: used_groups.add('Temporal')
+            else: used_groups.add('Clinical')
+        ax4.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.7)
+                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                   loc='lower right', fontsize=8)
     
     # Plot 5: Static categorical
     if shap_results['cat_shap'] is not None and shap_results['cat_shap'].size > 0:
@@ -903,6 +1012,300 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     return {'sample_idx': sample_idx, 'pid': display_pid}
 
 
+def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
+                                 pid: Union[int, str] = None,
+                                 holdout_pids: List = None,
+                                 channel2feature: Dict[int, str] = None,
+                                 save_path: str = None):
+    """
+    Visualize data completeness/missingness for an individual patient.
+
+    Shows a 3-state heatmap (present/missing/padding) for continuous TS channels,
+    grouped by type (Clinical, EBM, Temporal). Also shows categorical TS activity
+    if available.
+
+    Args:
+        shap_results: Dict from calculate_shap_from_dataloaders (contains test_data)
+        sample_idx: Direct index into the test data
+        pid: Patient ID to visualize (requires holdout_pids)
+        holdout_pids: List of PIDs in dataloader order
+        channel2feature: Mapping channel index -> feature name
+        save_path: Path to save the figure
+    """
+    # --- Resolve sample index ---
+    if pid is not None:
+        if holdout_pids is None:
+            raise ValueError("holdout_pids required when using pid parameter")
+        sample_idx = get_sample_idx_for_pid(holdout_pids, pid)
+        if sample_idx is None:
+            raise ValueError(f"PID {pid} not found in holdout data")
+    elif sample_idx is None:
+        sample_idx = 0
+
+    display_pid = None
+    if holdout_pids is not None and sample_idx < len(holdout_pids):
+        display_pid = holdout_pids[sample_idx]
+
+    # --- Extract data ---
+    ts_data = shap_results['test_data']['ts'][sample_idx]  # [n_channels, seq_len]
+    n_channels, n_steps = ts_data.shape
+
+    # Time axis
+    time_labels = [step_to_time(i) for i in range(n_steps)]
+    time_fmt = [time_to_hours(t) for t in time_labels]
+    n_ticks = min(10, n_steps)
+    tick_idx = np.linspace(0, n_steps - 1, n_ticks, dtype=int)
+
+    # --- Detect trajectory length ---
+    dp_idx = None
+    if channel2feature:
+        for idx, name in channel2feature.items():
+            if name == '_data_present':
+                dp_idx = idx
+                break
+
+    if dp_idx is not None:
+        trajectory_mask = ts_data[dp_idx] > 0.5  # [seq_len]
+    else:
+        data_length = get_actual_data_length(ts_data)
+        trajectory_mask = np.zeros(n_steps, dtype=bool)
+        trajectory_mask[:data_length] = True
+
+    traj_len = int(trajectory_mask.sum())
+
+    # --- Group channels ---
+    if channel2feature:
+        ordered_indices, ordered_labels, group_boundaries = _get_grouped_channel_order(channel2feature)
+    else:
+        ordered_indices = list(range(n_channels))
+        ordered_labels = [f'Ch{i}' for i in range(n_channels)]
+        group_boundaries = OrderedDict([('All', (0, n_channels))])
+
+    n_display = len(ordered_indices)
+
+    # --- Build presence matrix ---
+    # 0 = padding, 1 = missing (within trajectory, no measurement), 2 = present
+    presence = np.zeros((n_display, n_steps), dtype=np.int8)
+    for row, ch_idx in enumerate(ordered_indices):
+        for t in range(n_steps):
+            if not trajectory_mask[t]:
+                presence[row, t] = 0  # padding
+            elif abs(ts_data[ch_idx, t]) < 1e-8:
+                presence[row, t] = 1  # missing
+            else:
+                presence[row, t] = 2  # present
+
+    # --- Compute completeness per channel ---
+    if traj_len > 0:
+        completeness = np.array([(presence[row][trajectory_mask] == 2).sum() / traj_len
+                                 for row in range(n_display)])
+    else:
+        completeness = np.zeros(n_display)
+
+    # --- Figure layout ---
+    title_suffix = f" (PID: {display_pid})" if display_pid else f" (Sample {sample_idx})"
+    has_cat = ('ts_cat' in shap_results.get('test_data', {}) and
+               shap_results.get('encoding_info') is not None)
+
+    if has_cat:
+        fig = plt.figure(figsize=(22, 18))
+        gs = fig.add_gridspec(4, 2, hspace=0.45, wspace=0.3,
+                              height_ratios=[0.5, 1.5, 1.0, 1.0])
+    else:
+        fig = plt.figure(figsize=(22, 14))
+        gs = fig.add_gridspec(3, 2, hspace=0.45, wspace=0.3,
+                              height_ratios=[0.5, 1.5, 1.0])
+
+    # --- Plot 1: Data density timeline ---
+    ax1 = fig.add_subplot(gs[0, :])
+    clinical_rows = [row for row, ch_idx in enumerate(ordered_indices)
+                     if not channel2feature or channel2feature.get(ch_idx, '')
+                     not in (_TEMPORAL_CHANNELS | _EBM_CHANNELS | _AUXILIARY_CHANNELS)]
+    if not clinical_rows:
+        clinical_rows = list(range(n_display))
+
+    density = np.array([(presence[clinical_rows][:, t] == 2).sum() / len(clinical_rows)
+                        for t in range(n_steps)]) * 100
+
+    ax1.fill_between(range(n_steps), density, alpha=0.4, color='#2196F3')
+    ax1.plot(range(n_steps), density, linewidth=2, color='#1565C0')
+
+    # Mark trajectory end
+    padding_starts = np.where(~trajectory_mask)[0]
+    if len(padding_starts) > 0:
+        ax1.axvline(x=padding_starts[0], color='red', linewidth=1.5, linestyle='--',
+                    alpha=0.7, label='Trajectory end')
+    ax1.set_ylabel('% Clinical channels\nwith data')
+    ax1.set_title(f'Data Completeness Over Time{title_suffix}', fontweight='bold', fontsize=14)
+    ax1.set_xticks(tick_idx)
+    ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+    ax1.set_ylim(0, 105)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+
+    # --- Plot 2: Continuous TS presence heatmap (grouped) ---
+    ax2 = fig.add_subplot(gs[1, :])
+    cmap_presence = ListedColormap(['#E0E0E0', '#FF8A65', '#4CAF50'])
+    bounds = [-0.5, 0.5, 1.5, 2.5]
+    norm_presence = BoundaryNorm(bounds, cmap_presence.N)
+
+    im2 = ax2.imshow(presence, aspect='auto', cmap=cmap_presence, norm=norm_presence,
+                     interpolation='nearest')
+    ax2.set_xlabel('Time')
+    ax2.set_ylabel('Channel')
+    ax2.set_title('Continuous TS Data Presence (grouped)', fontweight='bold')
+
+    if n_display <= 40:
+        ax2.set_yticks(range(n_display))
+        ax2.set_yticklabels(ordered_labels, fontsize=7 if n_display > 25 else 8)
+    else:
+        step = max(1, n_display // 30)
+        yticks = list(range(0, n_display, step))
+        ax2.set_yticks(yticks)
+        ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=7)
+
+    ax2.set_xticks(tick_idx)
+    ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+    _draw_group_separators(ax2, group_boundaries)
+
+    ax2.legend(handles=[
+        Patch(facecolor='#4CAF50', label='Present'),
+        Patch(facecolor='#FF8A65', label='Missing'),
+        Patch(facecolor='#E0E0E0', label='Padding'),
+    ], loc='upper right', fontsize=9, framealpha=0.9, edgecolor='gray')
+
+    # --- Plot 3 (optional): Categorical TS activity ---
+    if has_cat:
+        ax3 = fig.add_subplot(gs[2, :])
+        cat_ts_data = shap_results['test_data']['ts_cat'][sample_idx]  # [n_cats, seq_len]
+        enc_info = shap_results['encoding_info']
+        cat_names = get_category_names_from_encoding_info(enc_info)
+
+        n_cats = cat_ts_data.shape[0]
+        while len(cat_names) < n_cats:
+            cat_names.append(f'Cat_{len(cat_names)}')
+
+        # 3-state: -1=padding, 0=inactive, 1=active
+        cat_presence = np.where(cat_ts_data > 0, 1.0, 0.0)
+        for t in range(n_steps):
+            if not trajectory_mask[t]:
+                cat_presence[:, t] = -1
+
+        cmap_cat = ListedColormap(['#E0E0E0', '#FFF9C4', '#66BB6A'])
+        bounds_cat = [-1.5, -0.5, 0.5, 1.5]
+        norm_cat = BoundaryNorm(bounds_cat, cmap_cat.N)
+
+        im3 = ax3.imshow(cat_presence, aspect='auto', cmap=cmap_cat, norm=norm_cat,
+                         interpolation='nearest')
+        ax3.set_xlabel('Time')
+        ax3.set_ylabel('Category')
+        ax3.set_title('Categorical TS Activity', fontweight='bold')
+
+        if n_cats <= 30:
+            ax3.set_yticks(range(n_cats))
+            ax3.set_yticklabels(cat_names[:n_cats], fontsize=8)
+        else:
+            step = max(1, n_cats // 20)
+            yticks = list(range(0, n_cats, step))
+            ax3.set_yticks(yticks)
+            ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
+
+        ax3.set_xticks(tick_idx)
+        ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+
+        # Concept group separators from encoding_info
+        for feat, (start, end) in enc_info.get('feature_ranges', {}).items():
+            if start > 0:
+                ax3.axhline(y=start - 0.5, color='white', linewidth=3, zorder=5)
+                ax3.axhline(y=start - 0.5, color='black', linewidth=1.2,
+                            linestyle='--', zorder=6)
+
+        ax3.legend(handles=[
+            Patch(facecolor='#66BB6A', label='Active'),
+            Patch(facecolor='#FFF9C4', label='No activity'),
+            Patch(facecolor='#E0E0E0', label='Padding'),
+        ], loc='upper right', fontsize=9, framealpha=0.9, edgecolor='gray')
+
+    # --- Last row: Completeness bar + Summary ---
+    last_row = 3 if has_cat else 2
+
+    # Left: Per-channel completeness bar chart (grouped)
+    ax4 = fig.add_subplot(gs[last_row, 0])
+    bar_colors = [_get_channel_color(channel2feature, ch_idx) if channel2feature
+                  else '#2196F3' for ch_idx in ordered_indices]
+    ax4.barh(range(n_display), completeness * 100, color=bar_colors, alpha=0.8)
+    ax4.set_yticks(range(n_display))
+    ax4.set_yticklabels(ordered_labels, fontsize=7 if n_display > 20 else 8)
+    ax4.set_xlabel('% Completeness')
+    ax4.set_title('Channel Completeness (within trajectory)', fontweight='bold')
+    ax4.set_xlim(0, 105)
+    ax4.grid(True, alpha=0.3, axis='x')
+    ax4.invert_yaxis()
+    _draw_group_separators(ax4, group_boundaries)
+
+    if channel2feature:
+        used_groups = set()
+        for ch_idx in ordered_indices:
+            name = channel2feature.get(ch_idx, '')
+            if name in _EBM_CHANNELS:
+                used_groups.add('EBM')
+            elif name in _TEMPORAL_CHANNELS:
+                used_groups.add('Temporal')
+            else:
+                used_groups.add('Clinical')
+        ax4.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.8)
+                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                   loc='lower right', fontsize=8)
+
+    # Right: Summary statistics
+    ax5 = fig.add_subplot(gs[last_row, 1])
+    ax5.axis('off')
+
+    traj_hours = 0
+    if traj_len > 0:
+        last_step = np.where(trajectory_mask)[0][-1]
+        t_min = step_to_time(last_step)
+        traj_hours = t_min / 60 if t_min else 0
+
+    overall_comp = completeness.mean() * 100
+
+    group_stats = []
+    for group_name, (start, end) in group_boundaries.items():
+        g_comp = completeness[start:end].mean() * 100
+        n_ch = end - start
+        group_stats.append(f"  {group_name} ({n_ch} ch): {g_comp:.1f}%")
+
+    sorted_comp = np.argsort(completeness)[::-1]
+    top_3 = [f"  {ordered_labels[i]}: {completeness[i]*100:.0f}%"
+             for i in sorted_comp[:3]]
+    bottom_3 = [f"  {ordered_labels[i]}: {completeness[i]*100:.0f}%"
+                for i in sorted_comp[-3:] if completeness[i] < 1.0]
+
+    summary = (
+        f"Summary\n{'=' * 30}\n\n"
+        f"Patient: {display_pid or sample_idx}\n"
+        f"Trajectory: {traj_len} steps ({traj_hours:.1f}h)\n"
+        f"Channels: {n_display}\n"
+        f"Overall completeness: {overall_comp:.1f}%\n\n"
+        f"Per group:\n" + "\n".join(group_stats) + "\n\n"
+        f"Most complete:\n" + "\n".join(top_3) + "\n\n"
+        f"Least complete:\n" + ("\n".join(bottom_3) if bottom_3 else "  (all 100%)")
+    )
+
+    ax5.text(0.05, 0.95, summary, transform=ax5.transAxes,
+             fontsize=11, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='#F5F5F5', edgecolor='#BDBDBD'))
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+    return {'sample_idx': sample_idx, 'pid': display_pid,
+            'completeness': dict(zip(ordered_labels, completeness))}
+
+
 def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] = None,
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
@@ -941,18 +1344,30 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Top channels
+    # Plot 2: Top channels (color-coded by group)
     ax2 = fig.add_subplot(gs[1, 0])
     ch_imp = np.abs(ts_shap).mean(axis=(0, 2))
     sorted_idx = np.argsort(ch_imp)[::-1][:max_display]
     if channel2feature:
         names = [channel2feature.get(int(i), f'Ch{i}') for i in sorted_idx]
+        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
     else:
         names = [f'Channel {i}' for i in sorted_idx]
-    ax2.barh(range(len(sorted_idx)), ch_imp[sorted_idx], color='#008bfb', alpha=0.7)
+        bar_colors = ['#008bfb'] * len(sorted_idx)
+    ax2.barh(range(len(sorted_idx)), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax2.set_yticks(range(len(sorted_idx))); ax2.set_yticklabels(names, fontsize=10)
     ax2.set_xlabel('Mean |SHAP|'); ax2.set_title(f'Top {len(sorted_idx)} Channels', fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='x'); ax2.invert_yaxis()
+    if channel2feature:
+        used_groups = set()
+        for i in sorted_idx:
+            name = channel2feature.get(int(i), '')
+            if name in _EBM_CHANNELS: used_groups.add('EBM')
+            elif name in _TEMPORAL_CHANNELS: used_groups.add('Temporal')
+            else: used_groups.add('Clinical')
+        ax2.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.7)
+                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                   loc='lower right', fontsize=8)
     
     # Plot 3: Categorical TS SHAP heatmap (mean across cohort)
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
@@ -1005,23 +1420,32 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
         plt.colorbar(im3, ax=ax3, label='Mean Activity')
     
-    # Plot 4: Continuous TS heatmap - with centered colormap
+    # Plot 4: Continuous TS heatmap - grouped by channel type
     ax4 = fig.add_subplot(gs[2, :])
     ts_mean = np.abs(ts_shap).mean(axis=0)
-    # For absolute values, use sequential colormap (no centering needed)
-    im = ax4.imshow(ts_mean, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0)
-    ax4.set_xlabel('Time'); ax4.set_ylabel('Channel')
-    ax4.set_title('Continuous TS |SHAP| Heatmap (Mean)', fontweight='bold')
     if channel2feature:
-        labels = [channel2feature.get(i, f'Ch{i}') for i in range(n_channels)]
-        if n_channels > 25:
-            step = max(1, n_channels // 25)
-            yticks = list(range(0, n_channels, step))
-            ax4.set_yticks(yticks); ax4.set_yticklabels([labels[i] for i in yticks], fontsize=8)
-        else:
-            ax4.set_yticks(range(n_channels)); ax4.set_yticklabels(labels, fontsize=9)
+        ordered_idx, ordered_labels_4, group_bounds_4 = _get_grouped_channel_order(channel2feature)
+        ts_mean_display = ts_mean[ordered_idx]
+        n_display_4 = len(ordered_idx)
+    else:
+        ts_mean_display = ts_mean
+        ordered_labels_4 = [f'Ch{i}' for i in range(n_channels)]
+        n_display_4 = n_channels
+        group_bounds_4 = OrderedDict()
+    im = ax4.imshow(ts_mean_display, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0)
+    ax4.set_xlabel('Time'); ax4.set_ylabel('Channel')
+    ax4.set_title('Continuous TS |SHAP| Heatmap (Mean, grouped)', fontweight='bold')
+    if n_display_4 <= 40:
+        ax4.set_yticks(range(n_display_4))
+        ax4.set_yticklabels(ordered_labels_4, fontsize=7 if n_display_4 > 25 else 9)
+    else:
+        step = max(1, n_display_4 // 30)
+        yticks = list(range(0, n_display_4, step))
+        ax4.set_yticks(yticks)
+        ax4.set_yticklabels([ordered_labels_4[i] for i in yticks], fontsize=7)
     ax4.set_xticks(tick_idx); ax4.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     plt.colorbar(im, ax=ax4, label='Mean |SHAP|')
+    _draw_group_separators(ax4, group_bounds_4)
     
     # Plot 5: Static categorical
     if shap_results['cat_shap'] is not None and shap_results['cat_shap'].size > 0:
@@ -1160,7 +1584,15 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
             class_idx=1,
             save_path='reports/shap/shap_individual_sample_0.png'
         )
-    
+
+        visualize_data_completeness(
+            shap_results,
+            pid=first_pid,
+            holdout_pids=holdout_pids,
+            channel2feature=channel2feature,
+            save_path='reports/shap/data_completeness_sample_0.png'
+        )
+
     # Return comprehensive results for further analysis
     return {
         'shap_results': shap_results,
