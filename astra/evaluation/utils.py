@@ -4,6 +4,7 @@ from scipy import stats
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 def prepare_learner(data, cfg):
+    import torch
     from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
     model_name = cfg["model_name"]
     # Detect temporal head config
@@ -22,7 +23,9 @@ def prepare_learner(data, cfg):
     )
     learn = Learner(data["holdout_mixed_dls"], backbone, metrics=None)
     learn.load(model_name, strict=False)
-    learn.to('cuda')
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    learn.to(device)
     learn = patch_learner_get_preds(learn)
     logger.info(f"Model loaded (temporal_head={is_temporal})")
 

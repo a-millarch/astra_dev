@@ -221,39 +221,44 @@ def get_static_cat_names_from_classes(classes: Dict) -> List[str]:
 
 class ModelWrapperWithEmbeddings(nn.Module):
     """Wrapper that takes pre-embedded categorical features."""
-    def __init__(self, model, has_cat_ts=False):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
-        
+        self.eval_timestep = eval_timestep
+
     def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_embedded=None, x_cont=None):
         device = x_ts.device
         mask = torch.isnan(x_ts)
         if mask.any():
             x_ts = x_ts.clone()
             x_ts[mask] = 0
-        
+
         x = self.model.W_P(x_ts).transpose(1, 2)
-        
+
         if self.has_cat_ts and x_ts_cat_embedded is not None:
             if self.model.cat_ts_combine == 'add':
                 x = x + x_ts_cat_embedded
             else:
                 x = torch.cat([x, x_ts_cat_embedded], dim=-1)
-        
+
         if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
             x = torch.cat([x, x_cat_embedded], 1)
-        
+
         if x_cont is not None and x_cont.shape[1] > 0:
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
-        
+
         x += self.model.pos_enc
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
-        x = self.model.transformer(x, key_padding_mask=None)
-        x = self.model.head(x)
-        return x
+        attn_mask = self.model.causal_mask if self.model.causal else None
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+
+        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
+            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
+            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+        return self.model.head(x)
 
 
 class ModelWrapperWithRawCatTS(nn.Module):
@@ -261,11 +266,12 @@ class ModelWrapperWithRawCatTS(nn.Module):
     Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
     This allows SHAP to compute per-category attributions.
     """
-    def __init__(self, model, has_cat_ts=False):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
-        
+        self.eval_timestep = eval_timestep
+
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
         """
         Args:
@@ -279,16 +285,16 @@ class ModelWrapperWithRawCatTS(nn.Module):
         if mask.any():
             x_ts = x_ts.clone()
             x_ts[mask] = 0
-        
+
         # Continuous TS encoding
         x = self.model.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
-        
+
         # Embed categorical TS from raw multi-hot (this is differentiable!)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
             # x_ts_cat_raw: [bs, n_categories, seq_len]
             # Transpose to [bs, seq_len, n_categories]
             x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
-            
+
             x_ts_cat_embedded_list = []
             dim_offset = 0
             for embed_layer, (feat_name, n_classes) in zip(
@@ -298,29 +304,33 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 feat_embedded = embed_layer(feat_multi_hot)
                 x_ts_cat_embedded_list.append(feat_embedded)
                 dim_offset += n_classes
-            
+
             if self.model.cat_ts_combine == 'add':
                 x_ts_cat_embedded = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
                 x = x + x_ts_cat_embedded
             else:
                 x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_embedded], dim=-1)
-        
+
         # Static categorical (pre-embedded)
         if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
             x = torch.cat([x, x_cat_embedded], 1)
-        
+
         # Static continuous
         if x_cont is not None and x_cont.shape[1] > 0:
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
-        
+
         x += self.model.pos_enc
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
-        x = self.model.transformer(x, key_padding_mask=None)
-        x = self.model.head(x)
-        return x
+        attn_mask = self.model.causal_mask if self.model.causal else None
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+
+        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
+            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
+            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+        return self.model.head(x)
 
 
 def embed_categorical_ts(model, x_ts_cat, encoding_info):
@@ -481,6 +491,9 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
                   is provided, to map PIDs to sample indices.
     """
     print("Extracting background data...")
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+  
     bg_ts, bg_ts_cat, bg_cat, bg_cont, bg_y = extract_data_from_dataloader(
         background_loader, max_samples=max_background_samples, device=device)
     
@@ -1527,6 +1540,8 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
     Returns:
         dict with 'shap_results', 'holdout_pids', 'channel2feature', 'static_cat_names'
     """
+    import torch
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if data is None:
         data = prepare_data_and_dls_cached(cfg)
     if learn is None:
@@ -1549,7 +1564,7 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
         model=learn.model,
         background_loader=data["mixed_dls"].train,
         test_loader=data["holdout_mixed_dls"].train,
-        device='cuda',
+        device=device,
         max_background_samples=600,
         max_test_samples=max_test_samples,
         encoding_info=data["encoding_info"],
@@ -1756,19 +1771,20 @@ class TemporalSHAPResults:
 
 class ModelWrapperWithRawCatTS(nn.Module):
     """Wrapper for SHAP with raw multi-hot categorical TS."""
-    def __init__(self, model, has_cat_ts=False):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
-        
+        self.eval_timestep = eval_timestep
+
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
         mask = torch.isnan(x_ts)
         if mask.any():
             x_ts = x_ts.clone()
             x_ts[mask] = 0
-        
+
         x = self.model.W_P(x_ts).transpose(1, 2)
-        
+
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
             x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
             x_ts_cat_embedded_list = []
@@ -1779,23 +1795,28 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 feat_multi_hot = x_ts_cat[:, :, dim_offset:dim_offset + n_classes]
                 x_ts_cat_embedded_list.append(embed_layer(feat_multi_hot))
                 dim_offset += n_classes
-            
+
             if self.model.cat_ts_combine == 'add':
                 x = x + torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
             else:
                 x = torch.cat([x, torch.cat(x_ts_cat_embedded_list, dim=-1)], dim=-1)
-        
+
         if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
             x = torch.cat([x, x_cat_embedded], 1)
-        
+
         if x_cont is not None and x_cont.shape[1] > 0:
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
-        
+
         x += self.model.pos_enc
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
-        x = self.model.transformer(x, key_padding_mask=None)
+        attn_mask = self.model.causal_mask if self.model.causal else None
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+
+        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
+            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
+            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
         return self.model.head(x)
 
 
@@ -1822,7 +1843,7 @@ class TemporalSHAPAnalyzer:
         self.model = model
         self.data = data
         self.background_loader = background_loader
-        self.device = device
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.max_background_samples = max_background_samples
         self.class_idx = class_idx
         
@@ -1893,7 +1914,8 @@ class TemporalSHAPAnalyzer:
         bg_cat_emb = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
         sample_cat_emb = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
         
-        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts)
+        eval_ts = censor_step if censor_step is not None else -1
+        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts)
         
         bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
         sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
@@ -2946,7 +2968,7 @@ def run_temporal_shap_analysis(data, learn, pid=None, sample_idx=None, timeframe
     os.makedirs(save_dir, exist_ok=True)
     
     analyzer = TemporalSHAPAnalyzer(
-        learn.model, data, data["mixed_dls"].train, 'cuda', max_background_samples
+        learn.model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu', max_background_samples
     )
     
     holdout_pids = analyzer.get_holdout_pids()
