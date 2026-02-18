@@ -30,7 +30,8 @@ def parse_args():
                         help='Skip SHAP computation (faster)')
     parser.add_argument('--save-bundle', action='store_true',
                         help='Save deployment bundle from cached data (run before first test)')
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Force device (default: auto-detect)')
     return parser.parse_args()
 
 

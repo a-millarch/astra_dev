@@ -71,7 +71,7 @@ def plot_prediction_trajectory(result, ctx, save_path=None):
 
 
 def run(cpr_hash, service_date, current_time, model_name,
-                data_dir="data/raw", save_dir="reports/inference"):
+                data_dir="data/raw", save_dir="reports/inference", device=None):
     """Full end-to-end example."""
 
     os.makedirs(save_dir, exist_ok=True)
@@ -81,7 +81,7 @@ def run(cpr_hash, service_date, current_time, model_name,
     print(f"\n{'='*60}")
     print(f"Loading model: {model_name}")
     print(f"{'='*60}")
-    session = InferenceSession.load(model_name, device="cuda")
+    session = InferenceSession.load(model_name, device=device)
     print(f"  Temporal head: {session.is_temporal}")
     print(f"  Channels: {len(session.bundle['ts_channel_names'])}")
 
@@ -189,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--model-name", required=True, help="Model name")
     parser.add_argument("--data-dir", default="data/raw", help="Raw CSV directory")
     parser.add_argument("--save-dir", default="reports/inference", help="Output directory")
+    parser.add_argument("--device", default=None, help="Force device (default: auto-detect)")
 
     args = parser.parse_args()
     run(
@@ -198,4 +199,5 @@ if __name__ == "__main__":
         model_name=args.model_name,
         data_dir=args.data_dir,
         save_dir=args.save_dir,
+        device=args.device,
     )
