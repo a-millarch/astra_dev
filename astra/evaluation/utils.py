@@ -3,6 +3,100 @@ import numpy as np
 from scipy import stats
 from sklearn.metrics import roc_auc_score, average_precision_score
 
+
+# ============================================================================
+# Time ↔ step utilities (reads bin grid from config)
+# ============================================================================
+
+def _parse_timedelta_to_minutes(s):
+    """Parse a time string like '3h', '5min', '14D' to minutes."""
+    s = s.strip()
+    if s.endswith('min'):
+        return int(s[:-3])
+    elif s.endswith('h'):
+        return int(s[:-1]) * 60
+    elif s.endswith('D'):
+        return int(s[:-1]) * 24 * 60
+    else:
+        raise ValueError(f"Cannot parse time string: {s}")
+
+
+def _get_intervals_from_cfg():
+    """
+    Parse cfg['bin_intervals'] into a list of (start_min, end_min, bin_min) tuples.
+
+    cfg['bin_intervals'] keys are interval endpoints (e.g. '3h', '6h', '14D', 'end'),
+    values are bin frequencies (e.g. '5min', '10min', '1h').
+    """
+    bin_intervals = cfg["bin_intervals"]
+    intervals = []
+    start_min = 0
+
+    for end_str, freq_str in bin_intervals.items():
+        end_min = None if end_str == "end" else _parse_timedelta_to_minutes(end_str)
+        bin_min = _parse_timedelta_to_minutes(freq_str)
+        intervals.append((start_min, end_min, bin_min))
+        if end_min is not None:
+            start_min = end_min
+
+    return intervals
+
+
+def time_to_step(time_value, time_unit='min'):
+    """Convert time value to time step index using config bin intervals."""
+    if time_unit == 'min':
+        time_min = time_value
+    elif time_unit == 'h':
+        time_min = time_value * 60
+    elif time_unit == 'D':
+        time_min = time_value * 24 * 60
+    else:
+        raise ValueError("Unsupported time unit. Use 'min', 'h' or 'D'.")
+
+    intervals = _get_intervals_from_cfg()
+
+    for i, (start_min, end_min, bin_min) in enumerate(intervals):
+        eff_end = end_min if end_min is not None else float('inf')
+        if start_min < time_min <= eff_end:
+            offset_min = time_min - start_min
+            step_offset = int(np.ceil(offset_min / bin_min)) - 1
+            bins_cum = 0
+            for j in range(i):
+                s, e, b = intervals[j]
+                if e is not None:
+                    bins_cum += (e - s) // b
+            return bins_cum + step_offset
+    return None
+
+
+def step_to_time(step):
+    """Convert step index back to time in minutes using config bin intervals."""
+    intervals = _get_intervals_from_cfg()
+
+    bins_cum = [0]
+    for start_min, end_min, bin_min in intervals[:-1]:
+        if end_min is not None:
+            duration = end_min - start_min
+            bins_cum.append(bins_cum[-1] + duration // bin_min)
+
+    for i in range(len(bins_cum) - 1):
+        if bins_cum[i] <= step < bins_cum[i + 1]:
+            start_min, end_min, bin_min = intervals[i]
+            step_offset = step - bins_cum[i]
+            return start_min + (step_offset + 1) * bin_min
+    return None
+
+
+def time_to_hours(minutes):
+    """Format a time in minutes to a human-readable string (e.g. '6.0h' or '2.5d')."""
+    if minutes is None:
+        return "N/A"
+    hours = minutes / 60
+    if hours < 24:
+        return f"{hours:.1f}h"
+    else:
+        return f"{hours/24:.1f}d"
+
 def prepare_learner(data, cfg):
     import torch
     from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds

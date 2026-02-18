@@ -18,7 +18,7 @@ import os
 from astra.utils import logger, cfg
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
 from astra.data.caching import prepare_data_and_dls_cached
-from astra.evaluation.utils import prepare_learner
+from astra.evaluation.utils import prepare_learner, step_to_time, time_to_step, time_to_hours
 
 def get_centered_norm(data, center=0.0):
     """
@@ -56,44 +56,10 @@ def get_centered_norm(data, center=0.0):
     return TwoSlopeNorm(vmin=vmin, vcenter=center, vmax=vmax)
 
 # ============================================================================
-# Utility Functions 
+# Utility Functions
 # ============================================================================
 
-def step_to_time(step):
-    """Convert time step to actual time in minutes."""
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins = duration_min // interval['bin_min']
-        bins_cum.append(bins_cum[-1] + bins)
-    
-    for i in range(len(bins_cum) - 1):
-        if bins_cum[i] <= step < bins_cum[i+1]:
-            interval = intervals[i]
-            step_offset = step - bins_cum[i]
-            start_min = interval['start_h'] * 60
-            return start_min + (step_offset + 1) * interval['bin_min']
-    return None
-
-
-def time_to_hours(minutes):
-    if minutes is None:
-        return "N/A"
-    hours = minutes / 60
-    if hours < 24:
-        return f"{hours:.1f}h"
-    else:
-        return f"{hours/24:.1f}d"
+# step_to_time, time_to_step, time_to_hours imported from astra.evaluation.utils
 
 
 def create_channel_mapping(data):
@@ -228,11 +194,17 @@ class ModelWrapperWithEmbeddings(nn.Module):
         self.eval_timestep = eval_timestep
 
     def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_embedded=None, x_cont=None):
-        device = x_ts.device
-        mask = torch.isnan(x_ts)
-        if mask.any():
+        nan_mask = torch.isnan(x_ts)
+        if nan_mask.any():
             x_ts = x_ts.clone()
-            x_ts[mask] = 0
+            x_ts[nan_mask] = 0
+
+        # Key padding mask: timesteps where ALL channels are zero/NaN
+        if self.model.key_padding_mask == "auto":
+            is_absent = (x_ts == 0) | nan_mask
+            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
+        else:
+            key_padding_mask = None
 
         x = self.model.W_P(x_ts).transpose(1, 2)
 
@@ -252,8 +224,19 @@ class ModelWrapperWithEmbeddings(nn.Module):
         x += self.model.pos_enc
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
+
+        # Extend key_padding_mask for static tokens (never masked)
+        if key_padding_mask is not None:
+            n_static = x.shape[1] - key_padding_mask.shape[1]
+            if n_static > 0:
+                static_mask = torch.zeros(
+                    key_padding_mask.shape[0], n_static,
+                    dtype=torch.bool, device=key_padding_mask.device,
+                )
+                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+
         attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
@@ -280,19 +263,23 @@ class ModelWrapperWithRawCatTS(nn.Module):
             x_cat_embedded: [bs, n_cat, d_model] - pre-embedded static categorical
             x_cont: [bs, n_cont] - static continuous
         """
-        device = x_ts.device
-        mask = torch.isnan(x_ts)
-        if mask.any():
+        nan_mask = torch.isnan(x_ts)
+        if nan_mask.any():
             x_ts = x_ts.clone()
-            x_ts[mask] = 0
+            x_ts[nan_mask] = 0
+
+        # Key padding mask: timesteps where ALL channels are zero/NaN
+        if self.model.key_padding_mask == "auto":
+            is_absent = (x_ts == 0) | nan_mask
+            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
+        else:
+            key_padding_mask = None
 
         # Continuous TS encoding
         x = self.model.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
 
         # Embed categorical TS from raw multi-hot (this is differentiable!)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
-            # x_ts_cat_raw: [bs, n_categories, seq_len]
-            # Transpose to [bs, seq_len, n_categories]
             x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
 
             x_ts_cat_embedded_list = []
@@ -324,8 +311,19 @@ class ModelWrapperWithRawCatTS(nn.Module):
         x += self.model.pos_enc
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
+
+        # Extend key_padding_mask for static tokens (never masked)
+        if key_padding_mask is not None:
+            n_static = x.shape[1] - key_padding_mask.shape[1]
+            if n_static > 0:
+                static_mask = torch.zeros(
+                    key_padding_mask.shape[0], n_static,
+                    dtype=torch.bool, device=key_padding_mask.device,
+                )
+                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+
         attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
@@ -588,10 +586,16 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     print("Calculating SHAP values...")
     shap_values = explainer.shap_values(test_inputs)
     print("SHAP calculation complete!")
-    
+
+    # For multi-output models (e.g. 2-class), GradientExplainer returns
+    # [[sv_per_input_class0], [sv_per_input_class1]].
+    # Select class 1 (mortality) by default.
     if isinstance(shap_values, list) and len(shap_values) > 0:
         if isinstance(shap_values[0], list):
-            shap_values = shap_values[0]
+            n_classes = len(shap_values)
+            selected_class = min(1, n_classes - 1)  # class 1 if available
+            print(f"  Multi-output model: {n_classes} classes, selecting class {selected_class}")
+            shap_values = shap_values[selected_class]
     
     print("\nSHAP value shapes:")
     for i, sv in enumerate(shap_values):
@@ -1639,69 +1643,10 @@ DEFAULT_TIMEFRAMES = OrderedDict([
     ('7D', 168), ('14D', 336), ('30D', 720), ('full', None)
 ])
 
-# ============================================================================
-# TIME UTILITIES
-# ============================================================================
-
-def step_to_time(step: int) -> Optional[float]:
-    """Convert time step to minutes."""
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins_cum.append(bins_cum[-1] + duration_min // interval['bin_min'])
-    
-    for i in range(len(bins_cum) - 1):
-        if bins_cum[i] <= step < bins_cum[i+1]:
-            step_offset = step - bins_cum[i]
-            start_min = intervals[i]['start_h'] * 60
-            return start_min + (step_offset + 1) * intervals[i]['bin_min']
-    
-    if step >= bins_cum[-1]:
-        step_offset = step - bins_cum[-1]
-        return intervals[-1]['start_h'] * 60 + (step_offset + 1) * intervals[-1]['bin_min']
-    return None
-
-
-def time_to_step(time_hours: float) -> int:
-    """Convert hours to step index."""
-    time_min = time_hours * 60
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-    bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins_cum.append(bins_cum[-1] + duration_min // interval['bin_min'])
-    
-    for i, interval in enumerate(intervals):
-        start_min = interval['start_h'] * 60
-        end_min = interval['end_h'] * 60 if interval['end_h'] else float('inf')
-        if start_min <= time_min < end_min:
-            return bins_cum[i] + int((time_min - start_min) / interval['bin_min'])
-    return bins_cum[-1]
-
-
-def time_to_hours_str(minutes: Optional[float]) -> str:
-    if minutes is None: return "N/A"
-    hours = minutes / 60
-    return f"{hours:.1f}h" if hours < 24 else f"{hours/24:.1f}d"
+# Time utilities (step_to_time, time_to_step, time_to_hours) imported from
+# astra.evaluation.utils — reads bin intervals from config instead of hardcoding.
+# Alias for backward compat:
+time_to_hours_str = time_to_hours
 
 
 def get_actual_data_length(ts_data: np.ndarray, threshold: float = 1e-6) -> int:
@@ -1769,55 +1714,8 @@ class TemporalSHAPResults:
 # MODEL WRAPPER
 # ============================================================================
 
-class ModelWrapperWithRawCatTS(nn.Module):
-    """Wrapper for SHAP with raw multi-hot categorical TS."""
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
-        super().__init__()
-        self.model = model
-        self.has_cat_ts = has_cat_ts
-        self.eval_timestep = eval_timestep
-
-    def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
-        mask = torch.isnan(x_ts)
-        if mask.any():
-            x_ts = x_ts.clone()
-            x_ts[mask] = 0
-
-        x = self.model.W_P(x_ts).transpose(1, 2)
-
-        if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
-            x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
-            x_ts_cat_embedded_list = []
-            dim_offset = 0
-            for embed_layer, (feat_name, n_classes) in zip(
-                self.model.ts_cat_embeds, self.model.ts_cat_dims.items()
-            ):
-                feat_multi_hot = x_ts_cat[:, :, dim_offset:dim_offset + n_classes]
-                x_ts_cat_embedded_list.append(embed_layer(feat_multi_hot))
-                dim_offset += n_classes
-
-            if self.model.cat_ts_combine == 'add':
-                x = x + torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-            else:
-                x = torch.cat([x, torch.cat(x_ts_cat_embedded_list, dim=-1)], dim=-1)
-
-        if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
-            x = torch.cat([x, x_cat_embedded], 1)
-
-        if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
-            x = torch.cat([x, x_cont_emb], 1)
-
-        x += self.model.pos_enc
-        if self.model.res_drop is not None:
-            x = self.model.res_drop(x)
-        attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
-
-        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
-            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
-        return self.model.head(x)
+# NOTE: ModelWrapperWithRawCatTS is defined above (used by both
+# calculate_shap_from_dataloaders and TemporalSHAPAnalyzer).
 
 
 def embed_categorical_features(model, x_cat):
@@ -2022,7 +1920,7 @@ class TemporalSHAPAnalyzer:
         
         for i, tf in enumerate(valid_tfs):
             tf_h = DEFAULT_TIMEFRAMES.get(tf)
-            censor = None if tf_h is None else time_to_step(tf_h)
+            censor = None if tf_h is None else time_to_step(tf_h, 'h')
             if verbose: print(f"  [{i+1}/{len(valid_tfs)}] {tf}...", end=" ", flush=True)
             
             t1 = time.time()
