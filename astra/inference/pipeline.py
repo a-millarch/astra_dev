@@ -167,17 +167,20 @@ class InferenceSession:
             self._bg = None
 
     @classmethod
-    def load(cls, model_name, device='cuda', bundle_dir='models/deployment',
+    def load(cls, model_name, device=None, bundle_dir='models/deployment',
              weights_dir='models'):
         """
         Load deployment bundle and model weights.
 
         Args:
             model_name: Name of the model (matches training save name).
-            device: 'cuda' or 'cpu'.
+            device: 'cuda', 'cpu', or None for auto-detect.
             bundle_dir: Where deployment bundles are stored.
             weights_dir: Where .pth model weights are stored.
         """
+        if device is None:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
         bundle = load_deployment_bundle(model_name, bundle_dir)
         params = bundle['model_params']
 

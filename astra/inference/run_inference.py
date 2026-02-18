@@ -20,7 +20,8 @@ import argparse
 import os
 
 import matplotlib
-matplotlib.use("Agg")
+if __name__ == "__main__":
+    matplotlib.use("Agg")  # headless backend for script execution only
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd

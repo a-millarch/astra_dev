@@ -1057,19 +1057,29 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     tick_idx = np.linspace(0, n_steps - 1, n_ticks, dtype=int)
 
     # --- Detect trajectory length ---
+    # The data may be raw (NaN for missing, 0.0 for padding) from the inference
+    # pipeline, or normalized (0.0 for both missing and padding) from training.
+    # We need NaN-aware logic for both cases.
     dp_idx = None
+    eh_idx = None
     if channel2feature:
         for idx, name in channel2feature.items():
             if name == '_data_present':
                 dp_idx = idx
-                break
+            elif name == 'elapsed_hours':
+                eh_idx = idx
 
     if dp_idx is not None:
         trajectory_mask = ts_data[dp_idx] > 0.5  # [seq_len]
+    elif eh_idx is not None:
+        # elapsed_hours is >0 for all in-trajectory steps, 0.0 for padding
+        eh = ts_data[eh_idx]
+        trajectory_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
     else:
-        data_length = get_actual_data_length(ts_data)
-        trajectory_mask = np.zeros(n_steps, dtype=bool)
-        trajectory_mask[:data_length] = True
+        # NaN-aware fallback: any channel has real data at this timestep
+        with np.errstate(all='ignore'):
+            max_per_step = np.nanmax(np.abs(ts_data), axis=0)
+        trajectory_mask = ~np.isnan(max_per_step) & (max_per_step > 1e-8)
 
     traj_len = int(trajectory_mask.sum())
 
@@ -1083,17 +1093,12 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 
     n_display = len(ordered_indices)
 
-    # --- Build presence matrix ---
+    # --- Build presence matrix (vectorized, NaN-aware) ---
     # 0 = padding, 1 = missing (within trajectory, no measurement), 2 = present
-    presence = np.zeros((n_display, n_steps), dtype=np.int8)
-    for row, ch_idx in enumerate(ordered_indices):
-        for t in range(n_steps):
-            if not trajectory_mask[t]:
-                presence[row, t] = 0  # padding
-            elif abs(ts_data[ch_idx, t]) < 1e-8:
-                presence[row, t] = 1  # missing
-            else:
-                presence[row, t] = 2  # present
+    ts_subset = ts_data[ordered_indices]  # [n_display, n_steps]
+    is_present = ~np.isnan(ts_subset) & (np.abs(np.nan_to_num(ts_subset, nan=0.0)) > 1e-8)
+    traj_broadcast = np.broadcast_to(trajectory_mask, (n_display, n_steps))
+    presence = np.where(~traj_broadcast, 0, np.where(is_present, 2, 1)).astype(np.int8)
 
     # --- Compute completeness per channel ---
     if traj_len > 0:
@@ -1130,10 +1135,10 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     ax1.fill_between(range(n_steps), density, alpha=0.4, color='#2196F3')
     ax1.plot(range(n_steps), density, linewidth=2, color='#1565C0')
 
-    # Mark trajectory end
-    padding_starts = np.where(~trajectory_mask)[0]
-    if len(padding_starts) > 0:
-        ax1.axvline(x=padding_starts[0], color='red', linewidth=1.5, linestyle='--',
+    # Mark trajectory end (first padding step after data begins)
+    if traj_len > 0 and traj_len < n_steps:
+        last_data_step = np.where(trajectory_mask)[0][-1]
+        ax1.axvline(x=last_data_step + 0.5, color='red', linewidth=1.5, linestyle='--',
                     alpha=0.7, label='Trajectory end')
     ax1.set_ylabel('% Clinical channels\nwith data')
     ax1.set_title(f'Data Completeness Over Time{title_suffix}', fontweight='bold', fontsize=14)
