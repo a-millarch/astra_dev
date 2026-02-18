@@ -1070,16 +1070,22 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
                 eh_idx = idx
 
     if dp_idx is not None:
-        trajectory_mask = ts_data[dp_idx] > 0.5  # [seq_len]
+        raw_mask = ts_data[dp_idx] > 0.5  # [seq_len]
     elif eh_idx is not None:
         # elapsed_hours is >0 for all in-trajectory steps, 0.0 for padding
         eh = ts_data[eh_idx]
-        trajectory_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
+        raw_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
     else:
-        # NaN-aware fallback: any channel has real data at this timestep
-        with np.errstate(all='ignore'):
-            max_per_step = np.nanmax(np.abs(ts_data), axis=0)
-        trajectory_mask = ~np.isnan(max_per_step) & (max_per_step > 1e-8)
+        # NaN-aware fallback: any channel has non-NaN data at this timestep
+        any_present = np.any(~np.isnan(ts_data), axis=0)
+        raw_mask = any_present
+
+    # Make trajectory contiguous: fill from first True to last True.
+    # Padding is only before/after the patient stay, never inside it.
+    trajectory_mask = np.zeros(n_steps, dtype=bool)
+    true_indices = np.where(raw_mask)[0]
+    if len(true_indices) > 0:
+        trajectory_mask[true_indices[0]:true_indices[-1] + 1] = True
 
     traj_len = int(trajectory_mask.sum())
 
@@ -1094,9 +1100,9 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     n_display = len(ordered_indices)
 
     # --- Build presence matrix (vectorized, NaN-aware) ---
-    # 0 = padding, 1 = missing (within trajectory, no measurement), 2 = present
+    # 0 = padding (outside trajectory), 1 = missing (within trajectory, NaN), 2 = present
     ts_subset = ts_data[ordered_indices]  # [n_display, n_steps]
-    is_present = ~np.isnan(ts_subset) & (np.abs(np.nan_to_num(ts_subset, nan=0.0)) > 1e-8)
+    is_present = ~np.isnan(ts_subset)  # NaN = missing; any real value (incl. zero) = present
     traj_broadcast = np.broadcast_to(trajectory_mask, (n_display, n_steps))
     presence = np.where(~traj_broadcast, 0, np.where(is_present, 2, 1)).astype(np.int8)
 
