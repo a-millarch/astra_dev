@@ -75,7 +75,7 @@ def run(cpr_hash, service_date, current_time, model_name,
     """Full end-to-end example."""
 
     os.makedirs(save_dir, exist_ok=True)
-    pid_short = cpr_hash[:8]
+    pid_short = cpr[:8] + sd.astype(str)[:10].replace('-','')
 
     # ---- 1. Load session ----
     print(f"\n{'='*60}")

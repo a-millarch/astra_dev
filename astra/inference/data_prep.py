@@ -1004,52 +1004,58 @@ def _extract_height_weight(base_df: pd.DataFrame, data_dir: str) -> pd.DataFrame
 
     try:
         vit_raw = pd.read_csv(f"{data_dir}/VitaleVaerdier.csv", index_col=0)
-        hw_map = {"Højde": "HEIGHT", "Vægt": "WEIGHT"}
-        vit_raw.rename(
-            columns={
-                "Værdi": "VALUE",
-                "Vital_parametre": "FEATURE",
-                "Registreringstidspunkt": "TIMESTAMP",
-            },
-            inplace=True,
-        )
-        vit_raw["FEATURE"] = vit_raw["FEATURE"].replace(to_replace=hw_map)
-        vit_raw["VALUE"] = pd.to_numeric(vit_raw["VALUE"], errors="coerce")
-        vit_raw = vit_raw.dropna(subset=["VALUE"])
-        vit_raw.loc[vit_raw.FEATURE == "HEIGHT", "VALUE"] = inches_to_cm(
-            vit_raw[vit_raw.FEATURE == "HEIGHT"].VALUE.astype(float)
-        )
-        vit_raw.loc[vit_raw.FEATURE == "WEIGHT", "VALUE"] = ounces_to_kg(
-            vit_raw[vit_raw.FEATURE == "WEIGHT"].VALUE.astype(float)
-        )
-
-        hw = vit_raw[vit_raw.FEATURE.isin(["HEIGHT", "WEIGHT"])].copy()
-        hw = hw.merge(
-            base_df[["PID", "CPR_hash", "start", "end"]],
-            on="CPR_hash",
-            how="inner",
-        )
-        hw["TIMESTAMP"] = pd.to_datetime(hw["TIMESTAMP"])
-        hw = hw[hw.TIMESTAMP <= hw.end]
-        hw = hw.sort_values(
-            ["CPR_hash", "TIMESTAMP"], ascending=False
-        ).drop_duplicates(subset=["CPR_hash", "FEATURE"], keep="first")
-
-        if len(hw) > 0:
-            pivot = hw.pivot(
-                index="PID", columns="FEATURE", values="VALUE"
-            ).reset_index()
-            base_df = base_df.merge(pivot, how="left", on="PID")
-
-        if "HEIGHT" not in base_df.columns:
+        vit_raw = vit_raw[vit_raw["CPR_hash"].isin(base_df["CPR_hash"].unique())]
+        if len(vit_raw) == 0:
             base_df["HEIGHT"] = np.nan
-        if "WEIGHT" not in base_df.columns:
             base_df["WEIGHT"] = np.nan
+            return base_df  
+        else:
+            hw_map = {"Højde": "HEIGHT", "Vægt": "WEIGHT"}
+            vit_raw.rename(
+                columns={
+                    "Værdi": "VALUE",
+                    "Vital_parametre": "FEATURE",
+                    "Registreringstidspunkt": "TIMESTAMP",
+                },
+                inplace=True,
+            )
+            vit_raw["FEATURE"] = vit_raw["FEATURE"].replace(to_replace=hw_map)
+            vit_raw["VALUE"] = pd.to_numeric(vit_raw["VALUE"], errors="coerce")
+            vit_raw = vit_raw.dropna(subset=["VALUE"])
+            vit_raw.loc[vit_raw.FEATURE == "HEIGHT", "VALUE"] = inches_to_cm(
+                vit_raw[vit_raw.FEATURE == "HEIGHT"].VALUE.astype(float)
+            )
+            vit_raw.loc[vit_raw.FEATURE == "WEIGHT", "VALUE"] = ounces_to_kg(
+                vit_raw[vit_raw.FEATURE == "WEIGHT"].VALUE.astype(float)
+            )
+
+            hw = vit_raw[vit_raw.FEATURE.isin(["HEIGHT", "WEIGHT"])].copy()
+            hw = hw.merge(
+                base_df[["PID", "CPR_hash", "start", "end"]],
+                on="CPR_hash",
+                how="inner",
+            )
+            hw["TIMESTAMP"] = pd.to_datetime(hw["TIMESTAMP"])
+            hw = hw[hw.TIMESTAMP <= hw.end]
+            hw = hw.sort_values(
+                ["CPR_hash", "TIMESTAMP"], ascending=False
+            ).drop_duplicates(subset=["CPR_hash", "FEATURE"], keep="first")
+
+            if len(hw) > 0:
+                pivot = hw.pivot(
+                    index="PID", columns="FEATURE", values="VALUE"
+                ).reset_index()
+                base_df = base_df.merge(pivot, how="left", on="PID")
+
+            if "HEIGHT" not in base_df.columns:
+                base_df["HEIGHT"] = np.nan
+            if "WEIGHT" not in base_df.columns:
+                base_df["WEIGHT"] = np.nan
 
     except (FileNotFoundError, KeyError) as e:
-        logger.warning(f"Could not extract HEIGHT/WEIGHT: {e}")
-        base_df["HEIGHT"] = np.nan
-        base_df["WEIGHT"] = np.nan
+            logger.warning(f"Could not extract HEIGHT/WEIGHT: {e}")
+            base_df["HEIGHT"] = np.nan
+            base_df["WEIGHT"] = np.nan
 
     return base_df
 
