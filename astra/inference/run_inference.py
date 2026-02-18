@@ -28,47 +28,7 @@ import pandas as pd
 
 from astra.inference import InferenceSession, PatientContext
 from astra.evaluation.behavior import visualize_shap_individual
-
-
-def plot_prediction_trajectory(result, ctx, save_path=None):
-    """Plot P(deceased_30d) at each visible timestep."""
-    if result.predictions_over_time is None:
-        print("Model does not have temporal head — skipping trajectory plot")
-        return
-
-    probs = result.predictions_over_time  # [seq_len]
-    traj_len = result.trajectory_length
-
-    # Bin midpoints as hours since admission
-    bin_df = ctx.bin_df
-    admission = ctx.admission_time
-    hours = [
-        (row.bin_start - admission).total_seconds() / 3600
-        + (row.bin_end - row.bin_start).total_seconds() / 7200
-        for _, row in bin_df.iterrows()
-    ]
-    hours = hours[:traj_len]
-    probs_visible = probs[:traj_len]
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(hours, probs_visible, "o-", color="steelblue", markersize=3, linewidth=1.5)
-    ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5, label="0.5 threshold")
-    ax.fill_between(hours, probs_visible, alpha=0.15, color="steelblue")
-
-    ax.set_xlabel("Hours since admission")
-    ax.set_ylabel("P(deceased 30d)")
-    ax.set_title(f"Prediction trajectory — Patient {ctx.pid}")
-    ax.set_ylim(-0.02, 1.02)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved trajectory plot to {save_path}")
-    plt.close(fig)
-
+from astra.visualize.inference import plot_prediction_trajectory
 
 def run(cpr_hash, service_date, current_time, model_name,
                 data_dir="data/raw", save_dir="reports/inference", device=None):
@@ -129,11 +89,7 @@ def run(cpr_hash, service_date, current_time, model_name,
     print("Computing SHAP explanation...")
     print(f"{'='*60}")
 
-    shap_result = session.explain(
-        x_ts=ctx.x_ts,
-        x_ts_cat=ctx.x_ts_cat,
-        tab_df=ctx.tab_df,
-    )
+    shap_result = session.explain_from_context(ctx)
 
     shap_dict, channel2feature, feature_names_cat, feature_names_cont = (
         session.shap_to_viz_dict(

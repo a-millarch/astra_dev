@@ -893,7 +893,8 @@ def prepare_patient_from_csv(
         )
         result['x_ts'] = inject_ebm_into_x_ts(
             result['x_ts'], ebm_preds, result['bin_df'],
-            raw_data['admission_time'], bundle
+            raw_data['admission_time'], bundle,
+            trajectory_length=result['trajectory_length'],
         )
 
     return result

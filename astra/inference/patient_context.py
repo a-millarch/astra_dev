@@ -71,6 +71,7 @@ class PatientContext:
     _raw_data: dict = field(repr=False)  # accumulated raw_data dict
     _bundle_name: Optional[str] = field(default=None, repr=False)
     _bundle_ref: Optional[dict] = field(default=None, repr=False)
+    _ebm_context: Optional[dict] = field(default=None, repr=False)  # for EBM re-injection on refresh
 
     # ---------------------------------------------------------------------- #
     # Construction
@@ -263,7 +264,16 @@ class PatientContext:
             ctx.x_ts = inject_ebm_into_x_ts(
                 ctx.x_ts, ebm_preds, ctx.bin_df,
                 raw_data['admission_time'], bundle,
+                trajectory_length=ctx.trajectory_length,
             )
+
+            # Store context for EBM re-injection on refresh()
+            ctx._ebm_context = {
+                'filtered_concepts': filtered_concepts,
+                'base_df': base_df,
+                'cfg': cfg,
+                'ebm_models_dir': ebm_models_dir,
+            }
 
         return ctx
 
@@ -329,6 +339,24 @@ class PatientContext:
         if self.trajectory_length < seq_len:
             self.x_ts_cat[:, self.trajectory_length:] = 0.0
 
+        # Re-inject EBM predictions if context was built with them
+        if '_ebm_pred' in bundle.get('ts_channel_names', []) and self._ebm_context is not None:
+            from astra.inference.ebm import (
+                compute_ebm_predictions, inject_ebm_into_x_ts,
+            )
+            ebm_preds = compute_ebm_predictions(
+                self._raw_data,
+                self._ebm_context['filtered_concepts'],
+                self._ebm_context['base_df'],
+                self._ebm_context['cfg'],
+                self._ebm_context['ebm_models_dir'],
+            )
+            self.x_ts = inject_ebm_into_x_ts(
+                self.x_ts, ebm_preds, self.bin_df,
+                self.admission_time, bundle,
+                trajectory_length=self.trajectory_length,
+            )
+
         logger.info(
             f"Refreshed context: trajectory_length={self.trajectory_length}, "
             f"current_time={self.current_time}"
@@ -376,6 +404,7 @@ class PatientContext:
             'x_ts_cat': self.x_ts_cat,
             '_raw_data': self._raw_data,
             '_bundle_name': self._bundle_name,
+            '_ebm_context': self._ebm_context,
         }
 
         with open(path, 'wb') as f:
@@ -412,6 +441,7 @@ class PatientContext:
             _raw_data=state['_raw_data'],
             _bundle_name=state.get('_bundle_name'),
             _bundle_ref=bundle,
+            _ebm_context=state.get('_ebm_context'),
         )
 
         logger.info(f"Loaded PatientContext from {path} (pid={ctx.pid})")

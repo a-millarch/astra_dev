@@ -72,11 +72,18 @@ class _SHAPModelWrapper(nn.Module):
         self.target_step = target_step  # For temporal head: which timestep to attribute
 
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
-        # Handle NaN
-        mask = torch.isnan(x_ts)
-        if mask.any():
+        # Handle NaN and build key_padding_mask (matching model._key_padding_mask)
+        nan_mask = torch.isnan(x_ts)
+        if nan_mask.any():
             x_ts = x_ts.clone()
-            x_ts[mask] = 0
+            x_ts[nan_mask] = 0
+
+        # Key padding mask: timesteps where ALL channels are zero/NaN
+        if self.model.key_padding_mask == "auto":
+            is_absent = (x_ts == 0) | nan_mask
+            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
+        else:
+            key_padding_mask = None
 
         x = self.model.W_P(x_ts).transpose(1, 2)
 
@@ -111,9 +118,19 @@ class _SHAPModelWrapper(nn.Module):
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
+        # Extend key_padding_mask for static tokens (never masked)
+        if key_padding_mask is not None:
+            n_static = x.shape[1] - key_padding_mask.shape[1]
+            if n_static > 0:
+                static_mask = torch.zeros(
+                    key_padding_mask.shape[0], n_static,
+                    dtype=torch.bool, device=key_padding_mask.device,
+                )
+                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+
         # Pass causal mask if model uses causal attention
         attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=None)
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
         # Head
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
@@ -647,7 +664,7 @@ class InferenceSession:
     # ------------------------------------------------------------------
     # PatientContext-based inference
     # ------------------------------------------------------------------
-
+    
     def create_patient_context(self, raw_data):
         """Create a :class:`PatientContext` for repeated inference.
 

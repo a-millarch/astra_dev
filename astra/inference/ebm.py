@@ -355,6 +355,7 @@ def inject_ebm_into_x_ts(
     bin_df: pd.DataFrame,
     admission_time: pd.Timestamp,
     bundle: dict,
+    trajectory_length: int = None,
 ) -> np.ndarray:
     """
     Populate the _ebm_pred channel in x_ts with forward-filled EBM predictions.
@@ -365,6 +366,8 @@ def inject_ebm_into_x_ts(
         bin_df: Patient bin DataFrame with bin_start, bin_end columns.
         admission_time: Patient admission time (pd.Timestamp).
         bundle: Deployment bundle.
+        trajectory_length: Number of visible bins (from current_time masking).
+            If None, defaults to min(len(bin_df), seq_len) for backward compat.
 
     Returns:
         Modified x_ts with EBM predictions filled in.
@@ -392,8 +395,10 @@ def inject_ebm_into_x_ts(
         + (bin_df['bin_end'] - bin_df['bin_start']).dt.total_seconds() / 7200
     ).values
 
-    # Get trajectory length (number of actual bins)
-    trajectory_length = min(len(bin_df), seq_len)
+    # Use caller-provided trajectory length (visible bins) or fall back to full grid
+    if trajectory_length is None:
+        trajectory_length = min(len(bin_df), seq_len)
+    trajectory_length = min(trajectory_length, seq_len)
 
     # Sort interval keys for forward-fill
     intervals_hours = sorted(ebm_predictions.keys())
