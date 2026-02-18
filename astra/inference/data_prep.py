@@ -25,7 +25,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 from astra.data.mappings import (
-    VITALS_MAP, BP_TYPES, LABS_REVERSE_MAP, ICU_MAP,
+    VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
     PROCEDURE_REVERSE_MAP, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
@@ -36,15 +36,22 @@ from astra.data.mappings import (
 # Time binning
 # ============================================================================
 
+MAX_PREDICTION_WINDOW = pd.Timedelta(days=30)
+
+
 def _create_patient_bins(
     admission_time: pd.Timestamp,
-    current_time: pd.Timestamp,
     data_config: dict,
 ) -> pd.DataFrame:
     """
-    Create variable-width time bins for a single patient trajectory.
+    Create the full fixed-duration bin grid for a single patient trajectory.
 
-    Replicates create_bin_df() from build_patient_info.py for one patient.
+    Always creates bins spanning [admission_time, admission_time + 30 days].
+    This makes the bin grid stable across re-inferences: position N always
+    maps to the same time window regardless of when inference is called.
+
+    Use ``_count_visible_bins()`` to determine how many bins are "live"
+    at a given ``current_time``.
 
     Returns:
         DataFrame with columns [bin_start, bin_end, bin_counter, bin_freq, position]
@@ -54,7 +61,7 @@ def _create_patient_bins(
     bin_freq_include = data_config['bin_freq_include']
 
     start_time = admission_time
-    end_time = current_time + pd.Timedelta(minutes=10)
+    end_time = admission_time + MAX_PREDICTION_WINDOW
 
     current = start_time
     bin_counter = 1
@@ -100,6 +107,16 @@ def _create_patient_bins(
     bin_df['position'] = range(len(bin_df))
 
     return bin_df
+
+
+def _count_visible_bins(bin_df: pd.DataFrame, current_time: pd.Timestamp) -> int:
+    """Count how many bins have started by ``current_time``.
+
+    A bin is "visible" (i.e. could contain data) if its start is at or before
+    ``current_time``.  This determines the effective trajectory length for a
+    given point in time on the fixed 30-day bin grid.
+    """
+    return int((bin_df['bin_start'] <= current_time).sum())
 
 
 # ============================================================================
@@ -306,9 +323,14 @@ def _build_continuous_ts(
     raw_data: dict,
     bin_df: pd.DataFrame,
     bundle: dict,
+    trajectory_length: Optional[int] = None,
 ) -> Tuple[np.ndarray, int]:
     """
     Build raw (unnormalized) continuous time series tensor.
+
+    Args:
+        trajectory_length: If provided, use this as the effective trajectory
+            length (from visibility masking). If None, defaults to len(bin_df).
 
     Returns:
         Tuple of (x_ts [n_channels, seq_len], trajectory_length).
@@ -364,8 +386,10 @@ def _build_continuous_ts(
         n = min(len(values), seq_len)
         x_ts[ch_idx, :n] = values[:n]
 
-    # Trajectory length = number of bins
-    trajectory_length = min(len(bin_df), seq_len)
+    # Trajectory length: use explicit value (from visibility masking) or bin count
+    if trajectory_length is None:
+        trajectory_length = len(bin_df)
+    trajectory_length = min(trajectory_length, seq_len)
 
     # Set padding beyond trajectory to 0.0
     if trajectory_length < seq_len:
@@ -548,22 +572,32 @@ def prepare_single_patient(
     raw_data['admission_time'] = pd.Timestamp(raw_data['admission_time'])
     raw_data['current_time'] = pd.Timestamp(raw_data['current_time'])
 
-    # 1. Create time bins
+    # 1. Create fixed 30-day bin grid (stable across re-inferences)
     bin_df = _create_patient_bins(
         raw_data['admission_time'],
-        raw_data['current_time'],
         data_config,
     )
+
+    # Determine how many bins are "visible" at current_time
+    visible_bins = _count_visible_bins(bin_df, raw_data['current_time'])
     logger.info(
-        f"Created {len(bin_df)} bins for trajectory "
-        f"{raw_data['admission_time']} -> {raw_data['current_time']}"
+        f"Created {len(bin_df)} bins (30-day grid), "
+        f"{visible_bins} visible at {raw_data['current_time']}"
     )
 
-    # 2. Build continuous TS
-    x_ts, trajectory_length = _build_continuous_ts(raw_data, bin_df, bundle)
+    # 2. Build continuous TS (trajectory_length clamped by visibility)
+    x_ts, trajectory_length = _build_continuous_ts(
+        raw_data, bin_df, bundle, trajectory_length=visible_bins,
+    )
 
     # 3. Build categorical TS
     x_ts_cat = _build_categorical_ts(raw_data, bin_df, bundle)
+
+    # Zero out bins beyond the visible horizon (guards against future data
+    # leaking in when simulating with historic patients).
+    seq_len = bundle['model_params']['seq_len']
+    if trajectory_length < seq_len:
+        x_ts_cat[:, trajectory_length:] = 0.0
 
     # 4. Build tabular features
     tab_df = _build_tab_df(raw_data, bundle)
@@ -826,14 +860,9 @@ def prepare_patient_from_csv(
         Same as prepare_single_patient(): dict with x_ts, x_ts_cat, tab_df,
         trajectory_length, bin_df.
     """
-    import os
-
     if cfg is None:
         from astra.utils import get_cfg
         cfg = get_cfg()
-
-    # Ensure data/interim exists (filter_vitals writes Height_Weight.pkl there)
-    os.makedirs('data/interim', exist_ok=True)
 
     # Phase 1: Build base_df
     base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
@@ -958,8 +987,8 @@ def _build_single_patient_base_df(
     if "first_RH" in result.columns:
         result.loc[result["first_RH"].notnull(), "LVL1TC"] = 1
 
-    # 10. Elixhauser comorbidity score
-    result = _try_add_elixhauser(result)
+    # 10. Elixhauser comorbidity score (pure Python, no file I/O)
+    result = _try_add_elixhauser(result, data_dir=data_dir)
 
     return result
 
@@ -1025,23 +1054,98 @@ def _extract_height_weight(base_df: pd.DataFrame, data_dir: str) -> pd.DataFrame
     return base_df
 
 
-def _try_add_elixhauser(base_df: pd.DataFrame) -> pd.DataFrame:
-    """Try to compute Elixhauser score. Defaults to NaN if unavailable."""
-    import subprocess
+def _try_add_elixhauser(
+    base_df: pd.DataFrame,
+    data_dir: str = 'data/raw',
+) -> pd.DataFrame:
+    """
+    Compute Elixhauser score using pure-Python implementation.
+
+    Replaces the previous R subprocess chain (prepare_elix_df → R script →
+    computed_elix_df.csv) with an in-memory computation that does not write
+    to any shared files.
+    """
+    from astra.inference.comorbidity import compute_elixhauser_for_patient
 
     try:
-        import astra.data.build_patient_info as bpi
-        result = bpi.add_elixhauser(base_df)
-        return result
-    except (FileNotFoundError, subprocess.CalledProcessError, OSError) as e:
+        return compute_elixhauser_for_patient(base_df, data_dir)
+    except Exception as e:
         logger.warning(
-            f"Elixhauser computation unavailable ({e}). Setting ASMT_ELIX=NaN."
+            f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=NaN."
         )
         base_df["ASMT_ELIX"] = np.nan
         return base_df
 
 
 # ---- Phase 2: Filter concepts ----------------------------------------------
+
+def _filter_vitals_stateless(vit: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stateless version of filters.filter_vitals().
+
+    Replicates the exact same logic (temp conversion, BP splitting, feature
+    mapping, numeric filtering) but does NOT write Height_Weight.pkl to disk.
+    """
+    from astra.utils import inches_to_cm, ounces_to_kg
+
+    vit = vit.copy()
+
+    # Fix temperature in fahrenheit
+    vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
+
+    # Rename to standard columns
+    vit.rename(
+        columns={
+            "Værdi": "VALUE",
+            "Vital_parametre": "FEATURE",
+            "Registreringstidspunkt": "TIMESTAMP",
+        },
+        inplace=True,
+    )
+    vit = vit[["TIMESTAMP", "PID", "FEATURE", "VALUE"]]
+
+    # Split blood pressure into SBP/DBP
+    for bt in BP_TYPES:
+        mask = vit['FEATURE'] == bt
+        if len(vit.loc[mask]) > 0:
+            split_values = vit.loc[mask, 'VALUE'].str.split('/', n=1, expand=True)
+            vit.loc[mask, 'FEATURE'] = 'SBP'
+            vit.loc[mask, 'VALUE'] = split_values[0]
+            diastolic_rows = vit[mask].copy()
+            diastolic_rows['FEATURE'] = 'DBP'
+            diastolic_rows['VALUE'] = split_values[1]
+            vit = pd.concat([vit, diastolic_rows], ignore_index=True)
+            vit.loc[vit['FEATURE'].isin(['SBP', 'DBP']), 'VALUE'] = pd.to_numeric(
+                vit.loc[vit['FEATURE'].isin(['SBP', 'DBP']), 'VALUE'],
+                errors='coerce',
+            )
+            vit['VALUE'] = vit['VALUE'].astype(str)
+
+    # Map feature names (Danish → standard)
+    vit["FEATURE"] = vit["FEATURE"].replace(to_replace=VITALS_MAP)
+    vit["FEATURE"] = vit["FEATURE"].replace(to_replace=HEIGHT_WEIGHT_MAP)
+    vit.loc[vit.FEATURE == 'HEIGHT', 'VALUE'] = inches_to_cm(
+        vit[vit.FEATURE == 'HEIGHT'].VALUE.astype(float)
+    )
+    vit.loc[vit.FEATURE == 'WEIGHT', 'VALUE'] = ounces_to_kg(
+        vit[vit.FEATURE == 'WEIGHT'].VALUE.astype(float)
+    )
+
+    # NOTE: Original filter_vitals writes Height_Weight.pkl here — we skip that.
+
+    # Keep only vitals (not HEIGHT/WEIGHT) with valid numeric values
+    pattern = r'([<>]\s*)?[-+]?\d*\.\d+|\d+\.?\d*'
+    vit = vit[
+        (vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
+        & (vit.VALUE.notnull())
+        & (
+            (vit['VALUE'].str.contains(pattern, regex=True))
+            | (vit['VALUE'].dtype == float)
+        )
+    ].copy(deep=True)
+
+    return vit
+
 
 def _filter_concepts_for_patient(
     base_df: pd.DataFrame,
@@ -1093,8 +1197,12 @@ def _filter_concepts_for_patient(
             continue
 
         # Apply concept-specific filter
+        # VitaleVaerdier uses a stateless variant to avoid writing
+        # Height_Weight.pkl to data/interim/ (shared with cohort pipeline).
         if concept == 'ADTHaendelser':
             concept_filtered = _filter_adt(inhospital, base_df=base_df)
+        elif concept == 'VitaleVaerdier':
+            concept_filtered = _filter_vitals_stateless(inhospital)
         else:
             filter_fn = collect_filter(concept)
             concept_filtered = filter_fn(inhospital)

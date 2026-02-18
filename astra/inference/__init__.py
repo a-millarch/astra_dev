@@ -1,4 +1,5 @@
 from astra.inference.pipeline import InferenceSession, InferenceResult, SHAPResult
+from astra.inference.patient_context import PatientContext
 from astra.inference.data_prep import (
     prepare_single_patient,
     prepare_from_raw_ehr,

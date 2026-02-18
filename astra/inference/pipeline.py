@@ -641,6 +641,76 @@ class InferenceSession:
 
         return shap_dict, channel2feature, feature_names_cat, feature_names_cont
 
+    # ------------------------------------------------------------------
+    # PatientContext-based inference
+    # ------------------------------------------------------------------
+
+    def create_patient_context(self, raw_data):
+        """Create a :class:`PatientContext` for repeated inference.
+
+        Args:
+            raw_data: Dict with patient data (same schema as
+                ``prepare_single_patient``).
+
+        Returns:
+            :class:`~astra.inference.patient_context.PatientContext`
+        """
+        from astra.inference.patient_context import PatientContext
+        return PatientContext.create(raw_data, self.bundle)
+
+    def predict_from_context(self, context, censor_step=None):
+        """Run prediction using an existing PatientContext.
+
+        Args:
+            context: A :class:`PatientContext` instance.
+            censor_step: Override timestep to evaluate at (temporal head).
+                Defaults to ``context.trajectory_length - 1``.
+
+        Returns:
+            :class:`InferenceResult`
+        """
+        step = censor_step if censor_step is not None else context.trajectory_length - 1
+        return self.predict(
+            context.x_ts,
+            context.x_ts_cat,
+            context.tab_df,
+            censor_step=step,
+            pid=context.pid,
+        )
+
+    def refresh_and_predict(self, context, current_time, new_data=None):
+        """Update a PatientContext with new data and run prediction.
+
+        Args:
+            context: A :class:`PatientContext` instance (modified in place).
+            current_time: New time horizon.
+            new_data: Optional dict with new measurements to append.
+
+        Returns:
+            :class:`InferenceResult`
+        """
+        context.refresh(current_time, new_data)
+        return self.predict_from_context(context)
+
+    def explain_from_context(self, context, censor_step=None):
+        """Compute SHAP explanation using an existing PatientContext.
+
+        Args:
+            context: A :class:`PatientContext` instance.
+            censor_step: Override timestep to attribute (temporal head).
+
+        Returns:
+            :class:`SHAPResult`
+        """
+        step = censor_step if censor_step is not None else context.trajectory_length - 1
+        return self.explain(
+            context.x_ts,
+            context.x_ts_cat,
+            context.tab_df,
+            censor_step=step,
+            pid=context.pid,
+        )
+
 
 # ============================================================================
 # HELPER: Extract a patient from existing data dict (for testing)

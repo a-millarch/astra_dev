@@ -1,0 +1,418 @@
+"""
+PatientContext: encapsulates all patient state for repeated inference.
+
+Supports two inference modes:
+
+1. **First-time inference** — Create a context via ``PatientContext.create()``
+   or ``PatientContext.from_csv()``.  This builds the fixed 30-day bin grid,
+   constructs initial tensors, and stores accumulated raw data.
+
+2. **Re-inference** — Call ``context.refresh(current_time, new_data)`` to
+   update visibility and incorporate new measurements without rebuilding
+   static patient info or recreating the bin grid.
+
+Usage::
+
+    session = InferenceSession.load("model_v2")
+
+    # First time
+    ctx = PatientContext.create(raw_data, session.bundle)
+    result = session.predict_from_context(ctx)
+
+    # Later — new data arrives
+    new_data = {'vitals': [...], 'labs': [...]}
+    ctx.refresh(current_time="2026-02-18 14:00", new_data=new_data)
+    result = session.predict_from_context(ctx)
+
+    # Persist / restore
+    ctx.save("patients/patient_abc.pkl")
+    ctx = PatientContext.load("patients/patient_abc.pkl", bundle=session.bundle)
+"""
+
+import copy
+import pickle
+import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PatientContext:
+    """Encapsulates all patient state for inference across repeated calls.
+
+    The bin grid is fixed at creation (admission + 30 days) so that tensor
+    positions are stable across re-inferences.  ``current_time`` controls
+    which bins are "visible" (i.e. ``trajectory_length``).
+    """
+
+    # ---- Identity ----------------------------------------------------------
+    pid: Any
+    admission_time: pd.Timestamp
+    max_time: pd.Timestamp  # admission + 30 days
+
+    # ---- Static (set once at creation) -------------------------------------
+    demographics: dict
+    tab_df: pd.DataFrame
+    bin_df: pd.DataFrame  # full 30-day grid, never changes
+
+    # ---- Dynamic (updated on refresh) --------------------------------------
+    current_time: pd.Timestamp
+    trajectory_length: int
+    x_ts: np.ndarray       # [n_channels, seq_len]
+    x_ts_cat: np.ndarray   # [n_cat_dims, seq_len]
+
+    # ---- Internal bookkeeping ----------------------------------------------
+    _raw_data: dict = field(repr=False)  # accumulated raw_data dict
+    _bundle_name: Optional[str] = field(default=None, repr=False)
+    _bundle_ref: Optional[dict] = field(default=None, repr=False)
+
+    # ---------------------------------------------------------------------- #
+    # Construction
+    # ---------------------------------------------------------------------- #
+
+    @classmethod
+    def create(
+        cls,
+        raw_data: dict,
+        bundle: dict,
+    ) -> "PatientContext":
+        """Create a PatientContext from a standardised raw_data dict.
+
+        This is the primary constructor.  It builds the fixed 30-day bin grid,
+        constructs all tensors, and stores the raw data for future refreshes.
+
+        ``raw_data`` follows the same schema as
+        :func:`~astra.inference.data_prep.prepare_single_patient`.
+        """
+        from astra.inference.data_prep import (
+            _create_patient_bins,
+            _count_visible_bins,
+            _build_continuous_ts,
+            _build_categorical_ts,
+            _build_tab_df,
+        )
+
+        # Parse timestamps
+        raw_data = copy.deepcopy(raw_data)
+        raw_data['admission_time'] = pd.Timestamp(raw_data['admission_time'])
+        raw_data['current_time'] = pd.Timestamp(raw_data['current_time'])
+
+        admission_time = raw_data['admission_time']
+        current_time = raw_data['current_time']
+        data_config = bundle['data_config']
+
+        # 1. Fixed 30-day bin grid
+        bin_df = _create_patient_bins(admission_time, data_config)
+        visible_bins = _count_visible_bins(bin_df, current_time)
+
+        logger.info(
+            f"PatientContext: {len(bin_df)} bins (30-day grid), "
+            f"{visible_bins} visible at {current_time}"
+        )
+
+        # 2. Tensors
+        x_ts, trajectory_length = _build_continuous_ts(
+            raw_data, bin_df, bundle, trajectory_length=visible_bins,
+        )
+        x_ts_cat = _build_categorical_ts(raw_data, bin_df, bundle)
+
+        # Zero out categorical beyond visibility
+        seq_len = bundle['model_params']['seq_len']
+        if trajectory_length < seq_len:
+            x_ts_cat[:, trajectory_length:] = 0.0
+
+        # 3. Static tabular
+        tab_df = _build_tab_df(raw_data, bundle)
+
+        from astra.inference.data_prep import MAX_PREDICTION_WINDOW
+
+        return cls(
+            pid=raw_data.get('pid'),
+            admission_time=admission_time,
+            max_time=admission_time + MAX_PREDICTION_WINDOW,
+            demographics=raw_data.get('demographics', {}),
+            tab_df=tab_df,
+            bin_df=bin_df,
+            current_time=current_time,
+            trajectory_length=trajectory_length,
+            x_ts=x_ts,
+            x_ts_cat=x_ts_cat,
+            _raw_data=raw_data,
+            _bundle_name=bundle.get('model_name'),
+            _bundle_ref=bundle,
+        )
+
+    @classmethod
+    def from_raw_ehr(
+        cls,
+        raw_ehr: dict,
+        bundle: dict,
+    ) -> "PatientContext":
+        """Create from raw Danish EHR data (same schema as ``prepare_from_raw_ehr``).
+
+        Standardises feature names then delegates to :meth:`create`.
+        """
+        from astra.inference.data_prep import (
+            _standardize_vitals,
+            _standardize_labs,
+            _standardize_icu,
+            _standardize_medications,
+            _standardize_procedures,
+            _standardize_adt,
+            SEX_MAP,
+        )
+        from astra.data.mappings import derive_first_hospital
+
+        admission_time = pd.Timestamp(raw_ehr['admission_time'])
+
+        age = raw_ehr.get('age')
+        if age is None and raw_ehr.get('dob') is not None:
+            dob = pd.Timestamp(raw_ehr['dob'])
+            age = int((admission_time - dob).days / 365.25)
+
+        sex_raw = raw_ehr.get('sex', np.nan)
+        sex = SEX_MAP.get(str(sex_raw), sex_raw)
+
+        hosp = raw_ehr.get('first_hospital')
+        if hosp is None and raw_ehr.get('first_department'):
+            hosp = derive_first_hospital(raw_ehr['first_department'])
+
+        raw_data = {
+            'pid': raw_ehr.get('pid'),
+            'admission_time': raw_ehr['admission_time'],
+            'current_time': raw_ehr['current_time'],
+            'demographics': {
+                'AGE': age,
+                'SEX': sex,
+                'FIRST_HOSPITAL': hosp,
+                'HEIGHT': raw_ehr.get('height_cm'),
+                'WEIGHT': raw_ehr.get('weight_kg'),
+                'ASMT_ELIX': raw_ehr.get('elixhauser_score'),
+            },
+            'vitals': _standardize_vitals(raw_ehr.get('vitals', [])),
+            'labs': _standardize_labs(raw_ehr.get('labs', [])),
+            'icu': _standardize_icu(raw_ehr.get('icu_scores', [])),
+            'medications': _standardize_medications(raw_ehr.get('medications', [])),
+            'procedures': _standardize_procedures(raw_ehr.get('procedures', [])),
+            'adt': _standardize_adt(raw_ehr.get('adt', [])),
+        }
+
+        return cls.create(raw_data, bundle)
+
+    @classmethod
+    def from_csv(
+        cls,
+        cpr_hash: str,
+        service_date,
+        current_time,
+        bundle: dict,
+        cfg: dict = None,
+        data_dir: str = 'data/raw',
+        ebm_models_dir: str = 'models/ebm',
+    ) -> "PatientContext":
+        """Create from raw CSV files (stateless — no shared file writes).
+
+        Equivalent to ``prepare_patient_from_csv`` but returns a reusable
+        PatientContext instead of a one-shot dict.
+        """
+        from astra.inference.data_prep import (
+            _build_single_patient_base_df,
+            _filter_concepts_for_patient,
+            _filtered_dfs_to_raw_data,
+        )
+
+        if cfg is None:
+            from astra.utils import get_cfg
+            cfg = get_cfg()
+
+        # Phase 1: Build base_df (stateless)
+        base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
+        logger.info(
+            f"Built base_df for patient {cpr_hash[:8]}...: "
+            f"trajectory {base_df['start'].iloc[0]} -> {base_df['end'].iloc[0]}"
+        )
+
+        # Phase 2: Filter concepts (stateless)
+        filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+        logger.info(
+            f"Filtered {len(filtered_concepts)} concepts: "
+            f"{list(filtered_concepts.keys())}"
+        )
+
+        # Phase 3: Convert to raw_data dict
+        raw_data = _filtered_dfs_to_raw_data(base_df, filtered_concepts, current_time)
+
+        # Phase 4: Create context
+        ctx = cls.create(raw_data, bundle)
+
+        # Phase 5: Inject EBM predictions if model expects them
+        if '_ebm_pred' in bundle.get('ts_channel_names', []):
+            from astra.inference.ebm import (
+                compute_ebm_predictions, inject_ebm_into_x_ts,
+            )
+
+            ebm_preds = compute_ebm_predictions(
+                raw_data, filtered_concepts, base_df, cfg, ebm_models_dir,
+            )
+            ctx.x_ts = inject_ebm_into_x_ts(
+                ctx.x_ts, ebm_preds, ctx.bin_df,
+                raw_data['admission_time'], bundle,
+            )
+
+        return ctx
+
+    # ---------------------------------------------------------------------- #
+    # Refresh (re-inference with updated data / time)
+    # ---------------------------------------------------------------------- #
+
+    def refresh(
+        self,
+        current_time,
+        new_data: Optional[dict] = None,
+    ) -> dict:
+        """Update patient state and return model-ready tensors.
+
+        Args:
+            current_time: New time horizon for visibility masking.
+            new_data: Optional dict with new measurements to append.
+                Same keys as ``raw_data`` (vitals, labs, icu, medications,
+                procedures, adt).  New entries are appended to accumulated
+                data; existing entries are preserved.
+
+        Returns:
+            Dict with x_ts, x_ts_cat, tab_df, trajectory_length, bin_df —
+            same schema as ``prepare_single_patient`` output.
+        """
+        from astra.inference.data_prep import (
+            _count_visible_bins,
+            _build_continuous_ts,
+            _build_categorical_ts,
+        )
+
+        self.current_time = pd.Timestamp(current_time)
+
+        # Append new data to accumulated store
+        if new_data:
+            for key in ('vitals', 'labs', 'icu', 'medications', 'procedures', 'adt'):
+                new_entries = new_data.get(key, [])
+                if new_entries:
+                    self._raw_data.setdefault(key, []).extend(new_entries)
+                    logger.info(f"Appended {len(new_entries)} {key} entries")
+
+        # Update current_time in raw_data (used by tensor builders)
+        self._raw_data['current_time'] = self.current_time
+
+        bundle = self._bundle_ref
+        if bundle is None:
+            raise RuntimeError(
+                "Bundle reference lost (was this context deserialized without "
+                "re-attaching the bundle? Use PatientContext.load(path, bundle=...))"
+            )
+
+        # Recompute visibility
+        visible_bins = _count_visible_bins(self.bin_df, self.current_time)
+
+        # Full tensor rebuild from accumulated data
+        self.x_ts, self.trajectory_length = _build_continuous_ts(
+            self._raw_data, self.bin_df, bundle, trajectory_length=visible_bins,
+        )
+        self.x_ts_cat = _build_categorical_ts(self._raw_data, self.bin_df, bundle)
+
+        # Zero out beyond visibility
+        seq_len = bundle['model_params']['seq_len']
+        if self.trajectory_length < seq_len:
+            self.x_ts_cat[:, self.trajectory_length:] = 0.0
+
+        logger.info(
+            f"Refreshed context: trajectory_length={self.trajectory_length}, "
+            f"current_time={self.current_time}"
+        )
+
+        return self.to_dict()
+
+    # ---------------------------------------------------------------------- #
+    # Output helpers
+    # ---------------------------------------------------------------------- #
+
+    def to_dict(self) -> dict:
+        """Return model-ready tensors in the same format as ``prepare_single_patient``."""
+        return {
+            'x_ts': self.x_ts,
+            'x_ts_cat': self.x_ts_cat,
+            'tab_df': self.tab_df,
+            'trajectory_length': self.trajectory_length,
+            'bin_df': self.bin_df,
+        }
+
+    # ---------------------------------------------------------------------- #
+    # Serialization
+    # ---------------------------------------------------------------------- #
+
+    def save(self, path: Union[str, Path]) -> None:
+        """Persist context to disk.
+
+        The deployment bundle reference is NOT saved (too large).  When
+        loading, pass the bundle explicitly via ``PatientContext.load()``.
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            'pid': self.pid,
+            'admission_time': self.admission_time,
+            'max_time': self.max_time,
+            'demographics': self.demographics,
+            'tab_df': self.tab_df,
+            'bin_df': self.bin_df,
+            'current_time': self.current_time,
+            'trajectory_length': self.trajectory_length,
+            'x_ts': self.x_ts,
+            'x_ts_cat': self.x_ts_cat,
+            '_raw_data': self._raw_data,
+            '_bundle_name': self._bundle_name,
+        }
+
+        with open(path, 'wb') as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        logger.info(f"Saved PatientContext to {path}")
+
+    @classmethod
+    def load(
+        cls,
+        path: Union[str, Path],
+        bundle: dict,
+    ) -> "PatientContext":
+        """Load a persisted context and re-attach the deployment bundle.
+
+        Args:
+            path: Path to the saved context file.
+            bundle: Deployment bundle (must match the one used at creation).
+        """
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+
+        ctx = cls(
+            pid=state['pid'],
+            admission_time=state['admission_time'],
+            max_time=state['max_time'],
+            demographics=state['demographics'],
+            tab_df=state['tab_df'],
+            bin_df=state['bin_df'],
+            current_time=state['current_time'],
+            trajectory_length=state['trajectory_length'],
+            x_ts=state['x_ts'],
+            x_ts_cat=state['x_ts_cat'],
+            _raw_data=state['_raw_data'],
+            _bundle_name=state.get('_bundle_name'),
+            _bundle_ref=bundle,
+        )
+
+        logger.info(f"Loaded PatientContext from {path} (pid={ctx.pid})")
+        return ctx
