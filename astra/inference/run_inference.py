@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from astra.inference import InferenceSession, PatientContext
+from astra.inference import InferenceSession, PatientContext, visualize_data_completeness
 from astra.evaluation.behavior import visualize_shap_individual
 from astra.visualize.inference import plot_prediction_trajectory
 
@@ -135,6 +135,96 @@ def run(cpr_hash, service_date, current_time, model_name,
     print(f"{'='*60}")
 
 
+def initialize_session(cpr_hash, service_date, current_time, model_name,
+                data_dir="data/raw", save_dir="reports/inference", device=None):
+
+    os.makedirs(save_dir, exist_ok=True)
+    pid_short = cpr_hash[:8] + service_date.astype(str)[:10].replace('-','')
+
+    # ---- 1. Load session ----
+    print(f"\n{'='*60}")
+    print(f"Loading model: {model_name}")
+    print(f"{'='*60}")
+    session = InferenceSession.load(model_name, device=device)
+    print(f"  Temporal head: {session.is_temporal}")
+    print(f"  Channels: {len(session.bundle['ts_channel_names'])}")
+
+    # ---- 2. Create PatientContext from CSV ----
+    print(f"\n{'='*60}")
+    print(f"Building PatientContext for {pid_short}...")
+    print(f"  Service date:  {service_date}")
+    print(f"  Current time:  {current_time}")
+    print(f"{'='*60}")
+
+    ctx = PatientContext.from_csv(
+        cpr_hash=cpr_hash,
+        service_date=service_date,
+        current_time=current_time,
+        bundle=session.bundle,
+        data_dir=data_dir,
+    )
+
+    print(f"  PID:               {ctx.pid}")
+    print(f"  Admission:         {ctx.admission_time}")
+    print(f"  Max window:        {ctx.max_time}")
+    print(f"  Trajectory length: {ctx.trajectory_length}")
+    print(f"  Total bins:        {len(ctx.bin_df)}")
+    print(f"  x_ts shape:        {ctx.x_ts.shape}")
+    print(f"  x_ts_cat shape:    {ctx.x_ts_cat.shape}")
+
+    # ---- 3. Predict ----
+    print(f"\n{'='*60}")
+    print("Running prediction...")
+    print(f"{'='*60}")
+
+    result = session.predict_from_context(ctx)
+    print(f"  P(deceased_30d):   {result.probability:.4f}")
+    print(f"  Censor step:       {result.censor_step}")
+    print(f"  Trajectory length: {result.trajectory_length}")
+    
+    session.ctx = ctx
+    session.result = result
+    
+    return session
+    
+def default_session_plot(session):
+    ctx = session.ctx
+    result = session.predict_from_context(ctx)
+    # ---- 4. Plot prediction trajectory ----
+    plot_prediction_trajectory(
+        result, ctx,
+        save_path=None,
+    )
+
+    # ---- 5. SHAP explanation ----
+    print(f"\n{'='*60}")
+    print("Computing SHAP explanation...")
+    print(f"{'='*60}")
+
+    shap_result = session.explain_from_context(ctx)
+
+    shap_dict, channel2feature, feature_names_cat, feature_names_cont = (
+        session.shap_to_viz_dict(
+            shap_result,
+            x_ts=ctx.x_ts,
+            x_ts_cat=ctx.x_ts_cat,
+            tab_df=ctx.tab_df,
+        )
+    )
+
+   # shap_save_path = f"{save_dir}/shap_patient_{pid_short}.png"
+    visualize_shap_individual(
+        shap_dict,
+        sample_idx=0,
+        channel2feature=channel2feature,
+        feature_names_cat=feature_names_cat,
+        feature_names_cont=feature_names_cont,
+        save_path=None,
+    )
+    
+    visualize_data_completeness(shap_dict, 
+                            channel2feature=channel2feature, save_path='reports/tst2.png')
+    
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="End-to-end inference example with PatientContext"

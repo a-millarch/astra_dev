@@ -1110,11 +1110,16 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 
     if dp_idx is not None:
         raw_mask = ts_data[dp_idx] > 0.5  # [seq_len]
-    elif eh_idx is not None:
+        if not np.any(raw_mask):
+            # _data_present found but all absent/NaN (e.g. pre-fix inference bundle)
+            # fall through to elapsed_hours or any-NaN fallback
+            dp_idx = None  # disable so elif branch triggers
+
+    if dp_idx is None and eh_idx is not None:
         # elapsed_hours is >0 for all in-trajectory steps, 0.0 for padding
         eh = ts_data[eh_idx]
         raw_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
-    else:
+    elif dp_idx is None:
         # NaN-aware fallback: any channel has non-NaN data at this timestep
         any_present = np.any(~np.isnan(ts_data), axis=0)
         raw_mask = any_present

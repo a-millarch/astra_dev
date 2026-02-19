@@ -386,6 +386,25 @@ def _build_continuous_ts(
         n = min(len(values), seq_len)
         x_ts[ch_idx, :n] = values[:n]
 
+    # Compute _data_present indicator: 1.0 where any clinical channel has a measurement.
+    # Must happen BEFORE padding zeros are applied so the padding bins stay 0.0.
+    # Auxiliary channels (elapsed_hours, bin_width_hours, _data_present, _ebm_pred) are
+    # excluded from the presence check — only actual clinical measurements count.
+    _AUXILIARY = {'elapsed_hours', 'bin_width_hours', '_data_present', '_ebm_pred'}
+    if '_data_present' in channel_to_idx:
+        dp_ch = channel_to_idx['_data_present']
+        clinical_indices = [
+            channel_to_idx[name]
+            for name in ts_channel_names
+            if name not in _AUXILIARY and name in channel_to_idx
+        ]
+        if clinical_indices:
+            # any non-NaN value in clinical channels → measurement present
+            has_data = ~np.all(np.isnan(x_ts[clinical_indices, :]), axis=0)  # [seq_len]
+            x_ts[dp_ch, :] = has_data.astype(np.float64)
+        else:
+            x_ts[dp_ch, :] = 0.0
+
     # Trajectory length: use explicit value (from visibility masking) or bin count
     if trajectory_length is None:
         trajectory_length = len(bin_df)
