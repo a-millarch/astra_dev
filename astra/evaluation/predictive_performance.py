@@ -18,7 +18,7 @@ from astra.data.dataloader import dfwide2ts_dls, normalize_with_padding_mask
 from astra.evaluation.utils import (
     calculate_roc_auc_ci, calculate_average_precision_ci,
     _parse_timedelta_to_minutes, _get_intervals_from_cfg,
-    time_to_step, step_to_time,
+    time_to_step, step_to_time, prepare_learner
 )
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
@@ -788,18 +788,7 @@ def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval:
     # ============================================================================
     # LOAD MODEL
     # ============================================================================
-    logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(
-        data, cfg,
-        temporal_head=is_temporal,
-        causal=model_cfg.get("causal", False),
-        temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
-    )
-    learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name, strict=False)
-    learn.to('cuda')
-    learn = patch_learner_get_preds(learn)
-    logger.info(f"Model loaded (temporal_head={is_temporal})")
+    learn = prepare_learner(data, cfg)
 
     # ============================================================================
     # TEMPORAL MODEL: single-forward-pass evaluation

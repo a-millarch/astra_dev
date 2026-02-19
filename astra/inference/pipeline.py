@@ -550,6 +550,11 @@ class InferenceSession:
         if x_ts_cat.ndim == 2:
             x_ts_cat = x_ts_cat[np.newaxis, ...]
 
+        # Compute trajectory_length from the zero-padded x_ts so that
+        # visualize_data_completeness can use it as the authoritative bound
+        # rather than relying on NaN heuristics (which fail for zero-padded data).
+        traj_len_ts = int(get_trajectory_lengths(x_ts)[0])
+
         shap_dict = {
             'ts_shap': ts_shap,
             'cat_ts_shap': cat_ts_shap,
@@ -560,6 +565,7 @@ class InferenceSession:
             'cont_shap': cont_shap,
             'n_static_cat': len(classes),
             'eval_timestep': shap_result.eval_timestep,
+            'trajectory_length': traj_len_ts,
             'test_data': {
                 'ts': x_ts,
                 'ts_cat': x_ts_cat,
