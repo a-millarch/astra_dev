@@ -21,29 +21,54 @@ def _parse_timedelta_to_minutes(s):
         raise ValueError(f"Cannot parse time string: {s}")
 
 
-def _get_intervals_from_cfg():
+def _get_intervals(bin_intervals, bin_freq_include=None):
     """
-    Parse cfg['bin_intervals'] into a list of (start_min, end_min, bin_min) tuples.
+    Parse bin_intervals into a list of (start_min, end_min, bin_min) tuples,
+    filtered by bin_freq_include.
 
-    cfg['bin_intervals'] keys are interval endpoints (e.g. '3h', '6h', '14D', 'end'),
-    values are bin frequencies (e.g. '5min', '10min', '1h').
+    Args:
+        bin_intervals: OrderedDict mapping interval endpoints (e.g. '3h', '14D', 'end')
+            to bin frequencies (e.g. '5min', '10min', '1h').
+        bin_freq_include: Optional list of frequency strings to keep.  When set,
+            intervals whose frequency is not in the list are skipped (but
+            their time span still advances ``start_min`` so that later
+            intervals get the correct offset).
     """
-    bin_intervals = cfg["bin_intervals"]
     intervals = []
     start_min = 0
 
     for end_str, freq_str in bin_intervals.items():
         end_min = None if end_str == "end" else _parse_timedelta_to_minutes(end_str)
         bin_min = _parse_timedelta_to_minutes(freq_str)
-        intervals.append((start_min, end_min, bin_min))
+        if bin_freq_include is None or freq_str in bin_freq_include:
+            intervals.append((start_min, end_min, bin_min))
         if end_min is not None:
             start_min = end_min
 
     return intervals
 
 
-def time_to_step(time_value, time_unit='min'):
-    """Convert time value to time step index using config bin intervals."""
+def _get_intervals_from_cfg():
+    """
+    Parse cfg['bin_intervals'] into a list of (start_min, end_min, bin_min) tuples,
+    respecting cfg['bin_freq_include'] filter.
+    """
+    return _get_intervals(
+        cfg["bin_intervals"],
+        cfg.get("bin_freq_include"),
+    )
+
+
+def time_to_step(time_value, time_unit='min', data_config=None):
+    """Convert time value to time step index using bin intervals.
+
+    Args:
+        time_value: Numeric time offset from admission start.
+        time_unit: ``'min'``, ``'h'`` or ``'D'``.
+        data_config: Optional dict with ``'bin_intervals'`` and
+            ``'bin_freq_include'`` keys (e.g. from a deployment bundle).
+            When *None*, reads from the global ``cfg``.
+    """
     if time_unit == 'min':
         time_min = time_value
     elif time_unit == 'h':
@@ -53,7 +78,16 @@ def time_to_step(time_value, time_unit='min'):
     else:
         raise ValueError("Unsupported time unit. Use 'min', 'h' or 'D'.")
 
-    intervals = _get_intervals_from_cfg()
+    if time_min <= 0:
+        return 0
+
+    if data_config is not None:
+        intervals = _get_intervals(
+            data_config['bin_intervals'],
+            data_config.get('bin_freq_include'),
+        )
+    else:
+        intervals = _get_intervals_from_cfg()
 
     for i, (start_min, end_min, bin_min) in enumerate(intervals):
         eff_end = end_min if end_min is not None else float('inf')
@@ -69,9 +103,22 @@ def time_to_step(time_value, time_unit='min'):
     return None
 
 
-def step_to_time(step):
-    """Convert step index back to time in minutes using config bin intervals."""
-    intervals = _get_intervals_from_cfg()
+def step_to_time(step, data_config=None):
+    """Convert step index back to time in minutes using bin intervals.
+
+    Args:
+        step: 0-based step index.
+        data_config: Optional dict with ``'bin_intervals'`` and
+            ``'bin_freq_include'`` keys.  When *None*, reads from
+            the global ``cfg``.
+    """
+    if data_config is not None:
+        intervals = _get_intervals(
+            data_config['bin_intervals'],
+            data_config.get('bin_freq_include'),
+        )
+    else:
+        intervals = _get_intervals_from_cfg()
 
     bins_cum = [0]
     for start_min, end_min, bin_min in intervals[:-1]:

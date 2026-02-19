@@ -93,11 +93,11 @@ class PatientContext:
         """
         from astra.inference.data_prep import (
             _create_patient_bins,
-            _count_visible_bins,
             _build_continuous_ts,
             _build_categorical_ts,
             _build_tab_df,
         )
+        from astra.evaluation.utils import time_to_step
 
         # Parse timestamps
         raw_data = copy.deepcopy(raw_data)
@@ -110,7 +110,11 @@ class PatientContext:
 
         # 1. Fixed 30-day bin grid
         bin_df = _create_patient_bins(admission_time, data_config)
-        visible_bins = _count_visible_bins(bin_df, current_time)
+
+        # Convert elapsed time to step index using cfg bin intervals
+        delta_minutes = (current_time - admission_time).total_seconds() / 60
+        step = time_to_step(delta_minutes, 'min', data_config=data_config)
+        visible_bins = (step + 1) if step is not None else len(bin_df)
 
         logger.info(
             f"PatientContext: {len(bin_df)} bins (30-day grid), "
@@ -300,10 +304,10 @@ class PatientContext:
             same schema as ``prepare_single_patient`` output.
         """
         from astra.inference.data_prep import (
-            _count_visible_bins,
             _build_continuous_ts,
             _build_categorical_ts,
         )
+        from astra.evaluation.utils import time_to_step
 
         self.current_time = pd.Timestamp(current_time)
 
@@ -325,8 +329,11 @@ class PatientContext:
                 "re-attaching the bundle? Use PatientContext.load(path, bundle=...))"
             )
 
-        # Recompute visibility
-        visible_bins = _count_visible_bins(self.bin_df, self.current_time)
+        # Recompute visibility using cfg bin intervals
+        data_config = bundle['data_config']
+        delta_minutes = (self.current_time - self.admission_time).total_seconds() / 60
+        step = time_to_step(delta_minutes, 'min', data_config=data_config)
+        visible_bins = (step + 1) if step is not None else len(self.bin_df)
 
         # Full tensor rebuild from accumulated data
         self.x_ts, self.trajectory_length = _build_continuous_ts(

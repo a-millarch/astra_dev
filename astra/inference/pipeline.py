@@ -252,7 +252,12 @@ class InferenceSession:
         if self.is_temporal:
             # logits: [1, seq_len]
             probs_all = torch.sigmoid(logits).cpu().numpy()[0]  # [seq_len]
-            step = min(censor_step, traj_len - 1) if censor_step is not None else traj_len - 1
+            seq_len = x_ts_t.shape[2]
+            if censor_step is not None:
+                # Trust the caller's step (from time_to_step); only cap at seq_len
+                step = min(censor_step, seq_len - 1)
+            else:
+                step = traj_len - 1
             step = max(step, 0)
             probability = float(probs_all[step])
             return InferenceResult(
@@ -307,12 +312,14 @@ class InferenceSession:
         # Temporal head: selects which output position to explain.
         # Non-temporal head: stored as eval_timestep for visualization cropping only
         #                    (the wrapper always returns class-1 logit regardless).
+        seq_len = x_ts_t.shape[2]
         target_step = None
         if self.is_temporal:
             step = censor_step if censor_step is not None else traj_len - 1
-            target_step = min(max(step, 0), traj_len - 1)
+            # Trust the caller's step (from time_to_step); only cap at seq_len
+            target_step = min(max(step, 0), seq_len - 1)
         elif censor_step is not None:
-            target_step = min(max(censor_step, 0), traj_len - 1)
+            target_step = min(max(censor_step, 0), seq_len - 1)
 
         # Censor future data if requested
         if censor_step is not None and censor_step < x_ts_t.shape[2] - 1:

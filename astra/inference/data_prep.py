@@ -50,8 +50,8 @@ def _create_patient_bins(
     This makes the bin grid stable across re-inferences: position N always
     maps to the same time window regardless of when inference is called.
 
-    Use ``_count_visible_bins()`` to determine how many bins are "live"
-    at a given ``current_time``.
+    Use ``time_to_step()`` from ``astra.evaluation.utils`` to convert
+    elapsed time to a step index on this grid.
 
     Returns:
         DataFrame with columns [bin_start, bin_end, bin_counter, bin_freq, position]
@@ -597,8 +597,11 @@ def prepare_single_patient(
         data_config,
     )
 
-    # Determine how many bins are "visible" at current_time
-    visible_bins = _count_visible_bins(bin_df, raw_data['current_time'])
+    # Determine how many bins are "visible" at current_time using cfg bin intervals
+    from astra.evaluation.utils import time_to_step
+    delta_minutes = (raw_data['current_time'] - raw_data['admission_time']).total_seconds() / 60
+    step = time_to_step(delta_minutes, 'min', data_config=data_config)
+    visible_bins = (step + 1) if step is not None else len(bin_df)
     logger.info(
         f"Created {len(bin_df)} bins (30-day grid), "
         f"{visible_bins} visible at {raw_data['current_time']}"
