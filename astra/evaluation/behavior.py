@@ -199,12 +199,11 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x_ts = x_ts.clone()
             x_ts[nan_mask] = 0
 
-        # Key padding mask: timesteps where ALL channels are zero/NaN
-        if self.model.key_padding_mask == "auto":
-            is_absent = (x_ts == 0) | nan_mask
-            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
-        else:
-            key_padding_mask = None
+        # Match model's _key_padding_mask: only mask when NaN values were present.
+        # During training on clean data _key_padding_mask returns None; using a
+        # zero-based mask here would compute gradients through a different attention
+        # pattern, invalidating the SHAP explanation.
+        key_padding_mask = None
 
         x = self.model.W_P(x_ts).transpose(1, 2)
 
@@ -268,12 +267,11 @@ class ModelWrapperWithRawCatTS(nn.Module):
             x_ts = x_ts.clone()
             x_ts[nan_mask] = 0
 
-        # Key padding mask: timesteps where ALL channels are zero/NaN
-        if self.model.key_padding_mask == "auto":
-            is_absent = (x_ts == 0) | nan_mask
-            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
-        else:
-            key_padding_mask = None
+        # Match model's _key_padding_mask: only mask when NaN values were present.
+        # During training on clean data _key_padding_mask returns None; using a
+        # zero-based mask here would compute gradients through a different attention
+        # pattern, invalidating the SHAP explanation.
+        key_padding_mask = None
 
         # Continuous TS encoding
         x = self.model.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
@@ -475,7 +473,7 @@ def get_pid_for_sample_idx(pids: List, sample_idx: int) -> Optional[Union[int, s
 def calculate_shap_from_dataloaders(model, background_loader, test_loader, encoding_info,
                                      device='cuda', max_background_samples=200, max_test_samples=100,
                                      compute_per_category_shap=True, specific_pids: List = None,
-                                     all_pids: List = None):
+                                     all_pids: List = None, eval_timestep: int = -1):
     """
     Calculate SHAP values for all model inputs.
 
@@ -487,6 +485,12 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
                        will be used for SHAP calculation.
         all_pids: List of all PIDs in the test loader (in order). Required if specific_pids
                   is provided, to map PIDs to sample indices.
+        eval_timestep: For temporal head models, which sequence position to evaluate.
+                       Default -1 (last position) is wrong for causal models — SHAP gradients
+                       decay to near-zero for early steps through the long attention chain.
+                       Use a fixed clinical timepoint instead, e.g.:
+                           from astra.evaluation.utils import time_to_step
+                           eval_timestep=time_to_step(24, 'h')  # prediction at 24 h
     """
     print("Extracting background data...")
     import torch
@@ -540,6 +544,10 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     bg_cat_emb = embed_categorical_features(model, bg_cat) if n_static_cat > 0 else None
     test_cat_emb = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
     
+    if model.temporal_head_enabled:
+        print(f"  Temporal head: eval_timestep={eval_timestep} "
+              f"({'last position — consider a clinical timepoint' if eval_timestep == -1 else 'OK'})")
+
     if bg_cat_emb is not None:
         print(f"  Static categorical embedded: {bg_cat_emb.shape}")
     
@@ -548,20 +556,22 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     if compute_per_category_shap and has_cat_ts:
         # Use wrapper that takes RAW categorical TS for per-category SHAP
         print("  Using ModelWrapperWithRawCatTS for per-category SHAP values")
-        wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts)
-        
+        wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts,
+                                                 eval_timestep=eval_timestep)
+
         # Ensure categorical TS is float and requires grad
         bg_ts_cat_input = bg_ts_cat.float()
         test_ts_cat_input = test_ts_cat.float()
         bg_ts_cat_input.requires_grad = True
         test_ts_cat_input.requires_grad = True
-        
+
         bg_inputs = [bg_ts, bg_ts_cat_input]
         test_inputs = [test_ts, test_ts_cat_input]
     else:
         # Use wrapper with pre-embedded categorical TS (faster, less granular)
         print("  Using ModelWrapperWithEmbeddings (embedded categorical TS)")
-        wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts)
+        wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
+                                                   eval_timestep=eval_timestep)
         
         if has_cat_ts:
             bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
