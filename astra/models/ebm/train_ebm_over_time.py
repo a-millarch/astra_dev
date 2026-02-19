@@ -33,120 +33,16 @@ from interpret.glassbox import ExplainableBoostingClassifier
 
 from astra.utils import get_base_df, get_train_test_split, cfg, logger
 from astra.data.datasets import AggregatedDS
+from astra.evaluation.utils import time_to_step, step_to_time
+from astra.evaluation.predictive_performance import generate_time_thresholds, format_step_label
 
 
 def step_to_timedelta(step: int) -> pd.Timedelta:
-    """
-    Convert step index to pandas Timedelta for masking point.
-
-    Uses the same time binning scheme as the hybrid model evaluation.
-    """
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-
-    bins_cum = [0]
-    for interval in intervals[:-1]:
-        duration_min = (interval['end_h'] - interval['start_h']) * 60
-        bins = duration_min // interval['bin_min']
-        bins_cum.append(bins_cum[-1] + bins)
-
-    for i in range(len(bins_cum) - 1):
-        if bins_cum[i] <= step < bins_cum[i+1]:
-            interval = intervals[i]
-            step_offset = step - bins_cum[i]
-            start_min = interval['start_h'] * 60
-            time_min = start_min + (step_offset + 1) * interval['bin_min']
-            return pd.Timedelta(minutes=time_min)
-
-    # Last interval
-    interval = intervals[-1]
-    step_offset = step - bins_cum[-1]
-    start_min = interval['start_h'] * 60
-    time_min = start_min + (step_offset + 1) * interval['bin_min']
+    """Convert step index to pandas Timedelta using cfg bin intervals."""
+    time_min = step_to_time(step)
+    if time_min is None:
+        raise ValueError(f"Step {step} is outside the configured bin grid")
     return pd.Timedelta(minutes=time_min)
-
-
-def time_to_step(time_value, time_unit='min'):
-    """Convert time value to time step index (matching hybrid model evaluation)."""
-    if time_unit == 'min':
-        time_min = time_value
-    elif time_unit == 'h':
-        time_min = time_value * 60
-    elif time_unit == 'D':
-        time_min = time_value * 24 * 60
-    else:
-        raise ValueError("Unsupported time unit. Use 'min', 'h' or 'D'.")
-
-    intervals = [
-        {'start_h': 0, 'end_h': 6, 'bin_min': 10},
-        {'start_h': 6, 'end_h': 12, 'bin_min': 20},
-        {'start_h': 12, 'end_h': 24, 'bin_min': 60},
-        {'start_h': 24, 'end_h': 72, 'bin_min': 240},
-        {'start_h': 72, 'end_h': 336, 'bin_min': 720},
-        {'start_h': 336, 'end_h': 720, 'bin_min': 1440},
-        {'start_h': 720, 'end_h': 2160, 'bin_min': 10080},
-        {'start_h': 2160, 'end_h': None, 'bin_min': 43200},
-    ]
-
-    for i, interval in enumerate(intervals):
-        start_min = interval['start_h'] * 60
-        end_min = interval['end_h'] * 60 if interval['end_h'] is not None else float('inf')
-        if start_min < time_min <= end_min:
-            offset_min = time_min - start_min
-            step_offset = int(np.ceil(offset_min / interval['bin_min'])) - 1
-            bins_cum = 0
-            for j in range(i):
-                duration_min = (intervals[j]['end_h'] - intervals[j]['start_h']) * 60
-                bins_cum += duration_min // intervals[j]['bin_min']
-            return bins_cum + step_offset
-    return None
-
-
-def generate_time_thresholds(max_days=30, cut_hours=72, step_hours=1, step_days=1):
-    """Generate list of time steps to evaluate at (matching hybrid model evaluation)."""
-    thresholds = []
-
-    # Hourly steps up to cut_hours
-    for h in range(step_hours, cut_hours+1, step_hours):
-        step = time_to_step(h, 'h')
-        if step is not None:
-            thresholds.append(step)
-
-    # Daily steps after cut_hours
-    start_day = int(np.ceil(cut_hours/24))
-    for d in range(start_day+1, max_days+1, step_days):
-        step = time_to_step(d, 'D')
-        if step is not None:
-            thresholds.append(step)
-
-    return sorted(list(set(thresholds)))
-
-
-def format_step_label(step):
-    """Convert step to human-readable time label."""
-    timedelta = step_to_timedelta(step)
-    time_min = timedelta.total_seconds() / 60
-
-    if time_min < 60:
-        return f"{int(time_min)}min"
-    elif time_min < 24 * 60:
-        hours = time_min / 60
-        if hours.is_integer():
-            hours = int(hours)
-        return f"{hours}h"
-    else:
-        days = time_min / (24 * 60)
-        if days.is_integer():
-            days = int(days)
-        return f"{days}D"
 
 
 def temporal_train_val_split(X, y, val_frac=0.25):
