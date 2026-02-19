@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 from astra.data.dataloader import (
     get_trajectory_lengths,
@@ -51,108 +50,12 @@ class SHAPResult:
     static_cat_shap: Optional[Dict[str, float]] = None   # {feature: importance}
     static_cont_shap: Optional[Dict[str, float]] = None  # {feature: importance}
     top_features: List[Tuple[str, float]] = field(default_factory=list)
+    eval_timestep: Optional[int] = None                  # step the model was evaluated at
 
 
-# ============================================================================
-# SHAP MODEL WRAPPER (fixes causal mask + temporal head output)
-# ============================================================================
-
-class _SHAPModelWrapper(nn.Module):
-    """
-    SHAP-compatible model wrapper that handles:
-    - Causal masking (passes attn_mask to transformer)
-    - Temporal head: returns logit at a specific timestep
-    - Standard head: returns class probabilities as-is
-    """
-
-    def __init__(self, model, has_cat_ts=False, target_step=None):
-        super().__init__()
-        self.model = model
-        self.has_cat_ts = has_cat_ts
-        self.target_step = target_step  # For temporal head: which timestep to attribute
-
-    def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
-        # Handle NaN and build key_padding_mask (matching model._key_padding_mask)
-        nan_mask = torch.isnan(x_ts)
-        if nan_mask.any():
-            x_ts = x_ts.clone()
-            x_ts[nan_mask] = 0
-
-        # Key padding mask: timesteps where ALL channels are zero/NaN
-        if self.model.key_padding_mask == "auto":
-            is_absent = (x_ts == 0) | nan_mask
-            key_padding_mask = is_absent.all(dim=1)  # [batch, seq_len]
-        else:
-            key_padding_mask = None
-
-        x = self.model.W_P(x_ts).transpose(1, 2)
-
-        # Categorical time series
-        if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
-            x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
-            x_ts_cat_embedded_list = []
-            dim_offset = 0
-            for embed_layer, (feat_name, n_classes) in zip(
-                self.model.ts_cat_embeds, self.model.ts_cat_dims.items()
-            ):
-                feat_multi_hot = x_ts_cat[:, :, dim_offset:dim_offset + n_classes]
-                x_ts_cat_embedded_list.append(embed_layer(feat_multi_hot))
-                dim_offset += n_classes
-
-            if self.model.cat_ts_combine == 'add':
-                x = x + torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-            else:
-                x = torch.cat([x, torch.cat(x_ts_cat_embedded_list, dim=-1)], dim=-1)
-
-        # Static categorical (pre-embedded)
-        if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
-            x = torch.cat([x, x_cat_embedded], 1)
-
-        # Static continuous
-        if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
-            x = torch.cat([x, x_cont_emb], 1)
-
-        # Positional encoding + transformer
-        x += self.model.pos_enc
-        if self.model.res_drop is not None:
-            x = self.model.res_drop(x)
-
-        # Extend key_padding_mask for static tokens (never masked)
-        if key_padding_mask is not None:
-            n_static = x.shape[1] - key_padding_mask.shape[1]
-            if n_static > 0:
-                static_mask = torch.zeros(
-                    key_padding_mask.shape[0], n_static,
-                    dtype=torch.bool, device=key_padding_mask.device,
-                )
-                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
-
-        # Pass causal mask if model uses causal attention
-        attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-
-        # Head
-        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
-            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            if self.target_step is not None:
-                # Return scalar logit at target timestep — SHAP attributes to this
-                return logits[:, self.target_step : self.target_step + 1]
-            return logits
-        else:
-            return self.model.head(x)  # [batch, c_out]
-
-
-def _embed_categorical_features(model, x_cat):
-    """Pre-embed static categorical features for SHAP."""
-    if x_cat is None or x_cat.shape[1] == 0:
-        return None
-    with torch.no_grad():
-        x_cat_emb = [model.embeds[i](x_cat[:, i]).unsqueeze(1)
-                      for i in range(x_cat.shape[1])]
-        x_cat_emb = torch.cat(x_cat_emb, 1)
-    x_cat_emb.requires_grad = True
-    return x_cat_emb
+# _SHAPModelWrapper and _embed_categorical_features live in
+# astra.evaluation.behavior (ModelWrapperWithRawCatTS / embed_categorical_features).
+# Imported lazily inside explain() to keep pipeline.py dependency-light.
 
 
 # ============================================================================
@@ -388,6 +291,7 @@ class InferenceSession:
             SHAPResult
         """
         import shap
+        from astra.evaluation.behavior import ModelWrapperWithRawCatTS, embed_categorical_features
 
         if self._bg is None:
             raise RuntimeError(
@@ -425,11 +329,12 @@ class InferenceSession:
 
         # Wrapper with causal mask + temporal step targeting
         has_cat_ts = self.model.n_ts_cat > 0
-        wrapped = _SHAPModelWrapper(self.model, has_cat_ts, target_step=target_step)
+        wrapped = ModelWrapperWithRawCatTS(self.model, has_cat_ts=has_cat_ts,
+                                           eval_timestep=target_step if target_step is not None else -1)
 
         # Pre-embed static categoricals (not differentiable — treated as context)
-        bg_cat_emb = _embed_categorical_features(self.model, self._bg['cat'])
-        sample_cat_emb = _embed_categorical_features(self.model, x_cat_t)
+        bg_cat_emb = embed_categorical_features(self.model, self._bg['cat'])
+        sample_cat_emb = embed_categorical_features(self.model, x_cat_t)
 
         # Build input lists for GradientExplainer
         bg_inputs = [bg_ts, bg_ts_cat.float().requires_grad_(True)]
@@ -534,6 +439,7 @@ class InferenceSession:
             static_cat_shap=static_cat_dict,
             static_cont_shap=static_cont_dict,
             top_features=all_importances[:20],
+            eval_timestep=target_step,
         )
 
     # ------------------------------------------------------------------
@@ -649,6 +555,7 @@ class InferenceSession:
             'cat_shap_embedded': None,
             'cont_shap': cont_shap,
             'n_static_cat': len(classes),
+            'eval_timestep': shap_result.eval_timestep,
             'test_data': {
                 'ts': x_ts,
                 'ts_cat': x_ts_cat,

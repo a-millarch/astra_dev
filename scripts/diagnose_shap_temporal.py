@@ -446,6 +446,18 @@ def diag3_gradient_profile(model, data, channel2feature, device, n_samples=N_GRA
         r  = gv / (g1 + 1e-15)
         print(f"  {name:<28s} {g1:>10.5f} {gv:>12.5f} {r:>8.2f}")
 
+    print()
+    print("  NOTE — Why gradient ranking != SHAP ranking for EBM:")
+    print("    Gradient (this table): mean|∂output/∂x| averaged over ALL timesteps.")
+    print("      EBM gradient is non-zero even at early steps (attention is global),")
+    print("      so its per-step gradient is diluted when averaged over 600+ steps → rank ~5.")
+    print("    SHAP = (x − x_background) × gradient.")
+    print("      At early steps x_ebm ≈ 0 and x_bg_ebm ≈ 0 → (x−bg) ≈ 0 → SHAP ≈ 0.")
+    print("      At late steps x_ebm ≠ 0 AND gradient is inflated by Bug #1 (eval@-1).")
+    print("      → EBM's SHAP concentrates at the same late steps where Bug #1 is strongest,")
+    print("        pushing it to rank #1 in SHAP despite rank #5 in raw gradient.")
+    print("    Fix: use a meaningful eval_timestep (e.g. 24h) to break the compounding.")
+
 
 # ---------------------------------------------------------------------------
 # Main
