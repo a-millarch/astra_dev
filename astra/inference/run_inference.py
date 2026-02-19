@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from astra.inference import InferenceSession, PatientContext, visualize_data_completeness
-from astra.evaluation.behavior import visualize_shap_individual
+from astra.inference import InferenceSession, PatientContext
+from astra.evaluation.behavior import visualize_shap_individual, visualize_data_completeness
 from astra.visualize.inference import plot_prediction_trajectory
 
 def run(cpr_hash, service_date, current_time, model_name,
