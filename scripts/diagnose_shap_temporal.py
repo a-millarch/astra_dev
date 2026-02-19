@@ -149,16 +149,20 @@ def diag1_per_timestep_predictions(model, data, device, n_patients=N_PATIENTS):
 # Diagnostic 2: EBM channel over time
 # ---------------------------------------------------------------------------
 
-def diag2_ebm_channel(data, n_patients=N_PATIENTS):
+def diag2_ebm_channel(data, channel2feature, n_patients=N_PATIENTS):
     _section("DIAGNOSTIC 2 — EBM channel values over time")
 
+    # Prefer the tracked index; fall back to scanning channel2feature for _ebm_pred
+    # (ebm_channel_idx can be None in cached data even when the channel exists)
     ebm_idx = data.get("ebm_channel_idx")
     if ebm_idx is None:
-        print("  SKIP: ebm_channel_idx is None (EBM not injected).")
+        feature2channel = {v: k for k, v in channel2feature.items()}
+        ebm_idx = feature2channel.get("_ebm_pred")
+    if ebm_idx is None:
+        print("  SKIP: _ebm_pred not found in channel2feature (EBM not injected).")
         return
 
-    ts_channel_names = data.get("ts_channel_names", [])
-    ebm_name = ts_channel_names[ebm_idx] if ebm_idx < len(ts_channel_names) else "_ebm_pred"
+    ebm_name = channel2feature.get(ebm_idx, "_ebm_pred")
     print(f"  EBM channel: index={ebm_idx}, name={ebm_name}")
 
     tX_raw   = data["tX_raw"]    # [n_holdout, n_channels, seq_len]  — raw (unscaled)
@@ -404,8 +408,8 @@ def diag3_gradient_profile(model, data, channel2feature, device, n_samples=N_GRA
     ch_imp_last  = compute_channel_importance(lambda i: -1)
     ch_imp_valid = compute_channel_importance(last_valid_step)
 
-    # Get channel names
-    ch_names = data.get("ts_channel_names", [f"ch_{i}" for i in range(n_channels)])
+    # Get channel names from channel2feature (index → feature name)
+    ch_names = [channel2feature.get(i, f"ch_{i}") for i in range(n_channels)]
 
     # Sort by importance under eval@last
     sort_idx = np.argsort(ch_imp_last)[::-1]
@@ -465,10 +469,12 @@ def main():
 
     channel2feature, _ = create_channel_mapping(data)
     print(f"  Model: temporal_head={model.temporal_head_enabled}, causal={model.causal}")
-    print(f"  Channels: {len(channel2feature)}")
+    print(f"  Channels ({len(channel2feature)}): { {i: channel2feature[i] for i in sorted(channel2feature)} }")
+    print(f"  ebm_channel_idx in data dict: {data.get('ebm_channel_idx')}  "
+          f"(resolved via channel2feature: {next((i for i,n in channel2feature.items() if n=='_ebm_pred'), None)})")
 
     diag1_per_timestep_predictions(model, data, device, n_patients=N_PATIENTS)
-    diag2_ebm_channel(data, n_patients=N_PATIENTS)
+    diag2_ebm_channel(data, channel2feature, n_patients=N_PATIENTS)
     diag3_gradient_profile(model, data, channel2feature, device, n_samples=N_GRAD_SAMPLES)
 
     print(f"\nAll outputs saved to {OUTPUT_DIR}/")

@@ -651,6 +651,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         'cat_shap_embedded': cat_shap_embedded,
         'cont_shap': cont_shap,
         'n_static_cat': n_static_cat,
+        'eval_timestep': eval_timestep,  # stored for visualization cropping
         'test_data': {
             'ts': test_ts.cpu().numpy(),
             'ts_cat': test_ts_cat.cpu().numpy(),
@@ -768,10 +769,11 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                                channel2feature: Dict[int, str] = None,
                                feature_names_cat: List[str] = None,
                                feature_names_cont: List[str] = None,
-                               class_idx: int = 1, save_path: str = None):
+                               class_idx: int = 1, save_path: str = None,
+                               eval_timestep: Optional[int] = None):
     """
     Visualize SHAP values for individual sample.
-    
+
     Args:
         sample_idx: Direct index into the test data (0-based)
         pid: Patient ID to visualize. If provided, will look up the sample_idx.
@@ -780,7 +782,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         feature_names_cat: List of static categorical feature names.
         class_idx: Which output class to show SHAP values for (default 1 for binary)
         save_path: Path to save the figure
-    
+        eval_timestep: Crop time axis to this step (default: read from shap_results).
+
     Note: Either sample_idx or (pid + holdout_pids) must be provided.
     """
     # Resolve sample_idx from PID if provided
@@ -810,7 +813,14 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     if ts_shap.ndim == 3:
         ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
     n_channels, n_steps = ts_shap.shape
-    
+
+    # Crop time axis to eval_timestep — steps beyond have ~0 SHAP due to causal masking.
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[..., :n_steps]
+
     time_labels = [step_to_time(i) for i in range(n_steps)]
     time_fmt = [time_to_hours(t) for t in time_labels]
     n_ticks = min(10, n_steps)
@@ -829,9 +839,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         cat_ts = shap_results['cat_ts_shap'][sample_idx]
         if cat_ts.ndim == 2:
             cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
+        cat_ts = cat_ts[:n_steps]  # crop to eval_timestep
         ax1.plot(cat_ts, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_ts)), cat_ts, alpha=0.2, color='#00d4aa')
-    
+
     ax1.set_xlabel('Time'); ax1.set_ylabel('|SHAP Value|')
     ax1.set_title(f'TS SHAP Over Time{title_suffix}, Class {class_idx}', fontweight='bold')
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
@@ -871,7 +882,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         cat_ts_shap_data = shap_results['cat_ts_shap_per_category'][sample_idx]  # [n_cats, seq_len]
         if cat_ts_shap_data.ndim == 3:
             cat_ts_shap_data = cat_ts_shap_data[..., min(class_idx, cat_ts_shap_data.shape[-1] - 1)]
-        
+        cat_ts_shap_data = cat_ts_shap_data[..., :n_steps]  # crop to eval_timestep
+
         enc_info = shap_results['encoding_info']
         cat_names = get_category_names_from_encoding_info(enc_info)
         
@@ -904,7 +916,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     elif shap_results.get('encoding_info') is not None:
         # Fallback: Show raw data with SHAP importance overlay
         ax3 = fig.add_subplot(gs[2, :])
-        cat_ts_data = shap_results['test_data']['ts_cat'][sample_idx]  # [n_cats, seq_len]
+        cat_ts_data = shap_results['test_data']['ts_cat'][sample_idx, :, :n_steps]  # crop to eval_timestep
         enc_info = shap_results['encoding_info']
         
         cat_names = get_category_names_from_encoding_info(enc_info)
@@ -1347,17 +1359,26 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] = None,
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
-                           max_display: int = 20, class_idx: int = 1, save_path: str = None):
+                           max_display: int = 20, class_idx: int = 1, save_path: str = None,
+                           eval_timestep: Optional[int] = None):
     """Summary visualizations across cohort."""
-    
+
     fig = plt.figure(figsize=(22, 18))
     gs = fig.add_gridspec(4, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1.2, 1])
-    
+
     ts_shap = shap_results['ts_shap']
     if ts_shap.ndim == 4:
         ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
     n_samples, n_channels, n_steps = ts_shap.shape
-    
+
+    # Crop time axis to eval_timestep — steps beyond have ~0 SHAP due to causal masking
+    # and showing them extends the x-axis with meaningless zeros.
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[..., :n_steps]
+
     time_labels = [step_to_time(i) for i in range(n_steps)]
     time_fmt = [time_to_hours(t) for t in time_labels]
     n_ticks = min(10, n_steps)
@@ -1373,6 +1394,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         cat_ts = shap_results['cat_ts_shap']
         if cat_ts.ndim == 3:
             cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
+        cat_ts = cat_ts[..., :n_steps]  # crop to eval_timestep
         cat_imp = np.abs(cat_ts).mean(axis=0)
         ax1.plot(cat_imp, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_imp)), cat_imp, alpha=0.2, color='#00d4aa')
@@ -1413,6 +1435,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         cat_ts_shap = shap_results['cat_ts_shap_per_category']  # [n_samples, n_cats, seq_len]
         if cat_ts_shap.ndim == 4:
             cat_ts_shap = cat_ts_shap[..., min(class_idx, cat_ts_shap.shape[-1] - 1)]
+        cat_ts_shap = cat_ts_shap[..., :n_steps]  # crop to eval_timestep
         cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
         
         enc_info = shap_results['encoding_info']
@@ -1437,7 +1460,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     elif shap_results.get('encoding_info') is not None:
         # Fallback: show activity data
         ax3 = fig.add_subplot(gs[1, 1])
-        cat_ts_data = shap_results['test_data']['ts_cat']
+        cat_ts_data = shap_results['test_data']['ts_cat'][..., :n_steps]  # crop to eval_timestep
         cat_ts_mean = cat_ts_data.mean(axis=0)
         enc_info = shap_results['encoding_info']
         cat_names = get_category_names_from_encoding_info(enc_info)

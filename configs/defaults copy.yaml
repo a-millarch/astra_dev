@@ -4,9 +4,9 @@ population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: hpt
-run_name: dynres
+run_name: lowres
 
-model_name: '19022026_simple'
+model_name: '16022026_dynres_perstep'
    
 target: deceased_30d
 
@@ -58,7 +58,7 @@ pretrain:
     mask_prob_cat_ts: 0.15
     mask_prob_cat: 0.15
     mask_prob_cont: 0.15
-    epochs: 3
+    epochs: 50
     lr: 5.0e-5
     warmup_epochs: 3
     ts_loss_weight: 1.5
@@ -78,7 +78,7 @@ training:
     
 model:
     res_dropout: 0.22
-    fc_dropout: 0.8
+    fc_dropout: 0.75
     fc_mults_1: 0.3
     fc_mults_2: 0.1
     n_layers: 8
@@ -145,13 +145,13 @@ bin_freq_include:
   #- '30D'
 
 temporal_features:
-  enabled: false
+  enabled: true
   features:
     - elapsed_hours
     - bin_width_hours
 
 ebm_feature:
-  enabled: false
+  enabled: true
   save_dir: data/interim/ebm_features
   n_folds: 5
   default_value: 0.0
