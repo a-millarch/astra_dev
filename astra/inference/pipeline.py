@@ -350,18 +350,20 @@ class InferenceSession:
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
         shap_values = explainer.shap_values(sample_inputs)
 
-        # Parse SHAP output
-        # GradientExplainer returns list[list[ndarray]] for multi-output models:
-        #   outer list = output classes/positions, inner list = input tensors
-        # For temporal head with target_step: output is [batch, 1] → single output
-        # For standard head: output is [batch, 2] → two classes
-        if isinstance(shap_values, list) and shap_values and isinstance(shap_values[0], list):
-            if self.is_temporal:
-                # Single target step → take first (only) output
-                shap_values = shap_values[0]
-            else:
-                # Standard head → take class 1 (deceased)
-                shap_values = shap_values[1]
+        # Parse SHAP output — normalise to flat list [per_input][n_samples, ...]
+        # GradientExplainer may return one of two formats depending on SHAP version:
+        #   Format (a): [n_classes][n_inputs][n_samples, ...]  — outer list indexed by class
+        #   Format (b): [n_inputs][n_samples, ..., n_classes]  — trailing class dim on ndarrays
+        # For temporal head: model returns [batch, 1] → treated as single output (class_idx=0)
+        # For standard head: model returns [batch, 2] → select class 1 (deceased)
+        if isinstance(shap_values, list) and shap_values:
+            class_idx = 0 if self.is_temporal else 1
+            if isinstance(shap_values[0], list):
+                # Format (a): select class
+                shap_values = shap_values[class_idx]
+            elif isinstance(shap_values[0], np.ndarray) and shap_values[0].ndim == 4:
+                # Format (b): TS input [1, n_ch, seq_len, n_classes] → strip trailing class dim
+                shap_values = [sv[..., class_idx] for sv in shap_values]
 
         # Unpack per-input SHAP values
         idx = 0
