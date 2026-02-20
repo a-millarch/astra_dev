@@ -1102,51 +1102,60 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     tick_idx = np.linspace(0, n_steps - 1, n_ticks, dtype=int)
 
     # --- Detect trajectory length ---
-    # When trajectory_length is stored in shap_results (inference session path),
-    # use it directly — zero-padded inference data makes NaN heuristics unreliable
-    # because 0.0 padding is indistinguishable from real measurements via ~isnan().
-    _traj_length_explicit = shap_results.get('trajectory_length')
-    if _traj_length_explicit is not None:
-        effective_traj = min(int(_traj_length_explicit), n_steps)
+    # Priority: (1) _data_present channel  → mask spans first..last measurement
+    #           (2) elapsed_hours channel  → mask spans first..last non-zero elapsed
+    #           (3) explicit trajectory_length (inference session) → mask spans 0..traj_len
+    #               This fixes the zero-padded inference case where heuristics fail.
+    #           (4) NaN-any fallback (unreliable for zero-padded data).
+    trajectory_mask = None  # set by whichever branch succeeds first
+
+    dp_idx = None
+    eh_idx = None
+    if channel2feature:
+        for idx, name in channel2feature.items():
+            if name == '_data_present':
+                dp_idx = idx
+            elif name == 'elapsed_hours':
+                eh_idx = idx
+
+    if dp_idx is not None:
+        raw_mask = ts_data[dp_idx] > 0.5  # [seq_len]
+        if not np.any(raw_mask):
+            dp_idx = None  # all zero → fall through
+
+    if dp_idx is not None:
+        # Contiguous fill: first..last measurement
         trajectory_mask = np.zeros(n_steps, dtype=bool)
-        trajectory_mask[:effective_traj] = True
-        traj_len = effective_traj
-    else:
-        # Heuristic fallback for data loaded from evaluation dataloaders
-        # (NaN for missing, 0.0 for padding — but channel heuristics are needed
-        # to distinguish within-trajectory missing from padding).
-        dp_idx = None
-        eh_idx = None
-        if channel2feature:
-            for idx, name in channel2feature.items():
-                if name == '_data_present':
-                    dp_idx = idx
-                elif name == 'elapsed_hours':
-                    eh_idx = idx
+        idxs = np.where(raw_mask)[0]
+        if len(idxs) > 0:
+            trajectory_mask[idxs[0]:idxs[-1] + 1] = True
 
-        if dp_idx is not None:
-            raw_mask = ts_data[dp_idx] > 0.5  # [seq_len]
-            if not np.any(raw_mask):
-                # _data_present found but all zero (e.g. pre-fix bundle)
-                dp_idx = None  # fall through to elapsed_hours or NaN fallback
+    if trajectory_mask is None and eh_idx is not None:
+        # elapsed_hours is >0 for in-trajectory steps, 0.0 for zero-padded
+        eh = ts_data[eh_idx]
+        raw_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
+        trajectory_mask = np.zeros(n_steps, dtype=bool)
+        idxs = np.where(raw_mask)[0]
+        if len(idxs) > 0:
+            trajectory_mask[idxs[0]:idxs[-1] + 1] = True
 
-        if dp_idx is None and eh_idx is not None:
-            # elapsed_hours is >0 for all in-trajectory steps, 0.0 for padding
-            eh = ts_data[eh_idx]
-            raw_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
-        elif dp_idx is None:
-            # NaN-aware fallback: any channel has non-NaN data at this timestep.
-            # NOTE: unreliable for zero-padded inference data (use trajectory_length).
+    if trajectory_mask is None:
+        _traj_length_explicit = shap_results.get('trajectory_length')
+        if _traj_length_explicit is not None:
+            # Inference session path: use exact trajectory_length to avoid
+            # treating zero-padded steps (0.0, non-NaN) as data present.
+            effective_traj = min(int(_traj_length_explicit), n_steps)
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            trajectory_mask[:effective_traj] = True
+        else:
+            # Last resort: NaN-any. Unreliable for zero-padded inference data.
             any_present = np.any(~np.isnan(ts_data), axis=0)
-            raw_mask = any_present
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            idxs = np.where(any_present)[0]
+            if len(idxs) > 0:
+                trajectory_mask[idxs[0]:idxs[-1] + 1] = True
 
-        # Make trajectory contiguous: fill from first True to last True.
-        trajectory_mask = np.zeros(n_steps, dtype=bool)
-        true_indices = np.where(raw_mask)[0]
-        if len(true_indices) > 0:
-            trajectory_mask[true_indices[0]:true_indices[-1] + 1] = True
-
-        traj_len = int(trajectory_mask.sum())
+    traj_len = int(trajectory_mask.sum())
 
     # --- Group channels ---
     if channel2feature:
