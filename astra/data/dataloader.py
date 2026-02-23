@@ -319,11 +319,14 @@ def prepare_data_and_dls(cfg):
     y = list(y[:, 0].flatten())
     logger.info(f'Train/val X shape (before normalization): {X.shape}')
 
-    # Compute EBM channel index (df2xy sorts by FEATURE → channel order)
+    # Channel names — df2xy sorts by FEATURE ascending, so this IS the channel order.
+    # Computed once here and reused for EBM, temporal features, and save_deployment_bundle.
+    ts_channel_names = sorted(trainval.complete['FEATURE'].unique())
+
+    # Compute EBM channel index
     if cfg.get('ebm_feature', {}).get('enabled', False):
-        features_sorted = sorted(trainval.complete['FEATURE'].unique())
-        ebm_channel_idx = features_sorted.index("_ebm_pred")
-        logger.info(f'EBM channel "_ebm_pred" at index {ebm_channel_idx}/{len(features_sorted)}')
+        ebm_channel_idx = ts_channel_names.index("_ebm_pred")
+        logger.info(f'EBM channel "_ebm_pred" at index {ebm_channel_idx}/{len(ts_channel_names)}')
 
     # Store raw X for debugging
     X_raw = X.copy()
@@ -343,6 +346,43 @@ def prepare_data_and_dls(cfg):
 
     # Per-channel normalization using trajectory_lengths + NaN awareness
     X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
+
+    # === TEMPORAL FEATURES: mode-aware index computation + elapsed_hours restoration ===
+    # 'off'        (enabled: false)  → no temporal channels, no-op
+    # 'channel'    (enabled: true, mode: channel)   → temporal features go through W_P
+    #              as normalized inputs — no special treatment (Option A)
+    # 'sinusoidal' (enabled: true, mode: sinusoidal) → elapsed_hours excluded from W_P,
+    #              restored to raw hours for sinusoidal positional encoding (Option B)
+    tf_cfg = cfg.get('temporal_features', {})
+    tf_enabled = tf_cfg.get('enabled', False)
+    tf_mode = tf_cfg.get('mode', 'channel')  # default to 'channel' when omitted
+
+    temporal_channel_idx = None
+    exclude_channel_indices = []
+
+    if tf_enabled and tf_mode == 'sinusoidal':
+        _aux_names = set(tf_cfg.get('features', []))   # e.g. {'elapsed_hours', 'bin_width_hours'}
+        if 'elapsed_hours' in ts_channel_names:
+            eh_idx = ts_channel_names.index('elapsed_hours')
+            # Restore raw values: sinusoidal PE requires actual hours (0–720), not ~N(0,1)
+            X_normalized[:, eh_idx, :] = X_raw[:, eh_idx, :]
+            temporal_channel_idx = eh_idx
+            logger.info(
+                f'Temporal PE (sinusoidal): restored raw elapsed_hours at channel {eh_idx}'
+            )
+        else:
+            logger.warning(
+                "temporal_features.mode=sinusoidal but 'elapsed_hours' not found in channels; "
+                "falling back to learned positional encoding."
+            )
+        exclude_channel_indices = [i for i, n in enumerate(ts_channel_names) if n in _aux_names]
+        if exclude_channel_indices:
+            excluded_names = [ts_channel_names[i] for i in exclude_channel_indices]
+            logger.info(
+                f'Temporal PE: excluding {excluded_names} (indices {exclude_channel_indices}) from W_P'
+            )
+    elif tf_enabled and tf_mode == 'channel':
+        logger.info('Temporal features mode=channel: elapsed_hours/bin_width_hours go through W_P normally')
 
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm = X_normalized[:, ebm_channel_idx, :]
@@ -458,6 +498,10 @@ def prepare_data_and_dls(cfg):
     # Per-channel normalization using trainval-fitted scaler
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
 
+    # Restore raw elapsed_hours in holdout (same logic as trainval above)
+    if tf_enabled and tf_mode == 'sinusoidal' and temporal_channel_idx is not None:
+        tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
+
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
         ebm_nz_h = ebm_norm_h[ebm_norm_h != 0]
@@ -554,9 +598,12 @@ def prepare_data_and_dls(cfg):
         "ts_scaler": ts_scaler,
         "tab_scaler": tab_scaler,
         "ts_feature_names": trainval.complete.columns[3:].tolist(),
-        "trajectory_lengths": traj_lengths,  # NEW: trainval trajectory lengths
-        "holdout_trajectory_lengths": holdout_traj_lengths,  # NEW: holdout trajectory lengths
+        "ts_channel_names": ts_channel_names,        # sorted FEATURE names = channel order in X
+        "trajectory_lengths": traj_lengths,
+        "holdout_trajectory_lengths": holdout_traj_lengths,
         "ebm_channel_idx": ebm_channel_idx,
+        "temporal_channel_idx": temporal_channel_idx,      # index of elapsed_hours, or None
+        "exclude_channel_indices": exclude_channel_indices, # aux channel indices to skip in W_P
     }
 
 
@@ -726,9 +773,9 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Channel names: df2xy sorts by FEATURE ascending — this IS the channel order
-    ts_channel_names = sorted(
-        data["trainval"].complete.sort_values(['PID', 'FEATURE'])['FEATURE'].unique()
+    # Channel names computed in prepare_data_and_dls; reuse to stay consistent
+    ts_channel_names = data.get('ts_channel_names') or sorted(
+        data["trainval"].complete['FEATURE'].unique()
     )
 
     bundle = {
@@ -757,6 +804,8 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'temporal_head': cfg.get("model", {}).get("temporal_head", False),
             'causal': cfg.get("model", {}).get("causal", False),
             'temporal_head_dropout': cfg.get("model", {}).get("temporal_head_dropout", 0.3),
+            'temporal_channel_idx': data.get('temporal_channel_idx', None),
+            'exclude_channel_indices': data.get('exclude_channel_indices', []),
         },
 
         # --- SHAP background data ---

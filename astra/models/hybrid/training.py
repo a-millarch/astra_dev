@@ -18,7 +18,14 @@ from astra.models.callbacks import SkipValidationCallback, ProgressiveTimeMaskin
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.data.dataloader import dfwide2ts_dls, tscatdfwide2x
 
-def get_backbone(data, cfg, temporal_head=False, causal=False, temporal_head_dropout=0.3):
+def get_backbone(
+    data, cfg,
+    temporal_head=False,
+    causal=False,
+    temporal_head_dropout=0.3,
+    temporal_channel_idx=None,
+    exclude_channel_indices=None,
+):
     backbone = TSTabFusionTransformerMultiHot(
         c_in=data["ts_dls"].vars,
         c_out=2,
@@ -37,6 +44,8 @@ def get_backbone(data, cfg, temporal_head=False, causal=False, temporal_head_dro
         temporal_head=temporal_head,
         causal=causal,
         temporal_head_dropout=temporal_head_dropout,
+        temporal_channel_idx=temporal_channel_idx,
+        exclude_channel_indices=exclude_channel_indices or [],
     )
     return backbone
 
@@ -221,8 +230,12 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     # CREATE BACKBONE AND MLM MODEL
     # ============================================================================
     logger.info("Creating backbone and MLM model...")
-    
-    backbone = get_backbone(data, cfg)
+
+    backbone = get_backbone(
+        data, cfg,
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
+    )
     logger.info(f"  Backbone: {type(backbone).__name__}")
     
     mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
@@ -284,7 +297,11 @@ def run_finetune(
     num_cols = data["num_cols"]
     classes = data["classes"]
 
-    backbone = get_backbone(data, cfg)
+    backbone = get_backbone(
+        data, cfg,
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
+    )
     
     if use_pretrained:
         if pretrain_cfg is None:
@@ -621,8 +638,12 @@ def run_finetune_early_prediction_optimized(
     import os
     
     mixed_dls = data["mixed_dls"]
-    backbone = get_backbone(data, cfg)
-    
+    backbone = get_backbone(
+        data, cfg,
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
+    )
+
     # Load pretrained weights
     if use_pretrained:
         checkpoint_dir = pretrain_cfg.checkpoint_dir if pretrain_cfg else f'./pretrain_checkpoints/{cfg["model_name"]}'

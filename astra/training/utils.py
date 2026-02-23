@@ -212,6 +212,8 @@ def save_model_fastai_compatible(
         temporal_head=model_cfg.get("temporal_head", False),
         causal=model_cfg.get("causal", False),
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
     )
     backbone.load_state_dict(model.state_dict())
 

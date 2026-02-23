@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from tsai.all import F
 
@@ -338,6 +340,59 @@ class MultiHotEmbedding(nn.Module):
         
         return embedded
 
+
+class TimeAwarePositionalEncoding(nn.Module):
+    """
+    Sinusoidal positional encoding for temporal tokens; learned for static tokens.
+
+    Temporal positions receive sinusoidal embeddings computed from raw elapsed_hours
+    (admission-relative hours at each bin).  Static token positions (categorical +
+    continuous features) receive a learned embedding.
+
+    When elapsed_hours is None (temporal_features mode != 'sinusoidal'), temporal
+    tokens receive zero PE and static tokens use the learned embedding — identical
+    to the previous nn.Parameter(zeros) behaviour so there is no regression.
+
+    A single learnable time_scale parameter allows the model to calibrate how
+    "spread out" the sinusoidal bands are relative to the raw hour values.
+    """
+
+    def __init__(self, d_model: int, n_static_tokens: int):
+        super().__init__()
+        self.d_model = d_model
+        self.n_static_tokens = n_static_tokens
+        # Learned embeddings for static tokens (replaces old pos_enc static slice)
+        self.static_pos = nn.Parameter(torch.zeros(1, n_static_tokens, d_model))
+        # Learnable global time scale (initialised to 1.0)
+        self.time_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: torch.Tensor, elapsed_hours: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x: [batch, seq_len + n_static_tokens, d_model]
+            elapsed_hours: [batch, seq_len] raw hours, or None for zero-PE fallback.
+        Returns:
+            x + positional encoding, same shape as x.
+        """
+        bs, total_len, d = x.shape
+        n_ts = total_len - self.n_static_tokens
+
+        if elapsed_hours is not None:
+            t = elapsed_hours.unsqueeze(-1).float() * self.time_scale  # [B, T, 1]
+            half_d = d // 2
+            freq = torch.exp(
+                torch.arange(half_d, device=x.device, dtype=torch.float32)
+                * -(math.log(10000.0) / half_d)
+            )
+            # [B, T, d]  (truncate last dim in case d is odd)
+            ts_pos = torch.cat([torch.sin(t * freq), torch.cos(t * freq)], dim=-1)[:, :, :d]
+        else:
+            ts_pos = torch.zeros(bs, n_ts, d, device=x.device)
+
+        static = self.static_pos.expand(bs, -1, -1)           # [B, n_static, d]
+        return x + torch.cat([ts_pos, static], dim=1)         # [B, total_len, d]
+
+
 class TSTabFusionTransformerMultiHot(nn.Module):
     """
     TSTabFusionTransformer with multi-hot categorical time series support.
@@ -383,6 +438,8 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         temporal_head: bool = False,            # Per-timestep prediction head
         causal: bool = False,                   # Causal attention masking
         temporal_head_dropout: float = 0.3,     # Dropout for temporal head MLP
+        temporal_channel_idx: Optional[int] = None,          # Index of elapsed_hours in x_ts
+        exclude_channel_indices: Optional[List[int]] = None, # Aux channels to skip in W_P
     ):
         """
         Args:
@@ -425,9 +482,18 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             self.ts_cat_dims = {}
             continuous_dim = d_model
         
+        # === AUXILIARY CHANNEL EXCLUSION ===
+        # Channels listed in exclude_channel_indices (e.g. elapsed_hours, bin_width_hours)
+        # remain in x_ts for extraction but are NOT projected through W_P.
+        # This keeps W_P operating on ~N(0,1) normalized clinical data only.
+        self.temporal_channel_idx = temporal_channel_idx
+        self.exclude_channel_indices = sorted(exclude_channel_indices or [])
+        self._signal_indices = [i for i in range(c_in) if i not in set(self.exclude_channel_indices)]
+        n_signal = len(self._signal_indices)
+
         # === CONTINUOUS TIME SERIES ===
         # Initialize W_P AFTER determining the correct output dimension
-        self.W_P = nn.Conv1d(c_in, continuous_dim, 1)
+        self.W_P = nn.Conv1d(n_signal, continuous_dim, 1)
         
         # === STATIC CATEGORICAL FEATURES ===
         n_cat = len(classes)
@@ -444,7 +510,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         
         # === TRANSFORMER ===
         self.res_drop = nn.Dropout(res_dropout) if res_dropout else None
-        self.pos_enc = nn.Parameter(torch.zeros(1, (n_cat + n_cont + seq_len), d_model))
+        self.pos_enc = TimeAwarePositionalEncoding(d_model, n_static_tokens=n_cat + n_cont)
         self.transformer = _TabFusionEncoder(
             n_cat + n_cont, d_model, n_heads=n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff,
             res_dropout=res_dropout, activation=attention_act,
@@ -567,7 +633,16 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             key_padding_mask = None
         
         # === PROCESS CONTINUOUS TIME SERIES ===
-        x = self.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
+        # Extract raw elapsed_hours for sinusoidal positional encoding (before stripping)
+        if self.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.temporal_channel_idx, :]   # [bs, seq_len]
+        else:
+            elapsed_hours = None
+
+        # Strip auxiliary channels (elapsed_hours, bin_width_hours) before W_P so that
+        # only ~N(0,1) normalized clinical features are projected.
+        x_ts_signal = x_ts[:, self._signal_indices, :] if self.exclude_channel_indices else x_ts
+        x = self.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
         
         # === PROCESS MULTI-HOT CATEGORICAL TIME SERIES ===
         if self.n_ts_cat > 0 and x_ts_cat_multi_hot is not None:
@@ -624,7 +699,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x = torch.cat([x, x_cont_proj], 1)
         
         # === TRANSFORMER ===
-        x += self.pos_enc
+        x = self.pos_enc(x, elapsed_hours=elapsed_hours)
 
         if self.res_drop is not None:
             x = self.res_drop(x)

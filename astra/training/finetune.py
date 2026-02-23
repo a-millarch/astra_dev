@@ -201,10 +201,14 @@ def load_pretrained_backbone(
     weights (pretraining doesn't use classification head). We load with
     strict=False so the new head gets random initialization.
     """
-    backbone = get_backbone(data, cfg_dict,
-                            temporal_head=temporal_head,
-                            causal=causal,
-                            temporal_head_dropout=temporal_head_dropout)
+    backbone = get_backbone(
+        data, cfg_dict,
+        temporal_head=temporal_head,
+        causal=causal,
+        temporal_head_dropout=temporal_head_dropout,
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
+    )
 
     if checkpoint_dir is None:
         checkpoint_dir = f'./pretrain_checkpoints/{cfg_dict["model_name"]}'
@@ -707,7 +711,12 @@ def run_finetune_v2(
             **temporal_kwargs,
         )
     else:
-        backbone = get_backbone(data, cfg, **temporal_kwargs)
+        backbone = get_backbone(
+            data, cfg,
+            **temporal_kwargs,
+            temporal_channel_idx=data.get('temporal_channel_idx'),
+            exclude_channel_indices=data.get('exclude_channel_indices', []),
+        )
         logger.info("Using randomly initialized backbone (no pretraining)")
 
     # Apply dropout overrides if specified

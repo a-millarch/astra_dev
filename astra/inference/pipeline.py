@@ -121,6 +121,8 @@ class InferenceSession:
             temporal_head=params['temporal_head'],
             causal=params['causal'],
             temporal_head_dropout=params['temporal_head_dropout'],
+            temporal_channel_idx=params.get('temporal_channel_idx', None),
+            exclude_channel_indices=params.get('exclude_channel_indices', []),
         )
 
         # Load weights (FastAI format: {'model': state_dict, ...})
@@ -182,6 +184,12 @@ class InferenceSession:
         ts_norm, tab_norm = normalize_new_patient(
             x_ts, tab_df, self.bundle
         )
+
+        # Restore raw elapsed_hours — sinusoidal PE requires actual hours (0–720),
+        # not the ~N(0,1) values produced by the TS scaler.
+        temporal_ch_idx = self.bundle['model_params'].get('temporal_channel_idx', None)
+        if temporal_ch_idx is not None:
+            ts_norm[0, temporal_ch_idx, :] = x_ts[0, temporal_ch_idx, :]
 
         # Trajectory length (computed on raw data before normalization zeroes padding)
         traj_len = int(get_trajectory_lengths(x_ts)[0])

@@ -74,17 +74,18 @@ class TSTabFusionMLM(nn.Module):
         self.config = config
         
         d_model = backbone.W_P.out_channels
-        c_in = backbone.W_P.in_channels
-        
+        # W_P only projects signal channels; reconstruction target must match.
+        n_signal = backbone.W_P.in_channels
+
         # === RECONSTRUCTION HEADS ===
-        
-        # 1. Continuous time series reconstruction
+
+        # 1. Continuous time series reconstruction (signal channels only)
         self.ts_head = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
             nn.LayerNorm(d_model * 2),
             nn.Dropout(0.1),
-            nn.Linear(d_model * 2, c_in)
+            nn.Linear(d_model * 2, n_signal)
         )
         
         # 2. Multi-hot categorical TS reconstruction (NEW)
@@ -285,8 +286,20 @@ class TSTabFusionMLM(nn.Module):
         else:
             key_padding_mask = None
         
-        # Continuous TS encoding
-        x_encoded = self.backbone.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
+        # Extract raw elapsed_hours before stripping (needed for sinusoidal PE)
+        if self.backbone.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.backbone.temporal_channel_idx, :]
+        else:
+            elapsed_hours = None
+
+        # Strip auxiliary channels before W_P (mirrors backbone.forward)
+        x_ts_signal = (
+            x_ts[:, self.backbone._signal_indices, :]
+            if self.backbone.exclude_channel_indices else x_ts
+        )
+
+        # Continuous TS encoding (signal channels only)
+        x_encoded = self.backbone.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
         
         # Multi-hot categorical TS encoding (if present)
         if self.backbone.n_ts_cat > 0 and x_ts_cat is not None:
@@ -328,8 +341,8 @@ class TSTabFusionMLM(nn.Module):
             x_cont_proj = self.backbone.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x_encoded = torch.cat([x_encoded, x_cont_proj], 1)
         
-        # Positional encoding
-        x_encoded += self.backbone.pos_enc
+        # Positional encoding (time-aware if elapsed_hours available, else zero TS PE)
+        x_encoded = self.backbone.pos_enc(x_encoded, elapsed_hours=elapsed_hours)
         
         if self.backbone.res_drop is not None:
             x_encoded = self.backbone.res_drop(x_encoded)
@@ -426,13 +439,16 @@ class TSTabFusionMLM(nn.Module):
         
         losses = {}
         
-        # 1. Continuous TS reconstruction
+        # 1. Continuous TS reconstruction (signal channels only — aux channels excluded)
         if ts_mask is not None and ts_mask.any():
-            ts_pred = self.ts_head(ts_output).transpose(1, 2)  # [bs, c_in, seq_len]
-            ts_loss = F.mse_loss(
-                ts_pred[ts_mask.unsqueeze(1).expand_as(ts_pred)],
-                original_ts[ts_mask.unsqueeze(1).expand_as(original_ts)]
-            )
+            ts_pred = self.ts_head(ts_output).transpose(1, 2)  # [bs, n_signal, seq_len]
+            # Compare against signal channels only; aux channels are not reconstructed
+            if self.backbone.exclude_channel_indices:
+                original_ts_signal = original_ts[:, self.backbone._signal_indices, :]
+            else:
+                original_ts_signal = original_ts
+            expand = ts_mask.unsqueeze(1).expand_as(ts_pred)
+            ts_loss = F.mse_loss(ts_pred[expand], original_ts_signal[expand])
             losses['ts_loss'] = ts_loss * self.config.ts_loss_weight
         
         # 2. Multi-hot categorical TS reconstruction (NEW)
