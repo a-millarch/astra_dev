@@ -1,15 +1,3 @@
-"""
-Shared clinical data mappings for the ASTRA project.
-
-Single source of truth for all feature name mappings, code-to-category
-lookups, and clinical classification logic used by both the training
-pipeline (filters.py, build_patient_info.py) and the inference pipeline
-(data_prep.py).
-
-No heavy dependencies (no astra.utils, no azureml) so this module can
-be imported anywhere.
-"""
-
 import re
 import numpy as np
 import pandas as pd

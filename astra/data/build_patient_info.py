@@ -568,7 +568,13 @@ def add_iss(base):
 
 
 def prepare_height_weight(base):
-    vit_raw = pd.read_csv("data/raw/VitaleVaerdier.csv", index_col=0)
+    from astra.data.collectors import population_filter_parquet
+    
+    if not is_file_present("data/raw/VitaleVaerdier.csv"):
+        logger.info("No local vitale vaerdier file, creating.")
+        population_filter_parquet("VitaleVaerdier", base=base)  
+
+    vit_raw = pd.read_csv("data/raw/VitaleVaerdier.csv") 
     hw_map = {"Højde": "HEIGHT", "Vægt": "WEIGHT"}
     vit_raw.rename(
         columns={
@@ -596,18 +602,12 @@ def prepare_height_weight(base):
         subset=["CPR_hash", "FEATURE"], keep="first"
     )
     #hw = hw[hw.delta.dt.days < 365 * 2]
-    hw[["TIMESTAMP", "PID", "FEATURE", "VALUE"]].to_pickle(
-        "data/interim/Height_Weight.pkl"
-    )
+    return hw[["TIMESTAMP", "PID", "FEATURE", "VALUE"]]
 
 
 def add_height_weight(base):
-    try: 
-        hw = pd.read_pickle("data/interim/Height_Weight.pkl")
-    except FileNotFoundError:
-        prepare_height_weight(base)
-        hw = pd.read_pickle("data/interim/Height_Weight.pkl")
-        
+
+    hw = prepare_height_weight(base)
     hw_df = hw.sort_values("TIMESTAMP").drop_duplicates(
         subset=["PID", "FEATURE"], keep="first"
     )

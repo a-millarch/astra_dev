@@ -110,7 +110,7 @@ def population_filter_parquet(filename, base =None, blobstore_uri=None):
     if base is None:
         base = get_base_df()
     if blobstore_uri is None:
-        blobstore_uri = 'https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/' # CHANGE TO SECRET?
+        blobstore_uri = cfg["raw_file_path"]
     
     logger.info(f'Collecting and filtering {filename}')
     path = f'{blobstore_uri}CPMI_{filename}.parquet'

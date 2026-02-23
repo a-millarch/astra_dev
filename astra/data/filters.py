@@ -77,7 +77,7 @@ def filter_subsets_inhospital(cfg, base=None):
 
         filtered_df = filter_inhospital(base, df, cfg, dt_name, offset=offset)
         # TODO: add valuefilter layer
-        filtered_df.to_pickle(f"data/interim/concepts/{filename}.pkl")
+        filtered_df.to_pickle(f"data/interim/concepts/{filename}.pkl", protocol=4)
 
 
 def filter_inhospital(
@@ -138,7 +138,7 @@ def filter_vitals(vit):
     vit["FEATURE"] = vit["FEATURE"].replace(to_replace=HEIGHT_WEIGHT_MAP)
     vit.loc[vit.FEATURE == 'HEIGHT', 'VALUE'] = inches_to_cm(vit[vit.FEATURE == 'HEIGHT'].VALUE.astype(float))
     vit.loc[vit.FEATURE == 'WEIGHT','VALUE'] = ounces_to_kg(vit[vit.FEATURE == 'WEIGHT'].VALUE.astype(float))
-    vit[(vit.FEATURE.isin(list(set(HEIGHT_WEIGHT_MAP.values()))))].to_pickle('data/interim/Height_Weight.pkl')
+    vit[(vit.FEATURE.isin(list(set(HEIGHT_WEIGHT_MAP.values()))))]
 
     pattern = r'([<>]\s*)?[-+]?\d*\.\d+|\d+\.?\d*'
     vit = vit[(vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
