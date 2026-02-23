@@ -23,9 +23,13 @@ def _compute_bin_elapsed_hours(
     bin_freq_include: list,
 ) -> pd.DataFrame:
     """
-    Compute elapsed_hours for each bin position for each patient.
+    Compute elapsed_hours at bin_start for each bin position for each patient.
 
-    Reuses the same logic as _create_temporal_features_df in datasets.py.
+    Uses bin_start (not midpoint) so that the forward-fill comparison
+    ``masking_hours <= elapsed_hours`` is strictly conservative: an EBM
+    trained at masking time M is only applied from the first bin that STARTS
+    at or after M, guaranteeing the bin's entire data window is posterior to
+    the EBM's training cutoff.
 
     Returns:
         DataFrame with columns: ['PID', 'position', 'elapsed_hours']
@@ -44,11 +48,11 @@ def _compute_bin_elapsed_hours(
     bf = bf.sort_values(["PID", "bin_counter"])
     bf["position"] = bf.groupby("PID").cumcount()
 
-    # Elapsed hours at bin midpoint (same formula as _create_temporal_features_df)
-    bf["elapsed_hours"] = (
-        (bf["bin_start"] - bf["start"]).dt.total_seconds() / 3600
-        + (bf["bin_end"] - bf["bin_start"]).dt.total_seconds() / 7200
-    )
+    # Elapsed hours at bin_start — used for causal EBM assignment.
+    # Note: datasets.py uses midpoint for positional encoding; here we use
+    # bin_start so masking_hours <= elapsed_hours means the EBM predates
+    # the entire bin, not just its midpoint.
+    bf["elapsed_hours"] = (bf["bin_start"] - bf["start"]).dt.total_seconds() / 3600
 
     return bf[["PID", "position", "elapsed_hours"]]
 
@@ -57,19 +61,23 @@ def _forward_fill_predictions(
     patient_elapsed: np.ndarray,
     ebm_intervals_hours: list,
     patient_preds: Dict[float, float],
-    default_value: float = 0.0,
+    default_value: float = np.nan,
 ) -> np.ndarray:
     """
     Forward-fill EBM predictions to bin positions for one patient.
 
-    For each bin position with elapsed_hours `t`, assigns the prediction
-    from the most recent EBM interval where masking_hours <= t.
+    For each bin position with elapsed_hours `t` (= bin_start in hours),
+    assigns the prediction from the most recent EBM interval where
+    masking_hours <= t.  Because `t` is the bin_start, this guarantees
+    the chosen EBM's training window does not overlap with the bin at all.
 
     Args:
         patient_elapsed: Array of elapsed_hours per position.
         ebm_intervals_hours: Sorted list of EBM masking times in hours.
         patient_preds: {masking_hours: predicted_probability} for this patient.
-        default_value: Value for bins before the first EBM interval.
+        default_value: Value for bins before the first EBM interval (default:
+            NaN so that normalization treats them as missing rather than as a
+            spurious "0% risk" measurement).
 
     Returns:
         Array of prediction values per position.
@@ -133,11 +141,10 @@ def create_ebm_feature_df(
 
     intervals_hours = ebm_predictions["intervals_hours"]
     preds_dict = ebm_predictions[split]  # {pid: {hours: pred}}
-    default_value = cfg.get("ebm_feature", {}).get("default_value", 0.0)
     target = cfg["target"]
     bin_freq_include = cfg.get("bin_freq_include", [])
 
-    # Compute elapsed hours per bin position per patient
+    # Compute elapsed hours (at bin_start) per bin position per patient
     bin_elapsed = _compute_bin_elapsed_hours(base_df, bin_freq_include)
     max_pos = bin_elapsed["position"].max()
     ts_cols = [str(i) for i in range(max_pos + 1)]
@@ -149,23 +156,27 @@ def create_ebm_feature_df(
         patient_bins = bin_elapsed[bin_elapsed["PID"] == pid].sort_values("position")
 
         if len(patient_bins) == 0:
-            # No bin data for this patient — fill with default
-            values = [default_value] * (max_pos + 1)
+            # No bin data for this patient — all padding (0.0)
+            values = [0.0] * (max_pos + 1)
         else:
             patient_elapsed = patient_bins["elapsed_hours"].values
             patient_positions = patient_bins["position"].values.astype(int)
 
             patient_preds = preds_dict.get(pid, {})
 
-            # Forward-fill predictions for positions with data
+            # Forward-fill predictions for positions within the trajectory.
+            # default_value=NaN marks pre-EBM steps as missing (not "0% risk"),
+            # so normalize_with_padding_mask treats them correctly.
             filled = _forward_fill_predictions(
-                patient_elapsed, intervals_hours, patient_preds, default_value
+                patient_elapsed, intervals_hours, patient_preds, default_value=np.nan
             )
 
-            # Create full-length array with 0.0 padding
+            # Trailing positions beyond trajectory end stay 0.0 (padding).
+            # Within-trajectory positions use the forward-filled value (NaN for
+            # pre-EBM steps, a probability otherwise).
             values = [0.0] * (max_pos + 1)
             for pos, val in zip(patient_positions, filled):
-                values[pos] = val
+                values[pos] = val  # NaN propagates correctly here
 
         row = {"PID": pid, "FEATURE": "_ebm_pred"}
         row.update({ts_cols[i]: values[i] for i in range(max_pos + 1)})
@@ -178,10 +189,17 @@ def create_ebm_feature_df(
     result[target] = result[target].astype(int)
     result = result.sort_values(["PID", "FEATURE"]).reset_index(drop=True)
 
+    # Logging: ignore NaN pre-EBM positions and 0.0 padding in range report
+    ebm_vals = result[ts_cols].values.ravel()
+    ebm_measured = ebm_vals[~np.isnan(ebm_vals) & (ebm_vals != 0.0)]
+    val_range = (
+        f"[{ebm_measured.min():.3f}, {ebm_measured.max():.3f}]"
+        if len(ebm_measured) > 0 else "N/A"
+    )
     logger.info(
         f"Created EBM feature channel ({split}): "
         f"{len(result)} rows, {max_pos + 1} timesteps, "
-        f"value range [{result[ts_cols].min().min():.3f}, {result[ts_cols].max().max():.3f}]"
+        f"EBM probability range {val_range}"
     )
 
     return result

@@ -227,7 +227,7 @@ def load_pretrained_backbone(
             mask_prob_cont=pc["mask_prob_cont"],
         )
 
-    # Check for c_in mismatch (EBM feature adds a channel)
+    # Check for c_in mismatch (EBM feature or temporal features add channels)
     full_c_in = backbone.W_P.in_channels
     pretrain_W_P_weight = checkpoint["model_state_dict"]["backbone.W_P.weight"]
     pretrain_c_in = pretrain_W_P_weight.shape[1]
@@ -237,6 +237,27 @@ def load_pretrained_backbone(
             f"W_P channel mismatch: checkpoint has {pretrain_c_in}, "
             f"current model has {full_c_in} — expanding W_P"
         )
+        # Identify which channel indices are NEW (not in the pretrained model).
+        # df2xy sorts channels by FEATURE name alphabetically — same order as W_P.
+        features_sorted = sorted(data["trainval"].complete["FEATURE"].unique())
+        temporal_names = set(
+            cfg_dict.get("temporal_features", {}).get("features", [])
+        )
+        new_channel_indices = sorted(
+            {i for i, f in enumerate(features_sorted)
+             if f in temporal_names or f == "_ebm_pred"}
+        )
+        if not new_channel_indices:
+            # Fallback: treat the last N channels as new (best-effort)
+            n_new = full_c_in - pretrain_c_in
+            new_channel_indices = list(range(full_c_in - n_new, full_c_in))
+            logger.warning(
+                f"Could not identify new channel names; Xavier-initializing "
+                f"last {n_new} channel(s): {new_channel_indices}"
+            )
+        logger.info(f"New channel indices to Xavier-init: {new_channel_indices} "
+                    f"({[features_sorted[i] for i in new_channel_indices]})")
+
         # Load only backbone weights (except W_P) via MLM wrapper.
         # MLM heads (ts_head, cat_heads, etc.) may also have c_in-dependent
         # shapes, so we skip all non-backbone keys.
@@ -251,7 +272,7 @@ def load_pretrained_backbone(
         # Expand W_P: copy pretrained weights, Xavier-init new channel(s)
         _expand_w_p(backbone, pretrain_W_P_weight,
                      checkpoint["model_state_dict"]["backbone.W_P.bias"],
-                     data.get("ebm_channel_idx"))
+                     new_channel_indices)
         logger.info(f"Pretrained weights loaded with W_P expansion from {checkpoint_path}")
     else:
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
@@ -270,27 +291,34 @@ def _expand_w_p(
     backbone: nn.Module,
     old_weight: torch.Tensor,
     old_bias: torch.Tensor,
-    ebm_channel_idx: Optional[int] = None,
+    new_channel_indices: Optional[list] = None,
 ):
     """
     Expand W_P Conv1d to accommodate additional input channel(s).
 
     Copies pretrained weights for existing channels to their correct
-    positions and Xavier-initializes the new EBM channel.
+    positions and Xavier-initializes any new channels (e.g. EBM,
+    elapsed_hours, bin_width_hours).
 
     W_P is nn.Conv1d(c_in, continuous_dim, kernel_size=1):
         weight shape: [out_channels, in_channels, 1]
         bias shape: [out_channels]
+
+    Args:
+        new_channel_indices: Sorted list of indices (into the new W_P) that
+            correspond to newly added channels and should be Xavier-initialized.
+            All other indices are filled from the pretrained weights in order.
     """
     new_c_in = backbone.W_P.in_channels
     old_c_in = old_weight.shape[1]
+    new_set = set(new_channel_indices or [])
 
     with torch.no_grad():
         backbone.W_P.bias.data.copy_(old_bias)
 
         old_idx = 0
         for new_idx in range(new_c_in):
-            if new_idx == ebm_channel_idx:
+            if new_idx in new_set:
                 nn.init.xavier_uniform_(
                     backbone.W_P.weight.data[:, new_idx : new_idx + 1, :]
                 )
@@ -302,7 +330,7 @@ def _expand_w_p(
 
     logger.info(
         f"W_P expanded: {old_c_in} → {new_c_in} channels "
-        f"(EBM at idx {ebm_channel_idx}, Xavier-initialized)"
+        f"(Xavier-initialized at indices {sorted(new_set)})"
     )
 
 

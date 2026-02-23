@@ -294,7 +294,20 @@ def run_finetune(
         checkpoint = torch.load(os.path.join(checkpoint_dir, 'best_model.pt'))
         # need the same MLM model structure to load, then extract backbone
         mlm_model = TSTabFusionMLM(backbone, pretrain_cfg)
-        mlm_model.load_state_dict(checkpoint['model_state_dict'])
+        # strict=False tolerates c_in mismatches (e.g. when temporal_features are
+        # added after pretraining) — W_P and ts_head reinitialize from scratch
+        # while all other weights (transformer, embeddings) reload correctly.
+        saved_c_in = checkpoint['model_state_dict']['backbone.W_P.weight'].shape[1]
+        current_c_in = backbone.W_P.in_channels
+        if saved_c_in != current_c_in:
+            logger.warning(
+                f"Pretrained c_in={saved_c_in} != current c_in={current_c_in} "
+                f"(temporal_features may have changed). Loading with strict=False: "
+                f"W_P and ts_head will train from scratch."
+            )
+            mlm_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        else:
+            mlm_model.load_state_dict(checkpoint['model_state_dict'])
         backbone = mlm_model.backbone
         logger.info("Pretrained model loaded")
 

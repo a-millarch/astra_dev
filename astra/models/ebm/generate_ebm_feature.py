@@ -20,8 +20,15 @@ def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
     Schedule:
     - Early: 10min, 30min, 1h, 2h, 3h, 4h
     - 4h-72h: every 2 hours
-    - Post-72h: match cfg bin_intervals boundaries
-      (daily 72h-7D, 2-day 7D-14D, 3-day 14D-30D)
+    - Post-72h: derived from cfg bin_intervals (one EBM per bin width)
+
+    All generated times are exact multiples of the active bin resolutions,
+    so they land on bin boundaries.  The forward-fill in create_ebm_feature_df
+    then uses bin_start for each step, so an EBM at time M is applied from the
+    first bin whose start >= M — no data from that bin leaks into the EBM.
+
+    Note: the final interval (e.g. 30D) may be generated but never applied,
+    because no bin has bin_start == trajectory_end.  This is harmless.
 
     Returns:
         Sorted list of masking times in hours.
