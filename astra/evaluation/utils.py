@@ -1,4 +1,5 @@
 from astra.utils import logger, cfg
+import math
 import numpy as np
 from scipy import stats
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -59,6 +60,68 @@ def _get_intervals_from_cfg():
     )
 
 
+def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
+    """Check that all bin intervals divide evenly (no partial last bins).
+
+    Prints a table of all active intervals and flags any that are not exact.
+    Returns True if all intervals are aligned, False otherwise.
+
+    Args:
+        bin_intervals: OrderedDict of interval config (defaults to cfg['bin_intervals']).
+        bin_freq_include: List of frequency strings to include (defaults to cfg value).
+
+    Example::
+
+        from astra.evaluation.utils import check_bin_alignment
+        check_bin_alignment()   # uses current cfg
+    """
+    if bin_intervals is None:
+        bin_intervals = cfg["bin_intervals"]
+    if bin_freq_include is None:
+        bin_freq_include = cfg.get("bin_freq_include")
+
+    intervals = _get_intervals(bin_intervals, bin_freq_include)
+
+    all_ok = True
+    total_steps = 0
+    rows = []
+    for start_min, end_min, bin_min in intervals:
+        if end_min is None:
+            rows.append((start_min, "open", bin_min, "?", "open-ended"))
+            continue
+        duration = end_min - start_min
+        n_exact = duration / bin_min
+        n_bins = math.ceil(n_exact)
+        status = "OK" if duration % bin_min == 0 else f"PARTIAL ({n_exact:.3g} bins)"
+        if duration % bin_min != 0:
+            all_ok = False
+        total_steps += n_bins
+        rows.append((start_min, end_min, bin_min, n_bins, status))
+
+    # Pretty-print
+    def fmt(minutes):
+        if minutes == "open":
+            return "open"
+        h = minutes / 60
+        if h < 24:
+            return f"{h:.4g}h"
+        return f"{h/24:.4g}D"
+
+    header = f"{'Start':>8}  {'End':>8}  {'Bin':>6}  {'Steps':>6}  Status"
+    print(header)
+    print("-" * len(header))
+    for start_min, end_min, bin_min, n_bins, status in rows:
+        print(f"{fmt(start_min):>8}  {fmt(end_min):>8}  {fmt(bin_min):>6}  {str(n_bins):>6}  {status}")
+    print("-" * len(header))
+    print(f"{'Total steps:':>{len(header) - 7}} {total_steps}")
+    print()
+    if all_ok:
+        print("All intervals aligned.")
+    else:
+        print("WARNING: partial bins detected — fix the interval boundaries in bin_intervals config.")
+    return all_ok
+
+
 def time_to_step(time_value, time_unit='min', data_config=None):
     """Convert time value to time step index using bin intervals.
 
@@ -93,12 +156,12 @@ def time_to_step(time_value, time_unit='min', data_config=None):
         eff_end = end_min if end_min is not None else float('inf')
         if start_min < time_min <= eff_end:
             offset_min = time_min - start_min
-            step_offset = int(np.ceil(offset_min / bin_min)) - 1
+            step_offset = math.ceil(offset_min / bin_min) - 1
             bins_cum = 0
             for j in range(i):
                 s, e, b = intervals[j]
                 if e is not None:
-                    bins_cum += (e - s) // b
+                    bins_cum += math.ceil((e - s) / b)
             return bins_cum + step_offset
     return None
 
@@ -121,16 +184,21 @@ def step_to_time(step, data_config=None):
         intervals = _get_intervals_from_cfg()
 
     bins_cum = [0]
-    for start_min, end_min, bin_min in intervals[:-1]:
+    for start_min, end_min, bin_min in intervals:
         if end_min is not None:
-            duration = end_min - start_min
-            bins_cum.append(bins_cum[-1] + duration // bin_min)
+            bins_cum.append(bins_cum[-1] + math.ceil((end_min - start_min) / bin_min))
+        else:
+            bins_cum.append(float('inf'))
 
-    for i in range(len(bins_cum) - 1):
+    for i in range(len(intervals)):
         if bins_cum[i] <= step < bins_cum[i + 1]:
             start_min, end_min, bin_min = intervals[i]
             step_offset = step - bins_cum[i]
-            return start_min + (step_offset + 1) * bin_min
+            t = start_min + (step_offset + 1) * bin_min
+            # Clamp to interval end so partial last bins don't overshoot
+            if end_min is not None:
+                t = min(t, end_min)
+            return t
     return None
 
 

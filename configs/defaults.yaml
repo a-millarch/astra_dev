@@ -126,7 +126,7 @@ bin_intervals:
   24h: '1h'
   72h: '4h'
   7D: '1D'
-  14D: '2D'
+  15D: '2D'
   30D: '3D'
   90D: '7D'
   end: '30D'
