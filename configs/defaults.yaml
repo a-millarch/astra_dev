@@ -4,7 +4,7 @@ population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: hpt
-run_name: dynres
+run_name: highres
 
 model_name: '23022026_simple'
    
@@ -119,29 +119,22 @@ large_load_filenames:
   - Notater
  
 bin_intervals:
-  2h: '5min'
-  4h: '10min'
-  8h: '20min'
-  12h: '30min'
-  24h: '1h'
-  72h: '4h'
-  7D: '1D'
-  15D: '2D'
-  30D: '3D'
-  90D: '7D'
-  end: '30D'
-
+  6h: 5min 
+  12h: 10min
+  72h: 20min 
+  5D: 1h
+  7D: 6h
+  14D: 12h
+  30D: 1D 
+  end: 30D
 bin_freq_include:
-  - '5min'
-  - '10min'
-  - '20min'
-  - '30min'
-  - '1h'
-  - '4h'
-  - '1D'
-  - '2D'
-  - '3D'
-  #- '7D'
+  - 5min
+  - 10min
+  - 20min
+  - 1h
+  - 6h
+  - 12h
+  - 1D
   #- '30D'
 
 temporal_features:
