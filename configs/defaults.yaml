@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '23022026_simple'
+model_name: '24022026_simple_2'
    
 target: deceased_30d
 
@@ -262,9 +262,6 @@ npartitions:
 mapping:
  Diagnoser: cat
  
-# timeseries 
-
-  
 drop_features:
   VitaleVaerdier:
     - nan
