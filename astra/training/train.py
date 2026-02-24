@@ -1,24 +1,30 @@
 """
-CLI entry point for the revised training pipeline.
+CLI entry point for the ASTRA training pipeline.
 
 Usage:
-    # Standard finetune (with pretrained weights)
+    # Full pipeline: pretrain → finetune on full trainval → eval
     python -m astra.training.train --pretrain --finetune --eval
+
+    # Finetune only (using existing pretrained checkpoint, full trainval)
+    python -m astra.training.train --finetune --eval
+
+    # Finetune with 80/20 validation split + early stopping
+    python -m astra.training.train --finetune --no-skip-valid --eval
 
     # Finetune with early prediction hardening
     python -m astra.training.train --finetune --early-prediction --eval
 
+    # Full pipeline with HP sweep: pretrain → HPO → retrain on full trainval → eval
+    python -m astra.training.train --pretrain --sweep-train --finetune --eval
+
     # Architecture sweep (Stage 1)
     python -m astra.training.train --sweep-arch --n-arch-trials 30
 
-    # Training HP sweep (Stage 2, requires pretrained checkpoint)
-    python -m astra.training.train --sweep-train --n-train-trials 50 --eval
+    # Training HP sweep only (Stage 2, without final retrain)
+    python -m astra.training.train --sweep-train --no-finetune --n-train-trials 50
 
-    # Full two-stage sweep
-    python -m astra.training.train --sweep-arch --sweep-train --eval
-
-    # Quick test
-    python -m astra.training.train --finetune --no-use-pretrained --eval
+    # Quick test (no pretraining, no eval)
+    python -m astra.training.train --finetune --no-use-pretrained --no-eval
 """
 
 import argparse
@@ -66,6 +72,8 @@ def parse_args():
     # Finetuning options
     parser.add_argument("--use-pretrained", action=argparse.BooleanOptionalAction, default=True,
                         help="Load pretrained weights before finetuning")
+    parser.add_argument("--skip-valid", action=argparse.BooleanOptionalAction, default=True,
+                        help="Train on full trainval without validation split (use --no-skip-valid for 80/20 split with early stopping)")
     parser.add_argument("--early-prediction", action="store_true", default=False,
                         help="Enable Phase 4: progressive time masking + weighted loss")
 
@@ -162,9 +170,14 @@ def main():
     # Stage 2: Training HP sweep (optional)
     # ========================================================================
     best_finetune_cfg = None
+    sweep_retrained = False
     if args.sweep_train:
         pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Training HP Sweep (Stage 2) ===")
+
+        # When sweep + finetune + skip-valid: retrain on full trainval inside
+        # the sweep using the best trial's actual epoch counts
+        do_retrain = args.finetune and args.skip_valid
         train_result = run_training_sweep(
             data, cfg,
             n_trials=args.n_train_trials,
@@ -172,14 +185,17 @@ def main():
             pretrain_cfg=pretrain_cfg,
             pretrain_checkpoint_dir=pretrain_cfg.checkpoint_dir,
             storage=args.study_storage,
+            retrain_full=do_retrain,
+            model_name=model_name if do_retrain else None,
         )
         report_sweep_results(train_result["study"])
         best_finetune_cfg = train_result["best_finetune_cfg"]
+        sweep_retrained = do_retrain and train_result.get("retrain_result") is not None
 
     # ========================================================================
     # Finetuning
     # ========================================================================
-    if args.finetune:
+    if args.finetune and not sweep_retrained:
         pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Finetuning (v2) ===")
 
@@ -194,6 +210,10 @@ def main():
         finetune_cfg.model_name = model_name
         finetune_cfg.pretrain_checkpoint_dir = pretrain_cfg.checkpoint_dir
 
+        if args.skip_valid:
+            finetune_cfg.valid_size = 0.0
+            logger.info("--skip-valid: training on full trainval data (valid_size=0.0)")
+
         if args.early_prediction:
             finetune_cfg.enable_early_prediction = True
 
@@ -202,7 +222,12 @@ def main():
             pretrain_cfg=pretrain_cfg,
             device="cuda",
         )
-        logger.info(f"Finetuning complete. Best AUROC: {result['best_auroc']:.4f}")
+        if result["best_auroc"] is not None:
+            logger.info(f"Finetuning complete. Best AUROC: {result['best_auroc']:.4f}")
+        else:
+            logger.info("Finetuning complete (full trainval, no validation AUROC)")
+    elif sweep_retrained:
+        logger.info("Finetuning already completed during sweep (retrain on full trainval)")
 
     # ========================================================================
     # Evaluation

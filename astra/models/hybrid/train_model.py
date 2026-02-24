@@ -21,7 +21,8 @@ def parse_args():
     # 2. Logic Flags (Default: Load pretrained model if finetuning)
     parser.add_argument('--use-pretrained', action=argparse.BooleanOptionalAction, default=True,
                        help='Load pretrained weights before finetuning')
-    parser.add_argument('--skip-valid',  action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--skip-valid',  action=argparse.BooleanOptionalAction, default=True,
+                       help='Train on full trainval without validation split (use --no-skip-valid for 80/20 split with early stopping)')
 
     # 3. Eval Flags (Default: Comprehensive is OFF, Multicurve is OFF)
     parser.add_argument('--comprehensive-eval', action=argparse.BooleanOptionalAction, default=False)
@@ -50,13 +51,20 @@ def main():
         finetune_cfg.model_name = cfg["model_name"]
         finetune_cfg.use_pretrained = args.use_pretrained
 
+        if args.skip_valid:
+            finetune_cfg.valid_size = 0.0
+            logger.info("--skip-valid: training on full trainval data (valid_size=0.0)")
+
         result = run_finetune_v2(
             data,
             finetune_cfg=finetune_cfg,
             pretrain_cfg=pretrain_cfg,
             device='cuda',
         )
-        logger.info(f"Best validation AUROC: {result['best_auroc']:.4f}")
+        if result["best_auroc"] is not None:
+            logger.info(f"Best validation AUROC: {result['best_auroc']:.4f}")
+        else:
+            logger.info("Training complete (full trainval, no validation AUROC)")
 
     if args.finetune:
         logger.info("=== Saving deployment bundle ===")

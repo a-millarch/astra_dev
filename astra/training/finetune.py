@@ -547,7 +547,7 @@ def _run_phase(
     finetune_cfg: FinetuneConfig,
     device: str,
     tracker: MetricTracker,
-    early_stopper: EarlyStopping,
+    early_stopper: Optional[EarlyStopping] = None,
     trial=None,
     global_epoch: int = 0,
     enable_masking: bool = False,
@@ -560,6 +560,10 @@ def _run_phase(
 ) -> int:
     """
     Run a single training phase.
+
+    Args:
+        valid_dl: Validation dataloader. None = no validation (full trainval mode).
+        early_stopper: Early stopping tracker. None = train for full epoch count.
 
     Returns:
         Updated global_epoch counter.
@@ -597,25 +601,31 @@ def _run_phase(
             time_weighting=time_weighting,
             early_weight_factor=early_weight_factor,
         )
-        val_auroc = compute_auroc(model, valid_dl, device=device,
-                                  temporal_head=temporal_head)
 
-        tracker.update(phase_name, global_epoch, train_loss=train_loss, val_auroc=val_auroc)
-        logger.info(
-            f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, val_auroc={val_auroc:.4f}"
-        )
+        if valid_dl is not None:
+            val_auroc = compute_auroc(model, valid_dl, device=device,
+                                      temporal_head=temporal_head)
+            tracker.update(phase_name, global_epoch, train_loss=train_loss, val_auroc=val_auroc)
+            logger.info(
+                f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, val_auroc={val_auroc:.4f}"
+            )
 
-        # Optuna reporting + pruning
-        if trial is not None:
-            import optuna
-            trial.report(val_auroc, global_epoch)
-            if trial.should_prune():
-                raise optuna.TrialPruned()
+            # Optuna reporting + pruning
+            if trial is not None:
+                import optuna
+                trial.report(val_auroc, global_epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
 
-        # Early stopping (tracks best model internally)
-        if early_stopper(val_auroc, model):
-            logger.info(f"  Early stopping at epoch {global_epoch + 1}")
-            break
+            # Early stopping (tracks best model internally)
+            if early_stopper is not None and early_stopper(val_auroc, model):
+                logger.info(f"  Early stopping at epoch {global_epoch + 1}")
+                break
+        else:
+            tracker.update(phase_name, global_epoch, train_loss=train_loss)
+            logger.info(
+                f"  Epoch {global_epoch + 1}: loss={train_loss:.4f} (no validation)"
+            )
 
         global_epoch += 1
 
@@ -684,26 +694,39 @@ def run_finetune_v2(
     backbone = backbone.to(device)
 
     # ========================================================================
-    # 2. Create train/valid split dataloaders
+    # 2. Create dataloaders
     # ========================================================================
-    logger.info("Creating train/valid split for finetuning...")
-    y = data["y"]
-    splits = get_stratified_splits(
-        y,
-        valid_size=finetune_cfg.valid_size,
-        random_state=42,
-    )
-    logger.info(f"  Train: {len(splits[0])} samples, Valid: {len(splits[1])} samples")
+    no_validation = finetune_cfg.valid_size <= 0.0
 
-    mixed_dls = create_split_dataloaders(data, splits, cfg)
-    train_dl = mixed_dls.train
-    valid_dl = mixed_dls.valid
+    if trial is not None and no_validation:
+        raise ValueError(
+            "Cannot use Optuna HPO (trial != None) with valid_size=0.0. "
+            "Validation data is required for trial evaluation."
+        )
+
+    if no_validation:
+        logger.info("Training on full trainval (no validation split)")
+        train_dl = data["mixed_dls"].train
+        valid_dl = None
+    else:
+        logger.info("Creating train/valid split for finetuning...")
+        y = data["y"]
+        splits = get_stratified_splits(
+            y,
+            valid_size=finetune_cfg.valid_size,
+            random_state=42,
+        )
+        logger.info(f"  Train: {len(splits[0])} samples, Valid: {len(splits[1])} samples")
+
+        mixed_dls = create_split_dataloaders(data, splits, cfg)
+        train_dl = mixed_dls.train
+        valid_dl = mixed_dls.valid
 
     # ========================================================================
     # 3. Setup tracking
     # ========================================================================
     tracker = MetricTracker()
-    early_stopper = EarlyStopping(
+    early_stopper = None if no_validation else EarlyStopping(
         patience=finetune_cfg.patience, mode="max",
     )
     global_epoch = 0
@@ -718,7 +741,7 @@ def run_finetune_v2(
     # Temporal head: compute pos_weight for class imbalance in BCE
     temporal_phase_kwargs = {}
     if temporal_head:
-        y_arr = np.array(y)
+        y_arr = np.array(data["y"])
         n_pos = y_arr.sum()
         n_neg = len(y_arr) - n_pos
         pw = torch.tensor([n_neg / max(n_pos, 1)], device=device)
@@ -754,7 +777,8 @@ def run_finetune_v2(
     # ========================================================================
     # 5. Phase 2: Partial unfreeze (upper transformer + head)
     # ========================================================================
-    early_stopper.reset_patience()  # fresh patience budget; best_state preserved
+    if early_stopper is not None:
+        early_stopper.reset_patience()  # fresh patience budget; best_state preserved
     unfreeze_from(backbone, finetune_cfg.phase2_unfreeze_from)
     logger.info(f"Phase 2: Unfreezing from {finetune_cfg.phase2_unfreeze_from}")
 
@@ -774,7 +798,8 @@ def run_finetune_v2(
     # ========================================================================
     # 6. Phase 3: Full finetune
     # ========================================================================
-    early_stopper.reset_patience()
+    if early_stopper is not None:
+        early_stopper.reset_patience()
     unfreeze_all(backbone)
     logger.info("Phase 3: Full finetune (all layers)")
 
@@ -795,7 +820,8 @@ def run_finetune_v2(
     # 7. Phase 4: Early prediction hardening (optional)
     # ========================================================================
     if finetune_cfg.enable_early_prediction and finetune_cfg.phase4_epochs > 0:
-        early_stopper.reset_patience()
+        if early_stopper is not None:
+            early_stopper.reset_patience()
         logger.info("Phase 4: Early prediction hardening (progressive masking + weighted loss)")
 
         global_epoch = _run_phase(
@@ -814,11 +840,15 @@ def run_finetune_v2(
         )
 
     # ========================================================================
-    # 8. Restore best model and save
+    # 8. Restore best model (if validation was used) and save
     # ========================================================================
-    early_stopper.restore_best(backbone)
-    best_auroc = early_stopper.best_score or 0.0
-    logger.info(f"Best validation AUROC: {best_auroc:.4f}")
+    if early_stopper is not None:
+        early_stopper.restore_best(backbone)
+        best_auroc = early_stopper.best_score or 0.0
+        logger.info(f"Best validation AUROC: {best_auroc:.4f}")
+    else:
+        best_auroc = None
+        logger.info("Full trainval training complete (no validation AUROC available)")
 
     # Save model + deployment bundle
     if finetune_cfg.model_name:

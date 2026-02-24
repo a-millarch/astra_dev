@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '24022026_simple_2'
+model_name: '24022026_fullds'
    
 target: deceased_30d
 
@@ -78,7 +78,7 @@ training:
     
 model:
     res_dropout: 0.22
-    fc_dropout: 0.8
+    fc_dropout: 0.75
     fc_mults_1: 0.3
     fc_mults_2: 0.1
     n_layers: 8

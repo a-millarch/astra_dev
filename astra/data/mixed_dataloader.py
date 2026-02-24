@@ -305,6 +305,8 @@ def get_stratified_splits(
         (train_indices, valid_indices)
     """
     y_arr = np.asarray(y)
+    if valid_size <= 0.0:
+        return list(range(len(y_arr))), []
     sss = StratifiedShuffleSplit(
         n_splits=1, test_size=valid_size, random_state=random_state,
     )

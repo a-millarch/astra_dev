@@ -264,6 +264,17 @@ def training_objective(
         verbose=False,
     )
 
+    # Record actual epoch counts per phase (for post-HPO full trainval retrain)
+    tracker = result["tracker"]
+    for phase_key, attr_name, cfg_field in [
+        ("phase1_head", "phase1_actual_epochs", "phase1_epochs"),
+        ("phase2_partial", "phase2_actual_epochs", "phase2_epochs"),
+        ("phase3_full", "phase3_actual_epochs", "phase3_epochs"),
+        ("phase4_early", "phase4_actual_epochs", "phase4_epochs"),
+    ]:
+        actual = len(tracker.get(f"{phase_key}/train_loss"))
+        trial.set_user_attr(attr_name, actual)
+
     clear_mem()
     return result["best_auroc"]
 
@@ -277,6 +288,8 @@ def run_training_sweep(
     pretrain_checkpoint_dir: Optional[str] = None,
     study_name: str = "astra_training_search",
     storage: Optional[str] = None,
+    retrain_full: bool = False,
+    model_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Stage 2: Search for optimal finetuning hyperparameters.
@@ -292,9 +305,12 @@ def run_training_sweep(
         pretrain_checkpoint_dir: Path to pretrained checkpoint.
         study_name: Optuna study name.
         storage: Optuna storage URL (None = in-memory).
+        retrain_full: If True, retrain on full trainval with best HPs after sweep.
+        model_name: Model name for the retrained model (required if retrain_full=True).
 
     Returns:
-        Dict with 'best_params', 'study', 'best_finetune_cfg'.
+        Dict with 'best_params', 'study', 'best_finetune_cfg', and
+        optionally 'retrain_result' if retrain_full=True.
     """
     logger.info("=" * 80)
     logger.info("STAGE 2: Training HP Search")
@@ -346,7 +362,39 @@ def run_training_sweep(
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
     )
 
-    return {"best_params": best, "study": study, "best_finetune_cfg": best_cfg}
+    retrain_result = None
+    if retrain_full:
+        logger.info("=" * 80)
+        logger.info("FINAL RETRAIN: Training on full trainval with best HPs")
+        logger.info("=" * 80)
+
+        # Use actual epoch counts from the best trial (accounts for early stopping)
+        best_attrs = study.best_trial.user_attrs
+        best_cfg.phase1_epochs = best_attrs.get("phase1_actual_epochs", best_cfg.phase1_epochs)
+        best_cfg.phase2_epochs = best_attrs.get("phase2_actual_epochs", best_cfg.phase2_epochs)
+        best_cfg.phase3_epochs = best_attrs.get("phase3_actual_epochs", best_cfg.phase3_epochs)
+        best_cfg.phase4_epochs = best_attrs.get("phase4_actual_epochs", best_cfg.phase4_epochs)
+        logger.info(f"  Using epoch counts from best trial: "
+                     f"P1={best_cfg.phase1_epochs}, P2={best_cfg.phase2_epochs}, "
+                     f"P3={best_cfg.phase3_epochs}, P4={best_cfg.phase4_epochs}")
+
+        best_cfg.valid_size = 0.0
+        best_cfg.model_name = model_name or cfg_dict.get("model_name", "")
+
+        retrain_result = run_finetune_v2(
+            data, best_cfg,
+            pretrain_cfg=pretrain_cfg,
+            device=device,
+            trial=None,
+        )
+        logger.info("Full trainval retrain complete")
+
+    return {
+        "best_params": best,
+        "study": study,
+        "best_finetune_cfg": best_cfg,
+        "retrain_result": retrain_result,
+    }
 
 
 def report_sweep_results(study: optuna.Study) -> None:
