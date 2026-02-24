@@ -336,7 +336,7 @@ def load_model_state(model_name: str, save_dir: str = 'models') -> dict:
         state_dict: OrderedDict of parameter tensors
     """
     path = os.path.join(save_dir, f'{model_name}.pth')
-    checkpoint = torch.load(path, map_location='cpu')
+    checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
         return checkpoint['model']
     # Assume it's a plain state dict

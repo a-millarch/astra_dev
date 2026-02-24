@@ -127,7 +127,7 @@ class InferenceSession:
 
         # Load weights (FastAI format: {'model': state_dict, ...})
         weights_path = os.path.join(weights_dir, f'{model_name}.pth')
-        checkpoint = torch.load(weights_path, map_location='cpu')
+        checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
         if isinstance(checkpoint, dict) and 'model' in checkpoint:
             model.load_state_dict(checkpoint['model'], strict=False)
         else:

@@ -179,7 +179,7 @@ def load_pretrained_backbone(
             f"Pretrained checkpoint not found: {checkpoint_path}"
         )
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     # Need the same MLM model structure to load, then extract backbone
     if pretrain_cfg is None:
