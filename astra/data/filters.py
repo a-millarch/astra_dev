@@ -113,7 +113,8 @@ def filter_vitals(vit):
         return (f - 32) * 5.0 / 9.0
 
     for f in TEMP_FAHRENHEIT:
-        vit.loc[vit.Vital_parametre == f, "Værdi"] = vit.Værdi.apply(fahrenheit_to_celsius)
+        numeric_vals = pd.to_numeric(vit.loc[vit.Vital_parametre == f, 'Værdi'], errors='coerce')
+        vit.loc[numeric_vals.index, 'Værdi'] = numeric_vals.apply(fahrenheit_to_celsius)
 
     # Value-based F→C for 'Temperatur': bimodal distribution — values >50 are in °F
     temp_numeric = pd.to_numeric(vit.loc[vit.Vital_parametre == 'Temperatur', 'Værdi'], errors='coerce')
