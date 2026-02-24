@@ -43,4 +43,4 @@ def plot_prediction_trajectory(result, ctx, save_path=None):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         print(f"Saved trajectory plot to {save_path}")
-    plt.close(fig)
+    plt.show()

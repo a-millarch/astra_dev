@@ -1,6 +1,5 @@
 import os
 import hashlib
-import yaml
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -160,6 +159,7 @@ def save_figure(fig, filename, save_dir='reports/studyfigs'):
     fig.savefig(png_path, dpi=1200, bbox_inches='tight')
 
 def get_cfg(cfg_path="configs/defaults.yaml"):
+    import yaml
     with open(cfg_path) as file:
         return yaml.safe_load(file)
 

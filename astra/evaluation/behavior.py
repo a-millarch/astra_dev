@@ -82,42 +82,47 @@ def create_channel_mapping(data):
 _TEMPORAL_CHANNELS = {'elapsed_hours', 'bin_width_hours'}
 _EBM_CHANNELS = {'_ebm_pred'}
 _AUXILIARY_CHANNELS = {'_data_present'}
+_SHAP_EXCLUDED_CHANNELS = _TEMPORAL_CHANNELS | _AUXILIARY_CHANNELS
 _GROUP_COLORS = {
     'Clinical': '#008bfb',
     'EBM': '#FF9800',
-    'Temporal': '#9C27B0',
 }
 
 
 def classify_channels(channel2feature: Dict[int, str]) -> OrderedDict:
     """
-    Classify continuous TS channels into groups: Clinical, EBM, Temporal.
-    Auxiliary channels (_data_present) are excluded.
+    Classify continuous TS channels into groups: Clinical, EBM.
+    Temporal and auxiliary channels are excluded (not used as model features).
     """
     groups = OrderedDict([
         ('Clinical', []),
         ('EBM', []),
-        ('Temporal', []),
     ])
 
     for ch_idx in sorted(channel2feature.keys()):
         feat_name = channel2feature[ch_idx]
-        if feat_name in _TEMPORAL_CHANNELS:
-            groups['Temporal'].append((ch_idx, feat_name))
+        if feat_name in _SHAP_EXCLUDED_CHANNELS:
+            continue
         elif feat_name in _EBM_CHANNELS:
             groups['EBM'].append((ch_idx, feat_name))
-        elif feat_name in _AUXILIARY_CHANNELS:
-            continue
         else:
             groups['Clinical'].append((ch_idx, feat_name))
 
     return OrderedDict((k, v) for k, v in groups.items() if v)
 
 
+def _get_display_channel_mask(channel2feature: Dict[int, str], n_channels: int) -> list:
+    """Return list of channel indices to include in SHAP displays (Clinical + EBM only)."""
+    if not channel2feature:
+        return list(range(n_channels))
+    return [i for i in range(n_channels)
+            if channel2feature.get(i, '') not in _SHAP_EXCLUDED_CHANNELS]
+
+
 def _get_grouped_channel_order(channel2feature: Dict[int, str]):
     """
-    Get channel indices reordered by group (Clinical, EBM, Temporal).
-    Auxiliary channels are excluded.
+    Get channel indices reordered by group (Clinical, EBM).
+    Temporal and auxiliary channels are excluded.
 
     Returns:
         ordered_indices, ordered_labels, group_boundaries
@@ -156,8 +161,6 @@ def _get_channel_color(channel2feature, ch_idx):
     name = channel2feature.get(ch_idx, '')
     if name in _EBM_CHANNELS:
         return _GROUP_COLORS['EBM']
-    elif name in _TEMPORAL_CHANNELS:
-        return _GROUP_COLORS['Temporal']
     return _GROUP_COLORS['Clinical']
 
 
@@ -1428,9 +1431,12 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     n_ticks = min(10, n_steps)
     tick_idx = np.linspace(0, n_steps-1, n_ticks, dtype=int)
     
+    # Channels to display (exclude temporal/auxiliary — not model features)
+    display_ch = _get_display_channel_mask(channel2feature, n_channels)
+
     # Plot 1: TS importance over time
     ax1 = fig.add_subplot(gs[0, :])
-    ts_imp = np.abs(ts_shap).mean(axis=(0, 1))
+    ts_imp = np.abs(ts_shap[:, display_ch, :]).mean(axis=(0, 1))
     ax1.plot(ts_imp, linewidth=2, color='#ff0051', label='Continuous TS')
     ax1.fill_between(range(len(ts_imp)), ts_imp, alpha=0.3, color='#ff0051')
     
@@ -1448,10 +1454,13 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Top channels (color-coded by group)
+    # Plot 2: Top channels (color-coded by group, excluding temporal/auxiliary)
     ax2 = fig.add_subplot(gs[1, 0])
     ch_imp = np.abs(ts_shap).mean(axis=(0, 2))
-    sorted_idx = np.argsort(ch_imp)[::-1][:max_display]
+    # Rank only displayable channels
+    ch_imp_display = ch_imp[display_ch]
+    sorted_display = np.argsort(ch_imp_display)[::-1][:max_display]
+    sorted_idx = [display_ch[i] for i in sorted_display]
     if channel2feature:
         names = [channel2feature.get(int(i), f'Ch{i}') for i in sorted_idx]
         bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
@@ -1467,10 +1476,9 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         for i in sorted_idx:
             name = channel2feature.get(int(i), '')
             if name in _EBM_CHANNELS: used_groups.add('EBM')
-            elif name in _TEMPORAL_CHANNELS: used_groups.add('Temporal')
             else: used_groups.add('Clinical')
         ax2.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.7)
-                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                            for g in ['Clinical', 'EBM'] if g in used_groups],
                    loc='lower right', fontsize=8)
     
     # Plot 3: Categorical TS SHAP heatmap (mean across cohort)
