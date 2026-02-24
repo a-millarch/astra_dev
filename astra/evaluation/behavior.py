@@ -205,7 +205,15 @@ class ModelWrapperWithEmbeddings(nn.Module):
         # pattern, invalidating the SHAP explanation.
         key_padding_mask = None
 
-        x = self.model.W_P(x_ts).transpose(1, 2)
+        # Extract elapsed_hours for positional encoding (before stripping aux channels)
+        if self.model.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
+        else:
+            elapsed_hours = None
+
+        # Strip auxiliary channels before W_P (same as model forward)
+        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        x = self.model.W_P(x_ts_signal).transpose(1, 2)
 
         if self.has_cat_ts and x_ts_cat_embedded is not None:
             if self.model.cat_ts_combine == 'add':
@@ -220,7 +228,7 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
-        x += self.model.pos_enc
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours)
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
@@ -273,8 +281,15 @@ class ModelWrapperWithRawCatTS(nn.Module):
         # pattern, invalidating the SHAP explanation.
         key_padding_mask = None
 
-        # Continuous TS encoding
-        x = self.model.W_P(x_ts).transpose(1, 2)  # [bs, seq_len, d_model]
+        # Extract elapsed_hours for positional encoding (before stripping aux channels)
+        if self.model.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
+        else:
+            elapsed_hours = None
+
+        # Strip auxiliary channels before W_P (same as model forward)
+        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        x = self.model.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
 
         # Embed categorical TS from raw multi-hot (this is differentiable!)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
@@ -306,7 +321,7 @@ class ModelWrapperWithRawCatTS(nn.Module):
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
-        x += self.model.pos_enc
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours)
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
