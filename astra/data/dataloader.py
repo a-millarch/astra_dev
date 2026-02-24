@@ -5,21 +5,19 @@ import os
 import pandas as pd
 import numpy as np
 
-from fastai.data.transforms import Categorize
-from fastai.tabular.core import Categorify, FillMissing, Normalize
-
-from tsai.data.core import get_ts_dls
-from tsai.data.preprocessing import TSStandardize
-from tsai.data.tabular import get_tabular_dls
-from tsai.data.mixed import get_mixed_dls
-from tsai.data.preparation import df2xy
-
 from sklearn.preprocessing import RobustScaler, StandardScaler
 import pickle
 
 from astra.utils import get_base_df, logger, align_dataframes
 from astra.data.preprocessing import MultiHotCategoricalEncoder
-from astra.data.datasets import TSDS 
+from astra.data.datasets import TSDS
+
+from astra.data.mixed_dataloader import (
+    df2xy_pure,
+    TabularEncoder,
+    AstraMixedDataset,
+    AstraMixedDataLoader,
+)
 
 
 # ============================================================================
@@ -134,7 +132,7 @@ def get_trajectory_lengths(X, padding_value=0.0):
 
 
 # ============================================================================
-# Utility functions (unchanged)
+# Utility functions
 # ============================================================================
 
 def tscatdfwide2x(df_wide:pd.DataFrame, sample_col:str='PID', cat_col='FEATURE'):
@@ -146,11 +144,15 @@ def tscatdfwide2x(df_wide:pd.DataFrame, sample_col:str='PID', cat_col='FEATURE')
         cat_col=cat_col,
         feature_names=df_wide.FEATURE.dropna().unique()
     )
-    return X_multi_hot, encoding_info 
+    return X_multi_hot, encoding_info
 
 
-def dfwide2ts_dls(df_wide, y, cfg, encoder=None):
-    """Create categorical TS dataloader with optional pre-fitted encoder."""
+def encode_categorical_ts(df_wide, y, cfg, encoder=None):
+    """Encode categorical TS to multi-hot arrays with optional pre-fitted encoder.
+
+    Returns:
+        X_multi_hot, encoding_info, ts_cat_dims, encoder
+    """
     if encoder is None:
         encoder = MultiHotCategoricalEncoder()
         X_multi_hot, encoding_info = encoder.fit_transform(
@@ -167,35 +169,25 @@ def dfwide2ts_dls(df_wide, y, cfg, encoder=None):
             timestep_cols=df_wide.timestep_cols,
             cat_col='FEATURE'
         )
-    
+
     logger.debug(f"X_multi_hot shape: {X_multi_hot.shape}")
-    
-    ts_cat_dls = get_ts_dls(
-        X_multi_hot.astype(np.int64), 
-        y, 
-        splits=None, 
-        bs=cfg["training"]["bs"],
-        shuffle=False
-    )
-    
+
     ts_cat_dims = {
-        feat_name: end - start 
+        feat_name: end - start
         for feat_name, (start, end) in encoding_info['feature_ranges'].items()
     }
-    ts_cat_dls.ts_cat_dims = ts_cat_dims
-    ts_cat_dls.X_multi_hot = X_multi_hot
-    return ts_cat_dls, encoding_info, encoder
+    return X_multi_hot, encoding_info, ts_cat_dims, encoder
 
 
 # ============================================================================
-# FIXED: Main data preparation function
+# Main data preparation function
 # ============================================================================
 
 def prepare_data_and_dls(cfg):
     """
-    Prepare data and dataloaders with FIXED normalization that preserves padding.
-    
-    KEY FIX: Uses normalize_with_padding_mask() to ensure:
+    Prepare data and dataloaders (pure PyTorch, no TSAI/FastAI).
+
+    Uses normalize_with_padding_mask() to ensure:
     - Scaler is fit only on non-padding (real) data
     - Padding zeros remain as zeros after normalization
     - Model correctly distinguishes signal from padding
@@ -219,13 +211,13 @@ def prepare_data_and_dls(cfg):
     # Split concepts into categorical and continuous
     for tsds in [holdout, trainval]:
         tsds.cat_concepts = {
-            k: tsds.concepts[k] 
-            for k in cfg["dataset"]["ts_cat_names"] 
+            k: tsds.concepts[k]
+            for k in cfg["dataset"]["ts_cat_names"]
             if k in tsds.concepts
         }
         tsds.cont_concepts = {
-            k: v 
-            for k, v in tsds.concepts.items() 
+            k: v
+            for k, v in tsds.concepts.items()
             if k not in cfg["dataset"]["ts_cat_names"]
         }
         tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
@@ -247,7 +239,7 @@ def prepare_data_and_dls(cfg):
             )
             tsds.cont_concepts['_ebm'] = ebm_df
             tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
-    
+
     # Align continuous dataframes (string column names)
     trainval.complete, holdout.complete = align_dataframes(
         trainval.complete,
@@ -271,45 +263,27 @@ def prepare_data_and_dls(cfg):
         ts = sorted(c for c in df.columns if isinstance(c, int))
         tsds_obj.complete_cat = df[non_ts + ts]
         tsds_obj.complete_cat.timestep_cols = ts
-    
+
     cat_cols = cfg["dataset"]["cat_cols"]
     num_cols = cfg["dataset"]["num_cols"]
     logger.info(f'Categoricals: {cat_cols}\nNumericals: {num_cols}')
 
-    # Common transforms (NO batch transforms!)
-    tfms = [None, [Categorize()]]
-    batch_tfms = None
-    procs = [Categorify, FillMissing]
-    
-    # Get classes from combined data
-    complete_tab_dls = get_tabular_dls(
+    # ============================================================================
+    # TABULAR ENCODING (replaces FastAI Categorify + FillMissing)
+    # ============================================================================
+    tab_encoder = TabularEncoder()
+    tab_encoder.fit(
         pd.concat([trainval.tab_df, holdout.tab_df]),
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg["target"],
-        splits=None,
-        drop_last=False,
-        shuffle=False
+        cat_cols=cat_cols,
+        num_cols=num_cols,
     )
-    classes = complete_tab_dls.classes
-
-    # Ensure classes includes _na columns added by FillMissing.
-    # FillMissing creates {col}_na boolean indicators for numeric columns
-    # with NaN values. These become categorical features in the model, but
-    # depending on FastAI/TSAI version, .classes may not include them.
-    df_combined = pd.concat([trainval.tab_df, holdout.tab_df])
-    for col in num_cols:
-        na_name = f'{col}_na'
-        if df_combined[col].isna().any() and na_name not in classes:
-            classes[na_name] = ['#na#', False, True]
-            logger.info(f'  Added missing indicator to classes: {na_name}')
+    classes = tab_encoder.classes
 
     # ============================================================================
     # TRAINVAL DATA EXTRACTION
     # ============================================================================
     logger.info("Setting up X,y for training and validation")
-    X, y = df2xy(
+    X, y = df2xy_pure(
         trainval.complete,
         sample_col='PID',
         feat_col='FEATURE',
@@ -319,8 +293,7 @@ def prepare_data_and_dls(cfg):
     y = list(y[:, 0].flatten())
     logger.info(f'Train/val X shape (before normalization): {X.shape}')
 
-    # Channel names — df2xy sorts by FEATURE ascending, so this IS the channel order.
-    # Computed once here and reused for EBM, temporal features, and save_deployment_bundle.
+    # Channel names — df2xy_pure sorts by FEATURE ascending, so this IS the channel order.
     ts_channel_names = sorted(trainval.complete['FEATURE'].unique())
 
     # Compute EBM channel index
@@ -332,10 +305,10 @@ def prepare_data_and_dls(cfg):
     X_raw = X.copy()
 
     # ============================================================================
-    # FIXED: FIT SCALERS ON TRAINVAL ONLY, PRESERVING PADDING
+    # FIT SCALERS ON TRAINVAL ONLY, PRESERVING PADDING
     # ============================================================================
     logger.info("Fitting normalization scalers on trainval data (excluding padding)...")
-    
+
     # 1. CONTINUOUS TIME SERIES SCALER
     ts_scaler = StandardScaler()
 
@@ -348,23 +321,17 @@ def prepare_data_and_dls(cfg):
     X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
 
     # === TEMPORAL FEATURES: mode-aware index computation + elapsed_hours restoration ===
-    # 'off'        (enabled: false)  → no temporal channels, no-op
-    # 'channel'    (enabled: true, mode: channel)   → temporal features go through W_P
-    #              as normalized inputs — no special treatment (Option A)
-    # 'sinusoidal' (enabled: true, mode: sinusoidal) → elapsed_hours excluded from W_P,
-    #              restored to raw hours for sinusoidal positional encoding (Option B)
     tf_cfg = cfg.get('temporal_features', {})
     tf_enabled = tf_cfg.get('enabled', False)
-    tf_mode = tf_cfg.get('mode', 'channel')  # default to 'channel' when omitted
+    tf_mode = tf_cfg.get('mode', 'channel')
 
     temporal_channel_idx = None
     exclude_channel_indices = []
 
     if tf_enabled and tf_mode == 'sinusoidal':
-        _aux_names = set(tf_cfg.get('features', []))   # e.g. {'elapsed_hours', 'bin_width_hours'}
+        _aux_names = set(tf_cfg.get('features', []))
         if 'elapsed_hours' in ts_channel_names:
             eh_idx = ts_channel_names.index('elapsed_hours')
-            # Restore raw values: sinusoidal PE requires actual hours (0–720), not ~N(0,1)
             X_normalized[:, eh_idx, :] = X_raw[:, eh_idx, :]
             temporal_channel_idx = eh_idx
             logger.info(
@@ -393,11 +360,11 @@ def prepare_data_and_dls(cfg):
                         f'range=[{ebm_nonzero.min():.3f}, {ebm_nonzero.max():.3f}]')
 
     logger.info(f'Train/val X shape (after normalization): {X_normalized.shape}')
-    
-    # Verify padding is preserved (use trajectory_lengths, not zero-detection)
+
+    # Verify padding is preserved
     s_len = X_normalized.shape[2]
     pos_arr = np.arange(s_len)[np.newaxis, :]
-    is_padding = pos_arr >= traj_lengths[:, np.newaxis]  # [n_samples, seq_len]
+    is_padding = pos_arr >= traj_lengths[:, np.newaxis]
     is_padding_3d = np.broadcast_to(is_padding[:, np.newaxis, :], X_normalized.shape)
     padding_vals = X_normalized[is_padding_3d]
     non_padding_vals = X_normalized[~is_padding_3d]
@@ -409,15 +376,14 @@ def prepare_data_and_dls(cfg):
     else:
         logger.info(f'Padding preserved correctly (mean = 0)')
     logger.info(f'Non-padding data stats: mean={non_padding_vals.mean():.4f}, std={non_padding_vals.std():.4f}')
-    # Count measured vs missing within non-padding
     n_measured = np.sum(non_padding_vals != 0)
     n_missing = np.sum(non_padding_vals == 0)
     logger.info(f'  Within trajectory: {n_measured} measured ({100*n_measured/(n_measured+n_missing):.1f}%), '
                f'{n_missing} missing ({100*n_missing/(n_measured+n_missing):.1f}%)')
-    
-    # 2. TABULAR DATA SCALER (unchanged - no padding issue)
+
+    # 2. TABULAR DATA SCALER
     tab_scaler = StandardScaler()
-    
+
     if num_cols:
         logger.info(f'Fitting tabular scaler on {len(num_cols)} continuous features')
         tab_scaler.fit(trainval.tab_df[num_cols])
@@ -427,52 +393,38 @@ def prepare_data_and_dls(cfg):
         trainval_tab_normalized = trainval.tab_df
 
     # ============================================================================
-    # TRAINVAL DATALOADERS
+    # TRAINVAL: Encode tabular + categorical TS → build dataloaders
     # ============================================================================
     logger.info("Creating trainval dataloaders...")
-    
-    ts_dls = get_ts_dls(
-        X_normalized,
-        y,
-        splits=None,
-        tfms=tfms,
-        batch_tfms=None,
-        bs=cfg["training"]["bs"],
-        drop_last=False,
-        shuffle=False
-    )
-   
-    tab_dls = get_tabular_dls(
-        trainval_tab_normalized,
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg["target"],
-        splits=None,
-        bs=cfg["training"]["bs"],
-        drop_last=False,
-        shuffle=False
+
+    trainval_tab_encoded = tab_encoder.transform(trainval_tab_normalized, cat_cols, num_cols)
+    trainval_x_cat, trainval_x_cont = tab_encoder.get_cat_cont_arrays(
+        trainval_tab_encoded, cat_cols, num_cols,
     )
 
-    ts_cat_dls, encoding_info, cat_encoder = dfwide2ts_dls(
-        trainval.complete_cat, 
-        y, 
-        cfg,
-        encoder=None
+    X_multi_hot, encoding_info, ts_cat_dims, cat_encoder = encode_categorical_ts(
+        trainval.complete_cat, y, cfg, encoder=None,
     )
-    
-    mixed_dls = get_mixed_dls(
-        ts_dls,
-        tab_dls,
-        ts_cat_dls,
-        bs=cfg["training"]["bs"]
+
+    trainval_dataset = AstraMixedDataset(
+        X_ts=X_normalized,
+        x_cat=trainval_x_cat,
+        x_cont=trainval_x_cont,
+        X_ts_cat=X_multi_hot,
+        y=y,
+    )
+    mixed_dls = AstraMixedDataLoader(
+        trainval_dataset,
+        splits=None,
+        bs=cfg["training"]["bs"],
+        shuffle_train=False,
     )
 
     # ============================================================================
     # HOLDOUT DATA EXTRACTION
     # ============================================================================
     logger.info('Preparing holdout data...')
-    tX, ty = df2xy(
+    tX, ty = df2xy_pure(
         holdout.complete,
         sample_col='PID',
         feat_col='FEATURE',
@@ -481,24 +433,20 @@ def prepare_data_and_dls(cfg):
     )
     ty = list(ty[:, 0].flatten())
     logger.info(f'Holdout X shape (before normalization): {tX.shape}')
-    
-    # Store raw for debugging
+
     tX_raw = tX.copy()
 
     # ============================================================================
-    # FIXED: TRANSFORM HOLDOUT WITH FITTED SCALERS, PRESERVING PADDING
+    # TRANSFORM HOLDOUT WITH FITTED SCALERS, PRESERVING PADDING
     # ============================================================================
     logger.info("Applying normalization to holdout (preserving padding)...")
-    
-    # Holdout trajectory lengths (computed before normalization)
+
     holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0)
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
                f'max: {holdout_traj_lengths.max()}, mean: {holdout_traj_lengths.mean():.1f}')
 
-    # Per-channel normalization using trainval-fitted scaler
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
 
-    # Restore raw elapsed_hours in holdout (same logic as trainval above)
     if tf_enabled and tf_mode == 'sinusoidal' and temporal_channel_idx is not None:
         tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
 
@@ -509,7 +457,7 @@ def prepare_data_and_dls(cfg):
             logger.info(f'Holdout EBM after standardization: '
                         f'mean={ebm_nz_h.mean():.3f}, std={ebm_nz_h.std():.3f}, '
                         f'range=[{ebm_nz_h.min():.3f}, {ebm_nz_h.max():.3f}]')
-    
+
     # Tabular
     if num_cols:
         holdout_tab_normalized = holdout.tab_df.copy()
@@ -518,92 +466,79 @@ def prepare_data_and_dls(cfg):
         holdout_tab_normalized = holdout.tab_df
 
     # ============================================================================
-    # HOLDOUT DATALOADERS
+    # HOLDOUT: Encode tabular + categorical TS → build dataloaders
     # ============================================================================
     logger.info("Creating holdout dataloaders...")
-    
-    test_ts_dls = get_ts_dls(
-        tX_normalized,
-        ty,
+
+    holdout_tab_encoded = tab_encoder.transform(holdout_tab_normalized, cat_cols, num_cols)
+    holdout_x_cat, holdout_x_cont = tab_encoder.get_cat_cont_arrays(
+        holdout_tab_encoded, cat_cols, num_cols,
+    )
+
+    tX_multi_hot, holdout_encoding_info, _, _ = encode_categorical_ts(
+        holdout.complete_cat, ty, cfg, encoder=cat_encoder,
+    )
+
+    holdout_dataset = AstraMixedDataset(
+        X_ts=tX_normalized,
+        x_cat=holdout_x_cat,
+        x_cont=holdout_x_cont,
+        X_ts_cat=tX_multi_hot,
+        y=ty,
+    )
+    holdout_mixed_dls = AstraMixedDataLoader(
+        holdout_dataset,
         splits=None,
-        tfms=tfms,
-        batch_tfms=None,
         bs=cfg["training"]["bs"],
-        drop_last=False,
-        shuffle=False
-    )
-    
-    test_tab_dls = get_tabular_dls(
-        holdout_tab_normalized,
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg["target"],
-        splits=None,
-        drop_last=False,
-        shuffle=False
-    )
-
-    test_ts_cat_dls, holdout_encoding_info, _ = dfwide2ts_dls(
-        holdout.complete_cat, 
-        ty, 
-        cfg,
-        encoder=cat_encoder
-    )
-
-    holdout_mixed_dls = get_mixed_dls(
-        test_ts_dls,
-        test_tab_dls,
-        test_ts_cat_dls,
-        bs=cfg["training"]["bs"]
+        shuffle_train=False,
     )
 
     # ============================================================================
     # VALIDATION
     # ============================================================================
-    # Padding must be zero
     pad_check = X_normalized[is_padding_3d]
     assert abs(pad_check.mean()) < 0.001, f"Padding not preserved! mean={pad_check.mean():.6f}"
     logger.info("Normalization validation passed — padding preserved correctly")
-    
+
     # ============================================================================
     # RETURN
     # ============================================================================
+    c_in = X_normalized.shape[1]
+    seq_len = X_normalized.shape[2]
+
     return {
         "base": base,
         "trainval": trainval,
         "holdout": holdout,
         "X": X_normalized,
-        "X_raw": X_raw,  # NEW: Include raw data for debugging
-        "X_multi_hot": ts_cat_dls.X_multi_hot, 
+        "X_raw": X_raw,
+        "X_multi_hot": X_multi_hot,
         "y": y,
         "tX": tX_normalized,
-        "tX_raw": tX_raw,  # NEW: Include raw data for debugging
-        "tX_multi_hot": test_ts_cat_dls.X_multi_hot,
+        "tX_raw": tX_raw,
+        "tX_multi_hot": tX_multi_hot,
         "ty": ty,
         "cat_cols": cat_cols,
         "num_cols": num_cols,
-        "tfms": tfms,
-        "batch_tfms": None,
-        "procs": procs,
         "classes": classes,
         "mixed_dls": mixed_dls,
         "holdout_mixed_dls": holdout_mixed_dls,
-        "ts_dls": ts_dls,
-        "holdout_ts_dls": test_ts_dls,
-        "ts_cat_dls": ts_cat_dls,
-        "holdout_ts_cat_dls": test_ts_cat_dls,
         "encoding_info": encoding_info,
         "cat_encoder": cat_encoder,
+        "tab_encoder": tab_encoder,
         "ts_scaler": ts_scaler,
         "tab_scaler": tab_scaler,
         "ts_feature_names": trainval.complete.columns[3:].tolist(),
-        "ts_channel_names": ts_channel_names,        # sorted FEATURE names = channel order in X
+        "ts_channel_names": ts_channel_names,
         "trajectory_lengths": traj_lengths,
         "holdout_trajectory_lengths": holdout_traj_lengths,
         "ebm_channel_idx": ebm_channel_idx,
-        "temporal_channel_idx": temporal_channel_idx,      # index of elapsed_hours, or None
-        "exclude_channel_indices": exclude_channel_indices, # aux channel indices to skip in W_P
+        "temporal_channel_idx": temporal_channel_idx,
+        "exclude_channel_indices": exclude_channel_indices,
+        # Explicit scalars (replace TSAI DL attributes)
+        "c_in": c_in,
+        "seq_len": seq_len,
+        "ts_cat_dims": ts_cat_dims,
     }
 
 
@@ -613,9 +548,8 @@ def prepare_data_and_dls(cfg):
 
 def save_normalization_artifacts(data, model_name, save_dir='models/scalers'):
     """Save normalization scalers and metadata for deployment."""
-    import os
     os.makedirs(save_dir, exist_ok=True)
-    
+
     artifacts = {
         'ts_scaler': data['ts_scaler'],
         'tab_scaler': data['tab_scaler'],
@@ -627,11 +561,11 @@ def save_normalization_artifacts(data, model_name, save_dir='models/scalers'):
         'model_name': model_name,
         'scaler_type': type(data['ts_scaler']).__name__,
     }
-    
+
     save_path = f'{save_dir}/normalization_{model_name}.pkl'
     with open(save_path, 'wb') as f:
         pickle.dump(artifacts, f)
-    
+
     logger.info(f"Saved normalization artifacts to {save_path}")
     return save_path
 
@@ -641,7 +575,7 @@ def load_normalization_artifacts(model_name, load_dir='models/scalers'):
     load_path = f'{load_dir}/normalization_{model_name}.pkl'
     with open(load_path, 'rb') as f:
         artifacts = pickle.load(f)
-    
+
     logger.info(f"Loaded normalization artifacts from {load_path}")
     return artifacts
 
@@ -709,16 +643,9 @@ def extract_shap_background(data, max_samples=200):
 def _build_channel_map(ts_channel_names, cfg):
     """
     Build a definitive mapping from each channel name to its source.
-
-    Resolves ambiguous names like BASE_EXCESS_max at save time when all
-    config information is available.
-
-    Returns:
-        dict: {channel_name: {'concept': str, 'feature': str, 'agg_func': str|None, 'type': str}}
     """
     channel_map = {}
 
-    # 1. Temporal features (elapsed_hours, bin_width_hours)
     temporal_features = cfg.get('temporal_features', {}).get('features', [])
     for ch in ts_channel_names:
         if ch in temporal_features:
@@ -727,7 +654,6 @@ def _build_channel_map(ts_channel_names, cfg):
                 'agg_func': None, 'type': 'temporal',
             }
 
-    # 2. EBM feature
     for ch in ts_channel_names:
         if ch == '_ebm_pred':
             channel_map[ch] = {
@@ -735,8 +661,6 @@ def _build_channel_map(ts_channel_names, cfg):
                 'agg_func': None, 'type': 'ebm',
             }
 
-    # 3. Continuous features: {FEATURE}_{agg_func}
-    # For each non-categorical concept, try to match channel names
     ts_cat_names = cfg['dataset'].get('ts_cat_names', [])
     for concept in cfg['concepts']:
         if concept in ts_cat_names:
@@ -755,7 +679,6 @@ def _build_channel_map(ts_channel_names, cfg):
                         'type': 'continuous',
                     }
 
-    # Warn about unmapped channels
     unmapped = [ch for ch in ts_channel_names if ch not in channel_map]
     if unmapped:
         logger.warning(f"Channel map: {len(unmapped)} unmapped channels: {unmapped}")
@@ -767,13 +690,9 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
                            max_bg_samples=200):
     """
     Save all artifacts needed for standalone single-patient inference.
-
-    Includes normalization scalers, model construction params, channel ordering,
-    and pre-extracted SHAP background data.
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # Channel names computed in prepare_data_and_dls; reuse to stay consistent
     ts_channel_names = data.get('ts_channel_names') or sorted(
         data["trainval"].complete['FEATURE'].unique()
     )
@@ -788,13 +707,13 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
         'cat_feature_names': data['cat_cols'],
         'ts_channel_names': ts_channel_names,
 
-        # --- Model construction params (replaces get_backbone + data dict) ---
+        # --- Model construction params ---
         'model_params': {
-            'c_in': data["ts_dls"].vars,
-            'seq_len': data["mixed_dls"].len,
+            'c_in': data["c_in"],
+            'seq_len': data["seq_len"],
             'classes': {k: list(v) for k, v in data["classes"].items()},
             'cont_names': list(data["num_cols"]),
-            'ts_cat_dims': dict(data["ts_cat_dls"].ts_cat_dims),
+            'ts_cat_dims': dict(data["ts_cat_dims"]),
             'd_model': cfg["model"]["d_model"],
             'n_layers': cfg["model"]["n_layers"],
             'n_heads': cfg["model"]["n_heads"],

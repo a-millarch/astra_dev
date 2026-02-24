@@ -5,8 +5,6 @@ Phase 1: Head-only (warm up randomly initialized classification head)
 Phase 2: Partial unfreeze (upper transformer layers + head)
 Phase 3: Full finetune (all layers with discriminative LRs)
 Phase 4: Early prediction hardening (optional progressive time masking)
-
-Replaces the FastAI-based run_finetune() while keeping TSAI data loading.
 """
 
 import os
@@ -19,16 +17,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from tsai.data.core import get_ts_dls
-from tsai.data.tabular import get_tabular_dls
-from tsai.data.mixed import get_mixed_dls
-from tsai.data.validation import get_splits
-
 from astra.utils import cfg, logger, clear_mem
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig
 from astra.models.hybrid.training import get_backbone
-from astra.data.dataloader import dfwide2ts_dls
+from astra.data.mixed_dataloader import (
+    AstraMixedDataset,
+    AstraMixedDataLoader,
+    get_stratified_splits,
+    save_model,
+)
 
 from astra.training.param_groups import (
     get_layer_groups,
@@ -43,7 +41,6 @@ from astra.training.utils import (
     EarlyStopping,
     MetricTracker,
     compute_auroc,
-    save_model_fastai_compatible,
     _to_device,
 )
 from astra.data.dataloader import save_deployment_bundle
@@ -113,69 +110,33 @@ def create_split_dataloaders(data: dict, splits, cfg_dict: dict):
     """
     Create train/valid mixed dataloaders from existing data arrays with split indices.
 
-    Follows the same pattern as run_pretrain() in training.py for creating
-    split-aware TSAI dataloaders from pre-normalized data.
-
     Args:
         data: Output from prepare_data_and_dls().
         splits: Tuple of (train_indices, valid_indices).
         cfg_dict: Global config dict.
 
     Returns:
-        Mixed dataloader with train and valid splits.
+        AstraMixedDataLoader with train and valid splits.
     """
-    X = data["X"]
-    y = data["y"]
-    num_cols = data["num_cols"]
-    cat_cols = data["cat_cols"]
-    tfms = data["tfms"]
-    procs = data["procs"]
-    bs = cfg_dict["training"]["bs"]
+    # Get pre-encoded tabular arrays from the existing dataset
+    trainval_ds = data["mixed_dls"]._train_ds
+    if hasattr(trainval_ds, 'dataset'):
+        trainval_ds = trainval_ds.dataset
 
-    # Reconstruct normalized tabular DataFrame
-    tab_scaler = data.get("tab_scaler", None)
-    if tab_scaler is not None and num_cols:
-        trainval_tab_normalized = data["trainval"].tab_df.copy()
-        trainval_tab_normalized[num_cols] = tab_scaler.transform(
-            data["trainval"].tab_df[num_cols]
-        )
-    else:
-        trainval_tab_normalized = data["trainval"].tab_df
-
-    # 1. Continuous TS
-    ts_dls = get_ts_dls(
-        X, y,
-        splits=splits,
-        tfms=tfms,
-        batch_tfms=None,
-        bs=bs,
-        drop_last=False,
+    dataset = AstraMixedDataset(
+        X_ts=trainval_ds.X_ts.numpy(),
+        x_cat=trainval_ds.x_cat.numpy(),
+        x_cont=trainval_ds.x_cont.numpy(),
+        X_ts_cat=trainval_ds.X_ts_cat.numpy(),
+        y=trainval_ds.y.numpy(),
     )
 
-    # 2. Tabular
-    tab_dls = get_tabular_dls(
-        trainval_tab_normalized,
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg_dict["target"],
+    return AstraMixedDataLoader(
+        dataset,
         splits=splits,
-        bs=bs,
-        drop_last=False,
+        bs=cfg_dict["training"]["bs"],
+        shuffle_train=True,
     )
-
-    # 3. Categorical TS
-    ts_cat_dls = get_ts_dls(
-        data["ts_cat_dls"].X_multi_hot.astype(np.int64),
-        y,
-        splits=splits,
-        bs=bs,
-        drop_last=False,
-    )
-
-    # 4. Combine
-    mixed_dls = get_mixed_dls(ts_dls, tab_dls, ts_cat_dls, bs=bs)
-    return mixed_dls
 
 
 def load_pretrained_backbone(
@@ -730,14 +691,11 @@ def run_finetune_v2(
     # ========================================================================
     logger.info("Creating train/valid split for finetuning...")
     y = data["y"]
-    splits = get_splits(
+    splits = get_stratified_splits(
         y,
         valid_size=finetune_cfg.valid_size,
-        stratify=True,
         random_state=42,
-        shuffle=True,
     )
-    splits = (splits[0], splits[1])
     logger.info(f"  Train: {len(splits[0])} samples, Valid: {len(splits[1])} samples")
 
     mixed_dls = create_split_dataloaders(data, splits, cfg)
@@ -865,9 +823,9 @@ def run_finetune_v2(
     best_auroc = early_stopper.best_score or 0.0
     logger.info(f"Best validation AUROC: {best_auroc:.4f}")
 
-    # Save in FastAI-compatible format + deployment bundle
+    # Save model + deployment bundle
     if finetune_cfg.model_name:
-        save_model_fastai_compatible(backbone, data, finetune_cfg.model_name, cfg)
+        save_model(backbone, finetune_cfg.model_name)
         save_deployment_bundle(data, cfg, finetune_cfg.model_name)
 
     clear_mem()

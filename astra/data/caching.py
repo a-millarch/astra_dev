@@ -7,15 +7,22 @@ import json
 import os
 
 import numpy as np
-import pandas as pd
 
-from astra.data.dataloader import prepare_data_and_dls, get_ts_dls, get_tabular_dls, get_mixed_dls
+from astra.data.dataloader import prepare_data_and_dls
+from astra.data.mixed_dataloader import (
+    AstraMixedDataset,
+    AstraMixedDataLoader,
+)
 from astra.utils import cfg, logger
+
+# Bump this when cached data format changes to auto-invalidate old caches
+_CACHE_VERSION = 2
+
 
 def _get_cache_key(cfg):
     """Generate a unique cache key based on config parameters that affect data preparation."""
-    # Extract config values that affect data preparation
     key_params = {
+        "_cache_version": _CACHE_VERSION,
         "dataset": cfg.get("dataset", {}),
         "concepts": cfg.get("concepts", []),
         "target": cfg.get("target"),
@@ -27,7 +34,6 @@ def _get_cache_key(cfg):
         "temporal_features": cfg.get("temporal_features", {}).get("enabled", False),
         "agg_func": cfg.get("agg_func", {}),
     }
-    # Create deterministic hash
     config_str = json.dumps(key_params, sort_keys=True, default=str)
     return hashlib.md5(config_str.encode()).hexdigest()[:12]
 
@@ -35,20 +41,24 @@ def _get_cache_key(cfg):
 def save_data_cache(data, cfg, cache_dir='data/cache'):
     """
     Save prepared data to disk for faster subsequent loads.
+
     Saves all arrays, scalers, encoders, and metadata needed to recreate
     the full data dictionary (including dataloaders) on load.
-    Args:
-        data: Dictionary returned by prepare_data_and_dls()
-        cfg: Config dictionary used to generate cache key
-        cache_dir: Directory to save cache files
-    Returns:
-        cache_path: Path to saved cache file
     """
     os.makedirs(cache_dir, exist_ok=True)
     cache_key = _get_cache_key(cfg)
     cache_path = os.path.join(cache_dir, f'data_cache_{cache_key}.pkl')
 
-    # Store everything needed to recreate dataloaders
+    # Extract x_cat / x_cont from trainval and holdout datasets
+    trainval_ds = data['mixed_dls']._train_ds
+    holdout_ds = data['holdout_mixed_dls']._train_ds
+    # AstraMixedDataset stores tensors; convert to numpy for pickling
+    if hasattr(trainval_ds, 'dataset'):
+        # It's a Subset — get underlying dataset
+        trainval_ds = trainval_ds.dataset
+    if hasattr(holdout_ds, 'dataset'):
+        holdout_ds = holdout_ds.dataset
+
     cache_data = {
         # Raw and normalized arrays
         'X': data['X'],
@@ -60,6 +70,12 @@ def save_data_cache(data, cfg, cache_dir='data/cache'):
         'tX_multi_hot': data['tX_multi_hot'],
         'ty': data['ty'],
 
+        # Encoded tabular arrays (avoid re-encoding on load)
+        'trainval_x_cat': trainval_ds.x_cat.numpy(),
+        'trainval_x_cont': trainval_ds.x_cont.numpy(),
+        'holdout_x_cat': holdout_ds.x_cat.numpy(),
+        'holdout_x_cont': holdout_ds.x_cont.numpy(),
+
         # Trajectory lengths
         'trajectory_lengths': data['trajectory_lengths'],
         'holdout_trajectory_lengths': data['holdout_trajectory_lengths'],
@@ -68,34 +84,34 @@ def save_data_cache(data, cfg, cache_dir='data/cache'):
         'ts_scaler': data['ts_scaler'],
         'tab_scaler': data['tab_scaler'],
         'cat_encoder': data['cat_encoder'],
+        'tab_encoder': data['tab_encoder'],
         'encoding_info': data['encoding_info'],
 
         # Feature metadata
         'cat_cols': data['cat_cols'],
         'num_cols': data['num_cols'],
         'ts_feature_names': data['ts_feature_names'],
+        'ts_channel_names': data['ts_channel_names'],
         'classes': data['classes'],
-        'tfms': data['tfms'],
-        'batch_tfms': data['batch_tfms'],
-        'procs': data['procs'],
 
-        # Tabular dataframes (needed to recreate tab_dls)
-        'trainval_tab_df': data['trainval'].tab_df,
-        'holdout_tab_df': data['holdout'].tab_df,
-
-        # Categorical TS data (needed to recreate ts_cat_dls)
-        'trainval_complete_cat': data['trainval'].complete_cat,
-        'holdout_complete_cat': data['holdout'].complete_cat,
-        'trainval_timestep_cols': data['trainval'].complete_cat.timestep_cols,
-        'holdout_timestep_cols': data['holdout'].complete_cat.timestep_cols,
+        # Channel indices
+        'ebm_channel_idx': data.get('ebm_channel_idx'),
+        'temporal_channel_idx': data.get('temporal_channel_idx'),
+        'exclude_channel_indices': data.get('exclude_channel_indices'),
 
         # Base dataframe and TSDS objects (for downstream use)
         'base': data['base'],
         'trainval': data['trainval'],
         'holdout': data['holdout'],
 
+        # Dimensions
+        'c_in': data['c_in'],
+        'seq_len': data['seq_len'],
+        'ts_cat_dims': data['ts_cat_dims'],
+
         # Config snapshot for validation
         '_cache_key': cache_key,
+        '_cache_version': _CACHE_VERSION,
         '_cfg_snapshot': {
             'target': cfg.get('target'),
             'holdout_split_date': cfg.get('holdout_split_date'),
@@ -115,9 +131,7 @@ def save_data_cache(data, cfg, cache_dir='data/cache'):
 def load_data_cache(cfg, cache_dir='data/cache'):
     """
     Load cached data and recreate dataloaders.
-    Args:
-        cfg: Config dictionary (used to find correct cache and recreate dataloaders)
-        cache_dir: Directory containing cache files
+
     Returns:
         data: Dictionary matching prepare_data_and_dls() output, or None if cache not found
     """
@@ -133,96 +147,49 @@ def load_data_cache(cfg, cache_dir='data/cache'):
     with open(cache_path, 'rb') as f:
         cache_data = pickle.load(f)
 
-    # Validate cache key matches
+    # Validate cache key and version
     if cache_data.get('_cache_key') != cache_key:
         logger.warning("Cache key mismatch - regenerating data")
         return None
 
+    if cache_data.get('_cache_version', 1) != _CACHE_VERSION:
+        logger.warning(f"Cache version mismatch (got {cache_data.get('_cache_version', 1)}, "
+                       f"expected {_CACHE_VERSION}) - regenerating data")
+        return None
+
     logger.info("Recreating dataloaders from cached data...")
 
-    # Common parameters
-    tfms = cache_data['tfms']
-    procs = cache_data['procs']
-    cat_cols = cache_data['cat_cols']
-    num_cols = cache_data['num_cols']
     bs = cfg["training"]["bs"]
 
     # ========== TRAINVAL DATALOADERS ==========
-    ts_dls = get_ts_dls(
-        cache_data['X'],
-        cache_data['y'],
-        splits=None,
-        tfms=tfms,
-        batch_tfms=None,
-        bs=bs,
-        drop_last=False,
-        shuffle=False
+    trainval_dataset = AstraMixedDataset(
+        X_ts=cache_data['X'],
+        x_cat=cache_data['trainval_x_cat'],
+        x_cont=cache_data['trainval_x_cont'],
+        X_ts_cat=cache_data['X_multi_hot'],
+        y=cache_data['y'],
     )
-
-    tab_dls = get_tabular_dls(
-        cache_data['trainval_tab_df'],
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg["target"],
+    mixed_dls = AstraMixedDataLoader(
+        trainval_dataset,
         splits=None,
         bs=bs,
-        drop_last=False,
-        shuffle=False
+        shuffle_train=False,
     )
-
-    # Build ts_cat_dls directly from cached multi-hot arrays (avoids re-encoding)
-    ts_cat_dls = get_ts_dls(
-        cache_data['X_multi_hot'].astype(np.int64),
-        cache_data['y'],
-        splits=None,
-        bs=bs,
-        shuffle=False
-    )
-    encoding_info = cache_data['encoding_info']
-    ts_cat_dims = {
-        feat_name: end - start
-        for feat_name, (start, end) in encoding_info['feature_ranges'].items()
-    }
-    ts_cat_dls.ts_cat_dims = ts_cat_dims
-    ts_cat_dls.X_multi_hot = cache_data['X_multi_hot']
-
-    mixed_dls = get_mixed_dls(ts_dls, tab_dls, ts_cat_dls, bs=bs)
 
     # ========== HOLDOUT DATALOADERS ==========
-    test_ts_dls = get_ts_dls(
-        cache_data['tX'],
-        cache_data['ty'],
-        splits=None,
-        tfms=tfms,
-        batch_tfms=None,
-        bs=bs,
-        drop_last=False,
-        shuffle=False
+    holdout_dataset = AstraMixedDataset(
+        X_ts=cache_data['tX'],
+        x_cat=cache_data['holdout_x_cat'],
+        x_cont=cache_data['holdout_x_cont'],
+        X_ts_cat=cache_data['tX_multi_hot'],
+        y=cache_data['ty'],
     )
-
-    test_tab_dls = get_tabular_dls(
-        cache_data['holdout_tab_df'],
-        procs=procs,
-        cat_names=cat_cols.copy(),
-        cont_names=num_cols.copy(),
-        y_names=cfg["target"],
-        splits=None,
-        drop_last=False,
-        shuffle=False
-    )
-
-    test_ts_cat_dls = get_ts_dls(
-        cache_data['tX_multi_hot'].astype(np.int64),
-        cache_data['ty'],
+    holdout_mixed_dls = AstraMixedDataLoader(
+        holdout_dataset,
         splits=None,
         bs=bs,
-        shuffle=False
+        shuffle_train=False,
     )
-    test_ts_cat_dls.ts_cat_dims = ts_cat_dims
-    test_ts_cat_dls.X_multi_hot = cache_data['tX_multi_hot']
-
-    holdout_mixed_dls = get_mixed_dls(test_ts_dls, test_tab_dls, test_ts_cat_dls, bs=bs)
 
     # ========== ASSEMBLE OUTPUT ==========
     data = {
@@ -239,37 +206,25 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         "ty": cache_data['ty'],
         "cat_cols": cache_data['cat_cols'],
         "num_cols": cache_data['num_cols'],
-        "tfms": cache_data['tfms'],
-        "batch_tfms": cache_data['batch_tfms'],
-        "procs": cache_data['procs'],
         "classes": cache_data['classes'],
         "mixed_dls": mixed_dls,
         "holdout_mixed_dls": holdout_mixed_dls,
-        "ts_dls": ts_dls,
-        "holdout_ts_dls": test_ts_dls,
-        "ts_cat_dls": ts_cat_dls,
-        "holdout_ts_cat_dls": test_ts_cat_dls,
         "encoding_info": cache_data['encoding_info'],
         "cat_encoder": cache_data['cat_encoder'],
+        "tab_encoder": cache_data['tab_encoder'],
         "ts_scaler": cache_data['ts_scaler'],
         "tab_scaler": cache_data['tab_scaler'],
         "ts_feature_names": cache_data['ts_feature_names'],
+        "ts_channel_names": cache_data['ts_channel_names'],
         "trajectory_lengths": cache_data['trajectory_lengths'],
         "holdout_trajectory_lengths": cache_data['holdout_trajectory_lengths'],
+        "ebm_channel_idx": cache_data.get('ebm_channel_idx'),
+        "temporal_channel_idx": cache_data.get('temporal_channel_idx'),
+        "exclude_channel_indices": cache_data.get('exclude_channel_indices'),
+        "c_in": cache_data['c_in'],
+        "seq_len": cache_data['seq_len'],
+        "ts_cat_dims": cache_data['ts_cat_dims'],
     }
-
-    # Ensure classes includes _na columns from FillMissing (old caches may lack them)
-    classes = data["classes"]
-    if isinstance(classes, dict):
-        num_cols = data["num_cols"]
-        trainval_tab_df = cache_data['trainval_tab_df']
-        holdout_tab_df = cache_data['holdout_tab_df']
-        df_combined = pd.concat([trainval_tab_df, holdout_tab_df])
-        for col in num_cols:
-            na_name = f'{col}_na'
-            if df_combined[col].isna().any() and na_name not in classes:
-                classes[na_name] = ['#na#', False, True]
-                logger.info(f'  Added missing indicator to classes: {na_name}')
 
     logger.info("Data loaded from cache successfully")
     return data
@@ -278,27 +233,18 @@ def load_data_cache(cfg, cache_dir='data/cache'):
 def prepare_data_and_dls_cached(cfg, use_cache=True, cache_dir='data/cache', force_refresh=False):
     """
     Wrapper for prepare_data_and_dls with caching support.
+
     First attempts to load from cache. If cache miss or force_refresh=True,
     runs full data preparation and saves to cache.
-    Args:
-        cfg: Config dictionary
-        use_cache: If False, always run full preparation (but still save cache)
-        cache_dir: Directory for cache files
-        force_refresh: If True, ignore existing cache and regenerate
-    Returns:
-        data: Dictionary matching prepare_data_and_dls() output
     """
-    # Try loading from cache
     if use_cache and not force_refresh:
         data = load_data_cache(cfg, cache_dir=cache_dir)
         if data is not None:
             return data
 
-    # Cache miss or refresh requested - run full preparation
     logger.info("Running full data preparation...")
     data = prepare_data_and_dls(cfg)
 
-    # Save to cache for next time
     if use_cache:
         try:
             save_data_cache(data, cfg, cache_dir=cache_dir)
@@ -311,6 +257,7 @@ def prepare_data_and_dls_cached(cfg, use_cache=True, cache_dir='data/cache', for
 def clear_data_cache(cache_dir='cache/data', cfg=None):
     """
     Clear cached data files.
+
     Args:
         cache_dir: Directory containing cache files
         cfg: If provided, only clear cache for this specific config.
@@ -321,7 +268,6 @@ def clear_data_cache(cache_dir='cache/data', cfg=None):
         return
 
     if cfg is not None:
-        # Clear specific cache
         cache_key = _get_cache_key(cfg)
         cache_path = os.path.join(cache_dir, f'data_cache_{cache_key}.pkl')
         if os.path.exists(cache_path):
@@ -330,7 +276,6 @@ def clear_data_cache(cache_dir='cache/data', cfg=None):
         else:
             logger.info(f"No cache found for key {cache_key}")
     else:
-        # Clear all caches
         import glob
         cache_files = glob.glob(os.path.join(cache_dir, 'data_cache_*.pkl'))
         for f in cache_files:

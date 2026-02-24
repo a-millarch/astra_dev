@@ -131,12 +131,7 @@ def compute_auroc(
 
 
 def _to_device(obj, device: str):
-    """Recursively move tensors to device, stripping TSAI/FastAI custom types.
-
-    TSAI dataloaders return TSTensor and TensorCategory subclasses that break
-    F.cross_entropy's __torch_function__ dispatch.  Converting to plain
-    torch.Tensor avoids this.
-    """
+    """Recursively move tensors to device, ensuring plain torch.Tensor type."""
     if isinstance(obj, torch.Tensor):
         t = obj.to(device)
         if type(t) is not torch.Tensor:
@@ -190,34 +185,15 @@ def save_checkpoint(
     )
 
 
-def save_model_fastai_compatible(
+def save_model_checkpoint(
     model: nn.Module,
-    data: dict,
     model_name: str,
-    cfg: dict,
+    save_dir: str = "models",
 ) -> None:
     """
-    Save a pure-PyTorch model in FastAI-compatible format so run_eval() works.
+    Save a pure-PyTorch model state dict.
 
-    Creates a temporary Learner, attaches the model state dict, and uses
-    learn.save() which writes to the models/ directory.
+    Saves as ``{'model': state_dict}`` to ``{save_dir}/{model_name}.pth``.
     """
-    from fastai.learner import Learner as FastAILearner
-    from astra.models.hybrid.training import get_backbone
-
-    # Build a fresh backbone with identical architecture (including temporal config)
-    model_cfg = cfg.get("model", {})
-    backbone = get_backbone(
-        data, cfg,
-        temporal_head=model_cfg.get("temporal_head", False),
-        causal=model_cfg.get("causal", False),
-        temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
-        temporal_channel_idx=data.get('temporal_channel_idx'),
-        exclude_channel_indices=data.get('exclude_channel_indices', []),
-    )
-    backbone.load_state_dict(model.state_dict())
-
-    mixed_dls = data["mixed_dls"]
-    learn = FastAILearner(mixed_dls, backbone, metrics=None)
-    learn.save(model_name)
-    logger.info(f"Model saved in FastAI format: models/{model_name}.pth")
+    from astra.data.mixed_dataloader import save_model
+    save_model(model, model_name, save_dir=save_dir)

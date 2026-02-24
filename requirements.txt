@@ -64,10 +64,6 @@ entrypoints==0.4
 et-xmlfile==1.1.0
 exceptiongroup==1.2.0
 executing==0.8.3
-fastai==2.7.12
-fastcore==1.5.51
-fastdownload==0.0.7
-fastprogress==1.0.3
 filelock==3.13.1
 Flask==3.0.3
 fonttools==4.51.0
@@ -224,7 +220,6 @@ tornado==6.4.1
 tqdm==4.66.4
 traitlets==5.14.3
 triton==2.3.1
-tsai==0.3.7
 typer==0.9.0
 typing_extensions==4.11.0
 tzdata==2023.3

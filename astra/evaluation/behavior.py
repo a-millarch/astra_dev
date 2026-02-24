@@ -16,9 +16,9 @@ import time
 import os
 
 from astra.utils import logger, cfg
-from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
-from astra.evaluation.utils import prepare_learner, step_to_time, time_to_step, time_to_hours
+from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours
 
 def get_centered_norm(data, center=0.0):
     """
@@ -1585,14 +1585,14 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
 
 
 
-def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_category_shap=True,
+def shap_analysis(data=None, model=None, model_name='13012025', compute_per_category_shap=True,
                   max_test_samples=90, visualize=True, specific_pids: List = None) -> Dict:
     """
     Run full SHAP analysis.
 
     Args:
         data: Prepared data dict
-        learn: Trained learner
+        model: Trained nn.Module (on device). If None, loaded via prepare_model.
         model_name: Model checkpoint name
         compute_per_category_shap: If True, compute SHAP on raw multi-hot categorical TS
                                    to get per-category attributions (shows which specific
@@ -1610,8 +1610,8 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if data is None:
         data = prepare_data_and_dls_cached(cfg)
-    if learn is None:
-        learn = prepare_learner(data, model_name)
+    if model is None:
+        model, device = prepare_model(data, cfg)
 
     # Get all holdout PIDs first (needed for filtering by specific_pids)
     all_holdout_pids = data["holdout"].tab_df['PID'].tolist()
@@ -1627,7 +1627,7 @@ def shap_analysis(data=None, learn=None, model_name='13012025', compute_per_cate
         print(f"Analyzing {len(specific_pids)} specific PIDs: {specific_pids}")
 
     shap_results = calculate_shap_from_dataloaders(
-        model=learn.model,
+        model=model,
         background_loader=data["mixed_dls"].train,
         test_loader=data["holdout_mixed_dls"].train,
         device=device,
@@ -2908,27 +2908,27 @@ class TemporalSHAPAnalyzer:
 # CONVENIENCE FUNCTION
 # ============================================================================
 
-def run_temporal_shap_analysis(data, learn, pid=None, sample_idx=None, timeframes=None,
+def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframes=None,
                                max_background_samples=200, save_dir='reports/shap', verbose=False):
     """
     Run complete temporal SHAP analysis with all visualizations.
-    
+
     Args:
         data: Data dict from prepare_data_and_dls()
-        learn: Trained Learner
+        model: Trained nn.Module
         pid: Patient ID to analyze
         sample_idx: Alternative to pid
         timeframes: List of timeframe names (default: all)
         save_dir: Output directory
         verbose: Print progress
-    
+
     Returns:
         TemporalSHAPResults
     """
     os.makedirs(save_dir, exist_ok=True)
-    
+
     analyzer = TemporalSHAPAnalyzer(
-        learn.model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu', max_background_samples
+        model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu', max_background_samples
     )
     
     holdout_pids = analyzer.get_holdout_pids()

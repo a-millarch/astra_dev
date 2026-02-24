@@ -1,7 +1,7 @@
 import math
 
 import numpy as np
-from tsai.all import F
+import torch.nn.functional as F
 
 from torch import Tensor
 import torch
@@ -722,11 +722,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         mask = torch.isnan(x)
         x[mask] = 0
         if mask.any():
-            try:
-                from tsai.data.core import TSMaskTensor
-                mask = TSMaskTensor((mask.float().mean(1) == 1).bool())
-            except:
-                mask = (mask.float().mean(1) == 1).bool()
+            mask = (mask.float().mean(1) == 1).bool()
             return x, mask
         else:
             return x, None

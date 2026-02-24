@@ -212,32 +212,38 @@ def time_to_hours(minutes):
     else:
         return f"{hours/24:.1f}d"
 
-def prepare_learner(data, cfg):
+def prepare_model(data, cfg):
+    """
+    Load a trained model and return (model, device).
+
+    Replaces the old ``prepare_learner()`` which returned a FastAI Learner.
+    """
     import torch
-    from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+    from astra.models.hybrid.training import get_backbone
+    from astra.data.mixed_dataloader import load_model_state
+
     model_name = cfg["model_name"]
-    # Detect temporal head config
     model_cfg = cfg.get("model", {})
     is_temporal = model_cfg.get("temporal_head", False)
 
-    # ============================================================================
-    # LOAD MODEL
-    # ============================================================================
     logger.info(f"Loading model: {model_name}")
     backbone = get_backbone(
         data, cfg,
         temporal_head=is_temporal,
         causal=model_cfg.get("causal", False),
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
     )
-    learn = Learner(data["holdout_mixed_dls"], backbone, metrics=None)
-    learn.load(model_name, strict=False)
-    
+
+    state_dict = load_model_state(model_name)
+    backbone.load_state_dict(state_dict, strict=False)
+
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    learn.to(device)
-    learn = patch_learner_get_preds(learn)
+    backbone = backbone.to(device)
+    backbone.eval()
     logger.info(f"Model loaded (temporal_head={is_temporal})")
-    return learn
+    return backbone, device
 
 def delong_roc_variance(ground_truth, predictions):
     order = np.argsort(predictions)

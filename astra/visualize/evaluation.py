@@ -18,7 +18,6 @@ from sklearn.metrics import (
 
 from sklearn.calibration import calibration_curve
 
-from fastai.tabular.all import L
 
 
 
@@ -146,26 +145,29 @@ def plot_evaluation(y_preds, ys, target):
     return fig
 
 
-def plot_loss(learn, fold=None):
-    # Create a Figure and Axes object
+def plot_loss(train_losses, val_losses=None, fold=None):
+    """Plot training and validation loss curves.
+
+    Args:
+        train_losses: List of per-batch training losses.
+        val_losses: Optional list of per-epoch validation losses.
+        fold: Optional fold number for title.
+    """
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    skip_start = 0
     # Plot training losses
-    train_iterations = list(range(skip_start, len(learn.recorder.losses)))
-    train_losses = learn.recorder.losses[skip_start:]
-    ax.plot(train_iterations, train_losses, label="Train", color="blue")
+    ax.plot(range(len(train_losses)), train_losses, label="Train", color="blue")
 
-    # Calculate index for validation losses
-    idx = (np.array(learn.recorder.iters) < skip_start).sum()
-    valid_col = learn.recorder.metric_names.index("valid_loss") - 1
+    # Plot validation losses (one per epoch, spread evenly across training iterations)
+    if val_losses is not None and len(val_losses) > 0:
+        n_train = len(train_losses)
+        n_val = len(val_losses)
+        if n_val > 1:
+            val_iterations = [int(i * n_train / n_val) for i in range(n_val)]
+        else:
+            val_iterations = [n_train - 1]
+        ax.plot(val_iterations, val_losses, label="Validation", color="orange")
 
-    # Plot validation losses
-    valid_iterations = learn.recorder.iters[idx:]
-    valid_losses = L(learn.recorder.values[idx:]).itemgot(valid_col)
-    ax.plot(valid_iterations, valid_losses, label="Validation", color="orange")  # type: ignore
-
-    # Set legend and labels
     ax.legend()
     ax.set_xlabel("Iterations")
     ax.set_ylabel("Loss")
@@ -181,15 +183,19 @@ def plot_loss(learn, fold=None):
     plt.show()
 
     # Create DataFrame
-    df = pd.DataFrame(
-        {
-            "Iteration": train_iterations + valid_iterations,
-            "Loss": train_losses + list(valid_losses),
-            "Type": ["Train"] * len(train_losses) + ["Validation"] * len(valid_losses),
-        }
-    )
+    iters_train = list(range(len(train_losses)))
+    losses_all = list(train_losses)
+    types_all = ["Train"] * len(train_losses)
+    if val_losses is not None and len(val_losses) > 0:
+        n_train = len(train_losses)
+        n_val = len(val_losses)
+        iters_val = [int(i * n_train / n_val) for i in range(n_val)] if n_val > 1 else [n_train - 1]
+        iters_train += iters_val
+        losses_all += list(val_losses)
+        types_all += ["Validation"] * len(val_losses)
+    df = pd.DataFrame({"Iteration": iters_train, "Loss": losses_all, "Type": types_all})
 
-    return fig, df  # Return both the Figure object and the DataFrame
+    return fig, df
 
 
 def plot_fold_evaluation(metrics, target):
@@ -320,25 +326,23 @@ def create_calibration_plot(y_true, y_pred, n_bins=4):
     return fig  # Return the Figure object
 
 
-def plot_multiple_evaluations(df, censor_ts, learn, labels=None):
-    from astra.evaluation.predictive_performance import get_eval_mixed_dls
-    
+def plot_multiple_evaluations(predictions_by_time, labels=None):
+    """Plot ROC and PR curves for multiple censoring time points.
+
+    Args:
+        predictions_by_time: List of (y_pred, y_true) tuples, one per time point.
+        labels: Optional list of labels for each time point.
+    """
     fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(12, 5))
-    
-    #colors = plt.cm.tab10(np.linspace(0, 1, len(censor_ts)))
+
     colors =['#1F77B4','#FF7F0E','#2CA02C','#D62728','#9467BD','#8C564B','#E377C2','#7F7F7F','#BCBD22','#17BECF']
-    
-    for i, censor_t in enumerate(censor_ts):
-        dls = get_eval_mixed_dls(df, censor_t)
-        preds, targets = learn.get_preds(dl=dls.train)
-        
-        y_preds = preds[:, 1]  # Assuming class 1 probability
-        ys = targets
+
+    for i, (y_preds, ys) in enumerate(predictions_by_time):
         
         # --- ROC ---
         fpr, tpr, _ = roc_curve(ys, y_preds)
         roc_auc = roc_auc_score(ys, y_preds)
-        label = labels[i] if labels else f"censor_t={censor_t}"
+        label = labels[i] if labels else f"t={i}"
         ax_roc.plot(fpr, tpr, color=colors[i % len(colors)], label=f"{label} (AUC={roc_auc:.3f})")
         
         # --- PR ---
@@ -350,7 +354,7 @@ def plot_multiple_evaluations(df, censor_ts, learn, labels=None):
         # --- PR ---
         precision, recall, _ = precision_recall_curve(ys, y_preds)
         auprc = average_precision_score(ys, y_preds)
-        label = labels[i] if labels else f"censor_t={censor_t}"
+        label = labels[i] if labels else f"t={i}"
         ax_pr.plot(recall, precision, color=colors[i % len(colors)], label=f"{label} (AUC={auprc:.3f})")
     
     # ROC formatting

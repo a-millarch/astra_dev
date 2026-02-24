@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 
 from astra.utils import cfg, logger
 from astra.utils import save_figure
-from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+from astra.evaluation.utils import prepare_model
 from astra.visualize.evaluation import plot_evaluation
 
 from astra.evaluation.predictive_performance import (
@@ -52,19 +52,15 @@ def run_eval_with_calibration(
     # ============================================================================
     # LOAD MODEL
     # ============================================================================
-    logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(data, cfg)
-    learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name)
-    learn.to('cuda')
-    learn = patch_learner_get_preds(learn)
-    logger.info("✓ Model loaded and moved to GPU")
-    
+    model, device = prepare_model(data, cfg)
+    logger.info("Model loaded and moved to device")
+
     # ============================================================================
     # BASELINE EVALUATION (Full Time Series)
     # ============================================================================
     logger.info("Running baseline evaluation with full time series...")
-    preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
+    from astra.evaluation.predictive_performance import _get_predictions
+    preds, targs = _get_predictions(model, holdout_mixed_dls.train, device)
     
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
@@ -81,8 +77,9 @@ def run_eval_with_calibration(
         logger.info("="*80)
         
         cal_metrics = add_calibration_to_eval(
-            learn,
+            model,
             holdout_mixed_dls,
+            device=device,
             model_name=model_name,
             save_dir='reports/calibration'
         )
@@ -94,7 +91,7 @@ def run_eval_with_calibration(
     # ============================================================================
     # TIME-DEPENDENT EVALUATION (same as before)
     # ============================================================================
-    evaluator = TimeDependentEvaluator(data, learn, cfg)
+    evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
     
     if multicurve:
         logger.info("Creating multiple ROC/PR curves at key timepoints...")
@@ -246,22 +243,17 @@ def analyze_calibration_only(data, model_name: str):
         cal_metrics: Dictionary with calibration metrics
     """
 
-    mixed_dls = data["mixed_dls"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
-    
+
     # Load model
-    logger.info(f"Loading model: {model_name}")
-    backbone = get_backbone(data, cfg)
-    learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name)
-    learn.to('cuda')
-    learn = patch_learner_get_preds(learn)
-    logger.info("✓ Model loaded")
-    
+    model, device = prepare_model(data, cfg)
+    logger.info("Model loaded")
+
     # Run calibration analysis
     cal_metrics = add_calibration_to_eval(
-        learn,
+        model,
         holdout_mixed_dls,
+        device=device,
         model_name=model_name,
         save_dir='reports/calibration'
     )
@@ -310,6 +302,8 @@ print(f"Brier Score: {cal_metrics['brier_score']:.4f}")
 
 # Option 3: Compare calibration of multiple models
 from calibration_plots import plot_calibration_comparison
+from astra.evaluation.utils import prepare_model
+from astra.evaluation.predictive_performance import _get_predictions
 import torch
 
 models = ["model1", "model2", "model3"]
@@ -317,8 +311,9 @@ y_true_list = []
 y_pred_list = []
 
 for model_name in models:
-    learn = load_model(model_name)  # Your loading function
-    preds, targs = learn.get_preds(dl=holdout_mixed_dls.train)
+    cfg["model_name"] = model_name
+    model, device = prepare_model(data, cfg)
+    preds, targs = _get_predictions(model, holdout_mixed_dls.valid, device)
     y_pred_list.append(preds[:, 1].cpu().numpy())
     y_true_list.append(targs.cpu().numpy())
 
@@ -799,39 +794,33 @@ def calibration_summary_table(y_true, y_pred, n_bins=10):
 # ============================================================================
 
 def add_calibration_to_eval(
-    learn,
+    model,
     holdout_mixed_dls,
-    model_name: str,
+    device: str = 'cuda',
+    model_name: str = '',
     save_dir: str = 'reports/calibration'
 ):
     """
     Add calibration plots to existing evaluation workflow.
-    
-    Usage:
-        from calibration_plots import add_calibration_to_eval
-        
-        # After training and loading model:
-        add_calibration_to_eval(learn, holdout_mixed_dls, model_name="my_model")
-    
+
     Args:
-        learn: Trained learner
+        model: Trained nn.Module (already on device)
         holdout_mixed_dls: Holdout dataloaders
+        device: Device string
         model_name: Model name for saving
         save_dir: Directory to save plots
-        
+
     Returns:
         dict with calibration metrics
     """
     import os
     os.makedirs(save_dir, exist_ok=True)
-    
+
     print("Generating calibration analysis...")
-    
-    # Get predictions
-    import torch
-    with torch.no_grad():
-        preds, targets = learn.get_preds(dl=holdout_mixed_dls.train)
-    
+
+    from astra.evaluation.predictive_performance import _get_predictions
+    preds, targets = _get_predictions(model, holdout_mixed_dls.train, device)
+
     y_pred = preds[:, 1].cpu().numpy()
     y_true = targets.cpu().numpy()
     

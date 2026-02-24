@@ -23,7 +23,8 @@ from dataclasses import dataclass
 
 from astra.utils import cfg, logger
 from astra.data.caching import prepare_data_and_dls_cached
-from astra.models.hybrid.training import get_backbone, Learner, patch_learner_get_preds
+from astra.models.hybrid.training import get_backbone
+from astra.evaluation.utils import prepare_model
 from astra.evaluation.predictive_performance import (
     TemporalEvaluator,
     time_to_step,
@@ -311,15 +312,16 @@ def run_validation(
         temporal_head=True,
         causal=True,  # Force True regardless of config
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+        temporal_channel_idx=data.get('temporal_channel_idx'),
+        exclude_channel_indices=data.get('exclude_channel_indices', []),
     )
 
-    mixed_dls = data["mixed_dls"]
-    learn = Learner(mixed_dls, backbone, metrics=None)
-    learn.load(model_name, strict=False)
-    learn.to(device)
-    learn = patch_learner_get_preds(learn)
+    from astra.data.mixed_dataloader import load_model_state
+    state_dict = load_model_state(model_name)
+    backbone.load_state_dict(state_dict, strict=False)
+    backbone = backbone.to(device)
 
-    model = learn.model
+    model = backbone
     model.eval()
 
     logger.info(f"Model loaded. causal={model.causal}, "
