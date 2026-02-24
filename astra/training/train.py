@@ -22,7 +22,6 @@ Usage:
 """
 
 import argparse
-import yaml
 from pathlib import Path
 
 from astra.utils import logger, cfg
@@ -74,34 +73,16 @@ def parse_args():
     parser.add_argument("--comprehensive-eval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--multicurve", action="store_true", default=False)
 
-    # Per-timestep prediction head
-    parser.add_argument("--temporal-head", action="store_true", default=False,
-                        help="Use per-timestep prediction head (enables causal masking)")
-    parser.add_argument("--no-causal", action="store_true", default=False,
-                        help="Disable causal masking even with temporal head")
+    # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
                         help="Cross-validate temporal eval vs censored-dataloader eval")
-
-    # Config override
-    parser.add_argument("--finetune-config", type=str, default=None,
-                        help="Path to finetune YAML config (overrides defaults)")
 
     return parser.parse_args()
 
 
-def load_finetune_config(config_path: str = None) -> FinetuneConfig:
-    """Load FinetuneConfig from YAML file, or return defaults."""
-    if config_path is None:
-        default_path = Path("configs/finetune.yaml")
-        if default_path.exists():
-            config_path = str(default_path)
-        else:
-            return FinetuneConfig()
-
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-
-    ft = raw.get("finetune", {})
+def load_finetune_config() -> FinetuneConfig:
+    """Build FinetuneConfig from the global cfg['finetune'] section."""
+    ft = cfg.get("finetune", {})
     return FinetuneConfig(**{k: v for k, v in ft.items() if hasattr(FinetuneConfig, k)})
 
 
@@ -196,13 +177,6 @@ def main():
         best_finetune_cfg = train_result["best_finetune_cfg"]
 
     # ========================================================================
-    # Apply temporal head to global config (for eval compatibility)
-    # ========================================================================
-    if args.temporal_head:
-        cfg.setdefault("model", {})["temporal_head"] = True
-        cfg["model"]["causal"] = not args.no_causal
-
-    # ========================================================================
     # Finetuning
     # ========================================================================
     if args.finetune:
@@ -213,7 +187,7 @@ def main():
             finetune_cfg = best_finetune_cfg
             logger.info("Using best HPs from sweep")
         else:
-            finetune_cfg = load_finetune_config(args.finetune_config)
+            finetune_cfg = load_finetune_config()
 
         # Apply CLI overrides
         finetune_cfg.use_pretrained = args.use_pretrained
@@ -222,10 +196,6 @@ def main():
 
         if args.early_prediction:
             finetune_cfg.enable_early_prediction = True
-
-        if args.temporal_head:
-            finetune_cfg.temporal_head = True
-            finetune_cfg.causal = not args.no_causal
 
         result = run_finetune_v2(
             data, finetune_cfg,

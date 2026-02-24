@@ -27,9 +27,6 @@ def parse_args():
     parser.add_argument('--comprehensive-eval', action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument('--multicurve', action='store_true', default=False)
 
-    # 4. Per-timestep prediction
-    parser.add_argument('--temporal-head', action='store_true', default=False)
-
     return parser.parse_args()
 
 def main():
@@ -46,11 +43,12 @@ def main():
     if args.finetune:
         logger.info("=== Running Fine-tuning ===")
 
+        ft = cfg.get("finetune", {})
         finetune_cfg = FinetuneConfig(
-            model_name=cfg["model_name"],
-            use_pretrained=args.use_pretrained,
-            temporal_head=args.temporal_head,
+            **{k: v for k, v in ft.items() if hasattr(FinetuneConfig, k)},
         )
+        finetune_cfg.model_name = cfg["model_name"]
+        finetune_cfg.use_pretrained = args.use_pretrained
 
         result = run_finetune_v2(
             data,

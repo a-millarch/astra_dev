@@ -98,10 +98,7 @@ class FinetuneConfig:
     use_pretrained: bool = True
     pretrain_checkpoint_dir: Optional[str] = None
 
-    # Per-timestep prediction head
-    temporal_head: bool = False
-    causal: bool = False
-    temporal_head_dropout: float = 0.3
+    # Time weighting for temporal head (training-specific, not model arch)
     time_weighting: str = "uniform"     # 'uniform' or 'early'
     early_weight_factor: float = 2.0
 
@@ -144,9 +141,6 @@ def load_pretrained_backbone(
     cfg_dict: dict,
     pretrain_cfg: Optional[MLMConfig] = None,
     checkpoint_dir: Optional[str] = None,
-    temporal_head: bool = False,
-    causal: bool = False,
-    temporal_head_dropout: float = 0.3,
 ) -> nn.Module:
     """
     Create a backbone and load pretrained weights from MLM checkpoint.
@@ -162,6 +156,11 @@ def load_pretrained_backbone(
     weights (pretraining doesn't use classification head). We load with
     strict=False so the new head gets random initialization.
     """
+    model_cfg = cfg_dict.get("model", {})
+    temporal_head = model_cfg.get("temporal_head", False)
+    causal = model_cfg.get("causal", False)
+    temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+
     backbone = get_backbone(
         data, cfg_dict,
         temporal_head=temporal_head,
@@ -648,33 +647,31 @@ def run_finetune_v2(
     # ========================================================================
     # 1. Load backbone (pretrained or fresh)
     # ========================================================================
+    # Read temporal model settings from global config (single source of truth)
+    model_cfg = cfg.get("model", {})
+    temporal_head = model_cfg.get("temporal_head", False)
+    causal = model_cfg.get("causal", False)
+    temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+
     # Auto-enable causal masking when temporal head is on (prevents silent leakage)
-    if finetune_cfg.temporal_head and not finetune_cfg.causal:
+    if temporal_head and not causal:
         logger.warning("temporal_head=True but causal=False! Auto-enabling causal masking. "
                        "Pass causal=False explicitly only if you intend to allow future info leakage.")
-        finetune_cfg.causal = True
+        cfg["model"]["causal"] = True
+        causal = True
 
-    temporal_kwargs = dict(
-        temporal_head=finetune_cfg.temporal_head,
-        causal=finetune_cfg.causal,
-        temporal_head_dropout=finetune_cfg.temporal_head_dropout,
-    )
-    # Propagate temporal config to global cfg for save_model_fastai_compatible
-    if finetune_cfg.temporal_head:
-        cfg.setdefault("model", {})["temporal_head"] = True
-        cfg["model"]["causal"] = finetune_cfg.causal
-        cfg["model"]["temporal_head_dropout"] = finetune_cfg.temporal_head_dropout
     if finetune_cfg.use_pretrained:
         backbone = load_pretrained_backbone(
             data, cfg,
             pretrain_cfg=pretrain_cfg,
             checkpoint_dir=finetune_cfg.pretrain_checkpoint_dir,
-            **temporal_kwargs,
         )
     else:
         backbone = get_backbone(
             data, cfg,
-            **temporal_kwargs,
+            temporal_head=temporal_head,
+            causal=causal,
+            temporal_head_dropout=temporal_head_dropout,
             temporal_channel_idx=data.get('temporal_channel_idx'),
             exclude_channel_indices=data.get('exclude_channel_indices', []),
         )
@@ -720,18 +717,18 @@ def run_finetune_v2(
 
     # Temporal head: compute pos_weight for class imbalance in BCE
     temporal_phase_kwargs = {}
-    if finetune_cfg.temporal_head:
+    if temporal_head:
         y_arr = np.array(y)
         n_pos = y_arr.sum()
         n_neg = len(y_arr) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], device=device)
+        pw = torch.tensor([n_neg / max(n_pos, 1)], device=device)
         temporal_phase_kwargs = dict(
             temporal_head=True,
-            pos_weight=pos_weight,
+            pos_weight=pw,
             time_weighting=finetune_cfg.time_weighting,
             early_weight_factor=finetune_cfg.early_weight_factor,
         )
-        logger.info(f"Temporal head: pos_weight={pos_weight.item():.2f}, "
+        logger.info(f"Temporal head: pos_weight={pw.item():.2f}, "
                      f"time_weighting={finetune_cfg.time_weighting}")
 
     # ========================================================================
