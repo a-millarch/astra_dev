@@ -6,7 +6,7 @@ from astra.utils import logger, cfg, get_base_df, mark_keywords_in_df
 from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_to_kg
 
 from astra.data.mappings import (
-    VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP,
+    VITALS_MAP, TEMP_FAHRENHEIT,BP_TYPES, HEIGHT_WEIGHT_MAP,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
     ICU_MAP,
     ATC_LVL3_MAP, ATC_LVL4_MAP, MEDICATION_ACTION_LIST,
@@ -109,8 +109,16 @@ def filter_vitals(vit):
     # Create a copy to avoid SettingWithCopyWarning
     vit = vit.copy()
 
-    # Fix temp in fahrenheit first
-    vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
+    def fahrenheit_to_celsius(f):
+        return (f - 32) * 5.0 / 9.0
+
+    for f in TEMP_FAHRENHEIT:
+        vit.loc[vit.Vital_parametre == f, "Værdi"] = vit.Værdi.apply(fahrenheit_to_celsius)
+
+    # Value-based F→C for 'Temperatur': bimodal distribution — values >50 are in °F
+    temp_numeric = pd.to_numeric(vit.loc[vit.Vital_parametre == 'Temperatur', 'Værdi'], errors='coerce')
+    f_idx = temp_numeric[temp_numeric > 50].index
+    vit.loc[f_idx, 'Værdi'] = temp_numeric.loc[f_idx].apply(fahrenheit_to_celsius)
 
     # rename cols to standard and reduce
     vit.rename(columns={"Værdi":"VALUE", "Vital_parametre":"FEATURE", "Registreringstidspunkt":"TIMESTAMP"}, inplace=True)

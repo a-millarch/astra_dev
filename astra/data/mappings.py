@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Tuple, Union
 # Vital signs: Danish parameter names → standardized feature names
 # (source: filter_vitals in filters.py)
 # ============================================================================
-
+TEMP_FAHRENHEIT = ["Kernetemperatur", "Blæretemperatur", "Rektaltemperatur", "Axiltemperatur", "Esophagustemperatur"]
 VITALS_MAP = {
     'Saturation': 'SPO2',
     'ABP Puls (fra A-kanyle)': 'HR',
@@ -17,7 +17,7 @@ VITALS_MAP = {
     'Resp.frekvens': 'RESPIRATORYRATE',
     'SYSTOLIC': 'SBP',
     'ART mean inv BT': 'MAP',
-    'Temp (in Celsius)': 'TEMP',
+    'Temperatur': 'TEMP',
     'Temp.': 'TEMP',
     'DBP': 'DBP',
     'SBP': 'SBP',
