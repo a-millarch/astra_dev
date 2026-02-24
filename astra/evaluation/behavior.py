@@ -964,30 +964,32 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             if start > 0:
                 ax3.axhline(y=start - 0.5, color='white', linewidth=2)
     
-    # Plot 4: Channel importance (color-coded by group)
+    # Plot 4: Channel importance (color-coded by group, excluding temporal/auxiliary)
     ax4 = fig.add_subplot(gs[3, :])
     ch_imp = np.abs(ts_shap).mean(axis=1)
-    sorted_idx = np.argsort(ch_imp)[::-1]
-    n_show = min(20, len(ch_imp))
+    display_ch = _get_display_channel_mask(channel2feature, n_channels)
+    ch_imp_display = ch_imp[display_ch]
+    sorted_display = np.argsort(ch_imp_display)[::-1]
+    n_show = min(20, len(ch_imp_display))
+    sorted_idx = [display_ch[i] for i in sorted_display[:n_show]]
     if channel2feature:
-        names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx[:n_show]]
-        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx[:n_show]]
+        names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx]
+        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
     else:
-        names = [f'Channel {i}' for i in sorted_idx[:n_show]]
+        names = [f'Channel {i}' for i in sorted_idx]
         bar_colors = ['#008bfb'] * n_show
-    ax4.barh(range(n_show), ch_imp[sorted_idx[:n_show]], color=bar_colors, alpha=0.7)
+    ax4.barh(range(n_show), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax4.set_yticks(range(n_show)); ax4.set_yticklabels(names, fontsize=9)
     ax4.set_xlabel('Mean |SHAP|'); ax4.set_title(f'Top {n_show} Channels', fontweight='bold')
     ax4.grid(True, alpha=0.3, axis='x'); ax4.invert_yaxis()
     if channel2feature:
         used_groups = set()
-        for i in sorted_idx[:n_show]:
+        for i in sorted_idx:
             name = channel2feature.get(int(i), '')
             if name in _EBM_CHANNELS: used_groups.add('EBM')
-            elif name in _TEMPORAL_CHANNELS: used_groups.add('Temporal')
             else: used_groups.add('Clinical')
         ax4.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.7)
-                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                            for g in ['Clinical', 'EBM'] if g in used_groups],
                    loc='lower right', fontsize=8)
     
     # Plot 5: Static categorical
@@ -1217,7 +1219,7 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     ax1 = fig.add_subplot(gs[0, :])
     clinical_rows = [row for row, ch_idx in enumerate(ordered_indices)
                      if not channel2feature or channel2feature.get(ch_idx, '')
-                     not in (_TEMPORAL_CHANNELS | _EBM_CHANNELS | _AUXILIARY_CHANNELS)]
+                     not in (_SHAP_EXCLUDED_CHANNELS | _EBM_CHANNELS)]
     if not clinical_rows:
         clinical_rows = list(range(n_display))
 
@@ -1346,12 +1348,10 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
             name = channel2feature.get(ch_idx, '')
             if name in _EBM_CHANNELS:
                 used_groups.add('EBM')
-            elif name in _TEMPORAL_CHANNELS:
-                used_groups.add('Temporal')
             else:
                 used_groups.add('Clinical')
         ax4.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.8)
-                            for g in ['Clinical', 'EBM', 'Temporal'] if g in used_groups],
+                            for g in ['Clinical', 'EBM'] if g in used_groups],
                    loc='lower right', fontsize=8)
 
     # Right: Summary statistics
