@@ -86,6 +86,7 @@ _TEMPORAL_CHANNELS = {'elapsed_hours', 'bin_width_hours'}
 _EBM_CHANNELS = {'_ebm_pred'}
 _AUXILIARY_CHANNELS = {'_data_present'}
 _SHAP_EXCLUDED_CHANNELS = _TEMPORAL_CHANNELS | _AUXILIARY_CHANNELS
+_SHAP_CLINICAL_DISPLAY_EXCLUDED = _SHAP_EXCLUDED_CHANNELS | _EBM_CHANNELS
 _GROUP_COLORS = {
     'Clinical': '#008bfb',
     'EBM': '#FF9800',
@@ -155,6 +156,114 @@ def _draw_group_separators(ax, group_boundaries: OrderedDict):
             ax.axhline(y=start - 0.5, color='white', linewidth=3, zorder=5)
             ax.axhline(y=start - 0.5, color='black', linewidth=1.2,
                        linestyle='--', zorder=6)
+
+
+def _get_clinical_only_channel_mask(channel2feature: Dict[int, str], n_channels: int) -> list:
+    """Return list of channel indices for clinical-only displays (excludes EBM, temporal, auxiliary)."""
+    if not channel2feature:
+        return list(range(n_channels))
+    return [i for i in range(n_channels)
+            if channel2feature.get(i, '') not in _SHAP_CLINICAL_DISPLAY_EXCLUDED]
+
+
+def _get_clinical_only_channel_order(channel2feature: Dict[int, str]):
+    """Get channel indices for clinical-only heatmaps (no EBM, no temporal/auxiliary).
+
+    Returns:
+        ordered_indices, ordered_labels
+    """
+    groups = classify_channels(channel2feature)
+    clinical = groups.get('Clinical', [])
+    ordered_indices = [ch_idx for ch_idx, feat_name in clinical]
+    ordered_labels = [feat_name for ch_idx, feat_name in clinical]
+    return ordered_indices, ordered_labels
+
+
+def _has_ebm_channels(channel2feature: Optional[Dict[int, str]]) -> bool:
+    """Check whether any EBM channel exists in the mapping."""
+    if not channel2feature:
+        return False
+    return any(name in _EBM_CHANNELS for name in channel2feature.values())
+
+
+def compute_ebm_vs_clinical_budget(
+    ts_shap: np.ndarray,
+    channel2feature: Dict[int, str],
+) -> Optional[Dict]:
+    """Compute EBM vs Clinical SHAP budget breakdown.
+
+    Args:
+        ts_shap: SHAP values — single sample [n_ch, seq_len] or cohort [n_samples, n_ch, seq_len].
+        channel2feature: channel index -> feature name mapping.
+
+    Returns:
+        Dict with 'ebm_pct', 'clinical_pct', 'ebm_temporal', 'clinical_temporal',
+        'ebm_total', 'clinical_total', 'total'.  None if no EBM channel present.
+    """
+    if not channel2feature:
+        return None
+
+    ebm_indices = [i for i, name in channel2feature.items()
+                   if name in _EBM_CHANNELS and name not in _SHAP_EXCLUDED_CHANNELS]
+    clinical_indices = [i for i, name in channel2feature.items()
+                        if name not in _SHAP_EXCLUDED_CHANNELS and name not in _EBM_CHANNELS]
+
+    if not ebm_indices:
+        return None
+
+    is_cohort = ts_shap.ndim == 3
+
+    if is_cohort:
+        ebm_abs = np.abs(ts_shap[:, ebm_indices, :])
+        clinical_abs = np.abs(ts_shap[:, clinical_indices, :])
+        ebm_total = ebm_abs.sum(axis=(1, 2)).mean()
+        clinical_total = clinical_abs.sum(axis=(1, 2)).mean()
+        ebm_temporal = ebm_abs.mean(axis=(0, 1))
+        clinical_temporal = clinical_abs.mean(axis=(0, 1))
+    else:
+        ebm_abs = np.abs(ts_shap[ebm_indices, :])
+        clinical_abs = np.abs(ts_shap[clinical_indices, :])
+        ebm_total = ebm_abs.sum()
+        clinical_total = clinical_abs.sum()
+        ebm_temporal = ebm_abs.mean(axis=0)
+        clinical_temporal = clinical_abs.mean(axis=0)
+
+    total = ebm_total + clinical_total
+    ebm_pct = (ebm_total / total * 100) if total > 0 else 0
+    clinical_pct = (clinical_total / total * 100) if total > 0 else 0
+
+    return {
+        'ebm_total': float(ebm_total),
+        'clinical_total': float(clinical_total),
+        'total': float(total),
+        'ebm_pct': float(ebm_pct),
+        'clinical_pct': float(clinical_pct),
+        'ebm_temporal': ebm_temporal,
+        'clinical_temporal': clinical_temporal,
+    }
+
+
+def _draw_ebm_budget_panel(ax, budget: Dict, title: str = 'SHAP Budget: EBM vs Clinical'):
+    """Draw a compact EBM vs Clinical SHAP budget breakdown on the given axes."""
+    ax.barh(0, budget['clinical_pct'], color=_GROUP_COLORS['Clinical'],
+            alpha=0.8, label=f"Clinical: {budget['clinical_pct']:.1f}%")
+    ax.barh(0, budget['ebm_pct'], left=budget['clinical_pct'],
+            color=_GROUP_COLORS['EBM'], alpha=0.8,
+            label=f"EBM: {budget['ebm_pct']:.1f}%")
+
+    if budget['clinical_pct'] > 10:
+        ax.text(budget['clinical_pct'] / 2, 0, f"{budget['clinical_pct']:.1f}%",
+                ha='center', va='center', fontweight='bold', fontsize=11, color='white')
+    if budget['ebm_pct'] > 10:
+        ax.text(budget['clinical_pct'] + budget['ebm_pct'] / 2, 0,
+                f"{budget['ebm_pct']:.1f}%",
+                ha='center', va='center', fontweight='bold', fontsize=11, color='white')
+
+    ax.set_xlim(0, 100)
+    ax.set_yticks([])
+    ax.set_xlabel('% of Total |SHAP|')
+    ax.set_title(title, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=9)
 
 
 def _get_channel_color(channel2feature, ch_idx):
@@ -827,9 +936,6 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     if holdout_pids is not None and sample_idx < len(holdout_pids):
         display_pid = holdout_pids[sample_idx]
     
-    fig = plt.figure(figsize=(22, 20))
-    gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
-    
     ts_shap = shap_results['ts_shap'][sample_idx]
     if ts_shap.ndim == 3:
         ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
@@ -846,16 +952,52 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     time_fmt = [time_to_hours(t) for t in time_labels]
     n_ticks = min(10, n_steps)
     tick_idx = np.linspace(0, n_steps-1, n_ticks, dtype=int)
-    
+
     # Title with PID if available
     title_suffix = f" (PID: {display_pid})" if display_pid is not None else f" (Sample {sample_idx})"
-    
+
+    # EBM two-view: compute budget and adjust layout
+    budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
+    has_ebm = budget is not None
+
+    if has_ebm:
+        fig = plt.figure(figsize=(22, 22))
+        gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
+                              height_ratios=[0.35, 1, 1, 1, 1, 1])
+        row_offset = 1
+        # Row 0: EBM budget panel
+        ax_budget = fig.add_subplot(gs[0, :])
+        _draw_ebm_budget_panel(ax_budget, budget, title=f'SHAP Budget{title_suffix}')
+    else:
+        fig = plt.figure(figsize=(22, 20))
+        gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
+        row_offset = 0
+
     # Plot 1: TS importance over time
-    ax1 = fig.add_subplot(gs[0, :])
-    ts_shap_avg = np.abs(ts_shap).mean(axis=0)
-    ax1.plot(ts_shap_avg, linewidth=2, color='#ff0051', label='Continuous TS')
-    ax1.fill_between(range(len(ts_shap_avg)), ts_shap_avg, alpha=0.3, color='#ff0051')
-    
+    ax1 = fig.add_subplot(gs[0 + row_offset, :])
+
+    if has_ebm:
+        # Two-view: separate Clinical and EBM lines
+        clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
+        ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
+
+        clinical_ts_avg = np.abs(ts_shap[clinical_ch]).mean(axis=0)
+        ax1.plot(clinical_ts_avg, linewidth=2, color=_GROUP_COLORS['Clinical'],
+                 label='Clinical channels')
+        ax1.fill_between(range(len(clinical_ts_avg)), clinical_ts_avg, alpha=0.2,
+                         color=_GROUP_COLORS['Clinical'])
+
+        if ebm_ch:
+            ebm_ts_avg = np.abs(ts_shap[ebm_ch]).mean(axis=0)
+            ax1.plot(ebm_ts_avg, linewidth=2, color=_GROUP_COLORS['EBM'],
+                     label='EBM (_ebm_pred)', linestyle='--')
+            ax1.fill_between(range(len(ebm_ts_avg)), ebm_ts_avg, alpha=0.2,
+                             color=_GROUP_COLORS['EBM'])
+    else:
+        ts_shap_avg = np.abs(ts_shap).mean(axis=0)
+        ax1.plot(ts_shap_avg, linewidth=2, color='#ff0051', label='Continuous TS')
+        ax1.fill_between(range(len(ts_shap_avg)), ts_shap_avg, alpha=0.3, color='#ff0051')
+
     if shap_results['cat_ts_shap'] is not None:
         cat_ts = shap_results['cat_ts_shap'][sample_idx]
         if cat_ts.ndim == 2:
@@ -869,9 +1011,13 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Continuous TS heatmap - grouped by channel type
-    ax2 = fig.add_subplot(gs[1, :])
-    if channel2feature:
+    # Plot 2: Continuous TS heatmap — clinical-only when EBM present
+    ax2 = fig.add_subplot(gs[1 + row_offset, :])
+    if channel2feature and has_ebm:
+        ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
+        ts_shap_display = ts_shap[ordered_idx]
+        n_display = len(ordered_idx)
+    elif channel2feature:
         ordered_idx, ordered_labels, group_bounds = _get_grouped_channel_order(channel2feature)
         ts_shap_display = ts_shap[ordered_idx]
         n_display = len(ordered_idx)
@@ -879,11 +1025,11 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ts_shap_display = ts_shap
         ordered_labels = [f'Ch{i}' for i in range(n_channels)]
         n_display = n_channels
-        group_bounds = OrderedDict()
     norm2 = get_centered_norm(ts_shap_display, center=0.0)
     im = ax2.imshow(ts_shap_display, aspect='auto', cmap='RdBu_r', interpolation='nearest', norm=norm2)
     ax2.set_xlabel('Time'); ax2.set_ylabel('Channel')
-    ax2.set_title('Continuous TS SHAP Heatmap (grouped)', fontweight='bold')
+    heatmap_title = 'Clinical Continuous TS SHAP Heatmap' if has_ebm else 'Continuous TS SHAP Heatmap (grouped)'
+    ax2.set_title(heatmap_title, fontweight='bold')
     if n_display <= 40:
         ax2.set_yticks(range(n_display))
         ax2.set_yticklabels(ordered_labels, fontsize=7 if n_display > 25 else 9)
@@ -894,12 +1040,13 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=7)
     ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     plt.colorbar(im, ax=ax2, label='SHAP Value')
-    _draw_group_separators(ax2, group_bounds)
+    if not has_ebm and channel2feature:
+        _draw_group_separators(ax2, group_bounds)
     
     # Plot 3: Categorical TS heatmap - SHAP values with centered colormap
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
         # Use per-category SHAP values if available
-        ax3 = fig.add_subplot(gs[2, :])
+        ax3 = fig.add_subplot(gs[2 + row_offset, :])
         cat_ts_shap_data = shap_results['cat_ts_shap_per_category'][sample_idx]  # [n_cats, seq_len]
         if cat_ts_shap_data.ndim == 3:
             cat_ts_shap_data = cat_ts_shap_data[..., min(class_idx, cat_ts_shap_data.shape[-1] - 1)]
@@ -936,7 +1083,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     elif shap_results.get('encoding_info') is not None:
         # Fallback: Show raw data with SHAP importance overlay
-        ax3 = fig.add_subplot(gs[2, :])
+        ax3 = fig.add_subplot(gs[2 + row_offset, :])
         cat_ts_data = shap_results['test_data']['ts_cat'][sample_idx, :, :n_steps]  # crop to eval_timestep
         enc_info = shap_results['encoding_info']
         
@@ -967,25 +1114,32 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             if start > 0:
                 ax3.axhline(y=start - 0.5, color='white', linewidth=2)
     
-    # Plot 4: Channel importance (color-coded by group, excluding temporal/auxiliary)
-    ax4 = fig.add_subplot(gs[3, :])
+    # Plot 4: Channel importance — clinical-only when EBM present
+    ax4 = fig.add_subplot(gs[3 + row_offset, :])
     ch_imp = np.abs(ts_shap).mean(axis=1)
-    display_ch = _get_display_channel_mask(channel2feature, n_channels)
+    if has_ebm:
+        display_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
+    else:
+        display_ch = _get_display_channel_mask(channel2feature, n_channels)
     ch_imp_display = ch_imp[display_ch]
     sorted_display = np.argsort(ch_imp_display)[::-1]
     n_show = min(20, len(ch_imp_display))
     sorted_idx = [display_ch[i] for i in sorted_display[:n_show]]
     if channel2feature:
         names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx]
-        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
+        if has_ebm:
+            bar_colors = [_GROUP_COLORS['Clinical']] * n_show
+        else:
+            bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
     else:
         names = [f'Channel {i}' for i in sorted_idx]
         bar_colors = ['#008bfb'] * n_show
     ax4.barh(range(n_show), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax4.set_yticks(range(n_show)); ax4.set_yticklabels(names, fontsize=9)
-    ax4.set_xlabel('Mean |SHAP|'); ax4.set_title(f'Top {n_show} Channels', fontweight='bold')
+    bar_title = f'Top {n_show} Clinical Channels' if has_ebm else f'Top {n_show} Channels'
+    ax4.set_xlabel('Mean |SHAP|'); ax4.set_title(bar_title, fontweight='bold')
     ax4.grid(True, alpha=0.3, axis='x'); ax4.invert_yaxis()
-    if channel2feature:
+    if channel2feature and not has_ebm:
         used_groups = set()
         for i in sorted_idx:
             name = channel2feature.get(int(i), '')
@@ -997,7 +1151,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     # Plot 5: Static categorical
     if shap_results['cat_shap'] is not None and shap_results['cat_shap'].size > 0:
-        ax5 = fig.add_subplot(gs[4, 0])
+        ax5 = fig.add_subplot(gs[4 + row_offset, 0])
         cat_shap = shap_results['cat_shap'][sample_idx]
         cat_data = shap_results['test_data']['cat'][sample_idx]
         if cat_shap.ndim == 2:
@@ -1032,7 +1186,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     # Plot 6: Static continuous
     if shap_results['cont_shap'] is not None and shap_results['cont_shap'].size > 0:
-        ax6 = fig.add_subplot(gs[4, 1])
+        ax6 = fig.add_subplot(gs[4 + row_offset, 1])
         cont_shap = shap_results['cont_shap'][sample_idx]
         cont_data = shap_results['test_data']['cont'][sample_idx]
         if cont_shap.ndim == 2:
@@ -1413,9 +1567,6 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
                            eval_timestep: Optional[int] = None):
     """Summary visualizations across cohort."""
 
-    fig = plt.figure(figsize=(22, 18))
-    gs = fig.add_gridspec(4, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1.2, 1])
-
     ts_shap = shap_results['ts_shap']
     if ts_shap.ndim == 4:
         ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
@@ -1433,16 +1584,53 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     time_fmt = [time_to_hours(t) for t in time_labels]
     n_ticks = min(10, n_steps)
     tick_idx = np.linspace(0, n_steps-1, n_ticks, dtype=int)
-    
+
+    # EBM two-view: compute budget and adjust layout
+    budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
+    has_ebm = budget is not None
+
+    if has_ebm:
+        fig = plt.figure(figsize=(22, 20))
+        gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3,
+                              height_ratios=[0.35, 1, 1, 1.2, 1])
+        row_offset = 1
+        # Row 0: EBM budget panel
+        ax_budget = fig.add_subplot(gs[0, :])
+        _draw_ebm_budget_panel(ax_budget, budget,
+                               title=f'SHAP Budget: EBM vs Clinical (Class {class_idx})')
+    else:
+        fig = plt.figure(figsize=(22, 18))
+        gs = fig.add_gridspec(4, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1.2, 1])
+        row_offset = 0
+
     # Channels to display (exclude temporal/auxiliary — not model features)
     display_ch = _get_display_channel_mask(channel2feature, n_channels)
 
     # Plot 1: TS importance over time
-    ax1 = fig.add_subplot(gs[0, :])
-    ts_imp = np.abs(ts_shap[:, display_ch, :]).mean(axis=(0, 1))
-    ax1.plot(ts_imp, linewidth=2, color='#ff0051', label='Continuous TS')
-    ax1.fill_between(range(len(ts_imp)), ts_imp, alpha=0.3, color='#ff0051')
-    
+    ax1 = fig.add_subplot(gs[0 + row_offset, :])
+
+    if has_ebm:
+        # Two-view: separate Clinical and EBM lines
+        clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
+        ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
+
+        clinical_imp = np.abs(ts_shap[:, clinical_ch, :]).mean(axis=(0, 1))
+        ax1.plot(clinical_imp, linewidth=2, color=_GROUP_COLORS['Clinical'],
+                 label='Clinical channels')
+        ax1.fill_between(range(len(clinical_imp)), clinical_imp, alpha=0.2,
+                         color=_GROUP_COLORS['Clinical'])
+
+        if ebm_ch:
+            ebm_imp = np.abs(ts_shap[:, ebm_ch, :]).mean(axis=(0, 1))
+            ax1.plot(ebm_imp, linewidth=2, color=_GROUP_COLORS['EBM'],
+                     label='EBM (_ebm_pred)', linestyle='--')
+            ax1.fill_between(range(len(ebm_imp)), ebm_imp, alpha=0.2,
+                             color=_GROUP_COLORS['EBM'])
+    else:
+        ts_imp = np.abs(ts_shap[:, display_ch, :]).mean(axis=(0, 1))
+        ax1.plot(ts_imp, linewidth=2, color='#ff0051', label='Continuous TS')
+        ax1.fill_between(range(len(ts_imp)), ts_imp, alpha=0.3, color='#ff0051')
+
     if shap_results['cat_ts_shap'] is not None:
         cat_ts = shap_results['cat_ts_shap']
         if cat_ts.ndim == 3:
@@ -1451,30 +1639,37 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         cat_imp = np.abs(cat_ts).mean(axis=0)
         ax1.plot(cat_imp, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_imp)), cat_imp, alpha=0.2, color='#00d4aa')
-    
+
     ax1.set_xlabel('Time'); ax1.set_ylabel('Mean |SHAP|')
     ax1.set_title(f'Feature Importance Over Time (Class {class_idx})', fontweight='bold')
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
     
-    # Plot 2: Top channels (color-coded by group, excluding temporal/auxiliary)
-    ax2 = fig.add_subplot(gs[1, 0])
+    # Plot 2: Top channels — clinical-only when EBM present
+    ax2 = fig.add_subplot(gs[1 + row_offset, 0])
     ch_imp = np.abs(ts_shap).mean(axis=(0, 2))
-    # Rank only displayable channels
-    ch_imp_display = ch_imp[display_ch]
+    if has_ebm:
+        bar_display_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
+    else:
+        bar_display_ch = display_ch
+    ch_imp_display = ch_imp[bar_display_ch]
     sorted_display = np.argsort(ch_imp_display)[::-1][:max_display]
-    sorted_idx = [display_ch[i] for i in sorted_display]
+    sorted_idx = [bar_display_ch[i] for i in sorted_display]
     if channel2feature:
         names = [channel2feature.get(int(i), f'Ch{i}') for i in sorted_idx]
-        bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
+        if has_ebm:
+            bar_colors = [_GROUP_COLORS['Clinical']] * len(sorted_idx)
+        else:
+            bar_colors = [_get_channel_color(channel2feature, int(i)) for i in sorted_idx]
     else:
         names = [f'Channel {i}' for i in sorted_idx]
         bar_colors = ['#008bfb'] * len(sorted_idx)
     ax2.barh(range(len(sorted_idx)), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax2.set_yticks(range(len(sorted_idx))); ax2.set_yticklabels(names, fontsize=10)
-    ax2.set_xlabel('Mean |SHAP|'); ax2.set_title(f'Top {len(sorted_idx)} Channels', fontweight='bold')
+    bar_title = f'Top {len(sorted_idx)} Clinical Channels' if has_ebm else f'Top {len(sorted_idx)} Channels'
+    ax2.set_xlabel('Mean |SHAP|'); ax2.set_title(bar_title, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='x'); ax2.invert_yaxis()
-    if channel2feature:
+    if channel2feature and not has_ebm:
         used_groups = set()
         for i in sorted_idx:
             name = channel2feature.get(int(i), '')
@@ -1486,7 +1681,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     # Plot 3: Categorical TS SHAP heatmap (mean across cohort)
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
-        ax3 = fig.add_subplot(gs[1, 1])
+        ax3 = fig.add_subplot(gs[1 + row_offset, 1])
         cat_ts_shap = shap_results['cat_ts_shap_per_category']  # [n_samples, n_cats, seq_len]
         if cat_ts_shap.ndim == 4:
             cat_ts_shap = cat_ts_shap[..., min(class_idx, cat_ts_shap.shape[-1] - 1)]
@@ -1514,7 +1709,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     elif shap_results.get('encoding_info') is not None:
         # Fallback: show activity data
-        ax3 = fig.add_subplot(gs[1, 1])
+        ax3 = fig.add_subplot(gs[1 + row_offset, 1])
         cat_ts_data = shap_results['test_data']['ts_cat'][..., :n_steps]  # crop to eval_timestep
         cat_ts_mean = cat_ts_data.mean(axis=0)
         enc_info = shap_results['encoding_info']
@@ -1536,10 +1731,14 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
         plt.colorbar(im3, ax=ax3, label='Mean Activity')
     
-    # Plot 4: Continuous TS heatmap - grouped by channel type
-    ax4 = fig.add_subplot(gs[2, :])
+    # Plot 4: Continuous TS heatmap — clinical-only when EBM present
+    ax4 = fig.add_subplot(gs[2 + row_offset, :])
     ts_mean = np.abs(ts_shap).mean(axis=0)
-    if channel2feature:
+    if channel2feature and has_ebm:
+        ordered_idx, ordered_labels_4 = _get_clinical_only_channel_order(channel2feature)
+        ts_mean_display = ts_mean[ordered_idx]
+        n_display_4 = len(ordered_idx)
+    elif channel2feature:
         ordered_idx, ordered_labels_4, group_bounds_4 = _get_grouped_channel_order(channel2feature)
         ts_mean_display = ts_mean[ordered_idx]
         n_display_4 = len(ordered_idx)
@@ -1547,10 +1746,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ts_mean_display = ts_mean
         ordered_labels_4 = [f'Ch{i}' for i in range(n_channels)]
         n_display_4 = n_channels
-        group_bounds_4 = OrderedDict()
     im = ax4.imshow(ts_mean_display, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0)
     ax4.set_xlabel('Time'); ax4.set_ylabel('Channel')
-    ax4.set_title('Continuous TS |SHAP| Heatmap (Mean, grouped)', fontweight='bold')
+    heatmap_title_4 = 'Clinical Continuous TS |SHAP| Heatmap (Mean)' if has_ebm else 'Continuous TS |SHAP| Heatmap (Mean, grouped)'
+    ax4.set_title(heatmap_title_4, fontweight='bold')
     if n_display_4 <= 40:
         ax4.set_yticks(range(n_display_4))
         ax4.set_yticklabels(ordered_labels_4, fontsize=7 if n_display_4 > 25 else 9)
@@ -1561,11 +1760,12 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         ax4.set_yticklabels([ordered_labels_4[i] for i in yticks], fontsize=7)
     ax4.set_xticks(tick_idx); ax4.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     plt.colorbar(im, ax=ax4, label='Mean |SHAP|')
-    _draw_group_separators(ax4, group_bounds_4)
+    if not has_ebm and channel2feature:
+        _draw_group_separators(ax4, group_bounds_4)
     
     # Plot 5: Static categorical
     if shap_results['cat_shap'] is not None and shap_results['cat_shap'].size > 0:
-        ax5 = fig.add_subplot(gs[3, 0])
+        ax5 = fig.add_subplot(gs[3 + row_offset, 0])
         cat_shap = shap_results['cat_shap']
         if cat_shap.ndim == 3:
             cat_shap = cat_shap[..., min(class_idx, cat_shap.shape[-1] - 1)]
@@ -1585,7 +1785,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     # Plot 6: Static continuous
     if shap_results['cont_shap'] is not None and shap_results['cont_shap'].size > 0:
-        ax6 = fig.add_subplot(gs[3, 1])
+        ax6 = fig.add_subplot(gs[3 + row_offset, 1])
         cont_shap = shap_results['cont_shap']
         if cont_shap.ndim == 3:
             cont_shap = cont_shap[..., min(class_idx, cont_shap.shape[-1] - 1)]
@@ -2349,10 +2549,20 @@ class TemporalSHAPAnalyzer:
         all_temp = [results.timeframe_results[t].ts_temporal_importance for t in tfs]
         all_chan = [results.timeframe_results[t].ts_channel_importance for t in tfs]
         temp_max = max(np.max(x) for x in all_temp)
-        chan_max = max(np.max(x) for x in all_chan)
-        
-        top_idx = np.argsort(np.mean(all_chan, axis=0))[-max_channels:][::-1]
-        
+
+        # Clinical-only channel selection when EBM present
+        has_ebm = _has_ebm_channels(results.channel2feature)
+        if has_ebm:
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(all_chan[0]))
+            clinical_chan = [ch[clinical_mask] for ch in all_chan]
+            chan_max = max(np.max(x) for x in clinical_chan)
+            top_clinical = np.argsort(np.mean(clinical_chan, axis=0))[-max_channels:][::-1]
+            top_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            chan_max = max(np.max(x) for x in all_chan)
+            top_idx = np.argsort(np.mean(all_chan, axis=0))[-max_channels:][::-1]
+
         for col, tf in enumerate(tfs):
             r = results.timeframe_results[tf]
             # Handle both 'full' and 'max(X.Xh)' style timeframe names
@@ -2363,7 +2573,14 @@ class TemporalSHAPAnalyzer:
                     suffix = f"(full: {results.actual_data_length_hours:.1f}h)"
             else:
                 suffix = f"({r.timeframe_hours}h)"
-            
+
+            # Compute per-timeframe EBM budget for annotation
+            ebm_annotation = ''
+            if has_ebm:
+                tf_budget = compute_ebm_vs_clinical_budget(r.ts_shap, results.channel2feature)
+                if tf_budget is not None:
+                    ebm_annotation = f"  [EBM: {tf_budget['ebm_pct']:.0f}%]"
+
             # Row 1: Temporal importance
             ax1 = fig.add_subplot(gs[0, col])
             ax1.plot(r.ts_temporal_importance, lw=2, color='#ff0051')
@@ -2372,9 +2589,9 @@ class TemporalSHAPAnalyzer:
             ax1.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5, alpha=0.7)
             ax1.set_xlim(0, seq_len); ax1.set_ylim(0, temp_max*1.1)
             ax1.set_xticks(tick_idx); ax1.set_xticklabels(tick_labels, rotation=45, fontsize=8)
-            ax1.set_title(f'{tf} {suffix}', fontweight='bold'); ax1.grid(True, alpha=0.3)
-            
-            # Row 2: Channel bars
+            ax1.set_title(f'{tf} {suffix}{ebm_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
+
+            # Row 2: Channel bars (clinical-only when EBM present)
             ax2 = fig.add_subplot(gs[1, col])
             names = [results.channel2feature.get(int(i), f'Ch{i}') for i in top_idx]
             ax2.barh(range(len(top_idx)), r.ts_channel_importance[top_idx], color=plt.cm.Blues(np.linspace(0.4,0.9,len(top_idx))))
@@ -2625,10 +2842,17 @@ class TemporalSHAPAnalyzer:
         colors = {'ts': '#1f77b4', 'cat_ts': '#2ca02c', 'static': '#ff7f0e'}
         
         # ====================================================================
-        # ROW 1: TS CHANNELS
+        # ROW 1: TS CHANNELS (clinical-only when EBM present)
         # ====================================================================
         ref_ts_imp = ref_result.ts_channel_importance
-        top_ts_idx = np.argsort(ref_ts_imp)[-max_features:]
+        if _has_ebm_channels(results.channel2feature):
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(ref_ts_imp))
+            clinical_imp = ref_ts_imp[clinical_mask]
+            top_clinical = np.argsort(clinical_imp)[-max_features:]
+            top_ts_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            top_ts_idx = np.argsort(ref_ts_imp)[-max_features:]
         ts_names = [results.channel2feature.get(int(i), f'Ch{i}') for i in top_ts_idx]
         
         for col, tf in enumerate(others):
@@ -2810,7 +3034,15 @@ class TemporalSHAPAnalyzer:
             # Find reference - prefer 'full', then 'max(...)', then last
             ref = 'full' if 'full' in tfs else next((t for t in tfs if 'max(' in t), tfs[-1])
             ref_imp = results.timeframe_results[ref].ts_channel_importance
-            top_idx = np.argsort(ref_imp)[-top_k:][::-1]
+            # Exclude EBM from auto-selection (clinical-only)
+            if _has_ebm_channels(results.channel2feature):
+                clinical_mask = _get_clinical_only_channel_mask(
+                    results.channel2feature, len(ref_imp))
+                clinical_imp = ref_imp[clinical_mask]
+                top_clinical = np.argsort(clinical_imp)[-top_k:][::-1]
+                top_idx = np.array([clinical_mask[i] for i in top_clinical])
+            else:
+                top_idx = np.argsort(ref_imp)[-top_k:][::-1]
             feature_names = [results.channel2feature.get(int(i), f'Ch{i}') for i in top_idx]
             feat_idx = top_idx
         else:
@@ -2853,15 +3085,22 @@ class TemporalSHAPAnalyzer:
                                        ref_result.ts_channel_importance)[0] 
                       if tf != ref_tf else 1.0)
             
+            # EBM budget for this timeframe
+            tf_budget = compute_ebm_vs_clinical_budget(r.ts_shap, results.channel2feature)
+
             record = {
-                'timeframe': tf, 
-                'hours': r.timeframe_hours, 
+                'timeframe': tf,
+                'hours': r.timeframe_hours,
                 'censor_step': r.censor_step,
                 'effective_steps': r.effective_steps,
-                
+
+                # EBM vs Clinical budget
+                'ebm_pct': tf_budget['ebm_pct'] if tf_budget else np.nan,
+                'clinical_pct': tf_budget['clinical_pct'] if tf_budget else np.nan,
+
                 # TS Channels
                 'ts_top_5': ', '.join(ts_top5),
-                'ts_mean_shap': np.abs(r.ts_shap).mean(), 
+                'ts_mean_shap': np.abs(r.ts_shap).mean(),
                 'ts_max_shap': np.abs(r.ts_shap).max(),
                 'ts_corr_with_ref': ts_corr,
             }
