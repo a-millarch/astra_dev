@@ -15,6 +15,8 @@ from collections import OrderedDict
 import time
 import os
 import logging
+import pickle
+from pathlib import Path
 
 from astra.utils import cfg
 from astra.models.hybrid.training import get_backbone
@@ -267,6 +269,160 @@ def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
     ax.set_ylabel('Sum |SHAP|')
     ax.set_title(title, fontweight='bold')
     ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+
+def _parse_ebm_time_label(label: str) -> float:
+    """Parse EBM model time label (e.g. '10min', '6h', '14D') to hours."""
+    if label.endswith('min'):
+        return float(label[:-3]) / 60
+    elif label.endswith('h'):
+        return float(label[:-1])
+    elif label.endswith('D'):
+        return float(label[:-1]) * 24
+    raise ValueError(f"Cannot parse EBM time label: {label}")
+
+
+def load_ebm_global_importances(
+    models_dir: str = 'models/ebm',
+    n_steps: int = 114,
+    top_n: int = 20,
+) -> Optional[Dict]:
+    """
+    Load all EBM deployment models and extract global term importances.
+
+    Returns a dict with importance matrix aligned to bin-step time axis
+    (forward-filled to match how _ebm_pred is populated), or None if no
+    models are found.
+    """
+    models_path = Path(models_dir)
+    model_files = sorted(models_path.glob('ebm_model_*.pkl'))
+    if not model_files:
+        logger.info("No EBM models found in %s — skipping EBM importance panel", models_dir)
+        return None
+
+    # Load each model and extract importances
+    records = []  # (step, label, {term: importance})
+    for mf in model_files:
+        # Parse time label from filename: ebm_model_{label}.pkl
+        label = mf.stem.replace('ebm_model_', '')
+        try:
+            hours = _parse_ebm_time_label(label)
+        except ValueError:
+            logger.warning("Cannot parse EBM model filename: %s", mf.name)
+            continue
+
+        step = time_to_step(hours, 'h')
+        if step is None or step >= n_steps:
+            continue
+
+        try:
+            with open(mf, 'rb') as f:
+                model_data = pickle.load(f)
+            ebm = model_data['model']
+            importances = ebm.term_importances()
+            term_names = list(ebm.term_names_)
+            records.append((step, label, dict(zip(term_names, importances))))
+        except Exception as e:
+            logger.warning("Failed to load EBM model %s: %s", mf.name, e)
+            continue
+
+    if not records:
+        logger.info("No valid EBM models loaded — skipping EBM importance panel")
+        return None
+
+    records.sort(key=lambda r: r[0])
+    logger.info("Loaded %d EBM models for importance visualization", len(records))
+
+    # Build union of all term names
+    all_terms: set = set()
+    for _, _, imp_dict in records:
+        all_terms.update(imp_dict.keys())
+    all_terms_list = sorted(all_terms)
+
+    # Build importance matrix at EBM model steps: [n_terms, n_model_steps]
+    model_steps = [r[0] for r in records]
+    model_labels = [r[1] for r in records]
+    sparse_matrix = np.zeros((len(all_terms_list), len(records)))
+    term_to_idx = {t: i for i, t in enumerate(all_terms_list)}
+    for col, (_, _, imp_dict) in enumerate(records):
+        for term, imp in imp_dict.items():
+            sparse_matrix[term_to_idx[term], col] = imp
+
+    # Select top_n terms by max importance across all time points
+    max_imp = sparse_matrix.max(axis=1)
+    top_indices = np.argsort(max_imp)[::-1][:top_n]
+    top_terms = [all_terms_list[i] for i in top_indices]
+    top_matrix = sparse_matrix[top_indices]  # [top_n, n_model_steps]
+
+    # Forward-fill to full n_steps grid
+    full_matrix = np.zeros((len(top_terms), n_steps))
+    for step_col in range(len(model_steps)):
+        start = model_steps[step_col]
+        end = model_steps[step_col + 1] if step_col + 1 < len(model_steps) else n_steps
+        full_matrix[:, start:end] = top_matrix[:, step_col:step_col + 1]
+
+    return {
+        'importance_matrix': full_matrix,
+        'feature_names': top_terms,
+        'model_steps': model_steps,
+        'model_labels': model_labels,
+        'n_models': len(records),
+    }
+
+
+def _draw_ebm_importance_heatmap(ax, ebm_imp: Dict, n_steps: int,
+                                  tick_idx, tick_labels,
+                                  title: str = 'EBM Feature Importance Over Time'):
+    """Draw heatmap of EBM global feature importances across time."""
+    matrix = ebm_imp['importance_matrix'][:, :n_steps]
+    names = ebm_imp['feature_names']
+    model_steps = [s for s in ebm_imp['model_steps'] if s < n_steps]
+    n_feat = len(names)
+
+    im = ax.imshow(matrix, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+    ax.set_xlabel('Time')
+    ax.set_ylabel('EBM Feature')
+    ax.set_title(title, fontweight='bold')
+
+    # Y-axis labels
+    fontsize = 7 if n_feat > 15 else (8 if n_feat > 10 else 9)
+    ax.set_yticks(range(n_feat))
+    ax.set_yticklabels(names, fontsize=fontsize)
+
+    # X-axis shared ticks
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=45)
+
+    # Vertical markers at EBM model change points
+    for s in model_steps:
+        ax.axvline(x=s, color='white', linewidth=0.5, alpha=0.6)
+
+    plt.colorbar(im, ax=ax, label='Importance', shrink=0.8)
+
+
+def _draw_ebm_importance_lines(ax, ebm_imp: Dict, n_steps: int,
+                                tick_idx, tick_labels, top_k: int = 5,
+                                title: str = 'Top EBM Features Over Time'):
+    """Draw line plot of top EBM features' importance over time."""
+    matrix = ebm_imp['importance_matrix'][:, :n_steps]
+    names = ebm_imp['feature_names']
+    cmap = plt.cm.tab10
+    x = np.arange(n_steps)
+
+    show_k = min(top_k, len(names))
+    for i in range(show_k):
+        ax.plot(x, matrix[i], linewidth=2, color=cmap(i), label=names[i])
+        ax.fill_between(x, matrix[i], alpha=0.1, color=cmap(i))
+
+    ax.set_xlim(0, n_steps - 1)
+    ax.set_ylim(0)
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=45)
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Importance')
+    ax.set_title(title, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=8, ncol=2 if show_k > 3 else 1)
     ax.grid(True, alpha=0.3)
 
 
@@ -904,7 +1060,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                                feature_names_cat: List[str] = None,
                                feature_names_cont: List[str] = None,
                                class_idx: int = 1, save_path: str = None,
-                               eval_timestep: Optional[int] = None):
+                               eval_timestep: Optional[int] = None,
+                               ebm_importances: Optional[Dict] = None):
     """
     Visualize SHAP values for individual sample.
 
@@ -917,6 +1074,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         class_idx: Which output class to show SHAP values for (default 1 for binary)
         save_path: Path to save the figure
         eval_timestep: Crop time axis to this step (default: read from shap_results).
+        ebm_importances: Dict from load_ebm_global_importances() with EBM feature
+            importance data, or None to skip EBM importance panels.
 
     Note: Either sample_idx or (pid + holdout_pids) must be provided.
     """
@@ -963,8 +1122,29 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     # EBM two-view: compute budget and adjust layout
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
     has_ebm = budget is not None
+    has_ebm_imp = has_ebm and ebm_importances is not None
 
-    if has_ebm:
+    if has_ebm and has_ebm_imp:
+        fig = plt.figure(figsize=(22, 28))
+        gs = fig.add_gridspec(8, 2, hspace=0.4, wspace=0.3,
+                              height_ratios=[0.7, 0.7, 1, 1, 1, 1, 1, 1])
+        row_offset = 3
+        # Row 0: EBM budget over time
+        ax_budget = fig.add_subplot(gs[0, :])
+        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
+                                  [time_fmt[i] for i in tick_idx],
+                                  title=f'SHAP Budget Over Time{title_suffix}')
+        # Row 1: EBM importance lines
+        ax_ebm_lines = fig.add_subplot(gs[1, :])
+        _draw_ebm_importance_lines(ax_ebm_lines, ebm_importances, n_steps,
+                                    tick_idx, [time_fmt[i] for i in tick_idx],
+                                    title=f'Top EBM Features Over Time{title_suffix}')
+        # Row 2: EBM importance heatmap
+        ax_ebm_hm = fig.add_subplot(gs[2, :])
+        _draw_ebm_importance_heatmap(ax_ebm_hm, ebm_importances, n_steps,
+                                      tick_idx, [time_fmt[i] for i in tick_idx],
+                                      title=f'EBM Feature Importance Over Time{title_suffix}')
+    elif has_ebm:
         fig = plt.figure(figsize=(22, 23))
         gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
                               height_ratios=[0.7, 1, 1, 1, 1, 1])
@@ -1570,7 +1750,8 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
                            max_display: int = 20, class_idx: int = 1, save_path: str = None,
-                           eval_timestep: Optional[int] = None):
+                           eval_timestep: Optional[int] = None,
+                           ebm_importances: Optional[Dict] = None):
     """Summary visualizations across cohort."""
 
     ts_shap = shap_results['ts_shap']
@@ -1594,8 +1775,29 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # EBM two-view: compute budget and adjust layout
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
     has_ebm = budget is not None
+    has_ebm_imp = has_ebm and ebm_importances is not None
 
-    if has_ebm:
+    if has_ebm and has_ebm_imp:
+        fig = plt.figure(figsize=(22, 25))
+        gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
+                              height_ratios=[0.7, 0.7, 1, 1, 1.2, 1])
+        row_offset = 3
+        # Row 0: EBM budget over time
+        ax_budget = fig.add_subplot(gs[0, :])
+        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
+                                  [time_fmt[i] for i in tick_idx],
+                                  title=f'SHAP Budget Over Time: EBM vs Clinical (Class {class_idx})')
+        # Row 1: EBM importance lines
+        ax_ebm_lines = fig.add_subplot(gs[1, :])
+        _draw_ebm_importance_lines(ax_ebm_lines, ebm_importances, n_steps,
+                                    tick_idx, [time_fmt[i] for i in tick_idx],
+                                    title=f'Top EBM Features Over Time (Class {class_idx})')
+        # Row 2: EBM importance heatmap
+        ax_ebm_hm = fig.add_subplot(gs[2, :])
+        _draw_ebm_importance_heatmap(ax_ebm_hm, ebm_importances, n_steps,
+                                      tick_idx, [time_fmt[i] for i in tick_idx],
+                                      title=f'EBM Feature Importance Over Time (Class {class_idx})')
+    elif has_ebm:
         fig = plt.figure(figsize=(22, 21))
         gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3,
                               height_ratios=[0.7, 1, 1, 1.2, 1])
@@ -1888,26 +2090,37 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
                     feature_names_cat=static_cat_names,
                     feature_names_cont=cfg["dataset"]["num_cols"])
     
+    # Load EBM glassbox importances if EBM channels are present
+    ebm_importances = None
+    if _has_ebm_channels(channel2feature):
+        ebm_importances = load_ebm_global_importances(
+            models_dir='models/ebm',
+            n_steps=data['seq_len'],
+            top_n=20,
+        )
+
     if visualize is True:
         visualize_shap_summary(
             shap_results, channel2feature=channel2feature,
             feature_names_cat=static_cat_names,
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
-            save_path='reports/shap/shap_summary_cohort.png'
+            save_path='reports/shap/shap_summary_cohort.png',
+            ebm_importances=ebm_importances,
         )
-        
+
         # Use first PID for individual plot
         first_pid = holdout_pids[0] if holdout_pids else None
         visualize_shap_individual(
-            shap_results, 
+            shap_results,
             pid=first_pid,
             holdout_pids=holdout_pids,
             channel2feature=channel2feature,
             feature_names_cat=static_cat_names,
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1,
-            save_path='reports/shap/shap_individual_sample_0.png'
+            save_path='reports/shap/shap_individual_sample_0.png',
+            ebm_importances=ebm_importances,
         )
 
         visualize_data_completeness(
