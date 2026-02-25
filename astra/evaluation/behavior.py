@@ -2137,7 +2137,8 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
         'holdout_pids': holdout_pids,
         'channel2feature': channel2feature,
         'static_cat_names': static_cat_names,
-        'data': data
+        'data': data,
+        'ebm_importances': ebm_importances,
     }
 
 
