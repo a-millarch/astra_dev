@@ -120,6 +120,41 @@ def _create_aggregated_dataset(
     return X, np.asarray(y), agg_ds.categorical_features, agg_ds.continuous_features
 
 
+def _pad_to_reference_features(
+    X: pd.DataFrame,
+    cat_feats: list,
+    cont_feats: list,
+    ref_cat_feats: list,
+    ref_cont_feats: list,
+) -> Tuple[pd.DataFrame, list, list]:
+    """
+    Ensure X has all reference features, adding zero-filled columns for missing ones.
+
+    This guarantees all EBM models (across all masking time points) share the same
+    feature space. Early time points where certain features don't exist yet get
+    zero-valued columns, so the EBM can still accept those features at inference
+    time for patients who do have data that early.
+
+    Returns:
+        X with all reference columns, ref_cat_feats, ref_cont_feats
+    """
+    missing_cont = [f for f in ref_cont_feats if f not in X.columns]
+    missing_cat = [f for f in ref_cat_feats if f not in X.columns]
+
+    if missing_cont or missing_cat:
+        # Build missing columns in one shot to avoid fragmentation
+        missing_data = {}
+        for feat in missing_cont:
+            missing_data[feat] = 0.0
+        for feat in missing_cat:
+            missing_data[feat] = np.nan
+        if missing_data:
+            missing_df = pd.DataFrame(missing_data, index=X.index)
+            X = pd.concat([X, missing_df], axis=1)
+
+    return X, ref_cat_feats, ref_cont_feats
+
+
 def preprocess_features(
     X: pd.DataFrame,
     cat_feats: list,
@@ -192,13 +227,12 @@ def preprocess_features(
         
         # === HANDLE CATEGORICAL FEATURES ===
         if len(expected_cat_feats) > 0:
-            # Create DataFrame with ALL expected categorical features
-            X_cat_full = pd.DataFrame(index=X.index)
-            for feat in expected_cat_feats:
-                if feat in X.columns:
-                    X_cat_full[feat] = X[feat]  # Use actual data
-                else:
-                    X_cat_full[feat] = np.nan   # Add missing feature as NaN
+            # Create DataFrame with ALL expected categorical features in one shot
+            cat_data = {
+                feat: X[feat] if feat in X.columns else np.nan
+                for feat in expected_cat_feats
+            }
+            X_cat_full = pd.DataFrame(cat_data, index=X.index)
             
             X_cat_encoded = encoder.transform(X_cat_full)
             
@@ -219,13 +253,12 @@ def preprocess_features(
             X_cat_df = pd.DataFrame(index=X.index)
         
         # === HANDLE CONTINUOUS FEATURES ===
-        # Create DataFrame with ALL expected continuous features
-        X_cont = pd.DataFrame(index=X.index)
-        for feat in expected_cont_feats:
-            if feat in X.columns:
-                X_cont[feat] = X[feat]  # Use actual data
-            else:
-                X_cont[feat] = 0.0      # Add missing feature as 0
+        # Create DataFrame with ALL expected continuous features in one shot
+        cont_data = {
+            feat: X[feat] if feat in X.columns else 0.0
+            for feat in expected_cont_feats
+        }
+        X_cont = pd.DataFrame(cont_data, index=X.index)
         
         # Combine categorical and continuous
         X_processed = pd.concat([X_cat_df, X_cont], axis=1)
@@ -240,11 +273,11 @@ def train_ebm_kfold_at_timepoint(
     masking_hours: float,
     n_folds: int = 5,
     ebm_params: Optional[dict] = None,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
 ) -> Tuple[Dict[int, float], list, list, list]:
     """
     Train K-fold EBMs at one masking point to generate OOF predictions.
-    
-    **FIX**: Uses explicit preprocessing to ensure consistent features across folds.
 
     Args:
         train_df: Training patients base_df (no holdout).
@@ -252,12 +285,15 @@ def train_ebm_kfold_at_timepoint(
         masking_hours: Time point in hours.
         n_folds: Number of CV folds.
         ebm_params: EBM hyperparameters.
+        ref_cat_feats: Reference categorical features (ensures consistent feature space
+            across all time points). If None, uses only features present at this time point.
+        ref_cont_feats: Reference continuous features. If None, uses only features present.
 
     Returns:
         oof_preds: {PID: predicted_probability} for all training patients.
         fold_models: List of (model, encoder, expected_cat_feats, expected_cont_feats) tuples.
-        expected_cat_feats: List of categorical feature names from training.
-        expected_cont_feats: List of continuous feature names from training.
+        expected_cat_feats: List of categorical feature names (reference set if provided).
+        expected_cont_feats: List of continuous feature names (reference set if provided).
     """
     if ebm_params is None:
         ebm_params = _get_default_ebm_params()
@@ -270,7 +306,13 @@ def train_ebm_kfold_at_timepoint(
     pids = X_full[id_col].values
     X_features = X_full.drop(columns=[id_col])
 
-    # **FIX**: Fit encoder on FULL dataset to ensure all categories are known
+    # Pad to reference features if provided (ensures all time points share same feature space)
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, cat_feats, cont_feats = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
+
+    # Fit encoder on FULL dataset to ensure all categories are known
     X_processed, global_encoder, feature_names = preprocess_features(
         X_features, cat_feats, cont_feats, encoder=None, fit=True
     )
@@ -329,12 +371,11 @@ def predict_holdout(
     fold_models: list,
     expected_cat_feats: list,
     expected_cont_feats: list,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
 ) -> Dict[int, float]:
     """
     Generate averaged predictions for holdout patients across K fold models.
-    
-    **FIX**: Uses stored encoders from training to ensure consistent features,
-    handling missing categorical AND continuous columns by adding zero-filled columns.
 
     Args:
         holdout_df: Holdout patients base_df.
@@ -343,6 +384,8 @@ def predict_holdout(
         fold_models: List of (model, encoder, expected_cat_feats, expected_cont_feats) tuples.
         expected_cat_feats: Categorical features expected from training.
         expected_cont_feats: Continuous features expected from training.
+        ref_cat_feats: Reference categorical features for consistent feature space.
+        ref_cont_feats: Reference continuous features for consistent feature space.
 
     Returns:
         {PID: averaged_probability}
@@ -355,24 +398,28 @@ def predict_holdout(
     pids = X_full[id_col].values
     X_features = X_full.drop(columns=[id_col])
 
+    # Pad to reference features if provided
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, _, _ = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
+
     if len(fold_models) == 0:
         return {pid: 0.0 for pid in pids}
 
     # Average predictions across fold models
     all_proba = np.zeros(len(X_features))
-    
+
     for model, encoder, _, _ in fold_models:
-        # **FIX**: Use the encoder from training to preprocess holdout data
-        # Pass expected_cat_feats and expected_cont_feats so missing features can be handled
         X_processed, _, _ = preprocess_features(
-            X_features, cat_feats, cont_feats, 
-            encoder=encoder, fit=False, 
+            X_features, cat_feats, cont_feats,
+            encoder=encoder, fit=False,
             expected_cat_feats=expected_cat_feats,
             expected_cont_feats=expected_cont_feats
         )
-        
+
         all_proba += model.predict_proba(X_processed)[:, 1]
-    
+
     all_proba /= len(fold_models)
 
     return {pid: float(prob) for pid, prob in zip(pids, all_proba)}
@@ -382,6 +429,8 @@ def train_final_ebm_at_timepoint(
     cfg_dict: dict,
     masking_hours: float,
     ebm_params: dict,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
 ):
     """
     Train ONE final EBM on full trainval data for deployment.
@@ -392,6 +441,12 @@ def train_final_ebm_at_timepoint(
 
     id_col = cfg_dict["dataset"]["id_col"]
     X_features = X_full.drop(columns=[id_col])
+
+    # Pad to reference features if provided
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, cat_feats, cont_feats = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
 
     X_processed, encoder, feature_names = preprocess_features(
         X_features, cat_feats, cont_feats, encoder=None, fit=True
@@ -455,6 +510,19 @@ def generate_ebm_feature(
     logger.info(f"EBM intervals: {len(intervals)} time points")
     logger.info(f"  Range: {intervals[0]:.2f}h to {intervals[-1]:.1f}h")
 
+    # Determine reference feature set from the latest interval (maximum masking time).
+    # This ensures all EBM models share the same feature space regardless of how
+    # sparse data is at early time points. Features that don't exist at a given
+    # time point are zero-filled, so the EBM can still accept them at inference.
+    logger.info("Determining reference feature set from latest interval...")
+    _, _, ref_cat_feats, ref_cont_feats = _create_aggregated_dataset(
+        trainval_df, cfg_dict, intervals[-1]
+    )
+    logger.info(
+        f"Reference features: {len(ref_cont_feats)} cont + {len(ref_cat_feats)} cat "
+        f"(from {_format_hours(intervals[-1])} masking point)"
+    )
+
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
     predictions_path = os.path.join(save_dir, "ebm_predictions.pkl")
@@ -496,11 +564,13 @@ def generate_ebm_feature(
                 train_ebm_kfold_at_timepoint(
                     trainval_df, cfg_dict, masking_hours,
                     n_folds=n_folds, ebm_params=ebm_params,
+                    ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
                 )
 
             hold_preds = predict_holdout(
                 holdout_df, cfg_dict, masking_hours, fold_models,
                 expected_cat_feats, expected_cont_feats,
+                ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
             )
 
             # Train final deployment model on full trainval
@@ -509,6 +579,8 @@ def generate_ebm_feature(
                 cfg_dict,
                 masking_hours,
                 ebm_params,
+                ref_cat_feats=ref_cat_feats,
+                ref_cont_feats=ref_cont_feats,
             )
             # Save deployment model as individual file
             model_path = os.path.join(models_dir, _model_filename(masking_hours))
