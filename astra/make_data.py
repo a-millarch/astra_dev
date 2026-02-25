@@ -1,10 +1,13 @@
+import logging
+import os
+
 import pandas as pd
 import numpy as np
-from astra.utils import ProjectManager
-import os 
 
-from astra.utils import cfg
+from astra.utils import ProjectManager, cfg, setup_logging
 from astra.utils import is_file_present, are_files_present
+
+logger = logging.getLogger(__name__)
 
 from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
@@ -90,7 +93,7 @@ def map_data_optimized(cfg):
             )            
 if __name__ =='__main__':
     pm = ProjectManager()
-    logger = pm.setup_logging(print_only=True)
+    setup_logging()
     #Single patient loop
     #generate_base_df() #Simulates new patient drop
     #population = bpi.load_or_collect_population(cfg)

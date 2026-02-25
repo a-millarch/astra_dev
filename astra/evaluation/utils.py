@@ -1,8 +1,12 @@
-from astra.utils import logger, cfg
+import logging
 import math
+
+from astra.utils import cfg
 import numpy as np
 from scipy import stats
 from sklearn.metrics import roc_auc_score, average_precision_score
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================

@@ -7,6 +7,7 @@ Phase 3: Full finetune (all layers with discriminative LRs)
 Phase 4: Early prediction hardening (optional progressive time masking)
 """
 
+import logging
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Optional, Dict, Any
@@ -17,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from astra.utils import cfg, logger, clear_mem
+from astra.utils import cfg, clear_mem
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig
 from astra.models.hybrid.training import get_backbone
@@ -44,6 +45,8 @@ from astra.training.utils import (
     _to_device,
 )
 from astra.data.dataloader import save_deployment_bundle
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

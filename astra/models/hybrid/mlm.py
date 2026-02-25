@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +10,7 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 from tqdm.auto import tqdm
 
-from astra.utils import logger
+logger = logging.getLogger(__name__)
 # ============================================================================
 # Configuration Management
 # ============================================================================

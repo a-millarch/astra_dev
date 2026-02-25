@@ -11,6 +11,7 @@ Usage:
     shap_result = session.explain(x_ts, x_ts_cat, tab_df)
 """
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -18,6 +19,8 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
+
+logger = logging.getLogger(__name__)
 
 from astra.data.dataloader import (
     get_trajectory_lengths,
@@ -101,6 +104,7 @@ class InferenceSession:
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+        logger.info("Loading model '%s' on %s", model_name, device)
         bundle = load_deployment_bundle(model_name, bundle_dir)
         params = bundle['model_params']
 
@@ -135,6 +139,13 @@ class InferenceSession:
 
         model.eval()
         model.to(device)
+
+        n_params = sum(p.numel() for p in model.parameters())
+        logger.info("Model loaded: %d parameters, temporal_head=%s",
+                     n_params, params['temporal_head'])
+        logger.debug("Model params: c_in=%d seq_len=%d d_model=%d n_layers=%d",
+                      params['c_in'], params['seq_len'],
+                      params['d_model'], params['n_layers'])
 
         return cls(model, bundle, device)
 
@@ -230,6 +241,9 @@ class InferenceSession:
         else:
             x_cont_t = torch.zeros(1, 0, dtype=torch.float32, device=self.device)
 
+        logger.debug("Tensors prepared: ts=%s cat=%s cont=%s ts_cat=%s traj_len=%d",
+                     x_ts_t.shape, x_cat_t.shape, x_cont_t.shape,
+                     x_ts_cat_t.shape, traj_len)
         return x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len
 
     # ------------------------------------------------------------------
@@ -259,6 +273,7 @@ class InferenceSession:
 
         if self.is_temporal:
             # logits: [1, seq_len]
+            logger.debug("Temporal logits shape: %s", logits.shape)
             probs_all = torch.sigmoid(logits).cpu().numpy()[0]  # [seq_len]
             seq_len = x_ts_t.shape[2]
             if censor_step is not None:
@@ -268,6 +283,8 @@ class InferenceSession:
                 step = traj_len - 1
             step = max(step, 0)
             probability = float(probs_all[step])
+            logger.info("Prediction: pid=%s P(deceased)=%.4f step=%d traj_len=%d",
+                        pid, probability, step, traj_len)
             return InferenceResult(
                 pid=pid,
                 probability=probability,
@@ -279,6 +296,8 @@ class InferenceSession:
             # logits: [1, 2]
             probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
             probability = float(probs[1])  # class 1 = deceased
+            logger.info("Prediction: pid=%s P(deceased)=%.4f traj_len=%d",
+                        pid, probability, traj_len)
             return InferenceResult(
                 pid=pid,
                 probability=probability,
@@ -305,6 +324,8 @@ class InferenceSession:
         """
         import shap
         from astra.evaluation.behavior import ModelWrapperWithRawCatTS, embed_categorical_features
+
+        logger.info("Computing SHAP explanation for pid=%s (censor_step=%s)", pid, censor_step)
 
         if self._bg is None:
             raise RuntimeError(
@@ -451,6 +472,8 @@ class InferenceSession:
                 all_importances.append((name, abs(val)))
         all_importances.sort(key=lambda x: x[1], reverse=True)
 
+        logger.info("SHAP done for pid=%s: %d TS channels, %d top features",
+                    pid, len(ts_shap_dict), min(len(all_importances), 20))
         return SHAPResult(
             pid=pid,
             ts_shap=ts_shap_dict,

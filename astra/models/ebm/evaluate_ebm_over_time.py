@@ -13,6 +13,7 @@ Usage:
     python evaluate_ebm_over_time.py --models_dir models/ebm --test_frac 0.20
 """
 
+import logging
 import os
 import sys
 import argparse
@@ -26,10 +27,12 @@ from dataclasses import dataclass
 
 from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 
-from astra.utils import get_base_df, get_train_test_split, cfg, logger, save_figure
+from astra.utils import get_base_df, get_train_test_split, cfg, save_figure
 from astra.data.datasets import AggregatedDS
 from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
 import seaborn as sns
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

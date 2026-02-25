@@ -2,6 +2,7 @@
 Training utilities: early stopping, metrics, checkpoint management.
 """
 
+import logging
 import os
 import copy
 from pathlib import Path
@@ -13,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
 
-from astra.utils import logger
+logger = logging.getLogger(__name__)
 
 
 class EarlyStopping:

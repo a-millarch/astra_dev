@@ -1,8 +1,10 @@
+import logging
+
 import pandas as pd
 import numpy as np
 import subprocess
 
-from astra.utils import logger, cfg, get_base_df, create_enumerated_id, is_file_present
+from astra.utils import cfg, get_base_df, create_enumerated_id, is_file_present
 from astra.utils import ensure_datetime,count_csv_rows, inches_to_cm, ounces_to_kg
 try:
     from astra.data.collectors import collect_procedures, population_filter_parquet
@@ -22,6 +24,8 @@ try:
     from azureml.core import Dataset
 except ImportError:
     Dataset = None
+
+logger = logging.getLogger(__name__)
 
 def create_base_df(cfg, result_path=None):
     if result_path is None:

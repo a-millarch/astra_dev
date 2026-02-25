@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import numpy as np
 
@@ -14,10 +15,11 @@ from sklearn.preprocessing import label_binarize
 from interpret.glassbox import ExplainableBoostingClassifier
 from interpret import show
 
-from astra.utils import get_base_df, cfg, logger
-
-
+from astra.utils import get_base_df, cfg
 from astra.data.datasets import AggregatedDS
+
+logger = logging.getLogger(__name__)
+
 
 def temporal_train_val_split(X, y, val_frac=0.25):
     n = len(X)

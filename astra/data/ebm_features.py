@@ -8,6 +8,7 @@ Forward-fills the most recent EBM prediction at each bin position to ensure
 no temporal data leakage.
 """
 
+import logging
 import os
 import pickle
 from typing import Dict, Optional
@@ -15,7 +16,9 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from astra.utils import get_bin_df, logger
+from astra.utils import get_bin_df
+
+logger = logging.getLogger(__name__)
 
 
 def _compute_bin_elapsed_hours(

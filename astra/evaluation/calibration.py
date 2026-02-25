@@ -4,19 +4,22 @@ Extended evaluation workflow that includes calibration analysis.
 
 """
 
+import logging
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-from astra.utils import cfg, logger
+from astra.utils import cfg
 from astra.utils import save_figure
 from astra.evaluation.utils import prepare_model
 from astra.visualize.evaluation import plot_evaluation
 
 from astra.evaluation.predictive_performance import (
-    TimeDependentEvaluator, time_to_step, format_step_label, 
+    TimeDependentEvaluator, time_to_step, format_step_label,
     plot_multiple_roc_pr_curves, generate_time_thresholds, plot_time_metrics)
+
+logger = logging.getLogger(__name__)
 
 
 def run_eval_with_calibration(

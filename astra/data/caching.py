@@ -1,10 +1,11 @@
 # ============================================================================
 # CACHING: Save/Load prepared data to avoid recomputation
 # ============================================================================
-import pickle
 import hashlib
 import json
+import logging
 import os
+import pickle
 
 import numpy as np
 
@@ -13,7 +14,9 @@ from astra.data.mixed_dataloader import (
     AstraMixedDataset,
     AstraMixedDataLoader,
 )
-from astra.utils import cfg, logger
+from astra.utils import cfg
+
+logger = logging.getLogger(__name__)
 
 # Bump this when cached data format changes to auto-invalidate old caches
 _CACHE_VERSION = 2

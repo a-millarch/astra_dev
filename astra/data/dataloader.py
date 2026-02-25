@@ -1,14 +1,14 @@
 # dataloader.py
 
-
+import logging
 import os
-import pandas as pd
-import numpy as np
-
-from sklearn.preprocessing import RobustScaler, StandardScaler
 import pickle
 
-from astra.utils import get_base_df, logger, align_dataframes
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler, StandardScaler
+
+from astra.utils import get_base_df, align_dataframes
 from astra.data.preprocessing import MultiHotCategoricalEncoder
 from astra.data.datasets import TSDS
 
@@ -18,6 +18,8 @@ from astra.data.mixed_dataloader import (
     AstraMixedDataset,
     AstraMixedDataLoader,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================

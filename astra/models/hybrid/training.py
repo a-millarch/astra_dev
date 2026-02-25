@@ -1,10 +1,11 @@
+import logging
 import os
 import numpy as np
 from tqdm.auto import tqdm
 
 import torch
 
-from astra.utils import cfg, logger, clear_mem
+from astra.utils import cfg, clear_mem
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig, pretrain_mlm_enhanced
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.data.mixed_dataloader import (
@@ -12,6 +13,8 @@ from astra.data.mixed_dataloader import (
     AstraMixedDataLoader,
     get_stratified_splits,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_backbone(

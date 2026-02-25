@@ -12,12 +12,15 @@ Tests:
 """
 
 import argparse
+import logging
 import sys
 
 import numpy as np
 import torch
 
-from astra.utils import logger, cfg
+from astra.utils import cfg
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():

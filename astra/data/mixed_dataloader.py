@@ -10,6 +10,7 @@ Provides:
   - save_model / load_model_state: plain torch checkpoint helpers
 """
 
+import logging
 import os
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -20,7 +21,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 
 from sklearn.model_selection import StratifiedShuffleSplit
 
-from astra.utils import logger
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================

@@ -7,6 +7,7 @@ Stage 2 (Training HPs): Fix architecture, pretrain once, sweep finetuning
     hyperparameters on top of pretrained checkpoint.
 """
 
+import logging
 import os
 import yaml
 from pathlib import Path
@@ -16,7 +17,7 @@ import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 
-from astra.utils import cfg, logger, clear_mem
+from astra.utils import cfg, clear_mem
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.models.hybrid.training import get_backbone
 from astra.models.hybrid.mlm import MLMConfig
@@ -26,6 +27,8 @@ from astra.training.finetune import (
     create_split_dataloaders,
 )
 from astra.training.param_groups import set_dropout_rates
+
+logger = logging.getLogger(__name__)
 
 
 SWEEP_RESULTS_DIR = Path("configs/sweep_results")

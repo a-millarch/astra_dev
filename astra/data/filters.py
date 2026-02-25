@@ -1,8 +1,10 @@
-import pandas as pd
-import numpy as np
 import gc
+import logging
 
-from astra.utils import logger, cfg, get_base_df, mark_keywords_in_df
+import numpy as np
+import pandas as pd
+
+from astra.utils import cfg, get_base_df, mark_keywords_in_df
 from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_to_kg
 
 from astra.data.mappings import (
@@ -13,6 +15,8 @@ from astra.data.mappings import (
     PROCEDURE_MAP, PROCEDURE_REVERSE_MAP, PROCEDURE_INCLUDE_LIST,
     ADT_PATTERNS, classify_department,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def filter_base(base):

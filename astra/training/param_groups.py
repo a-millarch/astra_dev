@@ -7,13 +7,14 @@ Splits TSTabFusionTransformerMultiHot into named parameter groups:
   - head: classification head (Flatten + MLP)
 """
 
+import logging
 import math
 from collections import OrderedDict
 from typing import Dict, List, Optional
 
 import torch.nn as nn
 
-from astra.utils import logger
+logger = logging.getLogger(__name__)
 
 
 def get_layer_groups(model: nn.Module) -> OrderedDict:

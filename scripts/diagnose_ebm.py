@@ -12,6 +12,7 @@ Usage:
     python scripts/diagnose_ebm.py
 """
 
+import logging
 import os
 import pickle
 import sys
@@ -20,7 +21,9 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-from astra.utils import get_bin_df, get_cfg, logger
+from astra.utils import get_bin_df, get_cfg
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

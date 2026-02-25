@@ -414,6 +414,8 @@ def _build_continuous_ts(
     if trajectory_length < seq_len:
         x_ts[:, trajectory_length:] = 0.0
 
+    logger.debug("_build_continuous_ts: shape=%s channels=%d traj_len=%d",
+                 x_ts.shape, len(ts_channel_names), trajectory_length)
     return x_ts, trajectory_length
 
 
@@ -503,6 +505,8 @@ def _build_categorical_ts(
             else:
                 logger.debug(f"Unknown category '{val}' for {encoder_feat_name} — skipping")
 
+    logger.debug("_build_categorical_ts: shape=%s total_dim=%d",
+                 x_ts_cat.shape, x_ts_cat.shape[0])
     return x_ts_cat
 
 
@@ -805,6 +809,9 @@ def prepare_from_raw_ehr(
         Same as prepare_single_patient(): dict with x_ts, x_ts_cat, tab_df,
         trajectory_length, bin_df.
     """
+    logger.info("prepare_from_raw_ehr: pid=%s admission=%s current=%s",
+                raw_ehr.get('pid', '?'), raw_ehr.get('admission_time'),
+                raw_ehr.get('current_time'))
     admission_time = pd.Timestamp(raw_ehr['admission_time'])
 
     # AGE

@@ -13,6 +13,7 @@ Usage:
     python train_ebm_over_time.py --max_days 30 --step_hours 6 --step_days 1
 """
 
+import logging
 import os
 import sys
 import argparse
@@ -31,10 +32,12 @@ from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, p
 
 from interpret.glassbox import ExplainableBoostingClassifier
 
-from astra.utils import get_base_df, get_train_test_split, cfg, logger
+from astra.utils import get_base_df, get_train_test_split, cfg
 from astra.data.datasets import AggregatedDS
 from astra.evaluation.utils import time_to_step, step_to_time
 from astra.evaluation.predictive_performance import generate_time_thresholds, format_step_label
+
+logger = logging.getLogger(__name__)
 
 
 def step_to_timedelta(step: int) -> pd.Timedelta:

@@ -28,9 +28,12 @@ Usage:
 """
 
 import argparse
+import logging
 from pathlib import Path
 
-from astra.utils import logger, cfg
+from astra.utils import cfg, setup_logging
+
+logger = logging.getLogger(__name__)
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.models.hybrid.training import run_pretrain
 from astra.models.hybrid.mlm import MLMConfig
@@ -85,6 +88,10 @@ def parse_args():
     parser.add_argument("--validate-temporal", action="store_true", default=False,
                         help="Cross-validate temporal eval vs censored-dataloader eval")
 
+    # Logging
+    parser.add_argument("--verbose", action="store_true", default=False,
+                        help="Enable DEBUG-level logging")
+
     return parser.parse_args()
 
 
@@ -119,6 +126,7 @@ def _get_pretrain_cfg() -> MLMConfig:
 
 def main():
     args = parse_args()
+    setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
     # ========================================================================
     # Load data (shared across all stages)

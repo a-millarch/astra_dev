@@ -1,13 +1,15 @@
 import argparse
+import logging
 
-from astra.utils import logger, cfg
+from astra.utils import cfg
 from astra.evaluation.predictive_performance import run_eval
-
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.data.dataloader import save_normalization_artifacts, save_deployment_bundle
 from astra.models.hybrid.training import run_pretrain
 from astra.training.finetune import run_finetune_v2, FinetuneConfig
 from astra.models.hybrid.mlm import MLMConfig
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args():

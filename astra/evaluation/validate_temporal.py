@@ -16,12 +16,13 @@ Usage:
 """
 
 import argparse
+import logging
 import numpy as np
 import torch
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
-from astra.utils import cfg, logger
+from astra.utils import cfg
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.models.hybrid.training import get_backbone
 from astra.evaluation.utils import prepare_model
@@ -33,6 +34,8 @@ from astra.evaluation.predictive_performance import (
     generate_time_thresholds,
 )
 from astra.evaluation.utils import calculate_roc_auc_ci, calculate_average_precision_ci
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

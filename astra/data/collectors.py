@@ -13,9 +13,7 @@ from astra.utils import cfg, get_base_df
 #from src.common.log_config import setup_logging, clear_log
 #from src.data.downloader import download_to_local
 
-from astra.utils import logger
-#setup_logging()
-#logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def download_to_local(FILES: list, LOCAL_DIR="data/dl"):

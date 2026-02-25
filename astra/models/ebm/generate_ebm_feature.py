@@ -1,3 +1,4 @@
+import logging
 import os
 import pickle
 import argparse
@@ -9,8 +10,10 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import OneHotEncoder
 from interpret.glassbox import ExplainableBoostingClassifier
 
-from astra.utils import get_base_df, get_train_test_split, cfg, logger
+from astra.utils import get_base_df, get_train_test_split, cfg
 from astra.data.datasets import AggregatedDS
+
+logger = logging.getLogger(__name__)
 
 
 def generate_ebm_intervals(cfg_dict: dict) -> List[float]:

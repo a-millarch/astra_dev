@@ -1,4 +1,5 @@
 # predictive_performance.py
+import logging
 import os
 import numpy as np
 import pandas as pd
@@ -8,7 +9,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from astra.utils import cfg, logger, save_figure
+from astra.utils import cfg, save_figure
 from astra.data.dataloader import normalize_with_padding_mask
 from astra.data.mixed_dataloader import (
     AstraMixedDataset,
@@ -23,6 +24,8 @@ from astra.evaluation.utils import (
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone
 from astra.visualize.evaluation import plot_evaluation
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

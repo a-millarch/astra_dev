@@ -6,10 +6,9 @@ from sklearn.model_selection import train_test_split
 
 
 import logging
-from logging.handlers import RotatingFileHandler
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from rich.logging import RichHandler
-from datetime import datetime
 
 class ProjectManager:
     """
@@ -33,7 +32,7 @@ class ProjectManager:
 
         self.init_dir = os.getcwd()
         self.workdir = self.init_dir
-        self.compute_name = compute_name = self.init_dir.split('clusters/')[1].split('/code')[0]
+        self.compute_name = self.init_dir.split('clusters/')[1].split('/code')[0]
         if workdir:
             if set_workdir:
                 self.set_workdir(workdir)
@@ -55,100 +54,97 @@ class ProjectManager:
         return
         print("No matching compute name found in the current working directory.")
         
-    def setup_logging(self, print_only: bool = False):
-        """
-        Configures logging for the current user.
 
-        Args:
-            print_only (bool, optional): If True, only print to console, don't save to file. Defaults to False.
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+_logging_initialized = False
 
-        Returns:
-            logging.Logger: The configured logger instance.
-        """
-        user = self.compute_name
-        logger_name = user
-        logger = logging.getLogger(logger_name)
-        logger.setLevel(logging.INFO)
 
-        #Remove any existing handlers
-        if logger.hasHandlers():
-            for handler in logger.handlers[:]:
-                logger.removeHandler(handler)
-                handler.close()
-        formatter = logging.Formatter(f'%(levelname)s - %(asctime)s - [User: {user}]\n%(message)s')
+def setup_logging(level=logging.INFO, log_dir=None):
+    """Configure the ``astra`` logger hierarchy.
 
-        if not print_only:
-            log_dir = Path(self.workdir) / 'logging' / 'users' / user  # Use pathlib
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_file_path = log_dir / 'app.log'
-            
-            if log_file_path.exists() and log_file_path.stat().st_size > 0:
-                print("Existing log file found with content. Archiving...")
-                self.clear_log()
+    Call once at each application entry point (``train.py``,
+    ``run_inference.py``, ``make_data.py``).  All module loggers created via
+    ``logging.getLogger(__name__)`` under the ``astra`` package automatically
+    inherit the handlers configured here.
 
-            file_handler = RotatingFileHandler(log_file_path)
-            file_handler.setFormatter(formatter)
-            logger.addHandler(file_handler)
+    Args:
+        level: Console log level (``logging.INFO`` or ``logging.DEBUG``).
+        log_dir: Directory for log files.  If *None*, only console logging is
+            enabled.  In Azure pass e.g. ``Path(pm.workdir) / 'logging'``.
+    """
+    global _logging_initialized
+    if _logging_initialized:
+        return logging.getLogger('astra')
 
-        # Add RichHandler for console output
-        rich_handler = RichHandler(markup=True)
-        rich_handler.setFormatter(formatter)
-        logger.addHandler(rich_handler)
+    root = logging.getLogger('astra')
+    root.setLevel(logging.DEBUG)  # let handlers decide what to show
 
-        logging.getLogger('matplotlib.font_manager').disabled = True
-        self.logger=logger
-        return logger
+    # Remove bootstrap handler (or any prior handlers)
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+        h.close()
 
-    
-    def clear_log(self):
-        p = Path(self.workdir)
-        user = self.compute_name 
-        current_date = datetime.now()
-        current_year = current_date.strftime('%Y')
-        current_month = current_date.strftime('%m')
-        current_day = current_date.strftime('%d')
-        current_time = current_date.strftime('%H%M')
-    
-        user_log_file = p.joinpath(f'logging/users/{user}/app.log')
-        archive_folder = p.joinpath(f'logging/archive/users/{user}/{current_year}/{current_month}/{current_day}/')
-        archive_folder.mkdir(parents=True, exist_ok=True)
-    
-        archive_file_path = archive_folder.joinpath(f"log_{current_time}.txt")
-    
-        with open(user_log_file, 'r') as original_file:
-            log_contents = original_file.read()
-    
-        with open(archive_file_path, 'w') as archive_file:
-            archive_file.write(log_contents)
-    
-        with open(user_log_file, 'w'):
-            pass
-        print()
- 
-    def print_log_dir(self):
-        try:
-            logger = self.logger
-        except AttributeError:
-            print("Logger not initialized yet")
-            return 
-            
-        if logger.handlers:
-            for handler in logger.handlers:
-                if isinstance(handler, logging.handlers.RotatingFileHandler):
-                    log_filepath = handler.baseFilename
-                    log_dir = os.path.dirname(log_filepath)
-                    print(f"Log directory: {log_dir}")
-                    break #Stop after first rotating file handler
+    # --- Console handler (RichHandler) ---
+    console = RichHandler(
+        markup=True,
+        show_time=True,
+        show_level=True,
+        show_path=False,
+    )
+    console.setLevel(level)
+    console.setFormatter(logging.Formatter('%(name)s - %(message)s'))
+    root.addHandler(console)
+
+    # --- File handler (TimedRotatingFileHandler) ---
+    if log_dir is not None:
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        file_handler = TimedRotatingFileHandler(
+            filename=str(log_path / 'astra.log'),
+            when='midnight',
+            interval=1,
+            backupCount=30,
+            encoding='utf-8',
+        )
+        file_handler.setLevel(logging.DEBUG)  # file always captures DEBUG
+        file_handler.setFormatter(logging.Formatter(
+            '%(asctime)s | %(levelname)-8s | %(name)s.%(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
+        ))
+        root.addHandler(file_handler)
+
+    # --- Suppress noisy third-party loggers ---
+    for name in ('matplotlib', 'matplotlib.font_manager', 'optuna',
+                 'urllib3', 'numba', 'PIL', 'fontTools'):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+    _logging_initialized = True
+    return root
+
+
+# Bootstrap: minimal console handler so logs aren't lost before an entry
+# point calls setup_logging().  setup_logging() clears and replaces this.
+_bootstrap_logger = logging.getLogger('astra')
+if not _bootstrap_logger.handlers:
+    _bootstrap_logger.setLevel(logging.INFO)
+    _bh = RichHandler(markup=True, show_path=False)
+    _bh.setFormatter(logging.Formatter('%(name)s - %(message)s'))
+    _bootstrap_logger.addHandler(_bh)
+
+# Backward-compat export: modules that still do ``from astra.utils import
+# logger`` get the root 'astra' logger.  After full migration to
+# ``logging.getLogger(__name__)`` this can be removed.
+logger = logging.getLogger('astra')
 
 try:
     pm = ProjectManager('andreas.skov.millarch/repos/ASTRA')
-    logger = pm.setup_logging(print_only=False)
+    # pm.workdir and pm.compute_name still work as before for dir management
+    setup_logging(log_dir=Path(pm.workdir) / 'logging')
 except (IndexError, FileNotFoundError, OSError):
-    # Outside Azure ML compute: use basic logging
-    logger = logging.getLogger('astra')
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        logger.addHandler(RichHandler(markup=True))
+    # Outside Azure ML compute: bootstrap handler already active.
+    # Entry points (train.py, etc.) call setup_logging() explicitly.
     pm = None
 
 pd.options.mode.chained_assignment = None

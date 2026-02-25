@@ -1,16 +1,18 @@
+import logging
 import os
 import pickle
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from astra.utils import logger
 from generate_ebm_feature import (
     _create_aggregated_dataset,
     _model_filename,
     generate_ebm_intervals,
     preprocess_features,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_available_intervals(
