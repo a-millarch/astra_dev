@@ -462,6 +462,7 @@ def train_one_epoch(
     pos_weight: Optional[torch.Tensor] = None,
     time_weighting: str = "uniform",
     early_weight_factor: float = 2.0,
+    desc: str = "Training",
 ) -> float:
     """
     Single epoch training loop for the TSAI mixed dataloader format.
@@ -491,7 +492,8 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
 
-    for batch in dataloader:
+    pbar = tqdm(dataloader, desc=desc, leave=False)
+    for batch in pbar:
         inputs, targets = batch
         inputs = _to_device(inputs, device)
         targets = _to_device(targets, device)
@@ -536,6 +538,11 @@ def train_one_epoch(
 
         total_loss += loss.item()
         n_batches += 1
+
+        postfix = {'Loss': f"{total_loss / n_batches:.4f}"}
+        if scheduler is not None:
+            postfix['LR'] = f"{scheduler.get_last_lr()[0]:.2e}"
+        pbar.set_postfix(postfix)
 
     return total_loss / max(n_batches, 1)
 
@@ -589,6 +596,7 @@ def _run_phase(
     logger.info(f"--- {phase_name} ({n_epochs} epochs, base_lr={base_lr:.2e}) ---")
 
     for epoch in range(n_epochs):
+        desc = f"{phase_name} [{epoch+1}/{n_epochs}]"
         train_loss = train_one_epoch(
             model, train_dl, optimizer, scheduler,
             device=device,
@@ -603,6 +611,7 @@ def _run_phase(
             pos_weight=pos_weight,
             time_weighting=time_weighting,
             early_weight_factor=early_weight_factor,
+            desc=desc,
         )
 
         if valid_dl is not None:

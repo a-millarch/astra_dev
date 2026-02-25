@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +98,7 @@ def compute_auroc(
     all_probs = []
     all_targets = []
 
-    for batch in dataloader:
+    for batch in tqdm(dataloader, desc="Validating", leave=False):
         inputs, targets = batch
         inputs = _to_device(inputs, device)
         targets = _to_device(targets, device)
