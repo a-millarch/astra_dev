@@ -50,16 +50,23 @@ data:
 
 
 pretrain:
-	python $(PROJECT_NAME)/models/hybrid/train_model.py --pretrain --no-finetune 
+	python $(PROJECT_NAME)/training/train.py --pretrain 
  
 train:
-	python $(PROJECT_NAME)/models/hybrid/train_model.py --pretrain --finetune --eval --comprehensive-eval
-	
+	python $(PROJECT_NAME)/training/train.py --pretrain --finetune --eval --multicurve --comprehensive-eval
+
+finetune:
+	python $(PROJECT_NAME)/training/train.py --finetune 
 	
 eval:
-	python $(PROJECT_NAME)/models/hybrid/train_model.py --no-pretrain --no-finetune --eval --comprehensive-eval
-fold:
-	python $(PROJECT_NAME)/train_fold.py
+	python $(PROJECT_NAME)/training/train.py --eval  --multicurve --comprehensive-eval
+
+sweep_arch:
+	python $(PROJECT_NAME)/training/train.py --sweep-arch --n-arch-trials 30
+sweep_train:
+	python $(PROJECT_NAME)/training/train.py --sweep-train --n-train-trials 50 --eval
+sweep:
+	python $(PROJECT_NAME)/training/train.py --sweep-arch --sweep-train --pretrain --finetune --eval --comprehensive-eval
 
 ## v2: Finetune with transfer learning (pretrain + 4-phase finetune + eval)
 train_v2:

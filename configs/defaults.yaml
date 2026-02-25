@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '24022026_fullds'
+model_name: '25022026_ebm'
    
 target: deceased_30d
 
@@ -222,7 +222,7 @@ temporal_features:
     - bin_width_hours
 
 ebm_feature:
-  enabled: false
+  enabled: true
   save_dir: data/interim/ebm_features
   n_folds: 5
   default_value: 0.0
