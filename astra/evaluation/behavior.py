@@ -1217,7 +1217,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax1.plot(cat_ts, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_ts)), cat_ts, alpha=0.2, color='#00d4aa')
 
-    ax1.set_xlabel('Time'); ax1.set_ylabel('|SHAP Value|')
+    ax1.set_xlabel('Time'); ax1.set_ylabel('mean |SHAP Value|')
     ax1.set_title(f'TS SHAP Over Time{title_suffix}, Class {class_idx}', fontweight='bold')
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
     ax1.legend(); ax1.grid(True, alpha=0.3)
