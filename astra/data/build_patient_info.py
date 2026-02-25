@@ -86,11 +86,8 @@ def define_historic_population(cfg=cfg):
 
 def define_single_patient(cfg):
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
-    
     pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
     'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv(cfg["trauma_call_file_path"])
-    
-   
 
 def load_or_collect_population(cfg):
     if cfg["single_patient_mode"] is True:
@@ -162,7 +159,7 @@ def build_trajectories(df_ad):
 
 
 def match_population_to_trajectories(of, population):
-    logger.info("Matcher procedurer til trajectories.")
+    logger.info("Matching population to trajectories")
     fdf = find_forløb(of, population, "ServiceDate")
     df = pd.merge(
         fdf[["CPR_hash", "trajectory", "ServiceDate"]],
@@ -178,7 +175,7 @@ def add_first_contacts(df, df_adt):
     Matches department admissions to trajectories and classifies visitation type. Finds the first department contact and first RH contact within each trajectory. Calculates time to first RH contact 
     and assigns visitation type: 'primær', 'sekundær', or 'primær ingen RH'.
     """ 
-    logger.info("Finder første afsnit og RH kontakt.")
+    logger.info("Adding first contacts and visitation type")
     merged = df_adt.merge(df[["CPR_hash", "ServiceDate", "start", "end"]], on="CPR_hash")
     filtered = merged[(merged["Flyt_ind"] >= merged["start"]) & (merged["Flyt_ind"] <= merged["end"])]
 
@@ -214,15 +211,13 @@ first_hospital = _first_hospital
 def add_first_hospital(df):
     # First, remove commas from FIRST_HOSPITAL (or source column before extraction)
     df['first_afsnit'] = df['first_afsnit'].str.replace(',', '', regex=False)
-
     df['FIRST_HOSPITAL'] = df['first_afsnit'].apply(first_hospital)
     df['FIRST_HOSPITAL'] = df['FIRST_HOSPITAL'].apply(standardize_hospital)
-    print(df.FIRST_HOSPITAL.value_counts())
     return df
 
 
 def add_patient_info(df, population):
-    logger.info("Tilføjer patientinformation.")
+    logger.info("Adding patient info file")
     population_filter_parquet("PatientInfo", base=population)
     pi = pd.read_csv("data/raw/PatientInfo.csv", index_col=0)
     pi = pi.rename(columns={"Fødselsdato": "DOB", "Dødsdato": "DOD", "Køn": "SEX"})
@@ -235,12 +230,12 @@ def add_patient_info(df, population):
 
 
 def add_patient_id(df):
-    logger.info("Opretter PID.")
+    logger.info("Creating PID")
     return create_enumerated_id(df, "CPR_hash", "ServiceDate")
 
 
 def final_cleanup(df):
-    logger.info("Rydder op i dataframe.")
+    logger.info("Base dataframe final cleanup")
     df = df[df["start"].notnull() & df["end"].notnull()]
     df = df.drop(columns=["Flyt_ind", "Flyt_ud", "ADT_haendelse"], errors='ignore')
     df = df.drop_duplicates(subset="PID").reset_index(drop=True)
