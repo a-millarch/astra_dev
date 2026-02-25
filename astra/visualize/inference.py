@@ -1,3 +1,4 @@
+import logging
 import os
 
 import matplotlib
@@ -5,12 +6,18 @@ if __name__ == "__main__":
     matplotlib.use("Agg")  # headless backend for script execution only
 import matplotlib.pyplot as plt
 
+logger = logging.getLogger(__name__)
+
 
 def plot_prediction_trajectory(result, ctx, save_path=None):
-    """Plot P(deceased_30d) at each visible timestep."""
+    """Plot P(deceased_30d) at each visible timestep.
+
+    Returns:
+        matplotlib.figure.Figure or None if model is not temporal.
+    """
     if result.predictions_over_time is None:
-        print("Model does not have temporal head — skipping trajectory plot")
-        return
+        logger.warning("Model does not have temporal head — skipping trajectory plot")
+        return None
 
     probs = result.predictions_over_time  # [seq_len]
     traj_len = result.trajectory_length
@@ -42,5 +49,6 @@ def plot_prediction_trajectory(result, ctx, save_path=None):
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"Saved trajectory plot to {save_path}")
+        logger.info("Saved trajectory plot to %s", save_path)
     plt.show()
+    return fig

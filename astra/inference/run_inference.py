@@ -158,7 +158,7 @@ def default_session_plot(session):
     ctx = session.ctx
     result = session.predict_from_context(ctx)
     # ---- 4. Plot prediction trajectory ----
-    plot_prediction_trajectory(
+    traj_fig = plot_prediction_trajectory(
         result, ctx,
         save_path=None,
     )
@@ -187,6 +187,8 @@ def default_session_plot(session):
 
     visualize_data_completeness(shap_dict,
                             channel2feature=channel2feature, save_path='reports/tst2.png')
+
+    return traj_fig
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
