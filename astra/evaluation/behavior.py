@@ -218,15 +218,17 @@ def compute_ebm_vs_clinical_budget(
         clinical_abs = np.abs(ts_shap[:, clinical_indices, :])
         ebm_total = ebm_abs.sum(axis=(1, 2)).mean()
         clinical_total = clinical_abs.sum(axis=(1, 2)).mean()
-        ebm_temporal = ebm_abs.mean(axis=(0, 1))
-        clinical_temporal = clinical_abs.mean(axis=(0, 1))
+        # Sum across channels per sample, then mean across samples
+        ebm_temporal = ebm_abs.sum(axis=1).mean(axis=0)
+        clinical_temporal = clinical_abs.sum(axis=1).mean(axis=0)
     else:
         ebm_abs = np.abs(ts_shap[ebm_indices, :])
         clinical_abs = np.abs(ts_shap[clinical_indices, :])
         ebm_total = ebm_abs.sum()
         clinical_total = clinical_abs.sum()
-        ebm_temporal = ebm_abs.mean(axis=0)
-        clinical_temporal = clinical_abs.mean(axis=0)
+        # Sum across channels per timestep
+        ebm_temporal = ebm_abs.sum(axis=0)
+        clinical_temporal = clinical_abs.sum(axis=0)
 
     total = ebm_total + clinical_total
     ebm_pct = (ebm_total / total * 100) if total > 0 else 0
@@ -243,27 +245,29 @@ def compute_ebm_vs_clinical_budget(
     }
 
 
-def _draw_ebm_budget_panel(ax, budget: Dict, title: str = 'SHAP Budget: EBM vs Clinical'):
-    """Draw a compact EBM vs Clinical SHAP budget breakdown on the given axes."""
-    ax.barh(0, budget['clinical_pct'], color=_GROUP_COLORS['Clinical'],
-            alpha=0.8, label=f"Clinical: {budget['clinical_pct']:.1f}%")
-    ax.barh(0, budget['ebm_pct'], left=budget['clinical_pct'],
-            color=_GROUP_COLORS['EBM'], alpha=0.8,
-            label=f"EBM: {budget['ebm_pct']:.1f}%")
+def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
+                              tick_idx, tick_labels,
+                              title: str = 'SHAP Budget Over Time: EBM vs Clinical'):
+    """Draw a stacked area chart of EBM vs Clinical SHAP budget over time."""
+    clinical_t = budget['clinical_temporal'][:n_steps]
+    ebm_t = budget['ebm_temporal'][:n_steps]
+    x = np.arange(n_steps)
 
-    if budget['clinical_pct'] > 10:
-        ax.text(budget['clinical_pct'] / 2, 0, f"{budget['clinical_pct']:.1f}%",
-                ha='center', va='center', fontweight='bold', fontsize=11, color='white')
-    if budget['ebm_pct'] > 10:
-        ax.text(budget['clinical_pct'] + budget['ebm_pct'] / 2, 0,
-                f"{budget['ebm_pct']:.1f}%",
-                ha='center', va='center', fontweight='bold', fontsize=11, color='white')
+    ax.fill_between(x, 0, clinical_t, alpha=0.7, color=_GROUP_COLORS['Clinical'],
+                    label=f"Clinical: {budget['clinical_pct']:.1f}%")
+    ax.fill_between(x, clinical_t, clinical_t + ebm_t, alpha=0.7,
+                    color=_GROUP_COLORS['EBM'],
+                    label=f"EBM: {budget['ebm_pct']:.1f}%")
 
-    ax.set_xlim(0, 100)
-    ax.set_yticks([])
-    ax.set_xlabel('% of Total |SHAP|')
+    ax.set_xlim(0, n_steps - 1)
+    ax.set_ylim(0)
+    ax.set_xticks(tick_idx)
+    ax.set_xticklabels(tick_labels, rotation=45)
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Sum |SHAP|')
     ax.set_title(title, fontweight='bold')
     ax.legend(loc='upper right', fontsize=9)
+    ax.grid(True, alpha=0.3)
 
 
 def _get_channel_color(channel2feature, ch_idx):
@@ -961,13 +965,15 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     has_ebm = budget is not None
 
     if has_ebm:
-        fig = plt.figure(figsize=(22, 22))
+        fig = plt.figure(figsize=(22, 23))
         gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
-                              height_ratios=[0.35, 1, 1, 1, 1, 1])
+                              height_ratios=[0.7, 1, 1, 1, 1, 1])
         row_offset = 1
-        # Row 0: EBM budget panel
+        # Row 0: EBM budget over time
         ax_budget = fig.add_subplot(gs[0, :])
-        _draw_ebm_budget_panel(ax_budget, budget, title=f'SHAP Budget{title_suffix}')
+        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
+                                  [time_fmt[i] for i in tick_idx],
+                                  title=f'SHAP Budget Over Time{title_suffix}')
     else:
         fig = plt.figure(figsize=(22, 20))
         gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
@@ -1590,14 +1596,15 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     has_ebm = budget is not None
 
     if has_ebm:
-        fig = plt.figure(figsize=(22, 20))
+        fig = plt.figure(figsize=(22, 21))
         gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3,
-                              height_ratios=[0.35, 1, 1, 1.2, 1])
+                              height_ratios=[0.7, 1, 1, 1.2, 1])
         row_offset = 1
-        # Row 0: EBM budget panel
+        # Row 0: EBM budget over time
         ax_budget = fig.add_subplot(gs[0, :])
-        _draw_ebm_budget_panel(ax_budget, budget,
-                               title=f'SHAP Budget: EBM vs Clinical (Class {class_idx})')
+        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
+                                  [time_fmt[i] for i in tick_idx],
+                                  title=f'SHAP Budget Over Time: EBM vs Clinical (Class {class_idx})')
     else:
         fig = plt.figure(figsize=(22, 18))
         gs = fig.add_gridspec(4, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1.2, 1])
