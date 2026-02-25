@@ -92,6 +92,7 @@ def setup_logging(level=logging.INFO, log_dir=None):
         show_time=True,
         show_level=True,
         show_path=False,
+        omit_repeated_times=False,
     )
     console.setLevel(level)
     console.setFormatter(logging.Formatter('%(name)s - %(message)s'))
@@ -129,7 +130,7 @@ def setup_logging(level=logging.INFO, log_dir=None):
 _bootstrap_logger = logging.getLogger('astra')
 if not _bootstrap_logger.handlers:
     _bootstrap_logger.setLevel(logging.INFO)
-    _bh = RichHandler(markup=True, show_path=False)
+    _bh = RichHandler(markup=True, show_time=True, show_path=False, omit_repeated_times=False)
     _bh.setFormatter(logging.Formatter('%(name)s - %(message)s'))
     _bootstrap_logger.addHandler(_bh)
 

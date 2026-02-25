@@ -559,8 +559,8 @@ class TSDS:
                 concept_long_df = concepts_raw[concept][self.cfg["agg_func"][concept][0]].copy(deep=True)
                 concepts[concept] = _get_long_concept_df_multi_label(concept_long_df, self.base, self.cfg, self._base_pids)
                 # specifcy max ts dims
-                if len(concepts[concept].timestep_cols) > len(self.timestep_cols):
-                    self.timestep_cols = concepts[concept].timestep_cols
+                if len(concepts[concept].attrs["timestep_cols"]) > len(self.timestep_cols):
+                    self.timestep_cols = concepts[concept].attrs["timestep_cols"]
             else:
                 concepts[concept] = _get_long_concept_df_single_label(
                     self.cfg,
@@ -837,7 +837,7 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
         })
         df_wide = pd.concat([df_wide, placeholder], ignore_index=True)
 
-    df_wide.timestep_cols = timestep_cols
+    df_wide.attrs["timestep_cols"] = timestep_cols
     logger.debug(f">>> after wide: {df_wide.PID.nunique()}")
     return df_wide
 

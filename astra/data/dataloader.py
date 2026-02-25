@@ -142,7 +142,7 @@ def tscatdfwide2x(df_wide:pd.DataFrame, sample_col:str='PID', cat_col='FEATURE')
     X_multi_hot, encoding_info = encoder.fit_transform(
         df_wide,
         sample_col=sample_col,
-        timestep_cols=df_wide.timestep_cols,
+        timestep_cols=df_wide.attrs["timestep_cols"],
         cat_col=cat_col,
         feature_names=df_wide.FEATURE.dropna().unique()
     )
@@ -160,7 +160,7 @@ def encode_categorical_ts(df_wide, y, cfg, encoder=None):
         X_multi_hot, encoding_info = encoder.fit_transform(
             df_wide,
             sample_col='PID',
-            timestep_cols=df_wide.timestep_cols,
+            timestep_cols=df_wide.attrs["timestep_cols"],
             cat_col='FEATURE',
             feature_names=df_wide.FEATURE.dropna().unique()
         )
@@ -168,7 +168,7 @@ def encode_categorical_ts(df_wide, y, cfg, encoder=None):
         X_multi_hot, encoding_info = encoder.transform(
             df_wide,
             sample_col='PID',
-            timestep_cols=df_wide.timestep_cols,
+            timestep_cols=df_wide.attrs["timestep_cols"],
             cat_col='FEATURE'
         )
 
@@ -224,7 +224,7 @@ def prepare_data_and_dls(cfg):
         }
         tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
         tsds.complete_cat = pd.concat(tsds.cat_concepts)
-        tsds.complete_cat.timestep_cols = tsds.timestep_cols
+        tsds.complete_cat.attrs["timestep_cols"] = tsds.timestep_cols
 
     # Inject EBM prediction channel if enabled
     ebm_channel_idx = None
@@ -264,7 +264,7 @@ def prepare_data_and_dls(cfg):
         non_ts = [c for c in df.columns if not isinstance(c, int)]
         ts = sorted(c for c in df.columns if isinstance(c, int))
         tsds_obj.complete_cat = df[non_ts + ts]
-        tsds_obj.complete_cat.timestep_cols = ts
+        tsds_obj.complete_cat.attrs["timestep_cols"] = ts
 
     cat_cols = cfg["dataset"]["cat_cols"]
     num_cols = cfg["dataset"]["num_cols"]

@@ -48,7 +48,6 @@ clean:
 data:
 	python $(PROJECT_NAME)/make_data.py
 
-
 pretrain:
 	python $(PROJECT_NAME)/training/train.py --pretrain 
  
