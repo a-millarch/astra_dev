@@ -250,16 +250,17 @@ def compute_ebm_vs_clinical_budget(
 def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
                               tick_idx, tick_labels,
                               title: str = 'SHAP Budget Over Time: EBM vs Clinical'):
-    """Draw a stacked area chart of EBM vs Clinical SHAP budget over time."""
+    """Draw overlapping area chart of EBM vs Clinical SHAP budget over time."""
     clinical_t = budget['clinical_temporal'][:n_steps]
     ebm_t = budget['ebm_temporal'][:n_steps]
     x = np.arange(n_steps)
 
-    ax.fill_between(x, 0, clinical_t, alpha=0.7, color=_GROUP_COLORS['Clinical'],
-                    label=f"Clinical: {budget['clinical_pct']:.1f}%")
-    ax.fill_between(x, clinical_t, clinical_t + ebm_t, alpha=0.7,
-                    color=_GROUP_COLORS['EBM'],
-                    label=f"EBM: {budget['ebm_pct']:.1f}%")
+    ax.plot(x, clinical_t, linewidth=2, color=_GROUP_COLORS['Clinical'],
+            label=f"Clinical: {budget['clinical_pct']:.1f}%")
+    ax.fill_between(x, 0, clinical_t, alpha=0.25, color=_GROUP_COLORS['Clinical'])
+    ax.plot(x, ebm_t, linewidth=2, color=_GROUP_COLORS['EBM'],
+            label=f"EBM: {budget['ebm_pct']:.1f}%")
+    ax.fill_between(x, 0, ebm_t, alpha=0.25, color=_GROUP_COLORS['EBM'])
 
     ax.set_xlim(0, n_steps - 1)
     ax.set_ylim(0)
