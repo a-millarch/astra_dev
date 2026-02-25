@@ -427,6 +427,54 @@ def _draw_ebm_importance_lines(ax, ebm_imp: Dict, n_steps: int,
     ax.grid(True, alpha=0.3)
 
 
+def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = 114,
+                               eval_timestep: Optional[int] = None,
+                               save_path: Optional[str] = None,
+                               title_suffix: str = ''):
+    """
+    Standalone plot of EBM glassbox feature importances over time.
+
+    Shows two panels: top feature importance lines and full importance heatmap,
+    using the same time axis as the SHAP plots.
+
+    Args:
+        ebm_importances: Dict from load_ebm_global_importances().
+        n_steps: Total number of bin steps (default 114).
+        eval_timestep: Crop time axis to this step (optional).
+        save_path: Path to save the figure (optional).
+        title_suffix: Appended to plot titles (e.g. ' (PID: 123)').
+    """
+    if ebm_importances is None:
+        return
+
+    # Respect eval_timestep cropping
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+
+    time_labels = [step_to_time(i) for i in range(n_steps)]
+    time_fmt = [time_to_hours(t) for t in time_labels]
+    n_ticks = min(10, n_steps)
+    tick_idx = np.linspace(0, n_steps - 1, n_ticks, dtype=int)
+    tick_labels = [time_fmt[i] for i in tick_idx]
+
+    fig, (ax_lines, ax_hm) = plt.subplots(2, 1, figsize=(22, 12),
+                                           gridspec_kw={'height_ratios': [0.7, 1],
+                                                        'hspace': 0.35})
+
+    _draw_ebm_importance_lines(ax_lines, ebm_importances, n_steps,
+                                tick_idx, tick_labels,
+                                title=f'Top EBM Features Over Time{title_suffix}')
+    _draw_ebm_importance_heatmap(ax_hm, ebm_importances, n_steps,
+                                  tick_idx, tick_labels,
+                                  title=f'EBM Feature Importance Over Time{title_suffix}')
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
 def _get_channel_color(channel2feature, ch_idx):
     """Get display color for a channel based on its group."""
     if channel2feature is None:
@@ -1061,8 +1109,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                                feature_names_cat: List[str] = None,
                                feature_names_cont: List[str] = None,
                                class_idx: int = 1, save_path: str = None,
-                               eval_timestep: Optional[int] = None,
-                               ebm_importances: Optional[Dict] = None):
+                               eval_timestep: Optional[int] = None):
     """
     Visualize SHAP values for individual sample.
 
@@ -1075,8 +1122,6 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         class_idx: Which output class to show SHAP values for (default 1 for binary)
         save_path: Path to save the figure
         eval_timestep: Crop time axis to this step (default: read from shap_results).
-        ebm_importances: Dict from load_ebm_global_importances() with EBM feature
-            importance data, or None to skip EBM importance panels.
 
     Note: Either sample_idx or (pid + holdout_pids) must be provided.
     """
@@ -1123,29 +1168,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     # EBM two-view: compute budget and adjust layout
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
     has_ebm = budget is not None
-    has_ebm_imp = has_ebm and ebm_importances is not None
 
-    if has_ebm and has_ebm_imp:
-        fig = plt.figure(figsize=(22, 28))
-        gs = fig.add_gridspec(8, 2, hspace=0.4, wspace=0.3,
-                              height_ratios=[0.7, 0.7, 1, 1, 1, 1, 1, 1])
-        row_offset = 3
-        # Row 0: EBM budget over time
-        ax_budget = fig.add_subplot(gs[0, :])
-        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
-                                  [time_fmt[i] for i in tick_idx],
-                                  title=f'SHAP Budget Over Time{title_suffix}')
-        # Row 1: EBM importance lines
-        ax_ebm_lines = fig.add_subplot(gs[1, :])
-        _draw_ebm_importance_lines(ax_ebm_lines, ebm_importances, n_steps,
-                                    tick_idx, [time_fmt[i] for i in tick_idx],
-                                    title=f'Top EBM Features Over Time{title_suffix}')
-        # Row 2: EBM importance heatmap
-        ax_ebm_hm = fig.add_subplot(gs[2, :])
-        _draw_ebm_importance_heatmap(ax_ebm_hm, ebm_importances, n_steps,
-                                      tick_idx, [time_fmt[i] for i in tick_idx],
-                                      title=f'EBM Feature Importance Over Time{title_suffix}')
-    elif has_ebm:
+    if has_ebm:
         fig = plt.figure(figsize=(22, 23))
         gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
                               height_ratios=[0.7, 1, 1, 1, 1, 1])
@@ -1751,8 +1775,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
                            max_display: int = 20, class_idx: int = 1, save_path: str = None,
-                           eval_timestep: Optional[int] = None,
-                           ebm_importances: Optional[Dict] = None):
+                           eval_timestep: Optional[int] = None):
     """Summary visualizations across cohort."""
 
     ts_shap = shap_results['ts_shap']
@@ -1776,29 +1799,8 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # EBM two-view: compute budget and adjust layout
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
     has_ebm = budget is not None
-    has_ebm_imp = has_ebm and ebm_importances is not None
 
-    if has_ebm and has_ebm_imp:
-        fig = plt.figure(figsize=(22, 25))
-        gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
-                              height_ratios=[0.7, 0.7, 1, 1, 1.2, 1])
-        row_offset = 3
-        # Row 0: EBM budget over time
-        ax_budget = fig.add_subplot(gs[0, :])
-        _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
-                                  [time_fmt[i] for i in tick_idx],
-                                  title=f'SHAP Budget Over Time: EBM vs Clinical (Class {class_idx})')
-        # Row 1: EBM importance lines
-        ax_ebm_lines = fig.add_subplot(gs[1, :])
-        _draw_ebm_importance_lines(ax_ebm_lines, ebm_importances, n_steps,
-                                    tick_idx, [time_fmt[i] for i in tick_idx],
-                                    title=f'Top EBM Features Over Time (Class {class_idx})')
-        # Row 2: EBM importance heatmap
-        ax_ebm_hm = fig.add_subplot(gs[2, :])
-        _draw_ebm_importance_heatmap(ax_ebm_hm, ebm_importances, n_steps,
-                                      tick_idx, [time_fmt[i] for i in tick_idx],
-                                      title=f'EBM Feature Importance Over Time (Class {class_idx})')
-    elif has_ebm:
+    if has_ebm:
         fig = plt.figure(figsize=(22, 21))
         gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3,
                               height_ratios=[0.7, 1, 1, 1.2, 1])
@@ -2107,7 +2109,6 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
             save_path='reports/shap/shap_summary_cohort.png',
-            ebm_importances=ebm_importances,
         )
 
         # Use first PID for individual plot
@@ -2121,8 +2122,15 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1,
             save_path='reports/shap/shap_individual_sample_0.png',
-            ebm_importances=ebm_importances,
         )
+
+        # Standalone EBM feature importance plot
+        if ebm_importances is not None:
+            visualize_ebm_importances(
+                ebm_importances,
+                n_steps=data['seq_len'],
+                save_path='reports/shap/ebm_feature_importance.png',
+            )
 
         visualize_data_completeness(
             shap_results,
