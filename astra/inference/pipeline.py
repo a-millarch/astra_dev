@@ -106,6 +106,7 @@ class InferenceSession:
 
         logger.info("Loading model '%s' on %s", model_name, device)
         bundle = load_deployment_bundle(model_name, bundle_dir)
+        bundle['model_name'] = model_name
         params = bundle['model_params']
 
         # Build model from saved params (no data dict needed)

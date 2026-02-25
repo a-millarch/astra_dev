@@ -72,6 +72,7 @@ def run(cpr_hash, service_date, current_time, model_name,
     plot_prediction_trajectory(
         result, ctx,
         save_path=f"{save_dir}/trajectory_{pid_short}.png",
+        model_name=model_name,
     )
 
     # ---- 5. SHAP explanation ----
@@ -158,9 +159,11 @@ def default_session_plot(session):
     ctx = session.ctx
     result = session.predict_from_context(ctx)
     # ---- 4. Plot prediction trajectory ----
+    model_name = session.bundle.get('model_name')
     traj_fig = plot_prediction_trajectory(
         result, ctx,
         save_path=None,
+        model_name=model_name,
     )
 
     # ---- 5. SHAP explanation ----
