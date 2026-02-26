@@ -206,8 +206,6 @@ def default_session_plot(session):
         logger.info("Computing EBM feature importance...")
         session.explain_ebm(ctx, save_path=None)
 
-    return traj_fig
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="End-to-end inference example with PatientContext"
