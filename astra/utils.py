@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from rich.logging import RichHandler
 
 class ProjectManager:
     """
@@ -85,8 +86,14 @@ def setup_logging(level=logging.INFO, log_dir=None):
         root.removeHandler(h)
         h.close()
 
-    # --- Console handler ---
-    console = logging.StreamHandler()
+    # --- Console handler (Rich for colored output) ---
+    console = RichHandler(
+        markup=True,
+        show_time=False,
+        show_level=False,
+        show_path=False,
+        omit_repeated_times=False,
+    )
     console.setLevel(level)
     console.setFormatter(logging.Formatter(
         '%(asctime)s\t%(levelname)-8s\t%(message)s\t%(filename)s:%(lineno)d',
@@ -126,7 +133,10 @@ def setup_logging(level=logging.INFO, log_dir=None):
 _bootstrap_logger = logging.getLogger('astra')
 if not _bootstrap_logger.handlers:
     _bootstrap_logger.setLevel(logging.INFO)
-    _bh = logging.StreamHandler()
+    _bh = RichHandler(
+        markup=True, show_time=False, show_level=False,
+        show_path=False, omit_repeated_times=False,
+    )
     _bh.setFormatter(logging.Formatter(
         '%(asctime)s\t%(levelname)-8s\t%(message)s\t%(filename)s:%(lineno)d',
         datefmt='%Y-%m-%d %H:%M:%S',
