@@ -77,10 +77,27 @@ def _plot_nontemporal_trajectory(ctx, save_path, model_name):
         return None
 
     preds_df = pd.read_csv(csv_path)
-    patient_df = preds_df[preds_df["PID"] == ctx.pid].sort_values("time_hours")
-    if patient_df.empty:
-        # PID type mismatch — try string match
-        patient_df = preds_df[preds_df["PID"].astype(str) == str(ctx.pid)].sort_values("time_hours")
+
+    # Map inference PID → cohort PID on-the-fly using historical base_df
+    cohort_pid = None
+    try:
+        from astra.utils import get_base_df, make_inference_pid
+        base = get_base_df()
+        pid_map = {
+            make_inference_pid(row.CPR_hash, row.ServiceDate): row.PID
+            for _, row in base[['PID', 'CPR_hash', 'ServiceDate']].iterrows()
+        }
+        cohort_pid = pid_map.get(str(ctx.pid))
+    except Exception:
+        pass
+
+    # Look up by resolved cohort PID, falling back to direct ctx.pid match
+    if cohort_pid is not None:
+        patient_df = preds_df[preds_df["PID"] == cohort_pid].sort_values("time_hours")
+    else:
+        patient_df = preds_df[preds_df["PID"] == ctx.pid].sort_values("time_hours")
+        if patient_df.empty:
+            patient_df = preds_df[preds_df["PID"].astype(str) == str(ctx.pid)].sort_values("time_hours")
 
     if patient_df.empty:
         logger.warning("Patient %s not found in preds_df (%s). "

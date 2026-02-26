@@ -334,6 +334,12 @@ def create_enumerated_id(df, string_col, datetime_col):
     return df
 
 
+def make_inference_pid(cpr_hash: str, service_date) -> str:
+    """Deterministic PID from CPR_hash + ServiceDate for deployment use."""
+    date_str = str(service_date)[:10].replace('-', '')
+    return str(cpr_hash)[:8] + date_str
+
+
 def mark_keywords_in_df(
     df,
     text_column,

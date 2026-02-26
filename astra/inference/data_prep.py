@@ -986,8 +986,9 @@ def _build_single_patient_base_df(
         pi[["CPR_hash", "DOB", "DOD", "SEX"]], on="CPR_hash", how="left"
     )
 
-    # 7. Assign PID (single patient)
-    result["PID"] = 1
+    # 7. Assign PID (deterministic inference PID from CPR_hash + ServiceDate)
+    from astra.utils import make_inference_pid
+    result["PID"] = make_inference_pid(cpr_hash, service_date)
 
     # 8. Cleanup (reuse existing)
     result = bpi.final_cleanup(result)

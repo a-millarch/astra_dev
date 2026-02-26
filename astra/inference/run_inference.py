@@ -30,6 +30,7 @@ import pandas as pd
 from astra.inference import InferenceSession, PatientContext
 from astra.evaluation.behavior import visualize_shap_individual, visualize_data_completeness
 from astra.visualize.inference import plot_prediction_trajectory
+from astra.utils import make_inference_pid
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ def run(cpr_hash, service_date, current_time, model_name,
     """Full end-to-end example."""
 
     os.makedirs(save_dir, exist_ok=True)
-    pid_short = cpr_hash[:8] + service_date.astype(str)[:10].replace('-','')
+    pid_short = make_inference_pid(cpr_hash, service_date)
 
     # ---- 1. Load session ----
     logger.info("Loading model: %s", model_name)
@@ -129,7 +130,7 @@ def initialize_session(cpr_hash, service_date, current_time, model_name,
                 data_dir="data/raw", save_dir="reports/inference", device=None):
 
     os.makedirs(save_dir, exist_ok=True)
-    pid_short = cpr_hash[:8] + service_date.astype(str)[:10].replace('-','')
+    pid_short = make_inference_pid(cpr_hash, service_date)
 
     # ---- 1. Load session ----
     logger.info("Loading model: %s", model_name)
