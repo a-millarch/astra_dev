@@ -723,15 +723,14 @@ class InferenceSession:
         if not explanations:
             return None
 
-        if save_path is not None:
-            from astra.evaluation.behavior import visualize_ebm_patient_importance
-            visualize_ebm_patient_importance(
-                explanations,
-                top_n=top_n,
-                top_k_lines=top_k_lines,
-                pid=context.pid,
-                save_path=save_path,
-            )
+        from astra.evaluation.behavior import visualize_ebm_patient_importance
+        visualize_ebm_patient_importance(
+            explanations,
+            top_n=top_n,
+            top_k_lines=top_k_lines,
+            pid=context.pid,
+            save_path=save_path,
+        )
 
         return explanations
 
@@ -782,15 +781,14 @@ def explain_ebm_standalone(
     if not explanations:
         return None
 
-    if save_path is not None:
-        from astra.evaluation.behavior import visualize_ebm_patient_importance
-        visualize_ebm_patient_importance(
-            explanations,
-            top_n=top_n,
-            top_k_lines=top_k_lines,
-            pid=pid,
-            save_path=save_path,
-        )
+    from astra.evaluation.behavior import visualize_ebm_patient_importance
+    visualize_ebm_patient_importance(
+        explanations,
+        top_n=top_n,
+        top_k_lines=top_k_lines,
+        pid=pid,
+        save_path=save_path,
+    )
 
     return explanations
 
