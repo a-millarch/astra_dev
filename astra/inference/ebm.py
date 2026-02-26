@@ -4,16 +4,23 @@ EBM (Explainable Boosting Machine) prediction for single-patient inference.
 Computes EBM predictions at multiple time intervals and injects them into
 the _ebm_pred channel of x_ts, matching the batch pipeline in dataloader.py.
 
+Also provides per-patient local explanations (feature contributions) from
+each available EBM model for interpretability visualization.
+
 Usage (called automatically by prepare_patient_from_csv when EBM is enabled):
     from astra.inference.ebm import compute_ebm_predictions, inject_ebm_into_x_ts
 
     preds = compute_ebm_predictions(raw_data, filtered_concepts, base_df, cfg, models_dir)
     x_ts = inject_ebm_into_x_ts(x_ts, preds, bin_df, admission_time, bundle)
+
+    # Per-patient feature importance:
+    from astra.inference.ebm import compute_ebm_local_explanations
+    explanations = compute_ebm_local_explanations(raw_data, filtered_concepts, base_df, cfg)
 """
 
 import os
 import pickle
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -23,6 +30,45 @@ logger = logging.getLogger(__name__)
 
 # Default aggregation functions (must match AggregatedDS defaults)
 _AGG_FUNCS = ['first', 'last', 'min', 'max', 'mean', 'std']
+
+
+def _get_valid_ebm_intervals(
+    raw_data: dict,
+    cfg: dict,
+    ebm_models_dir: str,
+) -> Tuple[List[float], pd.Timestamp, set]:
+    """
+    Determine valid EBM intervals for a patient based on elapsed time and
+    available model files.
+
+    Returns:
+        (valid_intervals, admission_time, ts_cat_names) or raises if no
+        models directory exists.
+    """
+    from astra.models.ebm.generate_ebm_feature import (
+        generate_ebm_intervals,
+        _model_filename,
+    )
+
+    admission_time = pd.Timestamp(raw_data['admission_time'])
+    current_time = pd.Timestamp(raw_data['current_time'])
+    max_elapsed_hours = (current_time - admission_time).total_seconds() / 3600
+
+    # Get all possible intervals from config
+    all_intervals = generate_ebm_intervals(cfg)
+
+    # Filter to intervals within patient's time window and with saved models
+    valid_intervals = []
+    for h in all_intervals:
+        if h > max_elapsed_hours:
+            continue
+        model_path = os.path.join(ebm_models_dir, _model_filename(h))
+        if os.path.exists(model_path):
+            valid_intervals.append(h)
+
+    ts_cat_names = set(cfg.get('dataset', {}).get('ts_cat_names', []))
+
+    return valid_intervals, admission_time, ts_cat_names
 
 
 def compute_ebm_predictions(
@@ -49,11 +95,6 @@ def compute_ebm_predictions(
     Returns:
         {masking_hours: predicted_probability}
     """
-    from astra.models.ebm.generate_ebm_feature import (
-        generate_ebm_intervals,
-        _model_filename,
-    )
-
     if not os.path.isdir(ebm_models_dir):
         logger.warning(
             f"EBM models directory not found: {ebm_models_dir}. "
@@ -61,36 +102,25 @@ def compute_ebm_predictions(
         )
         return {}
 
-    admission_time = pd.Timestamp(raw_data['admission_time'])
-    current_time = pd.Timestamp(raw_data['current_time'])
-    max_elapsed_hours = (current_time - admission_time).total_seconds() / 3600
-
-    # Get all possible intervals from config
-    all_intervals = generate_ebm_intervals(cfg)
-
-    # Filter to intervals within patient's time window and with saved models
-    valid_intervals = []
-    for h in all_intervals:
-        if h > max_elapsed_hours:
-            continue
-        model_path = os.path.join(ebm_models_dir, _model_filename(h))
-        if os.path.exists(model_path):
-            valid_intervals.append(h)
+    valid_intervals, admission_time, ts_cat_names = _get_valid_ebm_intervals(
+        raw_data, cfg, ebm_models_dir
+    )
 
     if not valid_intervals:
+        max_elapsed = (
+            pd.Timestamp(raw_data['current_time']) -
+            pd.Timestamp(raw_data['admission_time'])
+        ).total_seconds() / 3600
         logger.info(
-            f"No EBM models available for elapsed time {max_elapsed_hours:.1f}h. "
+            f"No EBM models available for elapsed time {max_elapsed:.1f}h. "
             f"Models dir: {ebm_models_dir}"
         )
         return {}
 
     logger.info(
         f"Computing EBM predictions at {len(valid_intervals)} intervals "
-        f"(elapsed: {max_elapsed_hours:.1f}h)"
+        f"(elapsed: {(pd.Timestamp(raw_data['current_time']) - admission_time).total_seconds() / 3600:.1f}h)"
     )
-
-    # Determine which concepts are categorical
-    ts_cat_names = set(cfg.get('dataset', {}).get('ts_cat_names', []))
 
     predictions = {}
     for masking_hours in valid_intervals:
@@ -122,7 +152,103 @@ def compute_ebm_predictions(
     return predictions
 
 
-def _predict_at_interval_from_raw(
+def compute_ebm_local_explanations(
+    raw_data: dict,
+    filtered_concepts: Dict[str, pd.DataFrame],
+    base_df: pd.DataFrame,
+    cfg: dict,
+    ebm_models_dir: str = 'models/ebm',
+) -> Dict[float, Dict]:
+    """
+    Compute per-feature local EBM explanations at all relevant intervals.
+
+    For each available EBM model (where masking_hours <= elapsed time),
+    extracts signed per-feature contributions using InterpretML's
+    explain_local(), which decomposes the prediction into additive
+    feature effects: logit = intercept + sum(f_i(x_i)).
+
+    Args:
+        raw_data: Dict with patient data (from _filtered_dfs_to_raw_data).
+        filtered_concepts: Dict mapping concept name -> filtered DataFrame.
+        base_df: Single-row patient base DataFrame.
+        cfg: Configuration dictionary.
+        ebm_models_dir: Directory containing saved EBM deployment models.
+
+    Returns:
+        {masking_hours: {
+            'feature_names': List[str],
+            'contributions': np.ndarray,   # signed per-feature contributions
+            'intercept': float,
+            'predicted_prob': float,
+            'feature_values': np.ndarray,  # raw feature values for context
+        }}
+        Empty dict if no models available.
+    """
+    if not os.path.isdir(ebm_models_dir):
+        logger.warning(
+            f"EBM models directory not found: {ebm_models_dir}. "
+            "Cannot compute local explanations."
+        )
+        return {}
+
+    valid_intervals, admission_time, ts_cat_names = _get_valid_ebm_intervals(
+        raw_data, cfg, ebm_models_dir
+    )
+
+    if not valid_intervals:
+        logger.info("No EBM models available for local explanations.")
+        return {}
+
+    logger.info(
+        f"Computing EBM local explanations at {len(valid_intervals)} intervals"
+    )
+
+    explanations = {}
+    for masking_hours in valid_intervals:
+        try:
+            model_dict, X_processed = _prepare_ebm_at_interval(
+                filtered_concepts=filtered_concepts,
+                base_df=base_df,
+                admission_time=admission_time,
+                masking_hours=masking_hours,
+                ts_cat_names=ts_cat_names,
+                cfg=cfg,
+                ebm_models_dir=ebm_models_dir,
+            )
+
+            ebm = model_dict['model']
+
+            # Get prediction probability
+            prob = float(ebm.predict_proba(X_processed)[:, 1][0])
+
+            # Get local explanation (additive feature contributions)
+            local_exp = ebm.explain_local(X_processed)
+            exp_data = local_exp.data(0)
+
+            explanations[masking_hours] = {
+                'feature_names': list(exp_data['names']),
+                'contributions': np.array(exp_data['scores'], dtype=float),
+                'intercept': float(ebm.intercept_[0]),
+                'predicted_prob': prob,
+                'feature_values': np.array(exp_data['values'], dtype=float),
+            }
+        except Exception as e:
+            logger.warning(
+                f"EBM local explanation failed at {masking_hours:.1f}h: {e}"
+            )
+            continue
+
+    if explanations:
+        logger.info(
+            f"EBM local explanations computed: {len(explanations)}/{len(valid_intervals)} intervals"
+        )
+    else:
+        logger.info("No EBM local explanations computed.")
+
+    return explanations
+
+
+def _prepare_ebm_at_interval(
     filtered_concepts: Dict[str, pd.DataFrame],
     base_df: pd.DataFrame,
     admission_time: pd.Timestamp,
@@ -130,12 +256,16 @@ def _predict_at_interval_from_raw(
     ts_cat_names: set,
     cfg: dict,
     ebm_models_dir: str,
-) -> float:
+) -> Tuple[dict, pd.DataFrame]:
     """
-    Aggregate features and run EBM prediction at a single interval.
+    Aggregate features and load EBM model at a single interval.
+
+    Shared helper for both prediction and local explanation.
 
     Returns:
-        Predicted probability (float).
+        (model_dict, X_processed) where model_dict contains the EBM model,
+        encoder, and feature metadata, and X_processed is the preprocessed
+        feature DataFrame ready for prediction/explanation.
     """
     from astra.models.ebm.generate_ebm_feature import (
         _model_filename,
@@ -180,6 +310,34 @@ def _predict_at_interval_from_raw(
         fit=False,
         expected_cat_feats=model_dict['expected_cat_feats'],
         expected_cont_feats=model_dict['expected_cont_feats'],
+    )
+
+    return model_dict, X_processed
+
+
+def _predict_at_interval_from_raw(
+    filtered_concepts: Dict[str, pd.DataFrame],
+    base_df: pd.DataFrame,
+    admission_time: pd.Timestamp,
+    masking_hours: float,
+    ts_cat_names: set,
+    cfg: dict,
+    ebm_models_dir: str,
+) -> float:
+    """
+    Aggregate features and run EBM prediction at a single interval.
+
+    Returns:
+        Predicted probability (float).
+    """
+    model_dict, X_processed = _prepare_ebm_at_interval(
+        filtered_concepts=filtered_concepts,
+        base_df=base_df,
+        admission_time=admission_time,
+        masking_hours=masking_hours,
+        ts_cat_names=ts_cat_names,
+        cfg=cfg,
+        ebm_models_dir=ebm_models_dir,
     )
 
     # Predict

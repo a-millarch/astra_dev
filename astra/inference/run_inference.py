@@ -99,6 +99,15 @@ def run(cpr_hash, service_date, current_time, model_name,
     )
     logger.info("Saved SHAP plot to %s", shap_save_path)
 
+    # ---- 5b. EBM feature importance (if EBM is enabled) ----
+    if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
+        logger.info("Computing EBM feature importance...")
+        ebm_save = f"{save_dir}/ebm_importance_{pid_short}.png"
+        ebm_explanations = session.explain_ebm(ctx, save_path=ebm_save)
+        if ebm_explanations:
+            logger.info("Saved EBM importance plot to %s (%d timeframes)",
+                        ebm_save, len(ebm_explanations))
+
     # ---- 6. Demonstrate re-inference (refresh) ----
     later_time = pd.Timestamp(current_time) + pd.Timedelta(hours=6)
     logger.info("Refreshing context to %s (6 hours later)", later_time)
@@ -190,6 +199,11 @@ def default_session_plot(session):
 
     visualize_data_completeness(shap_dict,
                             channel2feature=channel2feature, save_path='reports/tst2.png')
+
+    # ---- EBM feature importance (if EBM enabled) ----
+    if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
+        logger.info("Computing EBM feature importance...")
+        session.explain_ebm(ctx, save_path=None)
 
     return traj_fig
 

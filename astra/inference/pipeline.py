@@ -687,6 +687,113 @@ class InferenceSession:
             pid=context.pid,
         )
 
+    def explain_ebm(self, context, save_path=None, top_n=20, top_k_lines=5):
+        """Compute and optionally visualize per-patient EBM feature importance.
+
+        Extracts local explanations (signed per-feature contributions) from
+        each EBM model available at the patient's current observation time.
+
+        Args:
+            context: A :class:`PatientContext` with ``_ebm_context`` set
+                (created via ``PatientContext.from_csv`` with EBM enabled).
+            save_path: Optional path to save the visualization figure.
+            top_n: Max features to display (default 20).
+            top_k_lines: Top features for line plots in Case C (default 5).
+
+        Returns:
+            Dict of local explanations per timeframe, or None if EBM is not
+            available. See :func:`compute_ebm_local_explanations` for the
+            dict structure.
+        """
+        from astra.inference.ebm import compute_ebm_local_explanations
+
+        if context._ebm_context is None:
+            logger.info("No EBM context in PatientContext — skipping EBM explanation.")
+            return None
+
+        ebm_ctx = context._ebm_context
+        explanations = compute_ebm_local_explanations(
+            raw_data=context._raw_data,
+            filtered_concepts=ebm_ctx['filtered_concepts'],
+            base_df=ebm_ctx['base_df'],
+            cfg=ebm_ctx['cfg'],
+            ebm_models_dir=ebm_ctx['ebm_models_dir'],
+        )
+
+        if not explanations:
+            return None
+
+        if save_path is not None:
+            from astra.evaluation.behavior import visualize_ebm_patient_importance
+            visualize_ebm_patient_importance(
+                explanations,
+                top_n=top_n,
+                top_k_lines=top_k_lines,
+                pid=context.pid,
+                save_path=save_path,
+            )
+
+        return explanations
+
+
+# ============================================================================
+# STANDALONE EBM EXPLANATION (no InferenceSession needed)
+# ============================================================================
+
+def explain_ebm_standalone(
+    raw_data: dict,
+    filtered_concepts: Dict,
+    base_df: pd.DataFrame,
+    cfg: dict,
+    ebm_models_dir: str = 'models/ebm',
+    save_path: Optional[str] = None,
+    top_n: int = 20,
+    top_k_lines: int = 5,
+    pid: Optional[str] = None,
+) -> Optional[Dict]:
+    """
+    Compute and optionally visualize per-patient EBM feature importance
+    without requiring an InferenceSession.
+
+    Args:
+        raw_data: Dict with patient data (must include 'admission_time', 'current_time').
+        filtered_concepts: Dict mapping concept name -> filtered DataFrame.
+        base_df: Single-row patient base DataFrame.
+        cfg: Configuration dictionary.
+        ebm_models_dir: Directory containing saved EBM deployment models.
+        save_path: Optional path to save the visualization figure.
+        top_n: Max features to display (default 20).
+        top_k_lines: Top features for line plots in Case C (default 5).
+        pid: Optional patient ID for title.
+
+    Returns:
+        Dict of local explanations per timeframe, or None if no models available.
+    """
+    from astra.inference.ebm import compute_ebm_local_explanations
+
+    explanations = compute_ebm_local_explanations(
+        raw_data=raw_data,
+        filtered_concepts=filtered_concepts,
+        base_df=base_df,
+        cfg=cfg,
+        ebm_models_dir=ebm_models_dir,
+    )
+
+    if not explanations:
+        return None
+
+    if save_path is not None:
+        from astra.evaluation.behavior import visualize_ebm_patient_importance
+        visualize_ebm_patient_importance(
+            explanations,
+            top_n=top_n,
+            top_k_lines=top_k_lines,
+            pid=pid,
+            save_path=save_path,
+        )
+
+    return explanations
+
 
 # ============================================================================
 # HELPER: Extract a patient from existing data dict (for testing)

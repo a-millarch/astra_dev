@@ -475,6 +475,312 @@ def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = 114,
     plt.show()
 
 
+# ---------------------------------------------------------------------------
+# Per-patient EBM local explanation visualization
+# ---------------------------------------------------------------------------
+
+def _hours_to_label(hours: float) -> str:
+    """Convert hours to a readable label (e.g. 0.167 -> '10min', 1.0 -> '1h', 24.0 -> '1D')."""
+    if hours < 1:
+        minutes = hours * 60
+        return f"{minutes:.0f}min"
+    elif hours < 24:
+        if hours == int(hours):
+            return f"{int(hours)}h"
+        return f"{hours:.1f}h"
+    else:
+        days = hours / 24
+        if days == int(days):
+            return f"{int(days)}D"
+        return f"{days:.1f}D"
+
+
+def _build_contribution_matrix(
+    local_explanations: Dict[float, Dict],
+    top_n: int,
+) -> tuple:
+    """
+    Build a unified feature × timeframe contribution matrix from local explanations.
+
+    Returns:
+        (matrix, feature_names, sorted_hours) where:
+        - matrix: [top_n, n_timeframes] signed contributions
+        - feature_names: list of top_n feature names (sorted by max |contribution|)
+        - sorted_hours: list of masking_hours in ascending order
+    """
+    sorted_hours = sorted(local_explanations.keys())
+
+    # Build union of all feature names
+    all_features: set = set()
+    for data in local_explanations.values():
+        all_features.update(data['feature_names'])
+    all_features_list = sorted(all_features)
+
+    # Build full matrix: [n_features, n_timeframes]
+    feat_to_idx = {f: i for i, f in enumerate(all_features_list)}
+    full_matrix = np.zeros((len(all_features_list), len(sorted_hours)))
+
+    for col, h in enumerate(sorted_hours):
+        data = local_explanations[h]
+        for name, contrib in zip(data['feature_names'], data['contributions']):
+            full_matrix[feat_to_idx[name], col] = contrib
+
+    # Select top_n by max absolute contribution across timeframes
+    max_abs = np.abs(full_matrix).max(axis=1)
+    top_indices = np.argsort(max_abs)[::-1][:top_n]
+    top_names = [all_features_list[i] for i in top_indices]
+    top_matrix = full_matrix[top_indices]
+
+    return top_matrix, top_names, sorted_hours
+
+
+def _draw_ebm_patient_single(
+    local_explanations: Dict[float, Dict],
+    top_n: int,
+    title_suffix: str,
+    save_path: Optional[str],
+):
+    """Case A: Single EBM model — horizontal bar chart of feature contributions."""
+    hours = list(local_explanations.keys())[0]
+    data = local_explanations[hours]
+
+    names = np.array(data['feature_names'])
+    contribs = np.array(data['contributions'])
+
+    # Sort by absolute contribution, take top_n
+    sorted_idx = np.argsort(np.abs(contribs))[::-1][:top_n]
+    names = names[sorted_idx]
+    contribs = contribs[sorted_idx]
+
+    # Reverse for display (highest at top)
+    names = names[::-1]
+    contribs = contribs[::-1]
+
+    n_feat = len(names)
+    colors = ['#d32f2f' if c > 0 else '#1976d2' for c in contribs]
+
+    fig, ax = plt.subplots(figsize=(12, max(6, n_feat * 0.4)))
+    ax.barh(range(n_feat), contribs, color=colors, alpha=0.8)
+    ax.axvline(x=0, color='black', linewidth=0.8)
+
+    fontsize = 7 if n_feat > 15 else (8 if n_feat > 10 else 9)
+    ax.set_yticks(range(n_feat))
+    ax.set_yticklabels(names, fontsize=fontsize)
+    ax.set_xlabel('Contribution (log-odds)')
+    ax.set_title(
+        f'EBM Feature Contributions at {_hours_to_label(hours)}'
+        f' (P={data["predicted_prob"]:.3f}){title_suffix}',
+        fontweight='bold',
+    )
+
+    # Intercept annotation
+    ax.annotate(
+        f'Intercept: {data["intercept"]:.3f}',
+        xy=(0.98, 0.02), xycoords='axes fraction',
+        ha='right', va='bottom', fontsize=9,
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='wheat', alpha=0.7),
+    )
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#d32f2f', alpha=0.8, label='Risk-increasing'),
+        Patch(facecolor='#1976d2', alpha=0.8, label='Protective'),
+    ]
+    ax.legend(handles=legend_elements, loc='lower right', fontsize=9)
+    ax.grid(True, axis='x', alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+def _draw_ebm_patient_grouped(
+    local_explanations: Dict[float, Dict],
+    top_n: int,
+    title_suffix: str,
+    save_path: Optional[str],
+):
+    """Case B: 2-3 EBM models — grouped horizontal bars per timeframe."""
+    matrix, feature_names, sorted_hours = _build_contribution_matrix(
+        local_explanations, top_n
+    )
+    n_feat = len(feature_names)
+    n_groups = len(sorted_hours)
+
+    # Reverse for display (highest importance at top)
+    feature_names = feature_names[::-1]
+    matrix = matrix[::-1]
+
+    # Timeframe colors from a sequential palette
+    cmap = plt.cm.tab10
+    group_colors = [cmap(i) for i in range(n_groups)]
+
+    bar_height = 0.8 / n_groups
+    y_positions = np.arange(n_feat)
+
+    fig, ax = plt.subplots(figsize=(14, max(6, n_feat * 0.5)))
+
+    for i, h in enumerate(sorted_hours):
+        offset = (i - n_groups / 2 + 0.5) * bar_height
+        label = f'{_hours_to_label(h)} (P={local_explanations[h]["predicted_prob"]:.3f})'
+        ax.barh(
+            y_positions + offset, matrix[:, i],
+            height=bar_height, color=group_colors[i], alpha=0.8,
+            label=label,
+        )
+
+    ax.axvline(x=0, color='black', linewidth=0.8)
+
+    fontsize = 7 if n_feat > 15 else (8 if n_feat > 10 else 9)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(feature_names, fontsize=fontsize)
+    ax.set_xlabel('Contribution (log-odds)')
+    ax.set_title(
+        f'EBM Feature Contributions Across Timeframes{title_suffix}',
+        fontweight='bold',
+    )
+
+    ax.legend(loc='lower right', fontsize=9)
+    ax.grid(True, axis='x', alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+def _draw_ebm_patient_temporal(
+    local_explanations: Dict[float, Dict],
+    top_n: int,
+    top_k_lines: int,
+    title_suffix: str,
+    save_path: Optional[str],
+):
+    """Case C: 4+ EBM models — line plot + heatmap of contributions over time."""
+    matrix, feature_names, sorted_hours = _build_contribution_matrix(
+        local_explanations, top_n
+    )
+    n_feat = len(feature_names)
+    n_timeframes = len(sorted_hours)
+    x_labels = [_hours_to_label(h) for h in sorted_hours]
+
+    fig, (ax_lines, ax_hm) = plt.subplots(
+        2, 1, figsize=(max(14, n_timeframes * 1.2), 14),
+        gridspec_kw={'height_ratios': [0.7, 1], 'hspace': 0.35},
+    )
+
+    # --- Top panel: line plot of top-K features ---
+    cmap_lines = plt.cm.tab10
+    show_k = min(top_k_lines, n_feat)
+    x = np.arange(n_timeframes)
+
+    for i in range(show_k):
+        ax_lines.plot(
+            x, matrix[i], linewidth=2, color=cmap_lines(i),
+            label=feature_names[i], marker='o', markersize=4,
+        )
+        ax_lines.fill_between(x, matrix[i], alpha=0.1, color=cmap_lines(i))
+
+    ax_lines.axhline(y=0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
+    ax_lines.set_xlim(-0.5, n_timeframes - 0.5)
+    ax_lines.set_xticks(x)
+    ax_lines.set_xticklabels(x_labels, rotation=45)
+    ax_lines.set_xlabel('EBM Evaluation Timeframe')
+    ax_lines.set_ylabel('Contribution (log-odds)')
+    ax_lines.set_title(
+        f'Top EBM Feature Contributions Over Time{title_suffix}',
+        fontweight='bold',
+    )
+    ax_lines.legend(loc='best', fontsize=8, ncol=2 if show_k > 3 else 1)
+    ax_lines.grid(True, alpha=0.3)
+
+    # Add probability trajectory as secondary annotation
+    probs = [local_explanations[h]['predicted_prob'] for h in sorted_hours]
+    ax_prob = ax_lines.twinx()
+    ax_prob.plot(x, probs, color='gray', linewidth=1.5, linestyle=':', alpha=0.6,
+                 label='P(deceased)')
+    ax_prob.set_ylabel('P(deceased)', color='gray', alpha=0.7)
+    ax_prob.tick_params(axis='y', labelcolor='gray')
+    ax_prob.set_ylim(0, 1)
+
+    # --- Bottom panel: heatmap ---
+    # Use TwoSlopeNorm for diverging colormap centered at 0
+    vmax = np.abs(matrix).max()
+    if vmax == 0:
+        vmax = 1.0
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+    im = ax_hm.imshow(
+        matrix, aspect='auto', cmap='RdBu_r', norm=norm,
+        interpolation='nearest',
+    )
+
+    fontsize = 7 if n_feat > 15 else (8 if n_feat > 10 else 9)
+    ax_hm.set_yticks(range(n_feat))
+    ax_hm.set_yticklabels(feature_names, fontsize=fontsize)
+    ax_hm.set_xticks(range(n_timeframes))
+    ax_hm.set_xticklabels(x_labels, rotation=45)
+    ax_hm.set_xlabel('EBM Evaluation Timeframe')
+    ax_hm.set_ylabel('Feature')
+    ax_hm.set_title(
+        f'EBM Feature Contributions Heatmap{title_suffix}',
+        fontweight='bold',
+    )
+
+    plt.colorbar(im, ax=ax_hm, label='Contribution (log-odds)', shrink=0.8)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+
+def visualize_ebm_patient_importance(
+    local_explanations: Dict[float, Dict],
+    top_n: int = 20,
+    top_k_lines: int = 5,
+    pid: Optional[str] = None,
+    save_path: Optional[str] = None,
+):
+    """
+    Visualize per-patient EBM feature importance across available timeframes.
+
+    Adapts layout based on number of available EBM models:
+    - Case A (1 model): Single horizontal bar chart of feature contributions
+    - Case B (2-3 models): Grouped horizontal bars per timeframe
+    - Case C (4+ models): Line plot + heatmap
+
+    Args:
+        local_explanations: Dict from compute_ebm_local_explanations().
+            {masking_hours: {'feature_names': [...], 'contributions': [...],
+             'intercept': float, 'predicted_prob': float, ...}}
+        top_n: Max features to display (default 20).
+        top_k_lines: Top features to show as lines in Case C (default 5).
+        pid: Optional patient ID for title.
+        save_path: Optional path to save figure.
+    """
+    if not local_explanations:
+        logger.info("No EBM local explanations to visualize.")
+        return
+
+    n_models = len(local_explanations)
+    title_suffix = f' (PID: {pid})' if pid else ''
+
+    if n_models == 1:
+        _draw_ebm_patient_single(local_explanations, top_n, title_suffix, save_path)
+    elif n_models <= 3:
+        _draw_ebm_patient_grouped(local_explanations, top_n, title_suffix, save_path)
+    else:
+        _draw_ebm_patient_temporal(
+            local_explanations, top_n, top_k_lines, title_suffix, save_path
+        )
+
+
 def _get_channel_color(channel2feature, ch_idx):
     """Get display color for a channel based on its group."""
     if channel2feature is None:
