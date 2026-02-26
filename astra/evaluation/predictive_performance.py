@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 
-from astra.utils import cfg, save_figure
+from astra.utils import save_figure
 from astra.data.dataloader import normalize_with_padding_mask
 from astra.data.mixed_dataloader import (
     AstraMixedDataset,
@@ -607,12 +607,13 @@ def plot_multiple_roc_pr_curves(
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
-def run_eval(data, model_name: str, multicurve: bool = True, comprehensive_eval: bool = True):
+def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True):
     """
     Enhanced evaluation with time-dependent metrics.
 
     Uses direct model inference (no FastAI Learner).
     """
+    model_name = cfg["model_name"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
 
     model_cfg = cfg.get("model", {})

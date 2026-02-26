@@ -74,7 +74,7 @@ def main():
 
     if args.eval:
         logger.info("=== Running Evaluation ===")
-        results, preds_df = run_eval(data, cfg["model_name"], args.multicurve, args.comprehensive_eval)
+        results, preds_df = run_eval(data, cfg, args.multicurve, args.comprehensive_eval)
 
 if __name__ == "__main__":
     main()

@@ -243,7 +243,7 @@ def main():
     if args.eval:
         logger.info("=== Running Evaluation ===")
         results, preds_df = run_eval(
-            data, model_name, args.multicurve, args.comprehensive_eval,
+            data, cfg, args.multicurve, args.comprehensive_eval,
         )
 
     # ========================================================================

@@ -225,12 +225,20 @@ def compute_ebm_local_explanations(
             local_exp = ebm.explain_local(X_processed)
             exp_data = local_exp.data(0)
 
+            # Feature values may be mixed types (float for continuous,
+            # str for categorical/interaction terms), so keep as object array
+            raw_values = exp_data['values']
+            try:
+                feature_values = np.array(raw_values, dtype=float)
+            except (ValueError, TypeError):
+                feature_values = np.array(raw_values, dtype=object)
+
             explanations[masking_hours] = {
                 'feature_names': list(exp_data['names']),
                 'contributions': np.array(exp_data['scores'], dtype=float),
                 'intercept': float(ebm.intercept_[0]),
                 'predicted_prob': prob,
-                'feature_values': np.array(exp_data['values'], dtype=float),
+                'feature_values': feature_values,
             }
         except Exception as e:
             logger.warning(
