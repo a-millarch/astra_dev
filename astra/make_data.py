@@ -101,16 +101,24 @@ if __name__ =='__main__':
 
     # Cohort mode
     if is_file_present(cfg['base_df_path']):
-        pass
+        base = pd.read_pickle(cfg['base_df_path'])
     else:
         base = bpi.create_base_df(cfg)
-    # bin_df    
+
+    # Pre-hospital data extraction (when enabled)
+    if cfg.get("prehospital"):
+        from astra.data.prehospital import run_prehospital_pipeline
+        logger.info("Pre-hospital pipeline enabled — extracting PPJ data")
+        base = run_prehospital_pipeline(cfg, base=base)
+        # Re-save base_df with prehospital_start + ABCD columns
+        base.to_pickle(cfg["base_df_path"], protocol=4)
+        logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
+
+    # bin_df (now uses prehospital_start if available)
     if is_file_present(cfg['bin_df_path']):
         pass
-    else: 
-        bpi.create_bin_df(cfg)
-
-
+    else:
+        bpi.create_bin_df(cfg, base=base)
 
     proces_inhospital_concepts(cfg, reset=False)
     #map_data(cfg)

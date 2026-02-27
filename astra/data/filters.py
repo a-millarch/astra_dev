@@ -91,13 +91,23 @@ def filter_inhospital(
     colnames = df.columns.to_list()
     # ensure datetime format for input df
     df = ensure_datetime(df, dt_name)
-    # merge and filter
-    merged_df = base[["PID", "CPR_hash", "start", "end"]].merge(
-        df, on="CPR_hash", how="left"
-    )
+
+    # Determine which columns to merge — include prehospital_start when available
+    base_cols = ["PID", "CPR_hash", "start", "end"]
+    use_ph_start = cfg.get("prehospital", False) and "prehospital_start" in base.columns
+    if use_ph_start:
+        base_cols.append("prehospital_start")
+
+    merged_df = base[base_cols].merge(df, on="CPR_hash", how="left")
+
+    # Use prehospital_start as lower bound when available, else hospital start
+    if use_ph_start:
+        lower_bound = merged_df["prehospital_start"].fillna(merged_df["start"])
+    else:
+        lower_bound = merged_df["start"]
 
     filtered_df = merged_df[
-        (merged_df[dt_name] >= merged_df["start"] - pd.DateOffset(days=offset))
+        (merged_df[dt_name] >= lower_bound - pd.DateOffset(days=offset))
         & (merged_df[dt_name] <= merged_df["end"] + pd.DateOffset(days=offset))
     ]
     filtered_df = filtered_df.drop_duplicates().reset_index(drop=True)
@@ -157,6 +167,14 @@ def filter_vitals(vit):
     vit = vit[(vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
                 & (vit.VALUE.notnull())
                & ((vit['VALUE'].str.contains(pattern, regex=True) ) | (vit['VALUE'].dtype==float))].copy(deep=True)
+
+    # Concat pre-hospital vitals when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_VitaleVaerdier.pkl"):
+        logger.info("> Adding prehospital vitals")
+        phv = pd.read_pickle("data/interim/prehospital_VitaleVaerdier.pkl")
+        vit = pd.concat([vit, phv])
+        vit = vit.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> Vitals after prehospital merge: {len(vit)} rows")
 
     return vit
 
@@ -220,6 +238,15 @@ def filter_ita(ita):
     )
 
     ita["FEATURE"] = ita["FEATURE"].replace(to_replace=ICU_MAP)
+
+    # Concat pre-hospital GCS when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_GCS.pkl"):
+        logger.info("> Adding prehospital GCS")
+        ph_gcs = pd.read_pickle("data/interim/prehospital_GCS.pkl")
+        ita = pd.concat([ita, ph_gcs])
+        ita = ita.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> ITA after prehospital GCS merge: {len(ita)} rows")
+
     return ita
 
 

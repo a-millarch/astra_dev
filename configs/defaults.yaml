@@ -1,14 +1,32 @@
 single_patient_mode: False
 
-population_file_path: data/raw/trauma_call_historic_population.csv 
+population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: hpt
 run_name: highres
 
 model_name: '25022026_ebm'
-   
+
 target: deceased_30d
+
+# Pre-hospital (PPJ) data integration
+prehospital: false                     # Set true to enable pre-hospital data pipeline
+prehospital_only: false                # If true, only include patients WITH PPJ data
+
+prehospital_config:
+  ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
+  ppj_data_paths:
+    - data/raw/ppj/                                 # Directory containing raw PPJ CSVs
+  max_hours_before_admission: 48                    # Max hours before admission to include
+  event_descriptions_path: data/external/event_descriptions_modified.xlsx
+  # Override event codes if event_descriptions not available:
+  # gcs_event_codes: []
+  # abcd_event_codes:
+  #   "A: Luftveje": ["CODE"]
+  #   "B: Respiration": ["CODE"]
+  #   "C: Cirkulation": ["CODE"]
+  #   "D: Bevidsthedsniveau": ["CODE"]
 
 mapped_dir: data/interim/mapped
 concepts:
@@ -46,6 +64,13 @@ dataset:
   cat_cols:
       - SEX
       - FIRST_HOSPITAL
+
+  # Pre-hospital ABCD categorical columns (only used when prehospital: true)
+  ppj_cat_cols:
+      - A
+      - B
+      - C
+      - D
 
   num_cols:
       - AGE
