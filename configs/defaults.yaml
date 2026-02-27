@@ -6,9 +6,9 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '25022026_ebm'
+model_name: '26022026_ppj'
 
-target: deceased_30d
+target: deceased_90d
 
 # Pre-hospital (PPJ) data integration
 prehospital: false                     # Set true to enable pre-hospital data pipeline
@@ -220,8 +220,8 @@ bin_intervals:
   72h: '4h'
   14D: '12h'
   30D: '1D'
- # 90D: '7D'
-  end: '3D'
+  90D: '7D'
+  end: '30D'
 
 bin_freq_include:
   - '10min'
@@ -230,7 +230,7 @@ bin_freq_include:
   - '4h'
   - '12h'
   - '1D'
-  #- '7D'
+  - '7D'
   #- '30D'
 
 temporal_features:
@@ -247,7 +247,7 @@ temporal_features:
     - bin_width_hours
 
 ebm_feature:
-  enabled: true
+  enabled: false
   save_dir: data/interim/ebm_features
   n_folds: 5
   default_value: 0.0
@@ -255,8 +255,8 @@ ebm_feature:
 agg_func: #also for datasets, split it up
   VitaleVaerdier:
       #- first # tmp on for tab
-      - min
-      - max
+    #  - min
+    #  - max
       - mean
       - std
   ITAOversigtsrapport:
