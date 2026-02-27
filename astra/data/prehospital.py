@@ -612,6 +612,7 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
 
 if __name__ == "__main__":
     import argparse
+    import traceback
     from astra.utils import ProjectManager, setup_logging
 
     parser = argparse.ArgumentParser(description="Run pre-hospital (PPJ) data extraction")
@@ -621,7 +622,16 @@ if __name__ == "__main__":
     pm = ProjectManager()
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    cfg["prehospital"] = True  # force-enable for standalone run
-    base = run_prehospital_pipeline(cfg)
-    base.to_pickle(cfg["base_df_path"], protocol=4)
-    logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
+    # Verify logging works
+    print(f"[prehospital __main__] Logger handlers: {logging.getLogger('astra').handlers}")
+    print(f"[prehospital __main__] Logger level: {logging.getLogger('astra').level}")
+    logger.info("Pre-hospital pipeline starting (standalone mode)")
+
+    try:
+        cfg["prehospital"] = True  # force-enable for standalone run
+        base = run_prehospital_pipeline(cfg)
+        base.to_pickle(cfg["base_df_path"], protocol=4)
+        logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
+    except Exception as e:
+        print(f"[prehospital __main__] FATAL ERROR: {e}")
+        traceback.print_exc()
