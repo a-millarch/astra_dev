@@ -395,6 +395,10 @@ PPJ_VITALS_MAP = {
 }
 
 # PPJ EventCodeName → subset name for vital signs
+# NOTE: These are FALLBACK codes only, used when event_descriptions_modified.xlsx
+# is not available. The correct codes are resolved dynamically from the
+# "Eventkoder Vitaldata" sheet (typically OMI codes, not SVD codes).
+# SVD codes are secondary assessment listvalues, NOT numeric vital measurements.
 PPJ_VITAL_EVENT_CODES: Dict[str, str] = {
     "SVD00029": "M_Puls",
     "SVD00030": "M_NInv Sys Blodtryk",
@@ -402,7 +406,7 @@ PPJ_VITAL_EVENT_CODES: Dict[str, str] = {
     "SVD00032": "M_SpO2",
 }
 
-# PPJ EventCodeName for GCS
+# PPJ EventCodeName for GCS (legacy, resolved dynamically now)
 PPJ_GCS_EVENT_CODE = "GCS"  # subset name after ppjDataset.collect_subsets()
 
 # PPJ ABCD categorical assessment → short column names

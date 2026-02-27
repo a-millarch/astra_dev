@@ -218,19 +218,19 @@ def filter_ppj_to_population(
             f"{ppj_filtered['EventCodeName'].value_counts().head(30).to_dict()}"
         )
 
-        # Look up top event codes in event_descriptions to understand data structure
+        # Look up top event codes in event_descriptions (both sheets)
         ph_cfg = cfg.get("prehospital_config", {})
         ed_path = ph_cfg.get("event_descriptions_path")
         if ed_path and os.path.exists(ed_path):
             try:
-                ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
+                ed = _load_event_descriptions(ed_path)
                 top_codes = ppj_filtered["EventCodeName"].value_counts().head(15).index.tolist()
                 for code in top_codes:
                     row = ed[ed["Kode"] == code]
                     if not row.empty:
+                        dt = row["Datatype"].iloc[0] if "Datatype" in row.columns else "?"
                         logger.info(
-                            f"  {code}: Tekst='{row['Tekst'].iloc[0]}', "
-                            f"Datatype='{row['Datatype'].iloc[0]}'"
+                            f"  {code}: Tekst='{row['Tekst'].iloc[0]}', Datatype='{dt}'"
                         )
             except Exception as e:
                 logger.debug(f"Could not look up event codes in event_descriptions: {e}")
@@ -239,6 +239,75 @@ def filter_ppj_to_population(
     ph_pop = ph[["CPR_hash", "PID", "start", "end"]].drop_duplicates(subset=["PID"])
 
     return ppj_filtered, ph_pop
+
+
+# ============================================================================
+# Event code resolution from event_descriptions xlsx
+# ============================================================================
+
+def _load_event_descriptions(ed_path: str) -> pd.DataFrame:
+    """Load both sheets from event_descriptions and merge them.
+
+    The PPJ event_descriptions xlsx has two relevant sheets:
+    - "Prædefinerede eventkoder" — predefined codes (ABCD, GCS components, etc.)
+    - "Eventkoder Vitaldata" — vital sign / monitoring codes (HR, SBP, DBP, SpO2)
+
+    Returns merged DataFrame with columns [Kode, Tekst, Datatype, ...].
+    """
+    try:
+        ed_pre = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
+        ed_vitals = pd.read_excel(ed_path, sheet_name="Eventkoder Vitaldata", engine="openpyxl")
+        logger.info(f"event_descriptions: {len(ed_pre)} predefined + {len(ed_vitals)} vitaldata rows")
+        ed = pd.concat([ed_pre, ed_vitals], ignore_index=True)
+        return ed
+    except Exception as e:
+        logger.warning(f"Could not load event_descriptions from {ed_path}: {e}")
+        return pd.DataFrame()
+
+
+def _resolve_vital_event_codes() -> dict:
+    """Resolve vital sign event codes from event_descriptions xlsx.
+
+    Looks up the PPJ subset names (M_Puls, M_NInv Sys Blodtryk, etc.)
+    in the "Eventkoder Vitaldata" sheet to find their actual event codes
+    (typically OMI codes).
+
+    Returns dict mapping {event_code: subset_name}, e.g. {"OMI00001": "M_Puls"}.
+    Falls back to hardcoded PPJ_VITAL_EVENT_CODES if xlsx not available.
+    """
+    ph_cfg = cfg.get("prehospital_config", {})
+    ed_path = ph_cfg.get("event_descriptions_path")
+
+    if not ed_path or not os.path.exists(ed_path):
+        logger.warning("event_descriptions not available, using hardcoded vital event codes")
+        return dict(PPJ_VITAL_EVENT_CODES)
+
+    try:
+        ed_vitals = pd.read_excel(ed_path, sheet_name="Eventkoder Vitaldata", engine="openpyxl")
+        logger.info(f"Vitaldata sheet: {len(ed_vitals)} rows, columns: {ed_vitals.columns.tolist()}")
+
+        # Look up each subset name from PPJ_VITALS_MAP
+        subset_names = list(PPJ_VITALS_MAP.keys())  # ["M_NInv Sys Blodtryk", "M_NInv Dia Blodtryk", "M_Puls", "M_SpO2"]
+        code_to_subset = {}
+
+        for subset_name in subset_names:
+            matches = ed_vitals[ed_vitals["Tekst"] == subset_name]
+            if not matches.empty:
+                code = matches["Kode"].iloc[0]
+                code_to_subset[code] = subset_name
+                logger.info(f"  Vital '{subset_name}' → code '{code}'")
+            else:
+                logger.warning(f"  Vital '{subset_name}' not found in Eventkoder Vitaldata")
+
+        if code_to_subset:
+            logger.info(f"Resolved vital event codes: {code_to_subset}")
+            return code_to_subset
+
+    except Exception as e:
+        logger.warning(f"Could not read Eventkoder Vitaldata: {e}")
+
+    logger.warning("Falling back to hardcoded vital event codes (SVD — likely wrong!)")
+    return dict(PPJ_VITAL_EVENT_CODES)
 
 
 # ============================================================================
@@ -251,57 +320,39 @@ def extract_ppj_vitals(
 ) -> pd.DataFrame:
     """Extract pre-hospital vital signs from PPJ.
 
-    Filters by vital sign event codes, maps PPJ subset names to ASTRA standard
-    feature names (SBP, DBP, HR, SPO2), applies outlier bounds, and produces
-    a DataFrame in the standard ASTRA format: [TIMESTAMP, PID, FEATURE, VALUE].
+    Resolves vital sign event codes from the "Eventkoder Vitaldata" sheet,
+    maps to ASTRA standard feature names (SBP, DBP, HR, SPO2), applies
+    outlier bounds, and produces a DataFrame in standard ASTRA format.
     """
-    # Filter to vital sign event codes
-    vital_codes = list(PPJ_VITAL_EVENT_CODES.keys())
+    # Dynamically resolve vital event codes from event_descriptions
+    vital_code_to_subset = _resolve_vital_event_codes()
+    vital_codes = list(vital_code_to_subset.keys())
     logger.info(f"Filtering for vital event codes: {vital_codes}")
+
     vitals = ppj_filtered[ppj_filtered["EventCodeName"].isin(vital_codes)].copy()
     logger.info(f"Vital sign matches: {len(vitals)} rows")
 
     if len(vitals) > 0:
-        logger.info(f"  Non-null counts per column:\n{vitals.notna().sum().to_string()}")
-        logger.info(f"  ValueFloat non-null: {vitals['ValueFloat'].notna().sum()}, "
-                     f"ValueString non-null: {vitals['ValueString'].notna().sum()}")
-        logger.info(f"  ManualTime non-null: {vitals['ManualTime'].notna().sum()}, "
-                     f"CreationTime non-null: {vitals['CreationTime'].notna().sum()}")
-        logger.info(f"  Sample rows:\n{vitals.head(5).to_string()}")
-        # Check if values look like listvalue indices vs real measurements
+        logger.info(f"  CreationTime non-null: {vitals['CreationTime'].notna().sum()}, "
+                     f"ValueFloat non-null: {vitals['ValueFloat'].notna().sum()}")
+        # Show value ranges per code
         for code in vital_codes:
             code_rows = vitals[vitals["EventCodeName"] == code]
             if len(code_rows) > 0:
                 vals = pd.to_numeric(code_rows["ValueFloat"], errors="coerce").dropna()
-                logger.info(f"  {code} ({PPJ_VITAL_EVENT_CODES.get(code, '?')}): "
-                             f"n={len(vals)}, range=[{vals.min():.1f}, {vals.max():.1f}], "
-                             f"unique={sorted(vals.unique()[:15].tolist())}")
-
-    # Check event_descriptions Datatype for these codes
-    ph_cfg = cfg.get("prehospital_config", {})
-    ed_path = ph_cfg.get("event_descriptions_path")
-    if ed_path and os.path.exists(ed_path):
-        try:
-            ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
-            for code in vital_codes:
-                row = ed[ed["Kode"] == code]
-                if not row.empty:
-                    logger.info(f"  event_descriptions for {code}: Tekst='{row['Tekst'].iloc[0]}', "
-                                 f"Datatype='{row['Datatype'].iloc[0]}', "
-                                 f"Værdier='{row['Værdier'].iloc[0]}'")
-        except Exception as e:
-            logger.debug(f"Could not read event_descriptions for vital code info: {e}")
+                if len(vals) > 0:
+                    subset_name = vital_code_to_subset.get(code, "?")
+                    astra_name = PPJ_VITALS_MAP.get(subset_name, "?")
+                    logger.info(f"  {code} ({subset_name} → {astra_name}): "
+                                 f"n={len(vals)}, range=[{vals.min():.1f}, {vals.max():.1f}], "
+                                 f"mean={vals.mean():.1f}")
 
     if vitals.empty:
         logger.warning("No pre-hospital vital signs found in PPJ data")
-        logger.warning(
-            f"Available EventCodeNames (top 20): "
-            f"{ppj_filtered['EventCodeName'].value_counts().head(20).to_dict()}"
-        )
         return pd.DataFrame(columns=["TIMESTAMP", "PID", "FEATURE", "VALUE"])
 
-    # Map event codes to subset names, then to ASTRA standard names
-    vitals["FEATURE"] = vitals["EventCodeName"].map(PPJ_VITAL_EVENT_CODES)
+    # Map event codes → subset names → ASTRA standard names
+    vitals["FEATURE"] = vitals["EventCodeName"].map(vital_code_to_subset)
     vitals["FEATURE"] = vitals["FEATURE"].map(PPJ_VITALS_MAP)
 
     # Use ManualTime if available, else CreationTime
@@ -401,8 +452,9 @@ def extract_ppj_gcs(
 def _get_gcs_event_codes(ppj_filtered: pd.DataFrame) -> list:
     """Identify GCS event codes from PPJ data.
 
-    Tries to load from event_descriptions_modified.xlsx if available,
-    otherwise uses known GCS event code pattern.
+    Loads from BOTH event_descriptions sheets (predefined + vitaldata).
+    Prefers codes with float/numeric datatype (actual GCS total scores)
+    over listvalue codes (component scores that need decoding).
     """
     ph_cfg = cfg.get("prehospital_config", {})
     ed_path = ph_cfg.get("event_descriptions_path")
@@ -412,12 +464,26 @@ def _get_gcs_event_codes(ppj_filtered: pd.DataFrame) -> list:
 
     if ed_path and os.path.exists(ed_path):
         try:
-            ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
-            logger.info(f"  event_descriptions loaded: {len(ed)} rows, columns: {ed.columns.tolist()}")
+            ed = _load_event_descriptions(ed_path)
+            if ed.empty:
+                raise ValueError("Empty event descriptions")
+
             gcs_rows = ed[ed["Tekst"].str.contains("GCS", case=False, na=False)]
-            logger.info(f"  GCS rows found: {len(gcs_rows)}")
+            logger.info(f"  GCS rows found (both sheets): {len(gcs_rows)}")
             if not gcs_rows.empty:
-                logger.info(f"  GCS rows:\n{gcs_rows[['Kode', 'Tekst']].to_string()}")
+                # Show all GCS rows with their datatype
+                display_cols = [c for c in ["Kode", "Tekst", "Datatype"] if c in gcs_rows.columns]
+                logger.info(f"  GCS rows:\n{gcs_rows[display_cols].to_string()}")
+
+                # Prefer float/numeric datatype codes (total GCS) over listvalue (component scores)
+                if "Datatype" in gcs_rows.columns:
+                    float_gcs = gcs_rows[gcs_rows["Datatype"].str.contains("float|numeric|integer", case=False, na=False)]
+                    if not float_gcs.empty:
+                        codes = float_gcs["Kode"].tolist()
+                        logger.info(f"  Preferring float-type GCS codes: {codes}")
+                        return codes
+
+                # Fall back to all GCS codes
                 codes = gcs_rows["Kode"].tolist()
                 flat_codes = []
                 for c in codes:
