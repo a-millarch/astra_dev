@@ -73,6 +73,9 @@ def load_ppj_mapping(cfg) -> pd.DataFrame:
     ppj_map = ppj_map.loc[:, ~ppj_map.columns.str.startswith("Unnamed")]
     ppj_map.drop_duplicates(inplace=True)
 
+    logger.info(f"PPJ mapping columns: {ppj_map.columns.tolist()}")
+    logger.info(f"PPJ mapping: {len(ppj_map)} rows, {ppj_map['CPR_hash'].nunique()} unique CPR_hash")
+
     # Parse timestamps
     if "CreationTime" in ppj_map.columns:
         ppj_map["CreationTime_dt"] = parse_ppj_timestamps(ppj_map["CreationTime"])
@@ -131,6 +134,9 @@ def load_ppj_data(cfg) -> pd.DataFrame:
     ppj = ppj[ppj["EventCodeName"] != "PAT00013"].copy()
 
     logger.info(f"Loaded {len(ppj)} PPJ records across {ppj['JournalID'].nunique()} journals")
+    logger.info(f"PPJ data columns: {ppj.columns.tolist()}")
+    logger.info(f"PPJ dtypes:\n{ppj.dtypes}")
+    logger.debug(f"PPJ sample (first 3 rows):\n{ppj.head(3).to_string()}")
     return ppj
 
 
@@ -191,6 +197,13 @@ def filter_ppj_to_population(
     ppj_filtered = ppj_filtered.merge(jid_to_pid, on="JournalID", how="left")
     ppj_filtered = ppj_filtered[ppj_filtered["PID"].notnull()].copy()
 
+    logger.info(f"ppj_filtered: {len(ppj_filtered)} rows, columns: {ppj_filtered.columns.tolist()}")
+    if "EventCodeName" in ppj_filtered.columns and len(ppj_filtered) > 0:
+        logger.info(
+            f"ppj_filtered unique EventCodeNames ({ppj_filtered['EventCodeName'].nunique()}): "
+            f"{ppj_filtered['EventCodeName'].value_counts().head(30).to_dict()}"
+        )
+
     # Build per-PID population summary (ph_pop)
     ph_pop = ph[["CPR_hash", "PID", "start", "end"]].drop_duplicates(subset=["PID"])
 
@@ -213,10 +226,16 @@ def extract_ppj_vitals(
     """
     # Filter to vital sign event codes
     vital_codes = list(PPJ_VITAL_EVENT_CODES.keys())
+    logger.info(f"Filtering for vital event codes: {vital_codes}")
     vitals = ppj_filtered[ppj_filtered["EventCodeName"].isin(vital_codes)].copy()
+    logger.info(f"Vital sign matches: {len(vitals)} rows")
 
     if vitals.empty:
         logger.warning("No pre-hospital vital signs found in PPJ data")
+        logger.warning(
+            f"Available EventCodeNames (top 20): "
+            f"{ppj_filtered['EventCodeName'].value_counts().head(20).to_dict()}"
+        )
         return pd.DataFrame(columns=["TIMESTAMP", "PID", "FEATURE", "VALUE"])
 
     # Map event codes to subset names, then to ASTRA standard names
@@ -267,6 +286,7 @@ def extract_ppj_gcs(
     # The event code for GCS needs to be identified from event_descriptions.
     # For now, filter by ValueFloat presence and known GCS event codes.
     gcs_codes = _get_gcs_event_codes(ppj_filtered)
+    logger.info(f"GCS event codes resolved to: {gcs_codes}")
 
     if not gcs_codes:
         logger.warning("No GCS event codes identified in PPJ data")
@@ -310,13 +330,18 @@ def _get_gcs_event_codes(ppj_filtered: pd.DataFrame) -> list:
     ph_cfg = cfg.get("prehospital_config", {})
     ed_path = ph_cfg.get("event_descriptions_path")
 
+    logger.info(f"GCS code resolution — event_descriptions_path: {ed_path}")
+    logger.info(f"  exists on disk: {ed_path and os.path.exists(ed_path)}")
+
     if ed_path and os.path.exists(ed_path):
         try:
             ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
+            logger.info(f"  event_descriptions loaded: {len(ed)} rows, columns: {ed.columns.tolist()}")
             gcs_rows = ed[ed["Tekst"].str.contains("GCS", case=False, na=False)]
+            logger.info(f"  GCS rows found: {len(gcs_rows)}")
             if not gcs_rows.empty:
+                logger.info(f"  GCS rows:\n{gcs_rows[['Kode', 'Tekst']].to_string()}")
                 codes = gcs_rows["Kode"].tolist()
-                # Flatten lists if codes are stored as lists
                 flat_codes = []
                 for c in codes:
                     if isinstance(c, list):
@@ -330,21 +355,23 @@ def _get_gcs_event_codes(ppj_filtered: pd.DataFrame) -> list:
 
     # Fallback: scan PPJ data for likely GCS codes
     # GCS values are typically 3-15 (integers)
+    logger.info("GCS fallback: scanning PPJ data for likely GCS codes")
     if "ValueFloat" in ppj_filtered.columns:
+        numeric_vals = pd.to_numeric(ppj_filtered["ValueFloat"], errors="coerce")
         candidates = ppj_filtered[
-            ppj_filtered["ValueFloat"].between(3, 15)
+            numeric_vals.between(3, 15)
         ]["EventCodeName"].value_counts()
-        # Look for event codes that consistently have values 3-15
-        # This is a heuristic — log for manual verification
         if not candidates.empty:
-            logger.info(f"Candidate GCS event codes (by frequency): {candidates.head(5).to_dict()}")
+            logger.info(f"Candidate GCS event codes (by frequency): {candidates.head(10).to_dict()}")
 
     logger.warning(
         "Could not determine GCS event codes automatically. "
         "Set prehospital_config.gcs_event_codes in config or provide event_descriptions_path."
     )
     # Return configured codes if available
-    return ph_cfg.get("gcs_event_codes", [])
+    configured = ph_cfg.get("gcs_event_codes", [])
+    logger.info(f"GCS codes from config fallback: {configured}")
+    return configured
 
 
 def extract_ppj_abcd(
@@ -366,9 +393,15 @@ def extract_ppj_abcd(
     ed_path = ph_cfg.get("event_descriptions_path")
     abcd_codes = ph_cfg.get("abcd_event_codes", {})
 
+    logger.info(f"ABCD extraction — event_descriptions_path: {ed_path}")
+    logger.info(f"  exists on disk: {ed_path and os.path.exists(ed_path)}")
+    logger.info(f"  abcd_event_codes from config: {abcd_codes}")
+
     # Try to resolve ABCD event codes from event_descriptions
     if not abcd_codes and ed_path and os.path.exists(ed_path):
         abcd_codes = _get_abcd_event_codes(ed_path)
+
+    logger.info(f"ABCD event codes resolved to: {abcd_codes}")
 
     if not abcd_codes:
         logger.warning("No ABCD event codes configured — skipping ABCD extraction")
@@ -426,14 +459,21 @@ def _get_abcd_event_codes(ed_path: str) -> dict:
         ed_pre = pd.read_excel(
             ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl"
         )
+        logger.info(f"ABCD code resolution — event_descriptions loaded: {len(ed_pre)} rows")
+        logger.info(f"  Columns: {ed_pre.columns.tolist()}")
+        logger.info(f"  Sample Tekst values: {ed_pre['Tekst'].head(20).tolist()}")
         codes = {}
         for ppj_name in PPJ_ABCD_MAP:
             matches = ed_pre[ed_pre["Tekst"] == ppj_name]
+            logger.info(f"  ABCD lookup '{ppj_name}': {len(matches)} matches")
             if not matches.empty:
                 code_val = matches["Kode"].iloc[0]
                 codes[ppj_name] = [code_val] if not isinstance(code_val, list) else code_val
+                logger.info(f"    → code: {codes[ppj_name]}")
         if codes:
             logger.info(f"ABCD event codes from event_descriptions: {codes}")
+        else:
+            logger.warning("No ABCD event codes found in event_descriptions")
         return codes
     except Exception as e:
         logger.warning(f"Could not read ABCD event codes from {ed_path}: {e}")
