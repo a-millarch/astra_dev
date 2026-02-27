@@ -21,7 +21,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from astra.utils import cfg, get_base_df, is_file_present
+from astra.utils import cfg, get_base_df, is_file_present, setup_logging
 from astra.data.mappings import (
     PPJ_MONTH_DICT,
     PPJ_VITALS_MAP,
@@ -30,7 +30,7 @@ from astra.data.mappings import (
     PPJ_VITAL_BOUNDS,
 )
 
-logger = logging.getLogger(__name__)
+logger = setup_logging()
 
 
 # ============================================================================
@@ -625,13 +625,20 @@ if __name__ == "__main__":
     # Verify logging works
     print(f"[prehospital __main__] Logger handlers: {logging.getLogger('astra').handlers}")
     print(f"[prehospital __main__] Logger level: {logging.getLogger('astra').level}")
-    logger.info("Pre-hospital pipeline starting (standalone mode)")
+    print("[prehospital __main__] About to call run_prehospital_pipeline...")
+    import sys
+    sys.stdout.flush()
 
     try:
         cfg["prehospital"] = True  # force-enable for standalone run
+        print("[prehospital __main__] cfg set, calling pipeline now")
+        sys.stdout.flush()
         base = run_prehospital_pipeline(cfg)
+        print(f"[prehospital __main__] Pipeline returned, base shape: {base.shape}")
+        sys.stdout.flush()
         base.to_pickle(cfg["base_df_path"], protocol=4)
-        logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
-    except Exception as e:
-        print(f"[prehospital __main__] FATAL ERROR: {e}")
+        print(f"[prehospital __main__] Saved to {cfg['base_df_path']}")
+    except BaseException as e:
+        print(f"[prehospital __main__] FATAL ERROR ({type(e).__name__}): {e}")
         traceback.print_exc()
+        sys.stdout.flush()
