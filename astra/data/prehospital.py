@@ -165,6 +165,11 @@ def filter_ppj_to_population(
 
     # Compute hours before admission
     if "CreationTime_dt" in ph.columns:
+        # Ensure datetime types for subtraction
+        ph["CreationTime_dt"] = pd.to_datetime(ph["CreationTime_dt"])
+        ph["start"] = pd.to_datetime(ph["start"])
+        ph["end"] = pd.to_datetime(ph["end"])
+
         ph["delta_hours_start"] = (
             ph["CreationTime_dt"] - ph["start"]
         ).dt.total_seconds() / 3600
