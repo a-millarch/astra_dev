@@ -7,7 +7,7 @@ dependencies:
   # ── Python ────────────────────────────────────────────────────────────────
   - python=3.10.14
   - pip>=24.0
-  - setuptools>=69.0
+  - setuptools<=81
   - wheel>=0.43
 
   # ── PyTorch (CPU-only) ────────────────────────────────────────────────────
@@ -103,6 +103,7 @@ dependencies:
       - fsspec
       - narwhals
       - sqlalchemy
+      - openpyxl
 
       # ── Parallel / async ──────────────────────────────────────────────────
       - ray==2.2.0

@@ -529,6 +529,11 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
     ph_pop = compute_prehospital_times(ppj_filtered, ph_pop)
 
     # Step 5: Merge into base_df
+    # Drop existing prehospital columns to avoid _x/_y suffixing on re-runs
+    for col in ["prehospital_start", "prehospital_end"]:
+        if col in base.columns:
+            base = base.drop(columns=[col])
+
     # Add prehospital_start — fall back to hospital start for patients without PPJ
     base = base.merge(
         ph_pop[["PID", "prehospital_start", "prehospital_end"]],
@@ -542,6 +547,10 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
     # Add ABCD as tabular features
     if not abcd.empty and len(abcd.columns) > 1:
         abcd_cols = [c for c in abcd.columns if c != "PID"]
+        # Drop existing ABCD columns to avoid _x/_y suffixing on re-runs
+        for col in abcd_cols:
+            if col in base.columns:
+                base = base.drop(columns=[col])
         base = base.merge(abcd, on="PID", how="left")
         for col in abcd_cols:
             base[col] = base[col].fillna("#na#")
