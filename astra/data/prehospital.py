@@ -230,6 +230,14 @@ def extract_ppj_vitals(
     vitals = ppj_filtered[ppj_filtered["EventCodeName"].isin(vital_codes)].copy()
     logger.info(f"Vital sign matches: {len(vitals)} rows")
 
+    if len(vitals) > 0:
+        logger.info(f"  Non-null counts per column:\n{vitals.notna().sum().to_string()}")
+        logger.info(f"  ValueFloat non-null: {vitals['ValueFloat'].notna().sum()}, "
+                     f"ValueString non-null: {vitals['ValueString'].notna().sum()}")
+        logger.info(f"  ManualTime non-null: {vitals['ManualTime'].notna().sum()}, "
+                     f"CreationTime non-null: {vitals['CreationTime'].notna().sum()}")
+        logger.info(f"  Sample rows:\n{vitals.head(5).to_string()}")
+
     if vitals.empty:
         logger.warning("No pre-hospital vital signs found in PPJ data")
         logger.warning(
@@ -293,6 +301,13 @@ def extract_ppj_gcs(
         return pd.DataFrame(columns=["TIMESTAMP", "PID", "FEATURE", "VALUE"])
 
     gcs = ppj_filtered[ppj_filtered["EventCodeName"].isin(gcs_codes)].copy()
+    logger.info(f"GCS matches: {len(gcs)} rows")
+
+    if len(gcs) > 0:
+        logger.info(f"  GCS non-null counts:\n{gcs.notna().sum().to_string()}")
+        logger.info(f"  GCS ValueFloat non-null: {gcs['ValueFloat'].notna().sum()}, "
+                     f"ValueString non-null: {gcs['ValueString'].notna().sum()}")
+        logger.info(f"  GCS sample rows:\n{gcs.head(5).to_string()}")
 
     if gcs.empty:
         logger.warning("No pre-hospital GCS records found")
@@ -417,13 +432,21 @@ def extract_ppj_abcd(
             continue
 
         subset = ppj_filtered[ppj_filtered["EventCodeName"].isin(codes)].copy()
+        logger.info(f"  ABCD '{ppj_name}' ({short_name}): {len(subset)} rows matching codes {codes}")
         if subset.empty:
             continue
+
+        logger.info(f"    Non-null: ValueString={subset['ValueString'].notna().sum()}, "
+                     f"ValueFloat={subset['ValueFloat'].notna().sum()}, "
+                     f"ValueBool={subset['ValueBool'].notna().sum()}")
+        logger.info(f"    Sample rows:\n{subset.head(3).to_string()}")
 
         # Use ValueString for categorical values
         val_col = "ValueString" if "ValueString" in subset.columns else "ValueFloat"
         subset["value"] = subset[val_col].astype(str).str.replace('"', '')
+        logger.info(f"    After str conversion, unique values: {subset['value'].unique()[:10].tolist()}")
         subset = subset[subset["value"].notna() & (subset["value"] != "nan")]
+        logger.info(f"    After NaN filter: {len(subset)} rows")
 
         # Take latest observation per PID
         subset["ts"] = subset["ManualTime"].fillna(subset["CreationTime"])
