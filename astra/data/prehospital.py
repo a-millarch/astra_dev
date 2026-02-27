@@ -122,10 +122,24 @@ def load_ppj_data(cfg) -> pd.DataFrame:
     ppj = pd.concat(dfs, ignore_index=True)
     ppj.drop_duplicates(inplace=True)
 
-    # Parse timestamps
+    # Parse timestamps — try standard datetime first, fall back to PPJ SAS format
     for col in ["CreationTime", "ManualTime"]:
         if col in ppj.columns:
-            ppj[col] = parse_ppj_timestamps(ppj[col])
+            # Log sample raw values before parsing
+            raw_sample = ppj[col].dropna().head(3).tolist()
+            logger.info(f"Raw {col} samples (before parsing): {raw_sample}")
+
+            # Try standard datetime parsing (ISO, etc.)
+            parsed = pd.to_datetime(ppj[col], errors="coerce")
+            n_standard = parsed.notna().sum()
+
+            if n_standard == 0:
+                # Fall back to PPJ-specific SAS-style format (22FEB2018:13:40:02.2750)
+                logger.info(f"Standard parse yielded 0 timestamps for {col}, trying PPJ SAS format")
+                parsed = parse_ppj_timestamps(ppj[col])
+
+            ppj[col] = parsed
+            logger.info(f"Parsed {col}: {ppj[col].notna().sum()}/{len(ppj)} non-NaT")
 
     # Replace empty quoted strings with NaN
     ppj.replace('""', np.nan, inplace=True)
@@ -204,6 +218,23 @@ def filter_ppj_to_population(
             f"{ppj_filtered['EventCodeName'].value_counts().head(30).to_dict()}"
         )
 
+        # Look up top event codes in event_descriptions to understand data structure
+        ph_cfg = cfg.get("prehospital_config", {})
+        ed_path = ph_cfg.get("event_descriptions_path")
+        if ed_path and os.path.exists(ed_path):
+            try:
+                ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
+                top_codes = ppj_filtered["EventCodeName"].value_counts().head(15).index.tolist()
+                for code in top_codes:
+                    row = ed[ed["Kode"] == code]
+                    if not row.empty:
+                        logger.info(
+                            f"  {code}: Tekst='{row['Tekst'].iloc[0]}', "
+                            f"Datatype='{row['Datatype'].iloc[0]}'"
+                        )
+            except Exception as e:
+                logger.debug(f"Could not look up event codes in event_descriptions: {e}")
+
     # Build per-PID population summary (ph_pop)
     ph_pop = ph[["CPR_hash", "PID", "start", "end"]].drop_duplicates(subset=["PID"])
 
@@ -237,6 +268,29 @@ def extract_ppj_vitals(
         logger.info(f"  ManualTime non-null: {vitals['ManualTime'].notna().sum()}, "
                      f"CreationTime non-null: {vitals['CreationTime'].notna().sum()}")
         logger.info(f"  Sample rows:\n{vitals.head(5).to_string()}")
+        # Check if values look like listvalue indices vs real measurements
+        for code in vital_codes:
+            code_rows = vitals[vitals["EventCodeName"] == code]
+            if len(code_rows) > 0:
+                vals = pd.to_numeric(code_rows["ValueFloat"], errors="coerce").dropna()
+                logger.info(f"  {code} ({PPJ_VITAL_EVENT_CODES.get(code, '?')}): "
+                             f"n={len(vals)}, range=[{vals.min():.1f}, {vals.max():.1f}], "
+                             f"unique={sorted(vals.unique()[:15].tolist())}")
+
+    # Check event_descriptions Datatype for these codes
+    ph_cfg = cfg.get("prehospital_config", {})
+    ed_path = ph_cfg.get("event_descriptions_path")
+    if ed_path and os.path.exists(ed_path):
+        try:
+            ed = pd.read_excel(ed_path, sheet_name="Prædefinerede eventkoder", engine="openpyxl")
+            for code in vital_codes:
+                row = ed[ed["Kode"] == code]
+                if not row.empty:
+                    logger.info(f"  event_descriptions for {code}: Tekst='{row['Tekst'].iloc[0]}', "
+                                 f"Datatype='{row['Datatype'].iloc[0]}', "
+                                 f"Værdier='{row['Værdier'].iloc[0]}'")
+        except Exception as e:
+            logger.debug(f"Could not read event_descriptions for vital code info: {e}")
 
     if vitals.empty:
         logger.warning("No pre-hospital vital signs found in PPJ data")
@@ -308,6 +362,14 @@ def extract_ppj_gcs(
         logger.info(f"  GCS ValueFloat non-null: {gcs['ValueFloat'].notna().sum()}, "
                      f"ValueString non-null: {gcs['ValueString'].notna().sum()}")
         logger.info(f"  GCS sample rows:\n{gcs.head(5).to_string()}")
+        # Check value ranges per GCS code
+        for code in gcs_codes:
+            code_rows = gcs[gcs["EventCodeName"] == code]
+            if len(code_rows) > 0:
+                vals = pd.to_numeric(code_rows["ValueFloat"], errors="coerce").dropna()
+                if len(vals) > 0:
+                    logger.info(f"  {code}: n={len(vals)}, range=[{vals.min():.1f}, {vals.max():.1f}], "
+                                 f"unique={sorted(vals.unique()[:15].tolist())}")
 
     if gcs.empty:
         logger.warning("No pre-hospital GCS records found")
@@ -441,8 +503,12 @@ def extract_ppj_abcd(
                      f"ValueBool={subset['ValueBool'].notna().sum()}")
         logger.info(f"    Sample rows:\n{subset.head(3).to_string()}")
 
-        # Use ValueString for categorical values
-        val_col = "ValueString" if "ValueString" in subset.columns else "ValueFloat"
+        # Use ValueString for categorical values; fall back to ValueFloat if ValueString is all NaN
+        if "ValueString" in subset.columns and subset["ValueString"].notna().any():
+            val_col = "ValueString"
+        else:
+            val_col = "ValueFloat"
+        logger.info(f"    Using {val_col} for values")
         subset["value"] = subset[val_col].astype(str).str.replace('"', '')
         logger.info(f"    After str conversion, unique values: {subset['value'].unique()[:10].tolist()}")
         subset = subset[subset["value"].notna() & (subset["value"] != "nan")]
