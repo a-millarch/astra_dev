@@ -194,10 +194,8 @@ def prepare_data_and_dls(cfg):
     - Padding zeros remain as zeros after normalization
     - Model correctly distinguishes signal from padding
     """
-    # Load dataframes
+    # Load dataframes — exclusion criteria are applied inside TSDS.__init__
     base = get_base_df()
-    if cfg["dataset"]["exclusion"] == "lvl1tc":
-        base = base[base.LVL1TC == 1]
 
     concepts = cfg["concepts"]
 

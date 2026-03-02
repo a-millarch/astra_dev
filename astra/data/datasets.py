@@ -1,4 +1,5 @@
 import logging
+import operator
 import warnings
 from typing import List, Dict, Optional, Union
 
@@ -18,6 +19,136 @@ def get_effective_cat_cols(cfg: dict) -> list:
         ppj_cat_cols = cfg["dataset"].get("ppj_cat_cols", [])
         cat_cols.extend(c for c in ppj_cat_cols if c not in cat_cols)
     return cat_cols
+
+
+# ============================================================================
+# Exclusion criteria
+# ============================================================================
+
+_CUSTOM_OPS = {
+    "==": operator.eq, "!=": operator.ne,
+    "<": operator.lt,  "<=": operator.le,
+    ">": operator.gt,  ">=": operator.ge,
+}
+
+
+def resolve_exclusion_criteria(cfg: dict) -> Optional[dict]:
+    """Look up the active exclusion profile from config.
+
+    Returns the criteria dict for the selected profile, or None if exclusion
+    is disabled (null / false / 0).
+    """
+    profile = cfg.get("dataset", {}).get("exclusion")
+    if not profile:
+        return None
+    profiles = cfg.get("exclusion_criteria", {})
+    if profile not in profiles:
+        raise ValueError(
+            f"Exclusion profile '{profile}' not found in exclusion_criteria. "
+            f"Available: {list(profiles.keys())}"
+        )
+    return profiles[profile]
+
+
+def apply_exclusion_criteria(
+    base_df: pd.DataFrame,
+    criteria: dict,
+) -> pd.DataFrame:
+    """Filter *base_df* according to a criteria dict.
+
+    Each key is optional — only applied when present and has a truthy /
+    non-empty value.  Returns a filtered **copy**.
+    """
+    n_before = len(base_df)
+    mask = pd.Series(True, index=base_df.index)
+
+    # --- named criteria ------------------------------------------------
+    age_min = criteria.get("age_min")
+    if age_min is not None and age_min is not False:
+        m = base_df["AGE"] >= age_min
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  age_min >= {age_min}: -{excluded}")
+        mask &= m
+
+    age_max = criteria.get("age_max")
+    if age_max is not None and age_max is not False:
+        m = base_df["AGE"] <= age_max
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  age_max <= {age_max}: -{excluded}")
+        mask &= m
+
+    start_year = criteria.get("start_year")
+    if start_year:
+        m = base_df["ServiceDate"].dt.year >= start_year
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  start_year >= {start_year}: -{excluded}")
+        mask &= m
+
+    end_year = criteria.get("end_year")
+    if end_year:
+        m = base_df["ServiceDate"].dt.year <= end_year
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  end_year <= {end_year}: -{excluded}")
+        mask &= m
+
+    if criteria.get("lvl1tc"):
+        m = base_df["LVL1TC"] == 1
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  lvl1tc only: -{excluded}")
+        mask &= m
+
+    if criteria.get("prehospital_only"):
+        col = "prehospital_start" if "prehospital_start" in base_df.columns else "prehospital_end"
+        if col in base_df.columns:
+            m = base_df[col].notna()
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  prehospital_only ({col} notna): -{excluded}")
+            mask &= m
+        else:
+            logger.warning("  exclusion  prehospital_only requested but no prehospital column found")
+
+    first_hospital = criteria.get("first_hospital")
+    if first_hospital:
+        m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  first_hospital in {first_hospital}: -{excluded}")
+        mask &= m
+
+    # --- generic custom_filters ----------------------------------------
+    for filt in criteria.get("custom_filters", []) or []:
+        col = filt["column"]
+        op_str = filt["op"]
+        val = filt["value"]
+
+        if op_str == "in":
+            m = base_df[col].isin(val)
+        elif op_str == "not_in":
+            m = ~base_df[col].isin(val)
+        elif op_str in _CUSTOM_OPS:
+            m = _CUSTOM_OPS[op_str](base_df[col], val)
+        else:
+            raise ValueError(f"Unknown operator '{op_str}' in custom_filter for column '{col}'")
+
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  {col} {op_str} {val}: -{excluded}")
+        mask &= m
+
+    filtered = base_df.loc[mask].copy()
+    n_after = len(filtered)
+    logger.info(
+        f"Exclusion criteria applied: {n_before} → {n_after} patients "
+        f"(-{n_before - n_after})"
+    )
+    return filtered
+
 
 class AggregatedDS:
     """
@@ -59,9 +190,18 @@ class AggregatedDS:
     ):
         self.cfg = cfg
         self.target = cfg["target"]
-        #reorder by date for temporal split
-        self.base = base_df.sort_values('start').reset_index(drop=True).copy(deep=True)
         self.masking_point = masking_point
+
+        # Store unfiltered base for reset_filters()
+        self._unfiltered_base = base_df.copy()
+
+        # Apply config-driven exclusion criteria BEFORE any aggregation
+        criteria = resolve_exclusion_criteria(cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        # Reorder by date for temporal split
+        self.base = base_df.sort_values('start').reset_index(drop=True).copy(deep=True)
 
         # Try to import GPU libraries
         try:
@@ -522,6 +662,50 @@ class AggregatedDS:
         self.final_df.to_pickle(filepath)
         logger.info(f"Saved to {filepath}")
 
+    # --- post-hoc exclusion for experimentation -------------------------
+
+    def filter(self, criteria: dict):
+        """Apply exclusion criteria to the already-built dataset.
+
+        Filters all internal DataFrames by PID set.  Use ``reset_filters()``
+        to restore the original unfiltered state.  Returns *self* for chaining.
+        """
+        filtered_base = apply_exclusion_criteria(self.base, criteria)
+        keep_pids = set(filtered_base["PID"].unique())
+
+        self.base = filtered_base.reset_index(drop=True)
+        self._base_pids = keep_pids
+        self.tab_df = self.tab_df[self.tab_df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "final_df") and self.final_df is not None:
+            id_col = self.cfg["dataset"]["id_col"]
+            self.final_df = self.final_df[self.final_df[id_col].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "aggregated_concepts"):
+            for name, df in self.aggregated_concepts.items():
+                self.aggregated_concepts[name] = df[df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        return self
+
+    def reset_filters(self):
+        """Restore original unfiltered base_df and rebuild internal DataFrames."""
+        base_df = self._unfiltered_base.copy()
+
+        # Re-apply config exclusion if set
+        criteria = resolve_exclusion_criteria(self.cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        self.base = base_df.sort_values("start").reset_index(drop=True)
+        self._base_pids = set(self.base["PID"].unique())
+
+        self.continuous_features = []
+        self.categorical_features = []
+        self.set_tab_df()
+        self.collect_and_aggregate_concepts()
+        self.create_final_dataset()
+
+        return self
 
 
 class TSDS:
@@ -534,6 +718,15 @@ class TSDS:
     ):
         self.cfg = cfg
         self.target = cfg["target"]
+
+        # Store unfiltered base for reset_filters()
+        self._unfiltered_base = base_df.copy()
+
+        # Apply config-driven exclusion criteria BEFORE concept collection
+        criteria = resolve_exclusion_criteria(cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
         self.base = base_df
         self._base_pids = set(base_df['PID'].unique())
 
@@ -602,6 +795,43 @@ class TSDS:
             self.vitals.iloc[:, :-1] = self.vitals.iloc[:, :-1].ffill(axis=1)
             # for target and if ffill not available
             self.vitals = self.vitals.fillna(0.0)
+
+    # --- post-hoc exclusion for experimentation -------------------------
+
+    def filter(self, criteria: dict):
+        """Apply exclusion criteria to the already-built dataset.
+
+        Filters all internal DataFrames by PID set.  Use ``reset_filters()``
+        to restore the original unfiltered state.  Returns *self* for chaining.
+        """
+        filtered_base = apply_exclusion_criteria(self.base, criteria)
+        keep_pids = set(filtered_base["PID"].unique())
+
+        self.base = filtered_base.reset_index(drop=True)
+        self._base_pids = keep_pids
+        self.tab_df = self.tab_df[self.tab_df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "concepts") and isinstance(self.concepts, dict):
+            for name, df in self.concepts.items():
+                self.concepts[name] = df[df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        return self
+
+    def reset_filters(self):
+        """Restore original unfiltered base_df and rebuild internal DataFrames."""
+        base_df = self._unfiltered_base.copy()
+
+        # Re-apply config exclusion if set
+        criteria = resolve_exclusion_criteria(self.cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        self.base = base_df
+        self._base_pids = set(self.base["PID"].unique())
+        self.set_tab_df()
+        self.collect_concepts()
+
+        return self
 
 
 def _create_temporal_features_df(

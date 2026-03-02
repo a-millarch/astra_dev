@@ -24,9 +24,17 @@ _CACHE_VERSION = 2
 
 def _get_cache_key(cfg):
     """Generate a unique cache key based on config parameters that affect data preparation."""
+    # Resolve the active exclusion profile contents (not just the name)
+    # so that changing criteria within a profile invalidates the cache.
+    from astra.data.datasets import resolve_exclusion_criteria
+    resolved_exclusion = resolve_exclusion_criteria(cfg)
+
     key_params = {
         "_cache_version": _CACHE_VERSION,
         "dataset": cfg.get("dataset", {}),
+        "exclusion_criteria_resolved": resolved_exclusion,
+        "prehospital": cfg.get("prehospital", False),
+        "prehospital_only": cfg.get("prehospital_only", False),
         "concepts": cfg.get("concepts", []),
         "target": cfg.get("target"),
         "holdout_split_date": cfg.get("holdout_split_date", "2023-06-01"),

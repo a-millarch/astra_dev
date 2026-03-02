@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '26022026_ppj'
+model_name: '02032026_ppj_study'
 
 target: deceased_90d
 
@@ -41,16 +41,10 @@ concepts:
   
 
 dataset:
-  exclusion: 0 #lvl1tc
-  overwrite: True 
-  max_duration_days: 365 #now cut off using bins 
+  exclusion: null  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  overwrite: True
+  max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
-  
-  start_year: 2017
-  end_year: 2024
-  
-  age_min: 0
-  age_max: 90
 
   id_col: PID
   ts_cat_names:
@@ -77,7 +71,27 @@ dataset:
       - ASMT_ELIX
       - HEIGHT
       - WEIGHT
-      
+
+# Exclusion criteria profiles — selected by dataset.exclusion
+exclusion_criteria:
+  study:
+    age_min: 0
+    age_max: 90
+    start_year: 2017
+    end_year: None
+    lvl1tc: true
+    prehospital_only: true
+    first_hospital:
+      - None
+    custom_filters: []
+    # Example custom_filters:
+    # - column: DURATION
+    #   op: "<="
+    #   value: 365
+
+  lvl1tc:
+    lvl1tc: true
+
 pretrain:
     mask_prob_ts: 0.15
     mask_prob_cat_ts: 0.15
