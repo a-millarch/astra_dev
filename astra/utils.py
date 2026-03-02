@@ -42,17 +42,13 @@ class ProjectManager:
     def return_workdir(self, workdir):
         return f'/mnt/batch/tasks/shared/LS_root/mounts/clusters/{self.compute_name}/code/Users/{workdir}'
         
-    def set_workdir(self, workdir): 
+    def set_workdir(self, workdir):
         new_workdir = self.return_workdir(workdir)
-        
+
         if os.path.exists(new_workdir):
-            os.chdir(new_workdir)
-            print(f"Working directory changed to: {new_workdir}")
             self.workdir = new_workdir
         else:
             print(f"Directory does not exist: {new_workdir}")
-        return
-        print("No matching compute name found in the current working directory.")
         
 
 # ---------------------------------------------------------------------------
