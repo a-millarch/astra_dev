@@ -53,6 +53,7 @@ class ProjectManager:
 
         if os.path.exists(new_workdir):
             self.workdir = new_workdir
+            os.chdir(new_workdir)
         else:
             print(f"Directory does not exist: {new_workdir}")
         
