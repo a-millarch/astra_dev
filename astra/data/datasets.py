@@ -50,9 +50,20 @@ def resolve_exclusion_criteria(cfg: dict) -> Optional[dict]:
     return profiles[profile]
 
 
-def _is_numeric(val) -> bool:
-    """True if val is a real number (not None, not a string, not a bool)."""
-    return isinstance(val, (int, float)) and not isinstance(val, bool)
+def _sanitize_yaml(val):
+    """Normalize YAML quirks: turn the string ``"None"`` into Python ``None``.
+
+    YAML only recognizes ``null`` / ``~`` as null — unquoted ``None`` is parsed
+    as a string.  This helper is applied recursively so that any value in a
+    criteria dict written as ``None`` in YAML behaves like ``null``.
+    """
+    if isinstance(val, str) and val.lower() == "none":
+        return None
+    if isinstance(val, dict):
+        return {k: _sanitize_yaml(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_sanitize_yaml(v) for v in val]
+    return val
 
 
 def apply_exclusion_criteria(
@@ -61,16 +72,16 @@ def apply_exclusion_criteria(
 ) -> pd.DataFrame:
     """Filter *base_df* according to a criteria dict.
 
-    Each key is optional — only applied when present and has a real numeric /
-    truthy value.  YAML ``None`` (parsed as Python None *or* the string
-    ``"None"``) is treated as "skip this criterion".  Returns a filtered **copy**.
+    Each key is optional — only applied when present and has a truthy /
+    non-empty value (``null`` / ``None`` → skip).  Returns a filtered **copy**.
     """
+    criteria = _sanitize_yaml(criteria)
     n_before = len(base_df)
     mask = pd.Series(True, index=base_df.index)
 
     # --- named criteria ------------------------------------------------
     age_min = criteria.get("age_min")
-    if _is_numeric(age_min):
+    if isinstance(age_min, (int, float)):
         m = base_df["AGE"] >= age_min
         excluded = (~m & mask).sum()
         if excluded:
@@ -78,7 +89,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     age_max = criteria.get("age_max")
-    if _is_numeric(age_max):
+    if isinstance(age_max, (int, float)):
         m = base_df["AGE"] <= age_max
         excluded = (~m & mask).sum()
         if excluded:
@@ -86,7 +97,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     start_year = criteria.get("start_year")
-    if _is_numeric(start_year):
+    if isinstance(start_year, (int, float)):
         m = base_df["ServiceDate"].dt.year >= start_year
         excluded = (~m & mask).sum()
         if excluded:
@@ -94,7 +105,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     end_year = criteria.get("end_year")
-    if _is_numeric(end_year):
+    if isinstance(end_year, (int, float)):
         m = base_df["ServiceDate"].dt.year <= end_year
         excluded = (~m & mask).sum()
         if excluded:
