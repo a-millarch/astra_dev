@@ -78,11 +78,11 @@ exclusion_criteria:
     age_min: 0
     age_max: 90
     start_year: 2017
-    end_year: None
+    end_year: null
     lvl1tc: true
     prehospital_only: true
     first_hospital:
-      - None
+      - null
     custom_filters: []
     # Example custom_filters:
     # - column: DURATION
