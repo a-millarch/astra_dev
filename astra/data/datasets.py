@@ -113,7 +113,7 @@ def apply_exclusion_criteria(
         else:
             logger.warning("  exclusion  prehospital_only requested but no prehospital column found")
 
-    first_hospital = criteria.get("first_hospital")
+    first_hospital = [v for v in (criteria.get("first_hospital") or []) if v is not None]
     if first_hospital:
         m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
         excluded = (~m & mask).sum()

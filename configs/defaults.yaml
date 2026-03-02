@@ -41,7 +41,7 @@ concepts:
   
 
 dataset:
-  exclusion: null  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
   overwrite: True
   max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
