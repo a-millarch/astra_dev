@@ -328,9 +328,8 @@ def create_bin_df(cfg, base=None):
     and divides the trajectory into time intervals ("bins") according to rules defined in cfg["bin_intervals"].
     These bins can have varying frequencies depending on the duration of the trajectory.
 
-    When prehospital is enabled and base_df contains a ``prehospital_start`` column,
-    bins begin from prehospital_start instead of hospital admission (``start``).
-    For patients without pre-hospital data, falls back to ``start``.
+    After the prehospital pipeline, ``start`` is the universal earliest timestamp
+    (= min(prehospital_start, inhospital_start)), so bins always begin from ``start``.
     """
     logger.info("Generating bin_df")
     bin_list = []
@@ -340,20 +339,14 @@ def create_bin_df(cfg, base=None):
     # Load bin intervals from cfg
     bin_intervals = cfg["bin_intervals"]
 
-    # Determine which column to use as trajectory start
-    use_prehospital = cfg.get("prehospital", False)
-    has_ph_col = "prehospital_start" in base.columns
-    if use_prehospital and has_ph_col:
-        start_col = "prehospital_start"
-        logger.info("Using prehospital_start as trajectory start for bin_df")
-    else:
-        start_col = "start"
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
+    start_col = "start"
 
     for _, row in base.iterrows():
         start_time = row[start_col]
-        # Fall back to hospital start if prehospital_start is NaT
+        # Safety fallback if start is unexpectedly NaT
         if pd.isna(start_time):
-            start_time = row["start"]
+            start_time = row.get("inhospital_start", row.get("start"))
         end_time = row["end"] + pd.Timedelta(minutes=10)
         pid = row["PID"]
 

@@ -113,17 +113,28 @@ def check_base_df() -> dict:
     base = pd.read_pickle(base_path)
     results["shape"] = base.shape
 
-    # Check prehospital_start column
+    # Check prehospital_start column (NaT for patients without PPJ data)
     if "prehospital_start" not in base.columns:
         results["prehospital_start"] = "FAIL — column missing"
     else:
         ph_start = base["prehospital_start"]
         n_valid = ph_start.notna().sum()
-        n_before_admission = (ph_start < base["start"]).sum()
+        n_nat = ph_start.isna().sum()
+        ih_col = "inhospital_start" if "inhospital_start" in base.columns else "start"
+        n_before_admission = (ph_start < base[ih_col]).sum()
         results["prehospital_start"] = {
             "status": "PASS" if n_valid > 0 else "FAIL",
             "valid": f"{n_valid}/{len(base)}",
+            "nat (no PPJ)": f"{n_nat}/{len(base)}",
             "before_admission": n_before_admission,
+        }
+
+    # Check inhospital_start column
+    if "inhospital_start" in base.columns:
+        ih = base["inhospital_start"]
+        results["inhospital_start"] = {
+            "status": "PASS" if ih.notna().all() else "WARN",
+            "valid": f"{ih.notna().sum()}/{len(base)}",
         }
 
     # Check ABCD columns
@@ -165,9 +176,13 @@ def check_bin_df() -> dict:
     results["bin_df_shape"] = bin_df.shape
     results["n_patients"] = bin_df["PID"].nunique()
 
-    # For patients with prehospital_start < start, check that bins start earlier
+    # For patients with prehospital_start < inhospital_start, check bins start earlier
     if "prehospital_start" in base.columns:
-        ph_patients = base[base["prehospital_start"] < base["start"]].copy()
+        ih_col = "inhospital_start" if "inhospital_start" in base.columns else "start"
+        ph_patients = base[
+            base["prehospital_start"].notna()
+            & (base["prehospital_start"] < base[ih_col])
+        ].copy()
         n_ph = len(ph_patients)
         results["patients_with_earlier_start"] = n_ph
 
@@ -181,13 +196,13 @@ def check_bin_df() -> dict:
                 if len(pid_bins) > 0:
                     first_bin = pid_bins.iloc[0]["bin_start"]
                     ph_start = pid_base["prehospital_start"]
-                    hosp_start = pid_base["start"]
+                    hosp_start = pid_base.get(ih_col, pid_base["start"])
                     delta_hours = (hosp_start - first_bin).total_seconds() / 3600
                     checks.append({
                         "PID": pid,
                         "first_bin": str(first_bin),
                         "prehospital_start": str(ph_start),
-                        "hospital_start": str(hosp_start),
+                        "inhospital_start": str(hosp_start),
                         "hours_before_admission": round(delta_hours, 1),
                     })
             results["sample_bin_checks"] = checks

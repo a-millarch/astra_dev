@@ -19,7 +19,7 @@ from astra.utils import cfg
 logger = logging.getLogger(__name__)
 
 # Bump this when cached data format changes to auto-invalidate old caches
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 
 def _get_cache_key(cfg):

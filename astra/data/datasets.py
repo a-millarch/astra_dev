@@ -120,6 +120,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     if criteria.get("prehospital_only"):
+        # prehospital_start is NaT for patients without PPJ data
         col = "prehospital_start" if "prehospital_start" in base_df.columns else "prehospital_end"
         if col in base_df.columns:
             m = base_df[col].notna()
@@ -873,22 +874,16 @@ def _create_temporal_features_df(
         (bin_df['bin_freq'].isin(bin_freq_include))
     ].copy()
 
-    # Merge patient start times — use prehospital_start as reference when available
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
     merge_cols = ['PID', 'start']
-    if 'prehospital_start' in base.columns:
-        merge_cols.append('prehospital_start')
     bf = bf.merge(base[merge_cols], on='PID', how='left')
 
     # Sort and assign sequential position per patient (0-indexed)
     bf = bf.sort_values(['PID', 'bin_counter'])
     bf['position'] = bf.groupby('PID').cumcount()
 
-    # Compute temporal features — reference from trajectory start
-    # Use prehospital_start when available, falling back to hospital start
-    if 'prehospital_start' in bf.columns:
-        ref_start = bf['prehospital_start'].fillna(bf['start'])
-    else:
-        ref_start = bf['start']
+    # Compute temporal features — reference from universal trajectory start
+    ref_start = bf['start']
     bf['elapsed_hours'] = (
         (bf['bin_start'] - ref_start).dt.total_seconds() / 3600
         + (bf['bin_end'] - bf['bin_start']).dt.total_seconds() / 7200  # midpoint

@@ -92,19 +92,10 @@ def filter_inhospital(
     # ensure datetime format for input df
     df = ensure_datetime(df, dt_name)
 
-    # Determine which columns to merge — include prehospital_start when available
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
     base_cols = ["PID", "CPR_hash", "start", "end"]
-    use_ph_start = cfg.get("prehospital", False) and "prehospital_start" in base.columns
-    if use_ph_start:
-        base_cols.append("prehospital_start")
-
     merged_df = base[base_cols].merge(df, on="CPR_hash", how="left")
-
-    # Use prehospital_start as lower bound when available, else hospital start
-    if use_ph_start:
-        lower_bound = merged_df["prehospital_start"].fillna(merged_df["start"])
-    else:
-        lower_bound = merged_df["start"]
+    lower_bound = merged_df["start"]
 
     filtered_df = merged_df[
         (merged_df[dt_name] >= lower_bound - pd.DateOffset(days=offset))

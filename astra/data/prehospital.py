@@ -684,7 +684,10 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
     5. Merge prehospital_start and ABCD into base_df.
 
     Returns the updated base_df with new columns:
-    - prehospital_start: earliest PPJ timestamp (or hospital start if no PPJ)
+    - prehospital_start: earliest PPJ timestamp (NaT if no PPJ data)
+    - prehospital_end: latest PPJ timestamp (NaT if no PPJ data)
+    - inhospital_start: hospital admission time (formerly 'start')
+    - start: universal earliest timestamp = min(prehospital_start, inhospital_start)
     - A, B, C, D: ABCD categorical assessment values
 
     Args:
@@ -712,7 +715,11 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
 
     if ppj_filtered.empty:
         logger.warning("No PPJ data matched study population — skipping extraction")
-        base["prehospital_start"] = base["start"]
+        base["prehospital_start"] = pd.NaT
+        base["prehospital_end"] = pd.NaT
+        if "inhospital_start" not in base.columns:
+            base = base.rename(columns={"start": "inhospital_start"})
+        base["start"] = base["inhospital_start"].copy()
         return base
 
     # Step 3: Extract concepts
@@ -729,15 +736,23 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
         if col in base.columns:
             base = base.drop(columns=[col])
 
-    # Add prehospital_start — fall back to hospital start for patients without PPJ
+    # Add prehospital_start (NaT for patients without PPJ data — intentionally nullable)
     base = base.merge(
         ph_pop[["PID", "prehospital_start", "prehospital_end"]],
         on="PID",
         how="left",
     )
-    base.loc[base["prehospital_start"].isna(), "prehospital_start"] = base.loc[
-        base["prehospital_start"].isna(), "start"
-    ]
+
+    # Rename hospital admission 'start' → 'inhospital_start',
+    # then create universal 'start' = earliest of prehospital and inhospital
+    if "inhospital_start" not in base.columns:
+        base = base.rename(columns={"start": "inhospital_start"})
+    base["start"] = base["prehospital_start"].fillna(base["inhospital_start"])
+    # Guard: if prehospital_start is later than inhospital_start, use the earlier
+    mask = base["prehospital_start"].notna() & (
+        base["inhospital_start"] < base["prehospital_start"]
+    )
+    base.loc[mask, "start"] = base.loc[mask, "inhospital_start"]
 
     # Add ABCD as tabular features
     if not abcd.empty and len(abcd.columns) > 1:
