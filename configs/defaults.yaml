@@ -79,8 +79,8 @@ exclusion_criteria:
     age_max: 90
     start_year: 2017
     end_year: null
-    lvl1tc: true
-    prehospital_only: false
+    lvl1tc: false
+    prehospital_only: true
     first_hospital:
       - null
     custom_filters: []
