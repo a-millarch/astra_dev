@@ -10,6 +10,12 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from rich.logging import RichHandler
 
+pd.options.mode.chained_assignment = None
+
+# Project root directory, derived from this file's location.
+# Works regardless of the current working directory.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 class ProjectManager:
     """
     Manages project directory settings in a compute instance environment.
@@ -139,32 +145,21 @@ if not _bootstrap_logger.handlers:
     ))
     _bootstrap_logger.addHandler(_bh)
 
-# Backward-compat export: modules that still do ``from astra.utils import
-# logger`` get the root 'astra' logger.  After full migration to
-# ``logging.getLogger(__name__)`` this can be removed.
+# Module-level logger for functions in this file.
 logger = logging.getLogger('astra')
 
-try:
-    pm = ProjectManager('andreas.skov.millarch/repos/ASTRA')
-    # pm.workdir and pm.compute_name still work as before for dir management
-    setup_logging(log_dir=Path(pm.workdir) / 'logging')
-except (IndexError, FileNotFoundError, OSError):
-    # Outside Azure ML compute: bootstrap handler already active.
-    # Entry points (train.py, etc.) call setup_logging() explicitly.
-    pm = None
-
-pd.options.mode.chained_assignment = None
 
 def save_figure(fig, filename, save_dir='reports/studyfigs'):
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
     fig.savefig(png_path, dpi=1200, bbox_inches='tight')
 
-def get_cfg(cfg_path="configs/defaults.yaml"):
+def get_cfg(cfg_path=None):
     import yaml
+    if cfg_path is None:
+        cfg_path = PROJECT_ROOT / "configs" / "defaults.yaml"
     with open(cfg_path) as file:
         return yaml.safe_load(file)
-
 
 cfg = get_cfg()
 
@@ -173,11 +168,15 @@ def count_csv_rows(filename):
         next(f)  # skip header
         return sum(1 for line in f)
         
-def get_base_df(base_df_path=cfg["base_df_path"]):
+def get_base_df(base_df_path=None):
+    if base_df_path is None:
+        base_df_path = cfg["base_df_path"]
     return pd.read_pickle(base_df_path)
 
 
-def get_bin_df(bin_df_path=cfg["bin_df_path"]):
+def get_bin_df(bin_df_path=None):
+    if bin_df_path is None:
+        bin_df_path = cfg["bin_df_path"]
     bin_df = pd.read_pickle(bin_df_path)
     expected_freqs = set(cfg["bin_intervals"].values())
     actual_freqs = set(bin_df["bin_freq"].unique())
