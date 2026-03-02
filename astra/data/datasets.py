@@ -50,21 +50,27 @@ def resolve_exclusion_criteria(cfg: dict) -> Optional[dict]:
     return profiles[profile]
 
 
+def _is_numeric(val) -> bool:
+    """True if val is a real number (not None, not a string, not a bool)."""
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
 def apply_exclusion_criteria(
     base_df: pd.DataFrame,
     criteria: dict,
 ) -> pd.DataFrame:
     """Filter *base_df* according to a criteria dict.
 
-    Each key is optional — only applied when present and has a truthy /
-    non-empty value.  Returns a filtered **copy**.
+    Each key is optional — only applied when present and has a real numeric /
+    truthy value.  YAML ``None`` (parsed as Python None *or* the string
+    ``"None"``) is treated as "skip this criterion".  Returns a filtered **copy**.
     """
     n_before = len(base_df)
     mask = pd.Series(True, index=base_df.index)
 
     # --- named criteria ------------------------------------------------
     age_min = criteria.get("age_min")
-    if age_min is not None and age_min is not False:
+    if _is_numeric(age_min):
         m = base_df["AGE"] >= age_min
         excluded = (~m & mask).sum()
         if excluded:
@@ -72,7 +78,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     age_max = criteria.get("age_max")
-    if age_max is not None and age_max is not False:
+    if _is_numeric(age_max):
         m = base_df["AGE"] <= age_max
         excluded = (~m & mask).sum()
         if excluded:
@@ -80,7 +86,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     start_year = criteria.get("start_year")
-    if start_year:
+    if _is_numeric(start_year):
         m = base_df["ServiceDate"].dt.year >= start_year
         excluded = (~m & mask).sum()
         if excluded:
@@ -88,7 +94,7 @@ def apply_exclusion_criteria(
         mask &= m
 
     end_year = criteria.get("end_year")
-    if end_year:
+    if _is_numeric(end_year):
         m = base_df["ServiceDate"].dt.year <= end_year
         excluded = (~m & mask).sum()
         if excluded:
