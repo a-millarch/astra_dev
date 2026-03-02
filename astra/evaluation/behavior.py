@@ -18,13 +18,13 @@ import logging
 import pickle
 from pathlib import Path
 
-from astra.utils import cfg
+from astra.utils import cfg, setup_logging
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours
 
-logger = logging.getLogger(__name__)
-
+logger = setup_logging()
+ 
 def get_centered_norm(data, center=0.0):
     """
     Create a TwoSlopeNorm that centers the colormap at the specified value.
