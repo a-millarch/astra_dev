@@ -11,7 +11,7 @@ model_name: '02032026_ppj_study'
 target: deceased_90d
 
 # Pre-hospital (PPJ) data integration
-prehospital: false                     # Set true to enable pre-hospital data pipeline
+prehospital: true                     # Set true to enable pre-hospital data pipeline
 prehospital_only: false                # If true, only include patients WITH PPJ data
 
 prehospital_config:

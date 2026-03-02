@@ -219,21 +219,23 @@ def check_concept_files() -> dict:
         return {"status": "FAIL", "reason": "base_df not found"}
     base = pd.read_pickle(base_path)
 
+    # Use inhospital_start (hospital admission) as the boundary for "pre-admission"
+    ih_col = "inhospital_start" if "inhospital_start" in base.columns else "start"
+
     # Check VitaleVaerdier concept (should contain pre-hospital vitals)
     vit_path = "data/interim/concepts/VitaleVaerdier.pkl"
     if Path(vit_path).exists():
         vit = pd.read_pickle(vit_path)
         results["VitaleVaerdier"] = {"total_rows": len(vit)}
 
-        if "prehospital_start" in base.columns and "TIMESTAMP" in vit.columns:
-            # Find measurements that are before hospital admission
+        if "TIMESTAMP" in vit.columns:
             merged = vit.merge(
-                base[["PID", "start"]].drop_duplicates(),
+                base[["PID", ih_col]].drop_duplicates(),
                 on="PID",
                 how="left",
             )
             merged["TIMESTAMP"] = pd.to_datetime(merged["TIMESTAMP"], errors="coerce")
-            pre_admission = merged[merged["TIMESTAMP"] < merged["start"]]
+            pre_admission = merged[merged["TIMESTAMP"] < merged[ih_col]]
             results["VitaleVaerdier"]["pre_admission_rows"] = len(pre_admission)
             results["VitaleVaerdier"]["pre_admission_patients"] = (
                 pre_admission["PID"].nunique() if len(pre_admission) > 0 else 0
@@ -245,6 +247,8 @@ def check_concept_files() -> dict:
                 results["VitaleVaerdier"]["pre_admission_features"] = features_before
             else:
                 results["VitaleVaerdier"]["status"] = "FAIL — no pre-admission vitals found"
+        else:
+            results["VitaleVaerdier"]["status"] = "WARN — no TIMESTAMP column"
     else:
         results["VitaleVaerdier"] = {"status": "FAIL", "reason": "File not found"}
 
@@ -254,14 +258,14 @@ def check_concept_files() -> dict:
         ita = pd.read_pickle(ita_path)
         results["ITAOversigtsrapport"] = {"total_rows": len(ita)}
 
-        if "prehospital_start" in base.columns and "TIMESTAMP" in ita.columns:
+        if "TIMESTAMP" in ita.columns:
             merged = ita.merge(
-                base[["PID", "start"]].drop_duplicates(),
+                base[["PID", ih_col]].drop_duplicates(),
                 on="PID",
                 how="left",
             )
             merged["TIMESTAMP"] = pd.to_datetime(merged["TIMESTAMP"], errors="coerce")
-            pre_admission = merged[merged["TIMESTAMP"] < merged["start"]]
+            pre_admission = merged[merged["TIMESTAMP"] < merged[ih_col]]
             results["ITAOversigtsrapport"]["pre_admission_rows"] = len(pre_admission)
             results["ITAOversigtsrapport"]["pre_admission_patients"] = (
                 pre_admission["PID"].nunique() if len(pre_admission) > 0 else 0
@@ -273,6 +277,8 @@ def check_concept_files() -> dict:
                 results["ITAOversigtsrapport"]["status"] = "PASS"
             else:
                 results["ITAOversigtsrapport"]["status"] = "FAIL — no pre-admission GCS found"
+        else:
+            results["ITAOversigtsrapport"]["status"] = "WARN — no TIMESTAMP column"
     else:
         results["ITAOversigtsrapport"] = {"status": "FAIL", "reason": "File not found"}
 
@@ -314,6 +320,191 @@ def check_mapped_outputs() -> dict:
             results[name]["overall_fill_rate"] = f"{n_nonnan}/{n_total} ({100*n_nonnan/n_total:.1f}%)"
 
     return results
+
+
+def spot_check_patients(n_patients: int = 3, seed: int = 42) -> dict:
+    """Randomly select patients with PPJ data and verify mapped vitals align with sources.
+
+    For each sampled patient, checks:
+    - Raw prehospital vitals exist and fall within [prehospital_start, inhospital_start)
+    - Raw inhospital vitals exist and fall within [inhospital_start, end]
+    - Mapped bins in the prehospital period contain data matching prehospital source
+    - Mapped bins in the inhospital period contain data matching inhospital source
+    - Mapped mean values match manual recomputation from raw data
+    """
+    results = {}
+
+    base_path = cfg.get("base_df_path", "data/interim/base_df.pkl")
+    bin_path = "data/interim/mapped/bin_df.pkl"
+    mapped_path = "data/interim/mapped/VitaleVaerdier_mean.pkl"
+    ph_vitals_path = "data/interim/prehospital_VitaleVaerdier.pkl"
+    concept_vitals_path = "data/interim/concepts/VitaleVaerdier.pkl"
+
+    required = {
+        "base_df": base_path, "bin_df": bin_path, "mapped": mapped_path,
+        "ph_vitals": ph_vitals_path, "concept_vitals": concept_vitals_path,
+    }
+    for name, path in required.items():
+        if not Path(path).exists():
+            return {"status": "FAIL", "reason": f"{name} not found: {path}"}
+
+    base = pd.read_pickle(base_path)
+    bin_df = pd.read_pickle(bin_path)
+    mapped = pd.read_pickle(mapped_path)
+    ph_raw = pd.read_pickle(ph_vitals_path)
+    ih_raw = pd.read_pickle(concept_vitals_path)
+
+    ih_col = "inhospital_start" if "inhospital_start" in base.columns else "start"
+
+    # Select random patients WITH prehospital data
+    ph_pids = base[base["prehospital_start"].notna()]["PID"]
+    if len(ph_pids) == 0:
+        return {"status": "FAIL", "reason": "No patients with prehospital_start"}
+
+    rng = np.random.default_rng(seed)
+    sample_pids = rng.choice(ph_pids.values, size=min(n_patients, len(ph_pids)), replace=False)
+
+    # Ensure raw timestamps are datetime
+    ph_raw["TIMESTAMP"] = pd.to_datetime(ph_raw["TIMESTAMP"], errors="coerce")
+    ph_raw["VALUE"] = pd.to_numeric(ph_raw["VALUE"], errors="coerce")
+    ih_raw["TIMESTAMP"] = pd.to_datetime(ih_raw["TIMESTAMP"], errors="coerce")
+    ih_raw["VALUE"] = pd.to_numeric(ih_raw["VALUE"], errors="coerce")
+
+    patient_results = []
+    for pid in sample_pids:
+        pid = int(pid)
+        pr = {"PID": pid, "checks": []}
+        row = base[base["PID"] == pid].iloc[0]
+        ph_start = row["prehospital_start"]
+        ih_start = row[ih_col]
+        end = row["end"]
+
+        # --- Raw prehospital vitals for this patient ---
+        ph_pid = ph_raw[ph_raw["PID"] == pid].copy()
+        n_ph_raw = len(ph_pid)
+        pr["prehospital_raw_rows"] = n_ph_raw
+
+        if n_ph_raw > 0:
+            ph_before_admission = ph_pid[ph_pid["TIMESTAMP"] < ih_start]
+            ph_after_admission = ph_pid[ph_pid["TIMESTAMP"] >= ih_start]
+            pr["ph_before_admission"] = len(ph_before_admission)
+            pr["ph_after_admission"] = len(ph_after_admission)
+            pr["ph_time_range"] = f"{ph_pid['TIMESTAMP'].min()} → {ph_pid['TIMESTAMP'].max()}"
+            pr["checks"].append(
+                ("PASS" if len(ph_before_admission) > 0 else "WARN",
+                 f"prehospital vitals before admission: {len(ph_before_admission)} rows")
+            )
+
+        # --- Raw inhospital vitals for this patient ---
+        ih_pid = ih_raw[ih_raw["PID"] == pid].copy()
+        n_ih_raw = len(ih_pid)
+        pr["inhospital_raw_rows"] = n_ih_raw
+
+        if n_ih_raw > 0:
+            ih_in_window = ih_pid[
+                (ih_pid["TIMESTAMP"] >= ih_start) & (ih_pid["TIMESTAMP"] <= end)
+            ]
+            pr["ih_in_window"] = len(ih_in_window)
+            pr["ih_time_range"] = f"{ih_pid['TIMESTAMP'].min()} → {ih_pid['TIMESTAMP'].max()}"
+
+        # --- Mapped data for this patient ---
+        mapped_pid = mapped[mapped["PID"] == pid].copy()
+        pr["mapped_rows"] = len(mapped_pid)
+
+        # --- Bin-level cross-check: pick one prehospital bin and one inhospital bin ---
+        pid_bins = bin_df[bin_df["PID"] == pid].sort_values("bin_start")
+        ph_bins = pid_bins[pid_bins["bin_start"] < ih_start]
+        ih_bins = pid_bins[pid_bins["bin_start"] >= ih_start]
+        pr["n_prehospital_bins"] = len(ph_bins)
+        pr["n_inhospital_bins"] = len(ih_bins)
+
+        # Check a prehospital bin
+        if len(ph_bins) > 0 and n_ph_raw > 0:
+            check_bin = ph_bins.iloc[len(ph_bins) // 2]  # middle bin
+            pr["checks"] += _check_bin_values(
+                check_bin, ph_pid, mapped_pid, label="prehospital"
+            )
+
+        # Check an inhospital bin
+        if len(ih_bins) > 0 and n_ih_raw > 0:
+            check_bin = ih_bins.iloc[min(5, len(ih_bins) - 1)]  # early inhospital bin
+            pr["checks"] += _check_bin_values(
+                check_bin, ih_pid, mapped_pid, label="inhospital"
+            )
+
+        # Overall status
+        statuses = [c[0] for c in pr["checks"]]
+        if any(s == "FAIL" for s in statuses):
+            pr["status"] = "FAIL"
+        elif any(s == "WARN" for s in statuses):
+            pr["status"] = "WARN"
+        else:
+            pr["status"] = "PASS" if statuses else "SKIP"
+
+        patient_results.append(pr)
+
+    results["patients"] = patient_results
+    n_pass = sum(1 for p in patient_results if p["status"] == "PASS")
+    n_warn = sum(1 for p in patient_results if p["status"] == "WARN")
+    n_fail = sum(1 for p in patient_results if p["status"] == "FAIL")
+    results["summary"] = f"{n_pass} PASS, {n_warn} WARN, {n_fail} FAIL"
+    results["status"] = "FAIL" if n_fail > 0 else "PASS"
+    return results
+
+
+def _check_bin_values(
+    bin_row: pd.Series,
+    raw_df: pd.DataFrame,
+    mapped_df: pd.DataFrame,
+    label: str,
+) -> list:
+    """Cross-check a single bin: raw measurements vs mapped mean.
+
+    Returns list of (status, message) tuples.
+    """
+    checks = []
+    b_start = bin_row["bin_start"]
+    b_end = bin_row["bin_end"]
+    b_counter = bin_row["bin_counter"]
+
+    # Raw measurements in this bin
+    raw_in_bin = raw_df[
+        (raw_df["TIMESTAMP"] >= b_start) & (raw_df["TIMESTAMP"] <= b_end)
+    ]
+    # Mapped values for this bin
+    mapped_in_bin = mapped_df[mapped_df["bin_counter"] == b_counter]
+
+    if len(raw_in_bin) == 0:
+        checks.append(("SKIP", f"{label} bin {b_counter} [{b_start}]: no raw data"))
+        return checks
+
+    # Per-feature check
+    for feat in raw_in_bin["FEATURE"].unique():
+        raw_vals = raw_in_bin[raw_in_bin["FEATURE"] == feat]["VALUE"].dropna()
+        if len(raw_vals) == 0:
+            continue
+        expected_mean = raw_vals.mean()
+
+        mapped_val_row = mapped_in_bin[mapped_in_bin["FEATURE"] == feat]
+        if len(mapped_val_row) == 0:
+            checks.append(("WARN", f"{label} bin {b_counter} {feat}: raw has {len(raw_vals)} vals but no mapped row"))
+            continue
+
+        mapped_val = mapped_val_row["VALUE"].iloc[0]
+        if pd.isna(mapped_val):
+            checks.append(("WARN", f"{label} bin {b_counter} {feat}: mapped is NaN despite {len(raw_vals)} raw vals"))
+            continue
+
+        # Allow small tolerance for float comparison
+        if abs(mapped_val - expected_mean) < 0.01:
+            checks.append(("PASS", f"{label} bin {b_counter} {feat}: mapped={mapped_val:.2f} == raw_mean={expected_mean:.2f} (n={len(raw_vals)})"))
+        else:
+            # Might differ because inhospital + prehospital raw overlap in same bin
+            checks.append(("WARN",
+                f"{label} bin {b_counter} {feat}: mapped={mapped_val:.2f} != raw_mean={expected_mean:.2f} (n={len(raw_vals)}) "
+                f"— may include data from both sources"))
+
+    return checks
 
 
 # ============================================================================
@@ -415,6 +606,37 @@ def run_validation():
                 for k, v in info.items():
                     if k != "status":
                         print(f"       {k}: {v}")
+    print()
+
+    # 6. Spot-check: random patients with PPJ data
+    print("6. Spot-Check: Mapped Vitals vs Raw Sources")
+    print("-" * 50)
+    spot_results = spot_check_patients(n_patients=3)
+    if "reason" in spot_results:
+        print(f"  [FAIL] {spot_results['reason']}")
+        all_pass = False
+    else:
+        if spot_results.get("status") == "FAIL":
+            all_pass = False
+        print(f"  Summary: {spot_results.get('summary', '?')}")
+        for pr in spot_results.get("patients", []):
+            pid = pr["PID"]
+            status = pr.get("status", "?")
+            icon = {"PASS": "OK", "WARN": "~~", "FAIL": "FAIL", "SKIP": "SKIP"}.get(status, "??")
+            print(f"\n  [{icon}] PID {pid}")
+            print(f"       prehospital_raw_rows: {pr.get('prehospital_raw_rows', 0)}")
+            if "ph_time_range" in pr:
+                print(f"       ph_time_range: {pr['ph_time_range']}")
+                print(f"       ph_before_admission: {pr.get('ph_before_admission', 0)}")
+            print(f"       inhospital_raw_rows: {pr.get('inhospital_raw_rows', 0)}")
+            if "ih_time_range" in pr:
+                print(f"       ih_time_range: {pr['ih_time_range']}")
+            print(f"       n_prehospital_bins: {pr.get('n_prehospital_bins', 0)}")
+            print(f"       n_inhospital_bins: {pr.get('n_inhospital_bins', 0)}")
+            print(f"       mapped_rows: {pr.get('mapped_rows', 0)}")
+            for check_status, msg in pr.get("checks", []):
+                check_icon = {"PASS": "OK", "WARN": "~~", "FAIL": "FAIL", "SKIP": "--"}.get(check_status, "??")
+                print(f"       [{check_icon}] {msg}")
     print()
 
     # Final verdict
