@@ -97,7 +97,7 @@ exclusion_criteria:
     prehospital_only: true
     traumatext: true
     traumatext_12h: false
-    max_duration_days: 90
+    max_duration_days: 365
     first_hospital:
       - null
     custom_filters: []
@@ -265,14 +265,14 @@ bin_freq_include:
   #- '30D'
 
 temporal_features:
-  enabled: false
+  enabled: true
   # mode controls how temporal features are used when enabled:
   #   channel    – elapsed_hours and bin_width_hours are normalized and fed through W_P
   #                as regular input channels (Option A). No change to positional encoding.
   #   sinusoidal – elapsed_hours drives sinusoidal positional encoding; both temporal
   #                features are excluded from W_P (Option B). W_P operates on clinical
   #                channels only (~N(0,1)), raw hours used for sin/cos encoding.
-  mode: sinusoidal
+  mode: channel #sinusoidal
   features:
     - elapsed_hours
     - bin_width_hours
