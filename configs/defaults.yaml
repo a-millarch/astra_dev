@@ -6,13 +6,13 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '02032026_ppj_study'
+model_name: '03032026_ppj_study'
 
 target: deceased_90d
 
 # Pre-hospital (PPJ) data integration
 prehospital: true                     # Set true to enable pre-hospital data pipeline
-prehospital_only: false                # If true, only include patients WITH PPJ data
+prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
   ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
@@ -27,6 +27,20 @@ prehospital_config:
   #   "B: Respiration": ["CODE"]
   #   "C: Cirkulation": ["CODE"]
   #   "D: Bevidsthedsniveau": ["CODE"]
+
+# Trauma text (clinical notes) keyword marking
+traumatext_config:
+  enabled: true
+  source_file: data/interim/concepts/Notater.pkl
+  text_column: Note
+  timestamp_column: Oprettelsestidspunkt
+  time_window_hours: 12
+  keywords:
+    - traume
+    - trauma
+    - tilskadekomst
+    - traumemodtagelse
+    - traumecenter
 
 mapped_dir: data/interim/mapped
 concepts:
@@ -81,6 +95,8 @@ exclusion_criteria:
     end_year: null
     lvl1tc: false
     prehospital_only: true
+    traumatext: true
+    traumatext_12h: false
     first_hospital:
       - null
     custom_filters: []

@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
-from astra.data.filters import filter_subsets_inhospital
+from astra.data.filters import filter_subsets_inhospital, mark_traumatext
 from astra.data.mapper import map_concept, map_concept_optimized
 
 from astra.data.datasets import TSDS
@@ -121,6 +121,13 @@ if __name__ =='__main__':
         bpi.create_bin_df(cfg, base=base)
 
     proces_inhospital_concepts(cfg, reset=False)
+
+    # Mark trauma text keywords on base (requires Notater.pkl from step above)
+    if cfg.get("traumatext_config", {}).get("enabled", False):
+        base = mark_traumatext(base, cfg)
+        base.to_pickle(cfg["base_df_path"], protocol=4)
+        logger.info(f"Updated base_df with TRAUMATEXT columns at {cfg['base_df_path']}")
+
     #map_data(cfg)
     map_data_optimized(cfg)
     logger.info("Creating TSDS")

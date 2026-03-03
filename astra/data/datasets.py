@@ -131,6 +131,32 @@ def apply_exclusion_criteria(
         else:
             logger.warning("  exclusion  prehospital_only requested but no prehospital column found")
 
+    if criteria.get("traumatext"):
+        if "TRAUMATEXT" in base_df.columns:
+            m = base_df["TRAUMATEXT"] == True
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  traumatext (any time): -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  traumatext requested but TRAUMATEXT column "
+                "not found in base_df. Run mark_traumatext() first."
+            )
+
+    if criteria.get("traumatext_12h"):
+        if "TRAUMATEXT_12H" in base_df.columns:
+            m = base_df["TRAUMATEXT_12H"] == True
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  traumatext_12h: -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  traumatext_12h requested but TRAUMATEXT_12H column "
+                "not found in base_df. Run mark_traumatext() first."
+            )
+
     first_hospital = [v for v in (criteria.get("first_hospital") or []) if v is not None]
     if first_hospital:
         m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
