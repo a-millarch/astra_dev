@@ -412,6 +412,7 @@ def prepare_data_and_dls(cfg):
         x_cont=trainval_x_cont,
         X_ts_cat=X_multi_hot,
         y=y,
+        trajectory_lengths=traj_lengths,
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -485,6 +486,7 @@ def prepare_data_and_dls(cfg):
         x_cont=holdout_x_cont,
         X_ts_cat=tX_multi_hot,
         y=ty,
+        trajectory_lengths=holdout_traj_lengths,
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,

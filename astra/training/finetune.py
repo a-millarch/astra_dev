@@ -500,17 +500,20 @@ def train_one_epoch(
 
         # Optionally apply progressive time masking (Phase 4)
         if enable_masking and torch.rand(1).item() < masking_prob:
-            x_ts, x_tab, x_ts_cat = inputs
+            x_ts = inputs[0]
             x_ts = _apply_progressive_time_masking(x_ts, min_timesteps=min_timesteps)
-            inputs = (x_ts, x_tab, x_ts_cat)
+            inputs = (x_ts,) + inputs[1:]
 
         optimizer.zero_grad()
         logits = model(inputs)
 
-        # Compute loss
+        # Compute loss — use real trajectory lengths from dataloader when available
         if temporal_head:
             x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-            traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
+            if len(inputs) >= 4:
+                traj_lengths = inputs[3]
+            else:
+                traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
             loss = compute_temporal_loss(
                 logits, targets, traj_lengths,
                 pos_weight=pos_weight,

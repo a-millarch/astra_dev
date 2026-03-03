@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '03032026_ppj_study'
+model_name: '03032026_masking'
 
 target: deceased_90d
 
@@ -265,7 +265,7 @@ bin_freq_include:
   #- '30D'
 
 temporal_features:
-  enabled: true
+  enabled: false
   # mode controls how temporal features are used when enabled:
   #   channel    – elapsed_hours and bin_width_hours are normalized and fed through W_P
   #                as regular input channels (Option A). No change to positional encoding.
