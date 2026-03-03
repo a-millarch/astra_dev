@@ -76,7 +76,7 @@ def diag1_per_timestep_predictions(model, data, device, n_patients=N_PATIENTS):
         print("  SKIP: model does not have a temporal head (not applicable).")
         return
 
-    x_ts, x_ts_cat, x_cat, x_cont, y = _get_holdout_batches(
+    x_ts, x_ts_cat, x_cat, x_cont, y, _ = _get_holdout_batches(
         data, n_samples=n_patients, device=device
     )
     traj_lengths = data["holdout_trajectory_lengths"][:n_patients]
@@ -280,7 +280,7 @@ def diag3_gradient_profile(model, data, channel2feature, device, n_samples=N_GRA
         print("  SKIP: model does not have a temporal head (not applicable).")
         return
 
-    x_ts, x_ts_cat, x_cat, x_cont, y = _get_holdout_batches(
+    x_ts, x_ts_cat, x_cat, x_cont, y, _ = _get_holdout_batches(
         data, n_samples=n_samples, device=device
     )
     traj_lengths = np.array(data["holdout_trajectory_lengths"][:n_samples])

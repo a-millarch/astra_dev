@@ -22,6 +22,7 @@ from astra.utils import cfg
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours
+from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
 logger = logging.getLogger(__name__)
 
@@ -815,13 +816,47 @@ def get_static_cat_names_from_classes(classes: Dict) -> List[str]:
 # Model Wrapper for SHAP
 # ============================================================================
 
+def _build_padding_mask_for_shap(x_ts, traj_lengths, n_static_tokens=0):
+    """Build key_padding_mask matching model._build_traj_padding_mask().
+
+    Args:
+        x_ts: [batch, c_in, seq_len]
+        traj_lengths: [batch] int64
+        n_static_tokens: number of appended static tokens (never masked)
+    Returns:
+        key_padding_mask: [batch, seq_len + n_static_tokens] bool, True=padding
+    """
+    bs, _, seq_len = x_ts.shape
+    device = x_ts.device
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+    tl = traj_lengths.to(device).unsqueeze(1)                      # [batch, 1]
+    ts_mask = positions >= tl                                       # [batch, seq_len]
+    if n_static_tokens > 0:
+        static_mask = torch.zeros(bs, n_static_tokens, dtype=torch.bool, device=device)
+        return torch.cat([ts_mask, static_mask], dim=1)
+    return ts_mask
+
+
+def _resolve_traj_lengths(x_ts, stored_traj_lengths):
+    """Return traj_lengths for the current forward batch.
+
+    If stored_traj_lengths matches the batch size, use it directly.
+    Otherwise fall back to heuristic inference (handles GradientExplainer's
+    internal batching where batch sizes may differ from stored lengths).
+    """
+    if stored_traj_lengths is not None and stored_traj_lengths.shape[0] == x_ts.shape[0]:
+        return stored_traj_lengths.to(x_ts.device)
+    return _infer_trajectory_lengths_from_batch(x_ts)
+
+
 class ModelWrapperWithEmbeddings(nn.Module):
     """Wrapper that takes pre-embedded categorical features."""
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
         self.eval_timestep = eval_timestep
+        self.traj_lengths = traj_lengths  # [n_samples] or None
 
     def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_embedded=None, x_cont=None):
         nan_mask = torch.isnan(x_ts)
@@ -829,11 +864,10 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x_ts = x_ts.clone()
             x_ts[nan_mask] = 0
 
-        # Match model's _key_padding_mask: only mask when NaN values were present.
-        # During training on clean data _key_padding_mask returns None; using a
-        # zero-based mask here would compute gradients through a different attention
-        # pattern, invalidating the SHAP explanation.
-        key_padding_mask = None
+        # Build padding mask from trajectory lengths (matches model training behavior)
+        seq_len = x_ts.shape[2]
+        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
+        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)  # [batch, seq_len]
 
         # Extract elapsed_hours for positional encoding (before stripping aux channels)
         if self.model.temporal_channel_idx is not None:
@@ -858,22 +892,26 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
-        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours)
+        # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
+        ts_padding_mask = key_padding_mask[:, :seq_len]
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
         # Extend key_padding_mask for static tokens (never masked)
-        if key_padding_mask is not None:
-            n_static = x.shape[1] - key_padding_mask.shape[1]
-            if n_static > 0:
-                static_mask = torch.zeros(
-                    key_padding_mask.shape[0], n_static,
-                    dtype=torch.bool, device=key_padding_mask.device,
-                )
-                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+        n_static = x.shape[1] - key_padding_mask.shape[1]
+        if n_static > 0:
+            static_mask = torch.zeros(
+                key_padding_mask.shape[0], n_static,
+                dtype=torch.bool, device=key_padding_mask.device,
+            )
+            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
 
         attn_mask = self.model.causal_mask if self.model.causal else None
         x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # Zero out padding positions post-transformer (matches model.py L730-732)
+        x = x * (~key_padding_mask).unsqueeze(-1).float()
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
@@ -886,11 +924,12 @@ class ModelWrapperWithRawCatTS(nn.Module):
     Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
     This allows SHAP to compute per-category attributions.
     """
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
         self.eval_timestep = eval_timestep
+        self.traj_lengths = traj_lengths  # [n_samples] or None
 
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
         """
@@ -905,11 +944,10 @@ class ModelWrapperWithRawCatTS(nn.Module):
             x_ts = x_ts.clone()
             x_ts[nan_mask] = 0
 
-        # Match model's _key_padding_mask: only mask when NaN values were present.
-        # During training on clean data _key_padding_mask returns None; using a
-        # zero-based mask here would compute gradients through a different attention
-        # pattern, invalidating the SHAP explanation.
-        key_padding_mask = None
+        # Build padding mask from trajectory lengths (matches model training behavior)
+        seq_len = x_ts.shape[2]
+        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
+        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)  # [batch, seq_len]
 
         # Extract elapsed_hours for positional encoding (before stripping aux channels)
         if self.model.temporal_channel_idx is not None:
@@ -951,22 +989,26 @@ class ModelWrapperWithRawCatTS(nn.Module):
             x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
-        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours)
+        # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
+        ts_padding_mask = key_padding_mask[:, :seq_len]
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
         # Extend key_padding_mask for static tokens (never masked)
-        if key_padding_mask is not None:
-            n_static = x.shape[1] - key_padding_mask.shape[1]
-            if n_static > 0:
-                static_mask = torch.zeros(
-                    key_padding_mask.shape[0], n_static,
-                    dtype=torch.bool, device=key_padding_mask.device,
-                )
-                key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+        n_static = x.shape[1] - key_padding_mask.shape[1]
+        if n_static > 0:
+            static_mask = torch.zeros(
+                key_padding_mask.shape[0], n_static,
+                dtype=torch.bool, device=key_padding_mask.device,
+            )
+            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
 
         attn_mask = self.model.causal_mask if self.model.causal else None
         x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # Zero out padding positions post-transformer (matches model.py L730-732)
+        x = x * (~key_padding_mask).unsqueeze(-1).float()
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
@@ -1019,7 +1061,7 @@ def extract_data_from_dataloader(dataloader, max_samples=None, device='cpu'):
     if hasattr(dataloader, 'train'):
         dataloader = dataloader.train
 
-    all_ts, all_ts_cat, all_cat, all_cont, all_y = [], [], [], [], []
+    all_ts, all_ts_cat, all_cat, all_cont, all_y, all_traj = [], [], [], [], [], []
     n_samples = 0
 
     for batch in dataloader:
@@ -1028,29 +1070,38 @@ def extract_data_from_dataloader(dataloader, max_samples=None, device='cpu'):
         inputs, targets = batch
         x_ts, x_tab, x_ts_cat = inputs[0], inputs[1], inputs[2]
         x_cat, x_cont = x_tab
-        
+
+        # Extract trajectory lengths (4-element tuple) with backward compat
+        if len(inputs) >= 4:
+            traj_lengths = inputs[3]
+        else:
+            traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
+
         all_ts.append(x_ts.cpu())
         all_ts_cat.append(x_ts_cat.cpu())
         all_cat.append(x_cat.cpu())
         all_cont.append(x_cont.cpu())
         all_y.append(targets.cpu())
+        all_traj.append(traj_lengths.cpu())
         n_samples += x_ts.shape[0]
-    
+
     x_ts_full = torch.cat(all_ts, dim=0)
     x_ts_cat_full = torch.cat(all_ts_cat, dim=0)
     x_cat_full = torch.cat(all_cat, dim=0)
     x_cont_full = torch.cat(all_cont, dim=0)
     y_full = torch.cat(all_y, dim=0)
-    
+    traj_full = torch.cat(all_traj, dim=0)
+
     if max_samples is not None and x_ts_full.shape[0] > max_samples:
         x_ts_full = x_ts_full[:max_samples]
         x_ts_cat_full = x_ts_cat_full[:max_samples]
         x_cat_full = x_cat_full[:max_samples]
         x_cont_full = x_cont_full[:max_samples]
         y_full = y_full[:max_samples]
-    
-    return (x_ts_full.to(device), x_ts_cat_full.to(device), x_cat_full.to(device), 
-            x_cont_full.to(device), y_full.to(device))
+        traj_full = traj_full[:max_samples]
+
+    return (x_ts_full.to(device), x_ts_cat_full.to(device), x_cat_full.to(device),
+            x_cont_full.to(device), y_full.to(device), traj_full.to(device))
 
 
 def get_holdout_pids(data, max_samples=None, specific_pids: List = None):
@@ -1141,7 +1192,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
   
-    bg_ts, bg_ts_cat, bg_cat, bg_cont, bg_y = extract_data_from_dataloader(
+    bg_ts, bg_ts_cat, bg_cat, bg_cont, bg_y, bg_traj = extract_data_from_dataloader(
         background_loader, max_samples=max_background_samples, device=device)
     
     print(f"  Background samples: {bg_ts.shape[0]}")
@@ -1153,7 +1204,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     print("Extracting test data...")
     # If specific_pids provided, extract enough samples to include them all
     extraction_max = None if specific_pids is not None else max_test_samples
-    test_ts, test_ts_cat, test_cat, test_cont, test_y = extract_data_from_dataloader(
+    test_ts, test_ts_cat, test_cat, test_cont, test_y, test_traj = extract_data_from_dataloader(
         test_loader, max_samples=extraction_max, device=device)
     print(f"  Test samples extracted: {test_ts.shape[0]}")
 
@@ -1171,6 +1222,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         test_cat = test_cat[pid_indices]
         test_cont = test_cont[pid_indices]
         test_y = test_y[pid_indices]
+        test_traj = test_traj[pid_indices]
         print(f"  Filtered to {len(pid_indices)} specific PIDs")
 
     print(f"  Final test samples: {test_ts.shape[0]}")
@@ -1202,7 +1254,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         # Use wrapper that takes RAW categorical TS for per-category SHAP
         print("  Using ModelWrapperWithRawCatTS for per-category SHAP values")
         wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts,
-                                                 eval_timestep=eval_timestep)
+                                                 eval_timestep=eval_timestep,
+                                                 traj_lengths=test_traj)
 
         # Ensure categorical TS is float and requires grad
         bg_ts_cat_input = bg_ts_cat.float()
@@ -1216,7 +1269,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         # Use wrapper with pre-embedded categorical TS (faster, less granular)
         print("  Using ModelWrapperWithEmbeddings (embedded categorical TS)")
         wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
-                                                   eval_timestep=eval_timestep)
+                                                   eval_timestep=eval_timestep,
+                                                   traj_lengths=test_traj)
         
         if has_cat_ts:
             bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
@@ -1286,7 +1340,20 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         idx += 1
     
     cont_shap = shap_values[idx] if bg_cont.shape[1] > 0 else None
-    
+
+    # Zero SHAP values at padding positions (safety net — model already zeros
+    # padding output, but explicit zeroing ensures clean SHAP values)
+    test_traj_np = test_traj.cpu().numpy()
+    for i in range(ts_shap.shape[0]):
+        tl = int(test_traj_np[i])
+        ts_shap[i, :, tl:] = 0.0
+        if cat_ts_shap_per_category is not None:
+            cat_ts_shap_per_category[i, :, tl:] = 0.0
+        if cat_ts_shap is not None:
+            cat_ts_shap[i, tl:] = 0.0
+        if cat_ts_shap_embedded is not None:
+            cat_ts_shap_embedded[i, tl:] = 0.0
+
     return {
         'ts_shap': ts_shap,
         'cat_ts_shap': cat_ts_shap,
@@ -1302,14 +1369,16 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             'ts_cat': test_ts_cat.cpu().numpy(),
             'cat': test_cat.cpu().numpy(),
             'cont': test_cont.cpu().numpy(),
-            'y': test_y.cpu().numpy()
+            'y': test_y.cpu().numpy(),
+            'traj_lengths': test_traj.cpu().numpy()
         },
         'background_data': {
             'ts': bg_ts.cpu().numpy(),
             'ts_cat': bg_ts_cat.cpu().numpy(),
             'cat': bg_cat.cpu().numpy(),
             'cont': bg_cont.cpu().numpy(),
-            'y': bg_y.cpu().numpy()
+            'y': bg_y.cpu().numpy(),
+            'traj_lengths': bg_traj.cpu().numpy()
         },
         'encoding_info': encoding_info
     }
@@ -1633,7 +1702,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     
     # Plot 4: Channel importance — clinical-only when EBM present
     ax4 = fig.add_subplot(gs[3 + row_offset, :])
-    ch_imp = np.abs(ts_shap).mean(axis=1)
+    # Use traj_length for proper normalization (padding is zeroed, avoid dilution)
+    _traj_np = shap_results.get('test_data', {}).get('traj_lengths')
+    _tl = int(_traj_np[sample_idx]) if _traj_np is not None and sample_idx < len(_traj_np) else n_steps
+    ch_imp = np.abs(ts_shap[:, :_tl]).mean(axis=1) if _tl > 0 else np.zeros(n_channels)
     if has_ebm:
         display_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
     else:
@@ -1796,12 +1868,20 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
     tick_idx = np.linspace(0, n_steps - 1, n_ticks, dtype=int)
 
     # --- Detect trajectory length ---
-    # Priority: (1) _data_present channel  → mask spans first..last measurement
+    # Priority: (0) explicit traj_lengths from test_data (most reliable, from dataset)
+    #           (1) _data_present channel  → mask spans first..last measurement
     #           (2) elapsed_hours channel  → mask spans first..last non-zero elapsed
     #           (3) explicit trajectory_length (inference session) → mask spans 0..traj_len
     #               This fixes the zero-padded inference case where heuristics fail.
     #           (4) NaN-any fallback (unreliable for zero-padded data).
     trajectory_mask = None  # set by whichever branch succeeds first
+
+    # (0) Explicit traj_lengths from test_data (most reliable)
+    _traj_lengths_array = shap_results.get('test_data', {}).get('traj_lengths')
+    if _traj_lengths_array is not None and sample_idx < len(_traj_lengths_array):
+        effective_traj = min(int(_traj_lengths_array[sample_idx]), n_steps)
+        trajectory_mask = np.zeros(n_steps, dtype=bool)
+        trajectory_mask[:effective_traj] = True
 
     dp_idx = None
     eh_idx = None
@@ -1812,17 +1892,14 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
             elif name == 'elapsed_hours':
                 eh_idx = idx
 
-    if dp_idx is not None:
+    if trajectory_mask is None and dp_idx is not None:
         raw_mask = ts_data[dp_idx] > 0.5  # [seq_len]
-        if not np.any(raw_mask):
-            dp_idx = None  # all zero → fall through
-
-    if dp_idx is not None:
-        # Contiguous fill: first..last measurement
-        trajectory_mask = np.zeros(n_steps, dtype=bool)
-        idxs = np.where(raw_mask)[0]
-        if len(idxs) > 0:
-            trajectory_mask[idxs[0]:idxs[-1] + 1] = True
+        if np.any(raw_mask):
+            # Contiguous fill: first..last measurement
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            idxs = np.where(raw_mask)[0]
+            if len(idxs) > 0:
+                trajectory_mask[idxs[0]:idxs[-1] + 1] = True
 
     if trajectory_mask is None and eh_idx is not None:
         # elapsed_hours is >0 for in-trajectory steps, 0.0 for zero-padded
@@ -2127,25 +2204,53 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # Plot 1: TS importance over time
     ax1 = fig.add_subplot(gs[0 + row_offset, :])
 
+    # Build per-sample validity mask for masked averaging over time
+    traj_np = shap_results.get('test_data', {}).get('traj_lengths')
+    if traj_np is not None:
+        # valid_time: [n_samples, n_steps] — True where step < traj_length
+        valid_time = np.arange(n_steps)[None, :] < traj_np[:n_samples, None]
+    else:
+        valid_time = None  # fallback: treat all positions as valid
+
+    def _masked_temporal_mean(arr_3d, ch_indices):
+        """Mean |SHAP| over samples & channels -> [n_steps], padding-aware."""
+        subset = np.abs(arr_3d[:, ch_indices, :])  # [n_samples, n_ch, n_steps]
+        if valid_time is not None:
+            mask = valid_time[:, None, :]  # [n_samples, 1, n_steps]
+            mask = np.broadcast_to(mask, subset.shape)
+            denom = mask.sum(axis=(0, 1)).clip(1)
+            return (subset * mask).sum(axis=(0, 1)) / denom
+        return subset.mean(axis=(0, 1))
+
+    def _masked_channel_mean(arr_3d):
+        """Mean |SHAP| over samples & time -> [n_channels], padding-aware."""
+        subset = np.abs(arr_3d)  # [n_samples, n_channels, n_steps]
+        if valid_time is not None:
+            mask = valid_time[:, None, :]
+            mask = np.broadcast_to(mask, subset.shape)
+            denom = mask.sum(axis=(0, 2)).clip(1)
+            return (subset * mask).sum(axis=(0, 2)) / denom
+        return subset.mean(axis=(0, 2))
+
     if has_ebm:
         # Two-view: separate Clinical and EBM lines
         clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
         ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
 
-        clinical_imp = np.abs(ts_shap[:, clinical_ch, :]).mean(axis=(0, 1))
+        clinical_imp = _masked_temporal_mean(ts_shap, clinical_ch)
         ax1.plot(clinical_imp, linewidth=2, color=_GROUP_COLORS['Clinical'],
                  label='Clinical channels')
         ax1.fill_between(range(len(clinical_imp)), clinical_imp, alpha=0.2,
                          color=_GROUP_COLORS['Clinical'])
 
         if ebm_ch:
-            ebm_imp = np.abs(ts_shap[:, ebm_ch, :]).mean(axis=(0, 1))
+            ebm_imp = _masked_temporal_mean(ts_shap, ebm_ch)
             ax1.plot(ebm_imp, linewidth=2, color=_GROUP_COLORS['EBM'],
                      label='EBM (_ebm_pred)', linestyle='--')
             ax1.fill_between(range(len(ebm_imp)), ebm_imp, alpha=0.2,
                              color=_GROUP_COLORS['EBM'])
     else:
-        ts_imp = np.abs(ts_shap[:, display_ch, :]).mean(axis=(0, 1))
+        ts_imp = _masked_temporal_mean(ts_shap, display_ch)
         ax1.plot(ts_imp, linewidth=2, color='#ff0051', label='Continuous TS')
         ax1.fill_between(range(len(ts_imp)), ts_imp, alpha=0.3, color='#ff0051')
 
@@ -2165,7 +2270,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     # Plot 2: Top channels — clinical-only when EBM present
     ax2 = fig.add_subplot(gs[1 + row_offset, 0])
-    ch_imp = np.abs(ts_shap).mean(axis=(0, 2))
+    ch_imp = _masked_channel_mean(ts_shap)
     if has_ebm:
         bar_display_ch = _get_clinical_only_channel_mask(channel2feature, n_channels)
     else:
@@ -2589,26 +2694,33 @@ class TemporalSHAPAnalyzer:
     def _extract_background_data(self):
         if self._bg_data is not None:
             return self._bg_data
-        
+
         print("Extracting background data...")
-        all_ts, all_ts_cat, all_cat, all_cont = [], [], [], []
+        all_ts, all_ts_cat, all_cat, all_cont, all_traj = [], [], [], [], []
         n = 0
         for batch in self.background_loader:
             if n >= self.max_background_samples:
                 break
             inputs, _ = batch
             x_ts, x_tab, x_ts_cat = inputs[0], inputs[1], inputs[2]
+            # Extract trajectory lengths with backward compat
+            if len(inputs) >= 4:
+                traj_lengths = inputs[3]
+            else:
+                traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
             all_ts.append(x_ts.cpu())
             all_ts_cat.append(x_ts_cat.cpu())
             all_cat.append(x_tab[0].cpu())
             all_cont.append(x_tab[1].cpu())
+            all_traj.append(traj_lengths.cpu())
             n += x_ts.shape[0]
-        
+
         self._bg_data = {
             'ts': torch.cat(all_ts)[:self.max_background_samples].to(self.device),
             'ts_cat': torch.cat(all_ts_cat)[:self.max_background_samples].to(self.device),
             'cat': torch.cat(all_cat)[:self.max_background_samples].to(self.device),
-            'cont': torch.cat(all_cont)[:self.max_background_samples].to(self.device)
+            'cont': torch.cat(all_cont)[:self.max_background_samples].to(self.device),
+            'traj_lengths': torch.cat(all_traj)[:self.max_background_samples].to(self.device)
         }
         return self._bg_data
     
@@ -2621,58 +2733,75 @@ class TemporalSHAPAnalyzer:
             ts_cat_c[:, :, censor_step+1:] = 0
         return ts_c, ts_cat_c
     
-    def _compute_shap_for_sample(self, sample_ts, sample_ts_cat, sample_cat, sample_cont, censor_step=None):
+    def _compute_shap_for_sample(self, sample_ts, sample_ts_cat, sample_cat, sample_cont,
+                                censor_step=None, traj_length=None):
         bg = self._extract_background_data()
         bg_ts_c, bg_ts_cat_c = self._censor_data(bg['ts'], bg['ts_cat'], censor_step)
-        
+
         if sample_ts.dim() == 2:
             sample_ts = sample_ts.unsqueeze(0)
             sample_ts_cat = sample_ts_cat.unsqueeze(0)
             sample_cat = sample_cat.unsqueeze(0)
             sample_cont = sample_cont.unsqueeze(0)
-        
+
         sample_ts_c, sample_ts_cat_c = self._censor_data(sample_ts, sample_ts_cat, censor_step)
-        
+
         bg_cat_emb = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
         sample_cat_emb = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
-        
+
+        # Build traj_lengths tensor for wrapper (single sample -> [1])
+        if traj_length is not None:
+            wrapper_traj = traj_length.unsqueeze(0) if traj_length.dim() == 0 else traj_length
+        else:
+            wrapper_traj = None
+
         eval_ts = censor_step if censor_step is not None else -1
-        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts)
-        
+        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                           traj_lengths=wrapper_traj)
+
         bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
         sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
-        
+
         if bg_cat_emb is not None:
             bg_inputs.append(bg_cat_emb)
             sample_inputs.append(sample_cat_emb)
         if bg['cont'].shape[1] > 0:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
-        
+
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
         shap_values = explainer.shap_values(sample_inputs)
-        
+
         if isinstance(shap_values, list) and shap_values and isinstance(shap_values[0], list):
             shap_values = shap_values[0]
-        
+
         idx = 0
         ts_shap = shap_values[idx][0]
         idx += 1
-        
+
         cat_ts_shap_per_cat, cat_ts_shap = None, None
         if self.has_cat_ts:
             cat_ts_shap_per_cat = shap_values[idx][0]
             cat_ts_shap = np.abs(cat_ts_shap_per_cat).mean(axis=0)
             idx += 1
-        
+
         cat_shap = shap_values[idx][0].mean(axis=1) if bg_cat_emb is not None else None
         if bg_cat_emb is not None:
             idx += 1
-        
+
         cont_shap = shap_values[idx][0] if bg['cont'].shape[1] > 0 else None
-        
-        return {'ts_shap': ts_shap, 'cat_ts_shap': cat_ts_shap, 
-                'cat_ts_shap_per_category': cat_ts_shap_per_cat, 
+
+        # Zero SHAP values at padding positions
+        if traj_length is not None:
+            tl = int(traj_length)
+            ts_shap[:, tl:] = 0.0
+            if cat_ts_shap_per_cat is not None:
+                cat_ts_shap_per_cat[:, tl:] = 0.0
+            if cat_ts_shap is not None:
+                cat_ts_shap[tl:] = 0.0
+
+        return {'ts_shap': ts_shap, 'cat_ts_shap': cat_ts_shap,
+                'cat_ts_shap_per_category': cat_ts_shap_per_cat,
                 'cat_shap': cat_shap, 'cont_shap': cont_shap}
     
     def get_holdout_pids(self, max_samples=None):
@@ -2684,11 +2813,17 @@ class TemporalSHAPAnalyzer:
         for batch in test_loader:
             inputs, targets = batch
             x_ts, x_tab, x_ts_cat = inputs[0], inputs[1], inputs[2]
+            # Extract trajectory lengths with backward compat
+            if len(inputs) >= 4:
+                traj_lengths = inputs[3]
+            else:
+                traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
             bs = x_ts.shape[0]
             if curr <= sample_idx < curr + bs:
                 i = sample_idx - curr
                 return (x_ts[i].to(self.device), x_ts_cat[i].to(self.device),
-                        x_tab[0][i].to(self.device), x_tab[1][i].to(self.device), targets[i])
+                        x_tab[0][i].to(self.device), x_tab[1][i].to(self.device),
+                        targets[i], traj_lengths[i].to(self.device))
             curr += bs
         raise IndexError(f"Sample {sample_idx} out of range")
     
@@ -2704,10 +2839,11 @@ class TemporalSHAPAnalyzer:
             sample_idx = 0
         
         display_pid = pid or (holdout_pids[sample_idx] if holdout_pids else sample_idx)
-        sample_ts, sample_ts_cat, sample_cat, sample_cont, _ = self.get_sample_data(test_loader, sample_idx)
-        
+        sample_ts, sample_ts_cat, sample_cat, sample_cont, _, traj_length = self.get_sample_data(test_loader, sample_idx)
+
         ts_np = sample_ts.cpu().numpy()
-        actual_steps = get_actual_data_length(ts_np)
+        # Prefer explicit traj_length over heuristic
+        actual_steps = int(traj_length) if traj_length is not None else get_actual_data_length(ts_np)
         actual_min = step_to_time(actual_steps - 1) if actual_steps > 0 else 0
         actual_hours = (actual_min or 0) / 60
         
@@ -2748,13 +2884,23 @@ class TemporalSHAPAnalyzer:
             if verbose: print(f"  [{i+1}/{len(valid_tfs)}] {tf}...", end=" ", flush=True)
             
             t1 = time.time()
-            shap_res = self._compute_shap_for_sample(sample_ts, sample_ts_cat, sample_cat, sample_cont, censor)
+            shap_res = self._compute_shap_for_sample(
+                sample_ts, sample_ts_cat, sample_cat, sample_cont, censor,
+                traj_length=traj_length)
             if verbose: print(f"done ({time.time()-t1:.1f}s)")
-            
+
             ts_shap = shap_res['ts_shap']
             if ts_shap.ndim == 3:
                 ts_shap = ts_shap[..., min(self.class_idx, ts_shap.shape[-1] - 1)]
-            
+
+            # Compute importance with padding-aware averaging
+            tl = actual_steps  # already set from traj_length
+            ts_channel_importance = np.abs(ts_shap).mean(axis=1)  # [seq_len] — zeros beyond tl
+            ts_temporal_importance = (
+                np.abs(ts_shap[:, :tl]).mean(axis=1) if tl > 0
+                else np.zeros(ts_shap.shape[0])
+            )
+
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
                 actual_data_steps=actual_steps, ts_shap=ts_shap,
@@ -2763,8 +2909,8 @@ class TemporalSHAPAnalyzer:
                 cat_shap=shap_res['cat_shap'], cont_shap=shap_res['cont_shap'],
                 ts_data=ts_np, cat_ts_data=sample_ts_cat.cpu().numpy(),
                 cat_data=sample_cat.cpu().numpy(), cont_data=sample_cont.cpu().numpy(),
-                ts_channel_importance=np.abs(ts_shap).mean(axis=1),
-                ts_temporal_importance=np.abs(ts_shap).mean(axis=0)
+                ts_channel_importance=ts_channel_importance,
+                ts_temporal_importance=ts_temporal_importance
             )
         
         if verbose: print(f"Total: {time.time()-t0:.1f}s")
