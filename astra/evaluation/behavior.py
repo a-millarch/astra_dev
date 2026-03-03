@@ -248,6 +248,23 @@ def compute_ebm_vs_clinical_budget(
     }
 
 
+def _draw_inhospital_boundary(ax, inhospital_start_step, n_steps, label=True):
+    """Draw a dotted vertical line marking the prehospital/inhospital boundary.
+
+    Only draws if ``inhospital_start_step`` is not None and within the visible
+    range (0, n_steps).  Skipped for patients without prehospital data.
+    """
+    if inhospital_start_step is None:
+        return
+    if not (0 < inhospital_start_step < n_steps):
+        return
+    ihs_min = step_to_time(inhospital_start_step)
+    ihs_label = time_to_hours(ihs_min) if ihs_min is not None else str(inhospital_start_step)
+    ax.axvline(x=inhospital_start_step, color='#2196F3', linewidth=1.5,
+               linestyle=':', alpha=0.8,
+               label=f'Hospital arrival ({ihs_label})' if label else None)
+
+
 def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
                               tick_idx, tick_labels,
                               title: str = 'SHAP Budget Over Time: EBM vs Clinical'):
@@ -1129,6 +1146,52 @@ def get_holdout_pids(data, max_samples=None, specific_pids: List = None):
     return holdout_pids
 
 
+def compute_inhospital_start_steps(data, pids):
+    """Compute the step index where inhospital data starts for each PID.
+
+    Returns an array of step indices (int), or None where the patient has no
+    prehospital data (``prehospital_start`` is NaT → boundary at step 0, not
+    meaningful to plot).
+
+    Args:
+        data: Data dict with ``data["holdout"].base`` containing timestamps.
+        pids: List of PIDs in sample order.
+
+    Returns:
+        np.ndarray of shape ``[len(pids)]`` with dtype ``object`` — int step
+        values or ``None`` per sample.
+    """
+    base = data["holdout"].base
+    if "inhospital_start" not in base.columns or "start" not in base.columns:
+        return None
+    pid_col = base.set_index("PID")
+    result = np.empty(len(pids), dtype=object)
+    for i, pid in enumerate(pids):
+        if pid not in pid_col.index:
+            result[i] = None
+            continue
+        row = pid_col.loc[pid]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        ihs = row.get("inhospital_start")
+        start = row.get("start")
+        phs = row.get("prehospital_start")
+        # Skip patients without prehospital data
+        if pd.isna(phs):
+            result[i] = None
+            continue
+        if pd.isna(ihs) or pd.isna(start):
+            result[i] = None
+            continue
+        delta_min = (ihs - start).total_seconds() / 60
+        if delta_min <= 0:
+            result[i] = None
+            continue
+        step = time_to_step(delta_min, 'min')
+        result[i] = step
+    return result
+
+
 def get_sample_idx_for_pid(pids: List, target_pid: Union[int, str]) -> Optional[int]:
     """
     Find the sample index for a given PID.
@@ -1169,7 +1232,8 @@ def get_pid_for_sample_idx(pids: List, sample_idx: int) -> Optional[Union[int, s
 def calculate_shap_from_dataloaders(model, background_loader, test_loader, encoding_info,
                                      device='cuda', max_background_samples=200, max_test_samples=100,
                                      compute_per_category_shap=True, specific_pids: List = None,
-                                     all_pids: List = None, eval_timestep: int = -1):
+                                     all_pids: List = None, eval_timestep: int = -1,
+                                     inhospital_start_steps: np.ndarray = None):
     """
     Calculate SHAP values for all model inputs.
 
@@ -1187,6 +1251,10 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
                        Use a fixed clinical timepoint instead, e.g.:
                            from astra.evaluation.utils import time_to_step
                            eval_timestep=time_to_step(24, 'h')  # prediction at 24 h
+        inhospital_start_steps: Per-sample step index where inhospital data starts
+                                (from ``compute_inhospital_start_steps``). None entries
+                                mean the patient has no prehospital data. Stored in
+                                ``shap_results['test_data']`` for visualization.
     """
     print("Extracting background data...")
     import torch
@@ -1223,6 +1291,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         test_cont = test_cont[pid_indices]
         test_y = test_y[pid_indices]
         test_traj = test_traj[pid_indices]
+        if inhospital_start_steps is not None:
+            inhospital_start_steps = inhospital_start_steps[pid_indices.cpu().numpy()]
         print(f"  Filtered to {len(pid_indices)} specific PIDs")
 
     print(f"  Final test samples: {test_ts.shape[0]}")
@@ -1370,7 +1440,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             'cat': test_cat.cpu().numpy(),
             'cont': test_cont.cpu().numpy(),
             'y': test_y.cpu().numpy(),
-            'traj_lengths': test_traj.cpu().numpy()
+            'traj_lengths': test_traj.cpu().numpy(),
+            'inhospital_start_steps': inhospital_start_steps
         },
         'background_data': {
             'ts': bg_ts.cpu().numpy(),
@@ -1595,8 +1666,13 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     ax1.set_xlabel('Time'); ax1.set_ylabel('mean |SHAP Value|')
     ax1.set_title(f'TS SHAP Over Time{title_suffix}, Class {class_idx}', fontweight='bold')
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+    # Mark prehospital/inhospital boundary
+    _ihs_steps = shap_results.get('test_data', {}).get('inhospital_start_steps')
+    _ihs = int(_ihs_steps[sample_idx]) if (_ihs_steps is not None
+               and sample_idx < len(_ihs_steps) and _ihs_steps[sample_idx] is not None) else None
+    _draw_inhospital_boundary(ax1, _ihs, n_steps)
     ax1.legend(); ax1.grid(True, alpha=0.3)
-    
+
     # Plot 2: Continuous TS heatmap — clinical-only when EBM present
     ax2 = fig.add_subplot(gs[1 + row_offset, :])
     if channel2feature and has_ebm:
@@ -1625,10 +1701,11 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax2.set_yticks(yticks)
         ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=7)
     ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+    _draw_inhospital_boundary(ax2, _ihs, n_steps, label=False)
     plt.colorbar(im, ax=ax2, label='SHAP Value')
     if not has_ebm and channel2feature:
         _draw_group_separators(ax2, group_bounds)
-    
+
     # Plot 3: Categorical TS heatmap - SHAP values with centered colormap
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
         # Use per-category SHAP values if available
@@ -1660,13 +1737,14 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
         
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+        _draw_inhospital_boundary(ax3, _ihs, n_steps, label=False)
         plt.colorbar(im3, ax=ax3, label='SHAP Value')
-        
+
         # Feature boundaries
         for feat, (start, end) in enc_info.get('feature_ranges', {}).items():
             if start > 0:
                 ax3.axhline(y=start - 0.5, color='black', linewidth=1.5, linestyle='--')
-    
+
     elif shap_results.get('encoding_info') is not None:
         # Fallback: Show raw data with SHAP importance overlay
         ax3 = fig.add_subplot(gs[2 + row_offset, :])
@@ -1985,6 +2063,11 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
         last_data_step = np.where(trajectory_mask)[0][-1]
         ax1.axvline(x=last_data_step + 0.5, color='red', linewidth=1.5, linestyle='--',
                     alpha=0.7, label='Trajectory end')
+    # Mark prehospital/inhospital boundary
+    _ihs_steps_c = shap_results.get('test_data', {}).get('inhospital_start_steps')
+    _ihs_c = (int(_ihs_steps_c[sample_idx]) if (_ihs_steps_c is not None
+               and sample_idx < len(_ihs_steps_c) and _ihs_steps_c[sample_idx] is not None) else None)
+    _draw_inhospital_boundary(ax1, _ihs_c, n_steps)
     ax1.set_ylabel('% Clinical channels\nwith data')
     ax1.set_title(f'Data Completeness Over Time{title_suffix}', fontweight='bold', fontsize=14)
     ax1.set_xticks(tick_idx)
@@ -2016,6 +2099,7 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 
     ax2.set_xticks(tick_idx)
     ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+    _draw_inhospital_boundary(ax2, _ihs_c, n_steps, label=False)
     _draw_group_separators(ax2, group_boundaries)
 
     ax2.legend(handles=[
@@ -2631,6 +2715,7 @@ class TemporalSHAPResults:
     static_cont_names: List[str]
     encoding_info: Dict
     stability_metrics: Optional[Dict] = None
+    inhospital_start_step: Optional[int] = None
     
     def get_available_timeframes(self) -> List[str]:
         return list(self.timeframe_results.keys())
@@ -2846,9 +2931,19 @@ class TemporalSHAPAnalyzer:
         actual_steps = int(traj_length) if traj_length is not None else get_actual_data_length(ts_np)
         actual_min = step_to_time(actual_steps - 1) if actual_steps > 0 else 0
         actual_hours = (actual_min or 0) / 60
-        
+
+        # Compute inhospital boundary step for this patient
+        ihs_step = None
+        try:
+            ihs_steps = compute_inhospital_start_steps(self.data, [display_pid])
+            if ihs_steps is not None and ihs_steps[0] is not None:
+                ihs_step = int(ihs_steps[0])
+        except Exception:
+            pass  # base_df may not have the columns
+
         if verbose:
-            print(f"Patient {display_pid}: {actual_steps} steps ({actual_hours:.1f}h)")
+            ihs_info = f", inhospital at step {ihs_step}" if ihs_step is not None else ""
+            print(f"Patient {display_pid}: {actual_steps} steps ({actual_hours:.1f}h){ihs_info}")
         
         timeframes = timeframes or list(DEFAULT_TIMEFRAMES.keys())
         
@@ -2920,7 +3015,7 @@ class TemporalSHAPAnalyzer:
             actual_data_length_steps=actual_steps, actual_data_length_hours=actual_hours,
             timeframe_results=results, channel2feature=self.channel2feature,
             static_cat_names=self.static_cat_names, static_cont_names=self.static_cont_names,
-            encoding_info=self.encoding_info
+            encoding_info=self.encoding_info, inhospital_start_step=ihs_step
         )
         out.stability_metrics = self._compute_stability_metrics(out)
         return out
@@ -3269,6 +3364,7 @@ class TemporalSHAPAnalyzer:
             ax1.fill_between(range(len(r.ts_temporal_importance)), r.ts_temporal_importance, alpha=0.3, color='#ff0051')
             if r.censor_step: ax1.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax1.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5, alpha=0.7)
+            _draw_inhospital_boundary(ax1, results.inhospital_start_step, seq_len, label=(col == 0))
             ax1.set_xlim(0, seq_len); ax1.set_ylim(0, temp_max*1.1)
             ax1.set_xticks(tick_idx); ax1.set_xticklabels(tick_labels, rotation=45, fontsize=8)
             ax1.set_title(f'{tf} {suffix}{ebm_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
@@ -3291,6 +3387,7 @@ class TemporalSHAPAnalyzer:
                            norm=TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax))
             if r.censor_step: ax3.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax3.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5)
+            _draw_inhospital_boundary(ax3, results.inhospital_start_step, seq_len, label=False)
             ax3.set_yticks(range(len(top_idx))); ax3.set_yticklabels(names, fontsize=8)
             ax3.set_xticks(tick_idx); ax3.set_xticklabels(tick_labels, rotation=45, fontsize=8)
             plt.colorbar(im, ax=ax3, shrink=0.8)
