@@ -157,6 +157,20 @@ def apply_exclusion_criteria(
                 "not found in base_df. Run mark_traumatext() first."
             )
 
+    max_dur = criteria.get("max_duration_days")
+    if isinstance(max_dur, (int, float)):
+        if "DURATION" in base_df.columns:
+            m = base_df["DURATION"] <= max_dur
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  max_duration_days <= {max_dur}: -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  max_duration_days requested but DURATION column "
+                "not found in base_df."
+            )
+
     first_hospital = [v for v in (criteria.get("first_hospital") or []) if v is not None]
     if first_hospital:
         m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
