@@ -88,6 +88,15 @@ ICU_MAP = {
     'SOFA total score': 'SOFA',
 }
 
+# ============================================================================
+# EWS: measurement names → standardized feature names
+# (source: filter_ews in filters.py)
+# ============================================================================
+
+EWS_MAP = {
+    'EWS korr. total score': 'EWS_SCORE',
+}
+
 
 # ============================================================================
 # Medications: ATC code prefixes → category names

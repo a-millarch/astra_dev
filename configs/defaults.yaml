@@ -18,6 +18,7 @@ concepts:
   - Medicin
   - Procedurer
   - ADTHaendelser
+  - EWS
   #- IndUd
   #- ITARespirator
   
@@ -182,6 +183,7 @@ default_load_filenames:
   - ITAOversigtsrapport
   - IndUd
   - ITARespirator
+  - EWS
   
 large_load_filenames:
   - Labsvar
@@ -249,6 +251,8 @@ agg_func: #also for datasets, split it up
       - max
   ADTHaendelser:
       - max
+  EWS:
+      - max
 
 # Mapping
 npartitions:
@@ -258,7 +262,8 @@ npartitions:
   Diagnoser: 4
   Labsvar: 4
   Medicin: 4
-  
+  EWS: 1
+
 mapping:
  Diagnoser: cat
  
@@ -284,6 +289,8 @@ drop_features:
   IndUd:
     - nan
   ADTHaendelser:
+    - nan
+  EWS:
     - nan
 
 

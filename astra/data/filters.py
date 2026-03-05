@@ -10,7 +10,7 @@ from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_t
 from astra.data.mappings import (
     VITALS_MAP, TEMP_FAHRENHEIT,BP_TYPES, HEIGHT_WEIGHT_MAP,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
-    ICU_MAP,
+    ICU_MAP, EWS_MAP,
     ATC_LVL3_MAP, ATC_LVL4_MAP, MEDICATION_ACTION_LIST,
     PROCEDURE_MAP, PROCEDURE_REVERSE_MAP, PROCEDURE_INCLUDE_LIST,
     ADT_PATTERNS, classify_department,
@@ -223,6 +223,21 @@ def filter_ita(ita):
     return ita
 
 
+def filter_ews(ews):
+    """Uses EWS_MAP from mappings."""
+    ews = ews.copy()
+    ews.rename(
+        columns={
+            "EWS_Måling": "FEATURE",
+            "Værdi": "VALUE",
+            "Målingstidspunkt": "TIMESTAMP",
+        },
+        inplace=True,
+    )
+    ews["FEATURE"] = ews["FEATURE"].replace(to_replace=EWS_MAP)
+    return ews
+
+
 def reverse_dict_replace(original_dict, df, atc_level):
     # Invert the dictionary
     inverted_dict = {}
@@ -332,6 +347,7 @@ def collect_filter(concept: str):
         "Medicin": filter_medicin,
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
+        "EWS": filter_ews,
     }
 
     return filter_funcs[concept]
