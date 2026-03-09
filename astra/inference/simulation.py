@@ -14,6 +14,15 @@ Usage::
     result = runner.run("abc123hash", "2025-06-15")
     print(result.to_dataframe())
     result.plot_trajectory("simulation_output.png")
+
+Interactive (pause & inspect)::
+
+    runner = SimulationRunner(session)
+    runner.setup("abc123hash", "2025-06-15")
+    runner.advance_to(hours=12)
+    runner.inspect()              # SHAP, trajectory, data completeness
+    runner.advance_to(hours=24)
+    runner.inspect()
 """
 
 import logging
@@ -152,6 +161,185 @@ class SimulationRunner:
                 Should be loaded with ``device='cpu'``.
         """
         self.session = session
+        self.context = None
+        self._time_points: List[pd.Timestamp] = []
+        self._step_idx: int = 0
+        self._steps: List[SimulationStep] = []
+        self._prev_raw_counts: int = 0
+
+    # ---- Interactive (step-through) API ----
+
+    def setup(
+        self,
+        cpr_hash: str,
+        service_date,
+        cfg: dict = None,
+        data_dir: str = 'data/raw',
+        ebm_models_dir: str = 'models/ebm',
+        start_hours: float = 0.0,
+    ):
+        """Create PatientContext at admission and prepare for stepping.
+
+        After calling this, use :meth:`advance_to` to step through time
+        and :meth:`inspect` to visualize model behavior at the current time.
+
+        Args:
+            cpr_hash: Patient identifier hash.
+            service_date: Admission date (for base_df lookup).
+            cfg: Configuration dict (loaded from defaults.yaml if None).
+            data_dir: Path to raw CSV data.
+            ebm_models_dir: Path to saved EBM models.
+            start_hours: Start at this many hours after admission.
+        """
+        from astra.inference.patient_context import PatientContext
+
+        admission_start = pd.Timestamp(service_date)
+
+        self.context = PatientContext.from_csv(
+            cpr_hash=cpr_hash,
+            service_date=service_date,
+            current_time=admission_start + pd.Timedelta(hours=start_hours),
+            bundle=self.session.bundle,
+            cfg=cfg,
+            data_dir=data_dir,
+            ebm_models_dir=ebm_models_dir,
+        )
+
+        self._time_points = _generate_bin_aligned_times(
+            self.context.bin_df,
+            self.context.admission_time,
+            start_time=self.context.current_time,
+        )
+        self._step_idx = 0
+        self._steps = []
+        self._prev_raw_counts = _count_raw_data(self.context._raw_data)
+
+        # Make context available for default_session_plot
+        self.session.ctx = self.context
+
+        logger.info(
+            f"Setup complete: pid={self.context.pid}, "
+            f"{len(self._time_points)} time points, "
+            f"start={self.context.current_time}"
+        )
+
+    def advance_to(
+        self,
+        hours: Optional[float] = None,
+        time: Optional[pd.Timestamp] = None,
+    ) -> List[SimulationStep]:
+        """Advance simulation to a target time, returning steps taken.
+
+        Incrementally steps through bin boundaries up to the target.
+        After advancing, ``session.ctx`` is updated for inspection via
+        :func:`~astra.inference.run_inference.default_session_plot`.
+
+        Args:
+            hours: Target elapsed hours from admission.
+            time: Target absolute timestamp. Provide one of *hours* or *time*.
+
+        Returns:
+            List of :class:`SimulationStep` for the steps just taken.
+        """
+        if self.context is None:
+            raise RuntimeError("Call setup() before advance_to()")
+
+        if hours is not None:
+            target = self.context.admission_time + pd.Timedelta(hours=hours)
+        elif time is not None:
+            target = pd.Timestamp(time)
+        else:
+            raise ValueError("Provide either hours= or time=")
+
+        from astra.inference.data_prep import timed_stage
+
+        new_steps = []
+        while self._step_idx < len(self._time_points):
+            tp = self._time_points[self._step_idx]
+            if tp > target:
+                break
+
+            step_timing = {}
+
+            with timed_stage(step_timing, 'refresh'):
+                self.context.refresh(tp)
+
+            new_counts = _count_raw_data(self.context._raw_data)
+            n_new = new_counts - self._prev_raw_counts
+            self._prev_raw_counts = new_counts
+
+            with timed_stage(step_timing, 'predict'):
+                result = self.session.predict_from_context(self.context)
+
+            elapsed = (tp - self.context.admission_time).total_seconds() / 3600
+
+            step = SimulationStep(
+                current_time=tp,
+                elapsed_hours=elapsed,
+                trajectory_length=self.context.trajectory_length,
+                probability=result.probability,
+                predictions_over_time=result.predictions_over_time,
+                step_timing=step_timing,
+                n_new_measurements=n_new,
+            )
+            new_steps.append(step)
+            self._steps.append(step)
+            self._step_idx += 1
+
+        # Update session context for inspection
+        self.session.ctx = self.context
+
+        if new_steps:
+            logger.info(
+                f"Advanced {len(new_steps)} steps to "
+                f"{new_steps[-1].elapsed_hours:.1f}h "
+                f"(P={new_steps[-1].probability:.4f})"
+            )
+        else:
+            logger.info("No new steps to advance (already at or past target)")
+
+        return new_steps
+
+    def inspect(self):
+        """Run default_session_plot on the current context.
+
+        Convenience wrapper — equivalent to::
+
+            from astra.inference.run_inference import default_session_plot
+            default_session_plot(runner.session)
+        """
+        if self.context is None:
+            raise RuntimeError("Call setup() before inspect()")
+
+        from astra.inference.run_inference import default_session_plot
+        self.session.ctx = self.context
+        default_session_plot(self.session)
+
+    @property
+    def result(self) -> Optional[SimulationResult]:
+        """Build a SimulationResult from steps accumulated so far."""
+        if not self._steps or self.context is None:
+            return None
+        return SimulationResult(
+            pid=self.context.pid,
+            admission_time=self.context.admission_time,
+            steps=list(self._steps),
+            total_timing=dict(self.context._timing),
+        )
+
+    @property
+    def elapsed_hours(self) -> Optional[float]:
+        """Current elapsed hours (from last step taken)."""
+        if not self._steps:
+            return 0.0 if self.context else None
+        return self._steps[-1].elapsed_hours
+
+    @property
+    def remaining_steps(self) -> int:
+        """Number of time points not yet advanced through."""
+        return len(self._time_points) - self._step_idx
+
+    # ---- Batch API (unchanged) ----
 
     def run(
         self,
