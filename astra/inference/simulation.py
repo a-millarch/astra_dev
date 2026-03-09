@@ -60,6 +60,7 @@ class SimulationResult:
     steps: List[SimulationStep]
     total_timing: dict = field(default_factory=dict)
     wall_clock_seconds: float = 0.0
+    prediction_curve: Optional[np.ndarray] = None  # [seq_len], NaN where unpredicted
 
     @property
     def n_steps(self) -> int:
@@ -166,6 +167,7 @@ class SimulationRunner:
         self._step_idx: int = 0
         self._steps: List[SimulationStep] = []
         self._prev_raw_counts: int = 0
+        self._prediction_curve: Optional[np.ndarray] = None
 
     # ---- Interactive (step-through) API ----
 
@@ -213,6 +215,7 @@ class SimulationRunner:
         self._step_idx = 0
         self._steps = []
         self._prev_raw_counts = _count_raw_data(self.context._raw_data)
+        self._prediction_curve = np.full(len(self.context.bin_df), np.nan)
 
         # Make context available for default_session_plot
         self.session.ctx = self.context
@@ -271,6 +274,11 @@ class SimulationRunner:
             with timed_stage(step_timing, 'predict'):
                 result = self.session.predict_from_context(self.context)
 
+            # Store prediction at current bin position
+            bin_idx = self.context.trajectory_length - 1
+            if 0 <= bin_idx < len(self._prediction_curve):
+                self._prediction_curve[bin_idx] = result.probability
+
             elapsed = (tp - self.context.admission_time).total_seconds() / 3600
 
             step = SimulationStep(
@@ -303,17 +311,16 @@ class SimulationRunner:
     def inspect(self):
         """Run default_session_plot on the current context.
 
-        Convenience wrapper — equivalent to::
-
-            from astra.inference.run_inference import default_session_plot
-            default_session_plot(runner.session)
+        Uses the accumulated prediction curve so the trajectory plot
+        shows per-timestep predictions for both temporal and non-temporal
+        models (non-temporal models would otherwise need a pre-computed CSV).
         """
         if self.context is None:
             raise RuntimeError("Call setup() before inspect()")
 
         from astra.inference.run_inference import default_session_plot
         self.session.ctx = self.context
-        default_session_plot(self.session)
+        default_session_plot(self.session, prediction_curve=self._prediction_curve)
 
     @property
     def result(self) -> Optional[SimulationResult]:
@@ -325,6 +332,7 @@ class SimulationRunner:
             admission_time=self.context.admission_time,
             steps=list(self._steps),
             total_timing=dict(self.context._timing),
+            prediction_curve=self._prediction_curve.copy() if self._prediction_curve is not None else None,
         )
 
     @property
@@ -421,6 +429,7 @@ class SimulationRunner:
 
         steps = []
         prev_raw_counts = _count_raw_data(context._raw_data)
+        prediction_curve = np.full(len(context.bin_df), np.nan)
 
         for tp in time_points:
             step_timing = {}
@@ -437,6 +446,11 @@ class SimulationRunner:
             # Predict
             with timed_stage(step_timing, 'predict'):
                 result = self.session.predict_from_context(context)
+
+            # Store prediction at current bin position
+            bin_idx = context.trajectory_length - 1
+            if 0 <= bin_idx < len(prediction_curve):
+                prediction_curve[bin_idx] = result.probability
 
             elapsed = (tp - context.admission_time).total_seconds() / 3600
 
@@ -459,6 +473,7 @@ class SimulationRunner:
             steps=steps,
             total_timing=total_timing,
             wall_clock_seconds=time.perf_counter() - wall_start,
+            prediction_curve=prediction_curve,
         )
 
         logger.info(

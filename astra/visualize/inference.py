@@ -1,6 +1,7 @@
 import logging
 import os
 
+import numpy as np
 import matplotlib
 if __name__ == "__main__":
     matplotlib.use("Agg")  # headless backend for script execution only
@@ -47,6 +48,11 @@ def _plot_temporal_trajectory(result, ctx, save_path):
     ]
     hours = hours[:traj_len]
     probs_visible = probs[:traj_len]
+
+    # Filter NaN entries (bins not yet predicted, e.g. from simulation curves)
+    mask = ~np.isnan(probs_visible)
+    hours = [h for h, m in zip(hours, mask) if m]
+    probs_visible = probs_visible[mask]
 
     fig, ax = plt.subplots(figsize=(12, 4))
     ax.plot(hours, probs_visible, "o-", color="steelblue", markersize=3, linewidth=1.5)

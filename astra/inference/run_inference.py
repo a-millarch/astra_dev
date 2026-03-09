@@ -165,13 +165,29 @@ def initialize_session(cpr_hash, service_date, current_time, model_name,
 
     return session
 
-def default_session_plot(session):
+def default_session_plot(session, prediction_curve=None):
     ctx = session.ctx
     result = session.predict_from_context(ctx)
+
+    # If a simulation prediction curve is available, use it for trajectory
+    # plotting (enables non-temporal models to show per-timestep predictions
+    # from the simulation step-through without needing a pre-computed CSV).
+    if prediction_curve is not None and result.predictions_over_time is None:
+        from astra.inference.pipeline import InferenceResult
+        plot_result = InferenceResult(
+            pid=result.pid,
+            probability=result.probability,
+            trajectory_length=result.trajectory_length,
+            censor_step=result.censor_step,
+            predictions_over_time=prediction_curve,
+        )
+    else:
+        plot_result = result
+
     # ---- 4. Plot prediction trajectory ----
     model_name = session.bundle.get('model_name')
     traj_fig = plot_prediction_trajectory(
-        result, ctx,
+        plot_result, ctx,
         save_path=None,
         model_name=model_name,
     )
