@@ -12,13 +12,21 @@ logger = logging.getLogger(__name__)
 
 
 def _get_inhospital_start_hours(ctx):
-    """Return hours since admission_time for inhospital start, or None."""
+    """Return hours since admission_time for inhospital start, or None.
+
+    Returns None if hospital arrival has not yet occurred relative to
+    ctx.current_time (prevents future information leakage in simulation).
+    """
     ihs = ctx.demographics.get('inhospital_start')
     if ihs is None or (isinstance(ihs, float) and np.isnan(ihs)):
         return None
     ihs = pd.Timestamp(ihs)
     if pd.isna(ihs):
         return None
+    # Don't reveal future events in simulation mode
+    if hasattr(ctx, 'current_time') and ctx.current_time is not None:
+        if ihs > ctx.current_time:
+            return None
     hours = (ihs - ctx.admission_time).total_seconds() / 3600
     # Only meaningful if prehospital data pushes admission_time earlier
     return hours if hours > 0 else None

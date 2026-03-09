@@ -1622,24 +1622,40 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     _ihs = int(_ihs_steps[sample_idx]) if (_ihs_steps is not None
                and sample_idx < len(_ihs_steps) and _ihs_steps[sample_idx] is not None) else None
 
+    # Helper: move legend from data axes into the dedicated col-2 legend axes
+    def _legend_to_col2(src_ax, row):
+        leg_ax = fig.add_subplot(gs[row, 2])
+        leg_ax.axis('off')
+        handles, labels = src_ax.get_legend_handles_labels()
+        old = src_ax.get_legend()
+        if old is not None:
+            old.remove()
+        if handles:
+            leg_ax.legend(handles, labels, loc='upper left',
+                          fontsize=11, borderaxespad=0)
+
     if has_ebm:
         fig = plt.figure(figsize=(22, 23), constrained_layout=True)
-        gs = fig.add_gridspec(6, 2, hspace=0.05, wspace=0.3,
-                              height_ratios=[0.7, 1, 1, 1, 1, 1])
+        gs = fig.add_gridspec(6, 3, hspace=0.15, wspace=0.05,
+                              height_ratios=[0.7, 1, 1, 1, 1, 1],
+                              width_ratios=[1, 1, 0.04])
         row_offset = 1
         # Row 0: EBM budget over time
-        ax_budget = fig.add_subplot(gs[0, :])
+        ax_budget = fig.add_subplot(gs[0, 0:2])
         _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
                                   [time_fmt[i] for i in tick_idx],
                                   inhospital_start_step=_ihs,
                                   title=f'SHAP Budget Over Time{title_suffix}')
+        _legend_to_col2(ax_budget, 0)
     else:
         fig = plt.figure(figsize=(22, 20), constrained_layout=True)
-        gs = fig.add_gridspec(5, 2, hspace=0.05, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
+        gs = fig.add_gridspec(5, 3, hspace=0.15, wspace=0.05,
+                              height_ratios=[1, 1, 1, 1, 1],
+                              width_ratios=[1, 1, 0.04])
         row_offset = 0
 
     # Plot 1: TS importance over time
-    ax1 = fig.add_subplot(gs[0 + row_offset, :])
+    ax1 = fig.add_subplot(gs[0 + row_offset, 0:2])
 
     if has_ebm:
         # Two-view: separate Clinical and EBM lines
@@ -1676,11 +1692,12 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
     ax1.tick_params(axis='y', labelsize=11)
     _draw_inhospital_boundary(ax1, _ihs, n_steps)
-    ax1.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=11)
+    ax1.legend()  # temporary; transferred to col 2 below
+    _legend_to_col2(ax1, 0 + row_offset)
     ax1.grid(True, alpha=0.3)
 
     # Plot 2: Continuous TS heatmap — clinical-only when EBM present
-    ax2 = fig.add_subplot(gs[1 + row_offset, :])
+    ax2 = fig.add_subplot(gs[1 + row_offset, 0:2])
     if channel2feature and has_ebm:
         ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
         ts_shap_display = ts_shap[ordered_idx]
@@ -1708,14 +1725,15 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=8)
     ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
     _draw_inhospital_boundary(ax2, _ihs, n_steps, label=False)
-    plt.colorbar(im, ax=ax2, label='SHAP Value')
+    cax2 = fig.add_subplot(gs[1 + row_offset, 2])
+    fig.colorbar(im, cax=cax2, label='SHAP Value')
     if not has_ebm and channel2feature:
         _draw_group_separators(ax2, group_bounds)
 
     # Plot 3: Categorical TS heatmap - SHAP values with centered colormap
     if shap_results.get('encoding_info') is not None and shap_results.get('cat_ts_shap_per_category') is not None:
         # Use per-category SHAP values if available
-        ax3 = fig.add_subplot(gs[2 + row_offset, :])
+        ax3 = fig.add_subplot(gs[2 + row_offset, 0:2])
         cat_ts_shap_data = shap_results['cat_ts_shap_per_category'][sample_idx]  # [n_cats, seq_len]
         if cat_ts_shap_data.ndim == 3:
             cat_ts_shap_data = cat_ts_shap_data[..., min(class_idx, cat_ts_shap_data.shape[-1] - 1)]
@@ -1744,7 +1762,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
 
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
         _draw_inhospital_boundary(ax3, _ihs, n_steps, label=False)
-        plt.colorbar(im3, ax=ax3, label='SHAP Value')
+        cax3 = fig.add_subplot(gs[2 + row_offset, 2])
+        fig.colorbar(im3, cax=cax3, label='SHAP Value')
 
         # Feature boundaries
         for feat, (start, end) in enc_info.get('feature_ranges', {}).items():
@@ -1753,7 +1772,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
 
     elif shap_results.get('encoding_info') is not None:
         # Fallback: Show raw data with SHAP importance overlay
-        ax3 = fig.add_subplot(gs[2 + row_offset, :])
+        ax3 = fig.add_subplot(gs[2 + row_offset, 0:2])
         cat_ts_data = shap_results['test_data']['ts_cat'][sample_idx, :, :n_steps]  # crop to eval_timestep
         enc_info = shap_results['encoding_info']
         
@@ -1777,8 +1796,9 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=9)
 
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
-        plt.colorbar(im3, ax=ax3, label='Active')
-        
+        cax3 = fig.add_subplot(gs[2 + row_offset, 2])
+        fig.colorbar(im3, cax=cax3, label='Active')
+
         # Feature boundaries
         for feat, (start, end) in enc_info.get('feature_ranges', {}).items():
             if start > 0:
