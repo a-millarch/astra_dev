@@ -1623,8 +1623,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                and sample_idx < len(_ihs_steps) and _ihs_steps[sample_idx] is not None) else None
 
     if has_ebm:
-        fig = plt.figure(figsize=(22, 23))
-        gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
+        fig = plt.figure(figsize=(22, 23), constrained_layout=True)
+        gs = fig.add_gridspec(6, 2, hspace=0.05, wspace=0.3,
                               height_ratios=[0.7, 1, 1, 1, 1, 1])
         row_offset = 1
         # Row 0: EBM budget over time
@@ -1634,8 +1634,8 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                                   inhospital_start_step=_ihs,
                                   title=f'SHAP Budget Over Time{title_suffix}')
     else:
-        fig = plt.figure(figsize=(22, 20))
-        gs = fig.add_gridspec(5, 2, hspace=0.4, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
+        fig = plt.figure(figsize=(22, 20), constrained_layout=True)
+        gs = fig.add_gridspec(5, 2, hspace=0.05, wspace=0.3, height_ratios=[1, 1, 1, 1, 1])
         row_offset = 0
 
     # Plot 1: TS importance over time
@@ -1895,7 +1895,6 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax6.axvline(x=0, color='black', linewidth=0.8)
         ax6.grid(True, alpha=0.3, axis='x'); ax6.invert_yaxis()
     
-    plt.tight_layout()
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
