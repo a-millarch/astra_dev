@@ -154,7 +154,7 @@ class InferenceSession:
     # Data preparation
     # ------------------------------------------------------------------
 
-    def _prepare_tensors(self, x_ts, x_ts_cat, tab_df):
+    def _prepare_tensors(self, x_ts, x_ts_cat, tab_df, trajectory_length=None):
         """
         Normalize raw patient data and convert to model-ready tensors.
 
@@ -164,6 +164,9 @@ class InferenceSession:
             x_ts_cat: np.ndarray [n_cat_dims, seq_len] or [1, n_cat_dims, seq_len]
                       Multi-hot encoded categorical time series.
             tab_df: pd.DataFrame with one row containing static features.
+            trajectory_length: Optional override for trajectory length. When
+                provided (e.g. from PatientContext), used instead of detecting
+                from the tensor via get_trajectory_lengths().
 
         Returns:
             (x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len) — all tensors on device
@@ -203,8 +206,11 @@ class InferenceSession:
         if temporal_ch_idx is not None:
             ts_norm[0, temporal_ch_idx, :] = x_ts[0, temporal_ch_idx, :]
 
-        # Trajectory length (computed on raw data before normalization zeroes padding)
-        traj_len = int(get_trajectory_lengths(x_ts)[0])
+        # Trajectory length: use explicit value if provided, else detect from tensor
+        if trajectory_length is not None:
+            traj_len = int(trajectory_length)
+        else:
+            traj_len = int(get_trajectory_lengths(x_ts)[0])
 
         # Convert to tensors
         x_ts_t = torch.from_numpy(ts_norm).float().to(self.device)
@@ -251,7 +257,8 @@ class InferenceSession:
     # Prediction
     # ------------------------------------------------------------------
 
-    def predict(self, x_ts, x_ts_cat, tab_df, censor_step=None, pid=None):
+    def predict(self, x_ts, x_ts_cat, tab_df, censor_step=None, pid=None,
+                trajectory_length=None):
         """
         Run inference on a single patient.
 
@@ -261,12 +268,13 @@ class InferenceSession:
             tab_df: pd.DataFrame with one row — static demographics
             censor_step: Optional timestep to evaluate at (temporal head only)
             pid: Optional patient identifier for the result
+            trajectory_length: Optional override for trajectory length (from PatientContext).
 
         Returns:
             InferenceResult
         """
         x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len = self._prepare_tensors(
-            x_ts, x_ts_cat, tab_df
+            x_ts, x_ts_cat, tab_df, trajectory_length=trajectory_length
         )
 
         # Pass trajectory lengths so the model builds a proper key_padding_mask
@@ -313,7 +321,8 @@ class InferenceSession:
     # SHAP explanation
     # ------------------------------------------------------------------
 
-    def explain(self, x_ts, x_ts_cat, tab_df, censor_step=None, pid=None):
+    def explain(self, x_ts, x_ts_cat, tab_df, censor_step=None, pid=None,
+                trajectory_length=None):
         """
         Compute SHAP values for a single patient.
 
@@ -323,6 +332,7 @@ class InferenceSession:
             tab_df: pd.DataFrame with one row — static demographics
             censor_step: Timestep to attribute (temporal head) or None (standard head, class 1)
             pid: Optional patient identifier
+            trajectory_length: Optional override for trajectory length (from PatientContext).
 
         Returns:
             SHAPResult
@@ -339,7 +349,7 @@ class InferenceSession:
             )
 
         x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len = self._prepare_tensors(
-            x_ts, x_ts_cat, tab_df
+            x_ts, x_ts_cat, tab_df, trajectory_length=trajectory_length
         )
 
         # Determine target step.
@@ -658,6 +668,7 @@ class InferenceSession:
             context.tab_df,
             censor_step=step,
             pid=context.pid,
+            trajectory_length=context.trajectory_length,
         )
 
     def refresh_and_predict(self, context, current_time, new_data=None):
@@ -691,6 +702,7 @@ class InferenceSession:
             context.tab_df,
             censor_step=step,
             pid=context.pid,
+            trajectory_length=context.trajectory_length,
         )
 
     def explain_ebm(self, context, save_path=None, top_n=20, top_k_lines=5):

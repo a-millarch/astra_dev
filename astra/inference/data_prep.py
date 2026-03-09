@@ -49,7 +49,7 @@ def timed_stage(timing_dict: dict, stage_name: str):
     timing_dict.setdefault(stage_name, []).append(time.perf_counter() - start)
 
 from astra.data.mappings import (
-    VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP,
+    VITALS_MAP, TEMP_FAHRENHEIT, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
     PROCEDURE_REVERSE_MAP, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
@@ -180,7 +180,7 @@ def _assign_to_bins(
     if len(valid_idx) == 0:
         return measurements.assign(position=pd.Series(dtype=int)).iloc[0:0]
 
-    within_bin = timestamps[valid_idx] < bin_ends[indices[valid_idx]]
+    within_bin = timestamps[valid_idx] <= bin_ends[indices[valid_idx]]
     final_idx = valid_idx[within_bin]
 
     if len(final_idx) == 0:
@@ -1522,8 +1522,27 @@ def _filter_vitals_stateless(vit: pd.DataFrame) -> pd.DataFrame:
 
     vit = vit.copy()
 
-    # Fix temperature in fahrenheit
-    vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
+    # Fix temperature in fahrenheit — match filters.filter_vitals() logic
+    def fahrenheit_to_celsius(f):
+        return (f - 32) * 5.0 / 9.0
+
+    # Use Værdi_Omregnet for 'Temp.' if available (pre-computed conversion)
+    if 'Værdi_Omregnet' in vit.columns:
+        vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
+
+    # Explicit F→C for known Fahrenheit parameters (Kernetemperatur, etc.)
+    for f in TEMP_FAHRENHEIT:
+        numeric_vals = pd.to_numeric(
+            vit.loc[vit.Vital_parametre == f, 'Værdi'], errors='coerce'
+        )
+        vit.loc[numeric_vals.index, 'Værdi'] = numeric_vals.apply(fahrenheit_to_celsius)
+
+    # Value-based F→C for 'Temperatur': bimodal distribution — values >50 are in °F
+    temp_numeric = pd.to_numeric(
+        vit.loc[vit.Vital_parametre == 'Temperatur', 'Værdi'], errors='coerce'
+    )
+    f_idx = temp_numeric[temp_numeric > 50].index
+    vit.loc[f_idx, 'Værdi'] = temp_numeric.loc[f_idx].apply(fahrenheit_to_celsius)
 
     # Rename to standard columns
     vit.rename(
