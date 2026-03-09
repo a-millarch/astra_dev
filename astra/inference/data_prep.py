@@ -1706,14 +1706,9 @@ def _filtered_dfs_to_raw_data(
         'pid': row.get('PID', 1),
         'admission_time': row['start'],
         'current_time': pd.Timestamp(current_time),
-        'demographics': {
-            'AGE': row.get('AGE', np.nan),
-            'SEX': row.get('SEX', np.nan),
-            'FIRST_HOSPITAL': row.get('FIRST_HOSPITAL', np.nan),
-            'HEIGHT': row.get('HEIGHT', np.nan),
-            'WEIGHT': row.get('WEIGHT', np.nan),
-            'ASMT_ELIX': row.get('ASMT_ELIX', np.nan),
-        },
+        # Include all base_df columns as demographics so _build_tab_df()
+        # can find any tabular feature the model needs (e.g., prehospital ABCD).
+        'demographics': {col: row[col] for col in row.index},
         'vitals': [],
         'labs': [],
         'icu': [],
