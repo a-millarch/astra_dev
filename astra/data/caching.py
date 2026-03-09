@@ -179,6 +179,7 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         x_cont=cache_data['trainval_x_cont'],
         X_ts_cat=cache_data['X_multi_hot'],
         y=cache_data['y'],
+        trajectory_lengths=cache_data['trajectory_lengths'],
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -194,6 +195,7 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         x_cont=cache_data['holdout_x_cont'],
         X_ts_cat=cache_data['tX_multi_hot'],
         y=cache_data['ty'],
+        trajectory_lengths=cache_data['holdout_trajectory_lengths'],
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,

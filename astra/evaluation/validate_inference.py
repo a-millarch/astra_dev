@@ -159,102 +159,90 @@ def validate_pipeline_consistency(
     tf_results = {}
     all_pass = True
 
-    for tf_str in timeframes:
-        value, unit = _parse_timeframe(tf_str)
-        step = time_to_step(value, unit, data_config=data_config)
+    # --- Training pipeline: single forward pass ---
+    with torch.no_grad():
+        x_ts_b = x_ts_train.unsqueeze(0).float().to(device)
+        x_cat_b = x_cat_train.unsqueeze(0).to(device)
+        x_cont_b = x_cont_train.unsqueeze(0).float().to(device)
+        x_ts_cat_b = x_ts_cat_train.unsqueeze(0).float().to(device)
+        traj_b = traj_len_train.unsqueeze(0).to(device)
 
-        if step is None:
-            tf_results[tf_str] = {
-                "step": None,
-                "skipped": True,
-                "reason": "beyond bin grid",
-            }
-            continue
-
-        if step >= traj_len_train_int:
-            tf_results[tf_str] = {
-                "step": step,
-                "skipped": True,
-                "reason": f"step {step} >= traj_len {traj_len_train_int}",
-            }
-            continue
-
-        # --- Training pipeline forward pass ---
-        with torch.no_grad():
-            x_ts_b = x_ts_train.unsqueeze(0).float().to(device)
-            x_cat_b = x_cat_train.unsqueeze(0).to(device)
-            x_cont_b = x_cont_train.unsqueeze(0).float().to(device)
-            x_ts_cat_b = x_ts_cat_train.unsqueeze(0).float().to(device)
-            traj_b = traj_len_train.unsqueeze(0).to(device)
-
-            logits_train = model(
-                (x_ts_b, (x_cat_b, x_cont_b), x_ts_cat_b, traj_b)
-            )
-
-        if session.is_temporal:
-            probs_train = torch.sigmoid(logits_train).cpu().numpy()[0]
-            prob_train = float(probs_train[step])
-        else:
-            probs_train = torch.softmax(logits_train, dim=1).cpu().numpy()[0]
-            prob_train = float(probs_train[1])
-
-        # --- Inference pipeline prediction ---
-        inf_result = session.predict(
-            x_ts_raw.copy(),
-            x_ts_cat_raw.copy(),
-            tab_df.copy(),
-            censor_step=step,
-            pid=pid,
+        logits_train = model(
+            (x_ts_b, (x_cat_b, x_cont_b), x_ts_cat_b, traj_b)
         )
-        prob_inf = inf_result.probability
 
-        abs_diff = abs(prob_train - prob_inf)
-        passed = abs_diff <= atol
-        if not passed:
-            all_pass = False
+    if session.is_temporal:
+        # logits: [1, seq_len] — per-timestep predictions
+        probs_all_train = torch.sigmoid(logits_train).cpu().numpy()[0]
+    else:
+        # logits: [1, 2] — single prediction (timeframes don't apply)
+        probs_std = torch.softmax(logits_train, dim=1).cpu().numpy()[0]
+        prob_train_single = float(probs_std[1])
 
-        time_min = step_to_time(step, data_config=data_config)
-        tf_results[tf_str] = {
-            "step": step,
-            "time_label": time_to_hours(time_min) if time_min else tf_str,
-            "training_prob": prob_train,
-            "inference_prob": prob_inf,
-            "abs_diff": abs_diff,
-            "passed": passed,
-        }
-
-    # For non-temporal head, timeframes don't affect the prediction —
-    # add a single full-trajectory comparison if nothing was tested.
-    if not session.is_temporal and not any(
-        not v.get("skipped") for v in tf_results.values()
-    ):
-        with torch.no_grad():
-            x_ts_b = x_ts_train.unsqueeze(0).float().to(device)
-            x_cat_b = x_cat_train.unsqueeze(0).to(device)
-            x_cont_b = x_cont_train.unsqueeze(0).float().to(device)
-            x_ts_cat_b = x_ts_cat_train.unsqueeze(0).float().to(device)
-            traj_b = traj_len_train.unsqueeze(0).to(device)
-            logits_train = model(
-                (x_ts_b, (x_cat_b, x_cont_b), x_ts_cat_b, traj_b)
-            )
-        probs_train = torch.softmax(logits_train, dim=1).cpu().numpy()[0]
-        prob_train = float(probs_train[1])
-
+    if not session.is_temporal:
+        # Standard head: one comparison, censor_step irrelevant
         inf_result = session.predict(
             x_ts_raw.copy(), x_ts_cat_raw.copy(), tab_df.copy(), pid=pid,
         )
-        abs_diff = abs(prob_train - inf_result.probability)
+        abs_diff = abs(prob_train_single - inf_result.probability)
         passed = abs_diff <= atol
         if not passed:
             all_pass = False
         tf_results["full_trajectory"] = {
             "step": traj_len_train_int - 1,
             "time_label": "full",
-            "training_prob": prob_train,
+            "training_prob": prob_train_single,
             "inference_prob": inf_result.probability,
             "abs_diff": abs_diff,
             "passed": passed,
         }
+    else:
+        # Temporal head: compare at each timeframe
+        for tf_str in timeframes:
+            value, unit = _parse_timeframe(tf_str)
+            step = time_to_step(value, unit, data_config=data_config)
+
+            if step is None:
+                tf_results[tf_str] = {
+                    "step": None,
+                    "skipped": True,
+                    "reason": "beyond bin grid",
+                }
+                continue
+
+            if step >= traj_len_train_int:
+                tf_results[tf_str] = {
+                    "step": step,
+                    "skipped": True,
+                    "reason": f"step {step} >= traj_len {traj_len_train_int}",
+                }
+                continue
+
+            prob_train = float(probs_all_train[step])
+
+            inf_result = session.predict(
+                x_ts_raw.copy(),
+                x_ts_cat_raw.copy(),
+                tab_df.copy(),
+                censor_step=step,
+                pid=pid,
+            )
+            prob_inf = inf_result.probability
+
+            abs_diff = abs(prob_train - prob_inf)
+            passed = abs_diff <= atol
+            if not passed:
+                all_pass = False
+
+            time_min = step_to_time(step, data_config=data_config)
+            tf_results[tf_str] = {
+                "step": step,
+                "time_label": time_to_hours(time_min) if time_min else tf_str,
+                "training_prob": prob_train,
+                "inference_prob": prob_inf,
+                "abs_diff": abs_diff,
+                "passed": passed,
+            }
 
     # ================================================================
     # 6. Summary
