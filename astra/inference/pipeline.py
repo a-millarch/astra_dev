@@ -668,7 +668,6 @@ class InferenceSession:
             context.tab_df,
             censor_step=step,
             pid=context.pid,
-            trajectory_length=context.trajectory_length,
         )
 
     def refresh_and_predict(self, context, current_time, new_data=None):
@@ -702,7 +701,6 @@ class InferenceSession:
             context.tab_df,
             censor_step=step,
             pid=context.pid,
-            trajectory_length=context.trajectory_length,
         )
 
     def explain_ebm(self, context, save_path=None, top_n=20, top_k_lines=5):

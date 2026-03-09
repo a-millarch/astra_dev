@@ -49,7 +49,7 @@ def timed_stage(timing_dict: dict, stage_name: str):
     timing_dict.setdefault(stage_name, []).append(time.perf_counter() - start)
 
 from astra.data.mappings import (
-    VITALS_MAP, TEMP_FAHRENHEIT, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP,
+    VITALS_MAP, BP_TYPES, LABS_REVERSE_MAP, ICU_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
     PROCEDURE_REVERSE_MAP, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
@@ -1511,93 +1511,6 @@ def _try_add_elixhauser(
 
 # ---- Phase 2: Filter concepts ----------------------------------------------
 
-def _filter_vitals_stateless(vit: pd.DataFrame) -> pd.DataFrame:
-    """
-    Stateless version of filters.filter_vitals().
-
-    Replicates the exact same logic (temp conversion, BP splitting, feature
-    mapping, numeric filtering) but does NOT write Height_Weight.pkl to disk.
-    """
-    from astra.utils import inches_to_cm, ounces_to_kg
-
-    vit = vit.copy()
-
-    # Fix temperature in fahrenheit — match filters.filter_vitals() logic
-    def fahrenheit_to_celsius(f):
-        return (f - 32) * 5.0 / 9.0
-
-    # Use Værdi_Omregnet for 'Temp.' if available (pre-computed conversion)
-    if 'Værdi_Omregnet' in vit.columns:
-        vit.loc[vit.Vital_parametre == 'Temp.', 'Værdi'] = vit["Værdi_Omregnet"]
-
-    # Explicit F→C for known Fahrenheit parameters (Kernetemperatur, etc.)
-    for f in TEMP_FAHRENHEIT:
-        numeric_vals = pd.to_numeric(
-            vit.loc[vit.Vital_parametre == f, 'Værdi'], errors='coerce'
-        )
-        vit.loc[numeric_vals.index, 'Værdi'] = numeric_vals.apply(fahrenheit_to_celsius)
-
-    # Value-based F→C for 'Temperatur': bimodal distribution — values >50 are in °F
-    temp_numeric = pd.to_numeric(
-        vit.loc[vit.Vital_parametre == 'Temperatur', 'Værdi'], errors='coerce'
-    )
-    f_idx = temp_numeric[temp_numeric > 50].index
-    vit.loc[f_idx, 'Værdi'] = temp_numeric.loc[f_idx].apply(fahrenheit_to_celsius)
-
-    # Rename to standard columns
-    vit.rename(
-        columns={
-            "Værdi": "VALUE",
-            "Vital_parametre": "FEATURE",
-            "Registreringstidspunkt": "TIMESTAMP",
-        },
-        inplace=True,
-    )
-    vit = vit[["TIMESTAMP", "PID", "FEATURE", "VALUE"]]
-
-    # Split blood pressure into SBP/DBP
-    for bt in BP_TYPES:
-        mask = vit['FEATURE'] == bt
-        if len(vit.loc[mask]) > 0:
-            split_values = vit.loc[mask, 'VALUE'].str.split('/', n=1, expand=True)
-            vit.loc[mask, 'FEATURE'] = 'SBP'
-            vit.loc[mask, 'VALUE'] = split_values[0]
-            diastolic_rows = vit[mask].copy()
-            diastolic_rows['FEATURE'] = 'DBP'
-            diastolic_rows['VALUE'] = split_values[1]
-            vit = pd.concat([vit, diastolic_rows], ignore_index=True)
-            vit.loc[vit['FEATURE'].isin(['SBP', 'DBP']), 'VALUE'] = pd.to_numeric(
-                vit.loc[vit['FEATURE'].isin(['SBP', 'DBP']), 'VALUE'],
-                errors='coerce',
-            )
-            vit['VALUE'] = vit['VALUE'].astype(str)
-
-    # Map feature names (Danish → standard)
-    vit["FEATURE"] = vit["FEATURE"].replace(to_replace=VITALS_MAP)
-    vit["FEATURE"] = vit["FEATURE"].replace(to_replace=HEIGHT_WEIGHT_MAP)
-    vit.loc[vit.FEATURE == 'HEIGHT', 'VALUE'] = inches_to_cm(
-        vit[vit.FEATURE == 'HEIGHT'].VALUE.astype(float)
-    )
-    vit.loc[vit.FEATURE == 'WEIGHT', 'VALUE'] = ounces_to_kg(
-        vit[vit.FEATURE == 'WEIGHT'].VALUE.astype(float)
-    )
-
-    # NOTE: Original filter_vitals writes Height_Weight.pkl here — we skip that.
-
-    # Keep only vitals (not HEIGHT/WEIGHT) with valid numeric values
-    pattern = r'([<>]\s*)?[-+]?\d*\.\d+|\d+\.?\d*'
-    vit = vit[
-        (vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
-        & (vit.VALUE.notnull())
-        & (
-            (vit['VALUE'].str.contains(pattern, regex=True))
-            | (vit['VALUE'].dtype == float)
-        )
-    ].copy(deep=True)
-
-    return vit
-
-
 def _filter_concepts_for_patient(
     base_df: pd.DataFrame,
     cfg: dict,
@@ -1648,12 +1561,10 @@ def _filter_concepts_for_patient(
             continue
 
         # Apply concept-specific filter
-        # VitaleVaerdier uses a stateless variant to avoid writing
-        # Height_Weight.pkl to data/interim/ (shared with cohort pipeline).
+        # ADTHaendelser needs explicit base_df to avoid get_base_df() disk I/O.
+        # All other concepts use the batch filter functions via collect_filter().
         if concept == 'ADTHaendelser':
             concept_filtered = _filter_adt(inhospital, base_df=base_df)
-        elif concept == 'VitaleVaerdier':
-            concept_filtered = _filter_vitals_stateless(inhospital)
         else:
             filter_fn = collect_filter(concept)
             concept_filtered = filter_fn(inhospital)
