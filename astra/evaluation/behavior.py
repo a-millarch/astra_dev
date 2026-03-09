@@ -267,6 +267,7 @@ def _draw_inhospital_boundary(ax, inhospital_start_step, n_steps, label=True):
 
 def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
                               tick_idx, tick_labels,
+                              inhospital_start_step=None,
                               title: str = 'SHAP Budget Over Time: EBM vs Clinical'):
     """Draw overlapping area chart of EBM vs Clinical SHAP budget over time."""
     clinical_t = budget['clinical_temporal'][:n_steps]
@@ -283,11 +284,12 @@ def _draw_ebm_budget_temporal(ax, budget: Dict, n_steps: int,
     ax.set_xlim(0, n_steps - 1)
     ax.set_ylim(0)
     ax.set_xticks(tick_idx)
-    ax.set_xticklabels(tick_labels, rotation=45)
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Sum |SHAP|')
-    ax.set_title(title, fontweight='bold')
-    ax.legend(loc='upper right', fontsize=9)
+    ax.set_xticklabels(tick_labels, rotation=45, fontsize=11)
+    ax.set_xlabel('Time', fontsize=12)
+    ax.set_ylabel('Sum |SHAP|', fontsize=12)
+    ax.set_title(title, fontweight='bold', fontsize=14)
+    _draw_inhospital_boundary(ax, inhospital_start_step, n_steps)
+    ax.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=11)
     ax.grid(True, alpha=0.3)
 
 
@@ -1615,6 +1617,11 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
     has_ebm = budget is not None
 
+    # Compute inhospital boundary step (used across multiple plots)
+    _ihs_steps = shap_results.get('test_data', {}).get('inhospital_start_steps')
+    _ihs = int(_ihs_steps[sample_idx]) if (_ihs_steps is not None
+               and sample_idx < len(_ihs_steps) and _ihs_steps[sample_idx] is not None) else None
+
     if has_ebm:
         fig = plt.figure(figsize=(22, 23))
         gs = fig.add_gridspec(6, 2, hspace=0.4, wspace=0.3,
@@ -1624,6 +1631,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax_budget = fig.add_subplot(gs[0, :])
         _draw_ebm_budget_temporal(ax_budget, budget, n_steps, tick_idx,
                                   [time_fmt[i] for i in tick_idx],
+                                  inhospital_start_step=_ihs,
                                   title=f'SHAP Budget Over Time{title_suffix}')
     else:
         fig = plt.figure(figsize=(22, 20))
@@ -1663,15 +1671,13 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         ax1.plot(cat_ts, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_ts)), cat_ts, alpha=0.2, color='#00d4aa')
 
-    ax1.set_xlabel('Time'); ax1.set_ylabel('mean |SHAP Value|')
-    ax1.set_title(f'TS SHAP Over Time{title_suffix}, Class {class_idx}', fontweight='bold')
-    ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
-    # Mark prehospital/inhospital boundary
-    _ihs_steps = shap_results.get('test_data', {}).get('inhospital_start_steps')
-    _ihs = int(_ihs_steps[sample_idx]) if (_ihs_steps is not None
-               and sample_idx < len(_ihs_steps) and _ihs_steps[sample_idx] is not None) else None
+    ax1.set_xlabel('Time', fontsize=12); ax1.set_ylabel('mean |SHAP Value|', fontsize=12)
+    ax1.set_title(f'TS SHAP Over Time{title_suffix}, Class {class_idx}', fontweight='bold', fontsize=14)
+    ax1.set_xticks(tick_idx); ax1.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
+    ax1.tick_params(axis='y', labelsize=11)
     _draw_inhospital_boundary(ax1, _ihs, n_steps)
-    ax1.legend(); ax1.grid(True, alpha=0.3)
+    ax1.legend(bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=11)
+    ax1.grid(True, alpha=0.3)
 
     # Plot 2: Continuous TS heatmap — clinical-only when EBM present
     ax2 = fig.add_subplot(gs[1 + row_offset, :])
@@ -1689,18 +1695,18 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         n_display = n_channels
     norm2 = get_centered_norm(ts_shap_display, center=0.0)
     im = ax2.imshow(ts_shap_display, aspect='auto', cmap='RdBu_r', interpolation='nearest', norm=norm2)
-    ax2.set_xlabel('Time'); ax2.set_ylabel('Channel')
+    ax2.set_xlabel('Time', fontsize=12); ax2.set_ylabel('Channel', fontsize=12)
     heatmap_title = 'Clinical Continuous TS SHAP Heatmap' if has_ebm else 'Continuous TS SHAP Heatmap (grouped)'
-    ax2.set_title(heatmap_title, fontweight='bold')
+    ax2.set_title(heatmap_title, fontweight='bold', fontsize=14)
     if n_display <= 40:
         ax2.set_yticks(range(n_display))
-        ax2.set_yticklabels(ordered_labels, fontsize=7 if n_display > 25 else 9)
+        ax2.set_yticklabels(ordered_labels, fontsize=8 if n_display > 25 else 10)
     else:
         step = max(1, n_display // 30)
         yticks = list(range(0, n_display, step))
         ax2.set_yticks(yticks)
-        ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=7)
-    ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+        ax2.set_yticklabels([ordered_labels[i] for i in yticks], fontsize=8)
+    ax2.set_xticks(tick_idx); ax2.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
     _draw_inhospital_boundary(ax2, _ihs, n_steps, label=False)
     plt.colorbar(im, ax=ax2, label='SHAP Value')
     if not has_ebm and channel2feature:
@@ -1726,17 +1732,17 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         norm3 = get_centered_norm(cat_ts_shap_data, center=0.0)
         im3 = ax3.imshow(cat_ts_shap_data, aspect='auto', cmap='RdBu_r', 
                          interpolation='nearest', norm=norm3)
-        ax3.set_xlabel('Time'); ax3.set_ylabel('Category')
-        ax3.set_title('Categorical TS SHAP Heatmap', fontweight='bold')
-        
+        ax3.set_xlabel('Time', fontsize=12); ax3.set_ylabel('Category', fontsize=12)
+        ax3.set_title('Categorical TS SHAP Heatmap', fontweight='bold', fontsize=14)
+
         if n_cats <= 30:
-            ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names[:n_cats], fontsize=8)
+            ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names[:n_cats], fontsize=9)
         else:
             step = max(1, n_cats // 20)
             yticks = list(range(0, n_cats, step))
-            ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
-        
-        ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+            ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=9)
+
+        ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
         _draw_inhospital_boundary(ax3, _ihs, n_steps, label=False)
         plt.colorbar(im3, ax=ax3, label='SHAP Value')
 
@@ -1759,18 +1765,18 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         
         # Show activity data (0/1 so no centering needed)
         im3 = ax3.imshow(cat_ts_data, aspect='auto', cmap='YlGnBu', interpolation='nearest', vmin=0)
-        ax3.set_xlabel('Time'); ax3.set_ylabel('Category')
-        ax3.set_title('Categorical TS Activity (use compute_per_category_shap=True for SHAP values)', 
-                      fontweight='bold', fontsize=11)
-        
+        ax3.set_xlabel('Time', fontsize=12); ax3.set_ylabel('Category', fontsize=12)
+        ax3.set_title('Categorical TS Activity (use compute_per_category_shap=True for SHAP values)',
+                      fontweight='bold', fontsize=12)
+
         if n_cats <= 30:
-            ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names[:n_cats], fontsize=8)
+            ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names[:n_cats], fontsize=9)
         else:
             step = max(1, n_cats // 20)
             yticks = list(range(0, n_cats, step))
-            ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
-        
-        ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
+            ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=9)
+
+        ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45, fontsize=11)
         plt.colorbar(im3, ax=ax3, label='Active')
         
         # Feature boundaries
@@ -1802,9 +1808,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
         names = [f'Channel {i}' for i in sorted_idx]
         bar_colors = ['#008bfb'] * n_show
     ax4.barh(range(n_show), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
-    ax4.set_yticks(range(n_show)); ax4.set_yticklabels(names, fontsize=9)
+    ax4.set_yticks(range(n_show)); ax4.set_yticklabels(names, fontsize=10)
     bar_title = f'Top {n_show} Clinical Channels' if has_ebm else f'Top {n_show} Channels'
-    ax4.set_xlabel('Mean |SHAP|'); ax4.set_title(bar_title, fontweight='bold')
+    ax4.set_xlabel('Mean |SHAP|', fontsize=12); ax4.set_title(bar_title, fontweight='bold', fontsize=14)
+    ax4.tick_params(axis='x', labelsize=11)
     ax4.grid(True, alpha=0.3, axis='x'); ax4.invert_yaxis()
     if channel2feature and not has_ebm:
         used_groups = set()
@@ -1814,7 +1821,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             else: used_groups.add('Clinical')
         ax4.legend(handles=[Patch(facecolor=_GROUP_COLORS[g], label=g, alpha=0.7)
                             for g in ['Clinical', 'EBM'] if g in used_groups],
-                   loc='lower right', fontsize=8)
+                   loc='lower right', fontsize=11)
     
     # Plot 5: Static categorical
     if shap_results['cat_shap'] is not None and shap_results['cat_shap'].size > 0:
@@ -1845,9 +1852,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                     ylabels.append(f'{name}\n(val={val})')
             else:
                 ylabels.append(f'{name}')
-        ax5.set_yticklabels(ylabels, fontsize=9)
-        
-        ax5.set_xlabel('SHAP Value'); ax5.set_title('Static Categorical', fontweight='bold')
+        ax5.set_yticklabels(ylabels, fontsize=10)
+
+        ax5.set_xlabel('SHAP Value', fontsize=12); ax5.set_title('Static Categorical', fontweight='bold', fontsize=14)
+        ax5.tick_params(axis='x', labelsize=11)
         ax5.axvline(x=0, color='black', linewidth=0.8)
         ax5.grid(True, alpha=0.3, axis='x'); ax5.invert_yaxis()
     
@@ -1880,9 +1888,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
                     ylabels.append(f'{name}\n(val={val})')
             else:
                 ylabels.append(f'{name}')
-        ax6.set_yticklabels(ylabels, fontsize=9)
-        
-        ax6.set_xlabel('SHAP Value'); ax6.set_title('Static Continuous', fontweight='bold')
+        ax6.set_yticklabels(ylabels, fontsize=10)
+
+        ax6.set_xlabel('SHAP Value', fontsize=12); ax6.set_title('Static Continuous', fontweight='bold', fontsize=14)
+        ax6.tick_params(axis='x', labelsize=11)
         ax6.axvline(x=0, color='black', linewidth=0.8)
         ax6.grid(True, alpha=0.3, axis='x'); ax6.invert_yaxis()
     

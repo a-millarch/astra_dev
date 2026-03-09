@@ -61,6 +61,7 @@ class SimulationResult:
     total_timing: dict = field(default_factory=dict)
     wall_clock_seconds: float = 0.0
     prediction_curve: Optional[np.ndarray] = None  # [seq_len], NaN where unpredicted
+    inhospital_start_hours: Optional[float] = None  # hours after admission
 
     @property
     def n_steps(self) -> int:
@@ -109,6 +110,11 @@ class SimulationResult:
         # -- Prediction trajectory --
         ax = axes[0]
         ax.plot(df['elapsed_hours'], df['probability'], 'b-o', markersize=2, linewidth=1)
+        if self.inhospital_start_hours is not None and self.inhospital_start_hours > 0:
+            ax.axvline(x=self.inhospital_start_hours, color='#2196F3', linewidth=1.5,
+                       linestyle=':', alpha=0.8,
+                       label=f'Hospital arrival ({self.inhospital_start_hours:.1f}h)')
+            ax.legend()
         ax.set_ylabel('P(deceased 30d)')
         ax.set_title(f'Simulation: patient {self.pid} ({self.n_steps} steps, '
                       f'{self.wall_clock_seconds:.1f}s total)')
@@ -327,12 +333,22 @@ class SimulationRunner:
         """Build a SimulationResult from steps accumulated so far."""
         if not self._steps or self.context is None:
             return None
+        # Compute inhospital start hours for prehospital boundary
+        ihs_hours = None
+        ihs_time = self.context.demographics.get('inhospital_start')
+        if ihs_time is not None:
+            ihs_ts = pd.Timestamp(ihs_time)
+            if pd.notna(ihs_ts):
+                h = (ihs_ts - self.context.admission_time).total_seconds() / 3600
+                if h > 0:
+                    ihs_hours = h
         return SimulationResult(
             pid=self.context.pid,
             admission_time=self.context.admission_time,
             steps=list(self._steps),
             total_timing=dict(self.context._timing),
             prediction_curve=self._prediction_curve.copy() if self._prediction_curve is not None else None,
+            inhospital_start_hours=ihs_hours,
         )
 
     @property
@@ -467,6 +483,16 @@ class SimulationRunner:
         # Aggregate timing from context
         total_timing = dict(context._timing)
 
+        # Compute inhospital start hours for prehospital boundary plotting
+        ihs_hours = None
+        ihs_time = context.demographics.get('inhospital_start')
+        if ihs_time is not None:
+            ihs_ts = pd.Timestamp(ihs_time)
+            if pd.notna(ihs_ts):
+                h = (ihs_ts - context.admission_time).total_seconds() / 3600
+                if h > 0:
+                    ihs_hours = h
+
         sim_result = SimulationResult(
             pid=context.pid,
             admission_time=context.admission_time,
@@ -474,6 +500,7 @@ class SimulationRunner:
             total_timing=total_timing,
             wall_clock_seconds=time.perf_counter() - wall_start,
             prediction_curve=prediction_curve,
+            inhospital_start_hours=ihs_hours,
         )
 
         logger.info(

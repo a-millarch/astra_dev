@@ -205,6 +205,17 @@ def default_session_plot(session, prediction_curve=None):
         )
     )
 
+    # Inject inhospital boundary info for SHAP plots (prehospital patients)
+    ihs_time = ctx.demographics.get('inhospital_start')
+    if ihs_time is not None:
+        ihs_ts = pd.Timestamp(ihs_time)
+        if pd.notna(ihs_ts):
+            from astra.evaluation.utils import time_to_step
+            delta_min = (ihs_ts - ctx.admission_time).total_seconds() / 60
+            ihs_step = time_to_step(delta_min, 'min')
+            if ihs_step is not None:
+                shap_dict['test_data']['inhospital_start_steps'] = np.array([ihs_step])
+
     visualize_shap_individual(
         shap_dict,
         sample_idx=0,

@@ -11,6 +11,27 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _get_inhospital_start_hours(ctx):
+    """Return hours since admission_time for inhospital start, or None."""
+    ihs = ctx.demographics.get('inhospital_start')
+    if ihs is None or (isinstance(ihs, float) and np.isnan(ihs)):
+        return None
+    ihs = pd.Timestamp(ihs)
+    if pd.isna(ihs):
+        return None
+    hours = (ihs - ctx.admission_time).total_seconds() / 3600
+    # Only meaningful if prehospital data pushes admission_time earlier
+    return hours if hours > 0 else None
+
+
+def _draw_inhospital_boundary_hours(ax, ihs_hours):
+    """Draw a vertical line marking hospital arrival on an hours-based axis."""
+    if ihs_hours is None:
+        return
+    ax.axvline(x=ihs_hours, color='#2196F3', linewidth=1.5, linestyle=':',
+               alpha=0.8, label=f'Hospital arrival ({ihs_hours:.1f}h)')
+
+
 def plot_prediction_trajectory(result, ctx, save_path=None, model_name=None):
     """Plot P(deceased_30d) at each visible timestep.
 
@@ -58,6 +79,8 @@ def _plot_temporal_trajectory(result, ctx, save_path):
     ax.plot(hours, probs_visible, "o-", color="steelblue", markersize=3, linewidth=1.5)
     ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5, label="0.5 threshold")
     ax.fill_between(hours, probs_visible, alpha=0.15, color="steelblue")
+
+    _draw_inhospital_boundary_hours(ax, _get_inhospital_start_hours(ctx))
 
     ax.set_xlabel("Hours since admission")
     ax.set_ylabel("P(deceased 30d)")
@@ -127,6 +150,8 @@ def _plot_nontemporal_trajectory(ctx, save_path, model_name):
     ax.plot(hours, probs, "o-", color="steelblue", markersize=3, linewidth=1.5)
     ax.axhline(0.5, color="gray", linestyle="--", alpha=0.5, label="0.5 threshold")
     ax.fill_between(hours, probs, alpha=0.15, color="steelblue")
+
+    _draw_inhospital_boundary_hours(ax, _get_inhospital_start_hours(ctx))
 
     ax.set_xlabel("Hours since admission")
     ax.set_ylabel("P(deceased 30d)")
