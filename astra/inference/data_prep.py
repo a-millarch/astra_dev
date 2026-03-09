@@ -1416,6 +1416,88 @@ def _build_single_patient_base_df(
     # 10. Elixhauser comorbidity score (pure Python, no file I/O)
     result = _try_add_elixhauser(result, data_dir=data_dir)
 
+    # 11. Prehospital start — aligns bin grid with batch pipeline
+    if cfg.get("prehospital"):
+        result = _apply_prehospital_start(result, cpr_hash, cfg)
+
+    return result
+
+
+def _apply_prehospital_start(
+    result: pd.DataFrame,
+    cpr_hash: str,
+    cfg: dict,
+) -> pd.DataFrame:
+    """Look up prehospital_start from the batch base_df and align bin grid.
+
+    When ``cfg["prehospital"]`` is enabled, the batch pipeline sets
+    ``start = min(prehospital_start, inhospital_start)`` so that the bin
+    grid begins at the earliest prehospital encounter.  The inference
+    pipeline must do the same to keep bin positions aligned.
+
+    Reads the pre-built batch base_df (already processed by
+    :func:`~astra.data.prehospital.run_prehospital_pipeline` on Azure)
+    and copies ``prehospital_start`` + ABCD columns into the inference
+    base_df.
+    """
+    import os
+
+    batch_base_path = cfg.get("base_df_path", "data/interim/base_df.pkl")
+    if not os.path.isfile(batch_base_path):
+        logger.warning(
+            f"Prehospital enabled but batch base_df not found at "
+            f"{batch_base_path} — bin grid may be misaligned"
+        )
+        return result
+
+    batch_base = pd.read_pickle(batch_base_path)
+
+    if "prehospital_start" not in batch_base.columns:
+        logger.info("Batch base_df has no prehospital_start column — skipping")
+        return result
+
+    # Match by CPR_hash (and trajectory overlap if multiple rows)
+    cpr_match = batch_base[batch_base["CPR_hash"] == cpr_hash]
+    if cpr_match.empty:
+        logger.info(f"Patient {cpr_hash[:8]}... not found in batch base_df")
+        return result
+
+    # If multiple trajectories for same CPR_hash, pick the one overlapping
+    # with the inference trajectory's start time
+    if len(cpr_match) > 1:
+        inf_start = result["start"].iloc[0]
+        cpr_match = cpr_match[
+            (cpr_match["start"] <= inf_start + pd.Timedelta(hours=1))
+            & (cpr_match["end"] >= inf_start - pd.Timedelta(hours=1))
+        ]
+        if cpr_match.empty:
+            logger.warning("No matching trajectory in batch base_df for this patient")
+            return result
+
+    row = cpr_match.iloc[0]
+    ph_start = row.get("prehospital_start")
+
+    result["inhospital_start"] = result["start"].copy()
+    result["prehospital_start"] = ph_start
+
+    if pd.notna(ph_start):
+        ph_start = pd.Timestamp(ph_start)
+        result["start"] = result["start"].apply(
+            lambda s: min(ph_start, pd.Timestamp(s))
+        )
+        logger.info(
+            f"Prehospital start: {ph_start} "
+            f"(shifted bin grid by "
+            f"{(result['inhospital_start'].iloc[0] - ph_start).total_seconds() / 60:.0f} min)"
+        )
+    else:
+        logger.info("Patient has no prehospital data — start unchanged")
+
+    # Copy ABCD categorical columns if present in batch base_df
+    for col in ['A', 'B', 'C', 'D']:
+        if col in row.index:
+            result[col] = row[col]
+
     return result
 
 
@@ -1563,11 +1645,17 @@ def _filter_concepts_for_patient(
         # Apply concept-specific filter
         # ADTHaendelser needs explicit base_df to avoid get_base_df() disk I/O.
         # All other concepts use the batch filter functions via collect_filter().
+        patient_pids = inhospital['PID'].unique() if 'PID' in inhospital.columns else None
         if concept == 'ADTHaendelser':
             concept_filtered = _filter_adt(inhospital, base_df=base_df)
         else:
             filter_fn = collect_filter(concept)
             concept_filtered = filter_fn(inhospital)
+
+        # Batch filters may concat population-level prehospital data;
+        # keep only the current patient's rows.
+        if patient_pids is not None and 'PID' in concept_filtered.columns:
+            concept_filtered = concept_filtered[concept_filtered['PID'].isin(patient_pids)]
 
         if concept_filtered.empty:
             logger.info(f"No {concept} data after concept filter")
