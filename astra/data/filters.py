@@ -19,32 +19,82 @@ from astra.data.mappings import (
 logger = logging.getLogger(__name__)
 
 
-def filter_base(base):
-    # filter by notes
-    logger.info("Loading Notes")
-    df = pd.read_csv("data/raw/Notater.csv")
-    dff = filter_inhospital(base, df, cfg, "Redigeringstidspunkt", offset=0)
-    dff = dff.merge(base[["PID", "start"]], on="PID", how="left")
+def mark_traumatext(base, cfg):
+    """Mark patients whose clinical notes contain trauma-related keywords.
 
-    keywords = ["traume", "trauma", "tilskadekomst", "traumemodtagelse", "traumecenter"]
+    Adds two boolean columns to *base*:
+      - ``TRAUMATEXT``     – True if any in-hospital note contains a keyword
+      - ``TRAUMATEXT_12H`` – True if a matching note appears within the
+        configured time window of the patient's ``start`` time
+
+    Reads the already-filtered Notater concept from
+    ``data/interim/concepts/Notater.pkl``.  If the file does not exist the
+    columns are initialised to ``False`` and a warning is logged.
+    """
+    tt_cfg = cfg.get("traumatext_config", {})
+    if not tt_cfg.get("enabled", False):
+        logger.info("Traumatext marking disabled in config, skipping")
+        base["TRAUMATEXT"] = False
+        base["TRAUMATEXT_12H"] = False
+        return base
+
+    source_file = tt_cfg.get("source_file", "data/interim/concepts/Notater.pkl")
+
+    if not is_file_present(source_file):
+        logger.warning(
+            f"Notater file not found at {source_file}. "
+            "TRAUMATEXT columns set to False. Run filter_subsets_inhospital first."
+        )
+        base["TRAUMATEXT"] = False
+        base["TRAUMATEXT_12H"] = False
+        return base
+
+    logger.info("Marking trauma keywords in clinical notes")
+
+    text_column = tt_cfg.get("text_column", "Note")
+    ts_column = tt_cfg.get("timestamp_column", "Oprettelsestidspunkt")
+    t_delta = tt_cfg.get("time_window_hours", 12)
+    keywords = tt_cfg.get("keywords", [
+        "traume", "trauma", "tilskadekomst",
+        "traumemodtagelse", "traumecenter",
+    ])
+
+    df = pd.read_pickle(source_file)
+    dff = df.merge(base[["PID", "start"]], on="PID", how="left")
+
     dff = mark_keywords_in_df(
         dff,
-        "Note",
+        text_column,
         keywords,
-        "Oprettelsestidspunkt",
+        ts_column,
         "start",
-        t_delta=12,
+        t_delta=t_delta,
         new_column="TRAUMATEXT",
     )
 
-    # Mark in base
-    pids_wtt_12 = dff.loc[
-        (dff["TRAUMATEXT"] == True) & (dff["within_12_hours"] == True)
-    ].PID.unique()
+    # Initialise columns to False
+    base["TRAUMATEXT"] = False
+    base["TRAUMATEXT_12H"] = False
+
+    # Any-time keyword match
+    pids_any = dff.loc[dff["TRAUMATEXT"] == True, "PID"].unique()
+    base.loc[base.PID.isin(pids_any), "TRAUMATEXT"] = True
+
+    # Within time-window match
+    within_col = f"within_{t_delta}_hours"
+    if within_col in dff.columns:
+        pids_window = dff.loc[
+            (dff["TRAUMATEXT"] == True) & (dff[within_col] == True),
+            "PID",
+        ].unique()
+        base.loc[base.PID.isin(pids_window), "TRAUMATEXT_12H"] = True
+
+    n_any = base["TRAUMATEXT"].sum()
+    n_window = base["TRAUMATEXT_12H"].sum()
     logger.info(
-        f"{len(pids_wtt_12)} of {len(base)} patients have trauma keywords in notes."
+        f"TRAUMATEXT: {n_any}/{len(base)} patients have trauma keywords "
+        f"({n_window} within {t_delta}h window)"
     )
-    base.loc[base.PID.isin(pids_wtt_12), "TRAUMATEXT"] = True
     return base
 
 
@@ -91,13 +141,14 @@ def filter_inhospital(
     colnames = df.columns.to_list()
     # ensure datetime format for input df
     df = ensure_datetime(df, dt_name)
-    # merge and filter
-    merged_df = base[["PID", "CPR_hash", "start", "end"]].merge(
-        df, on="CPR_hash", how="left"
-    )
+
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
+    base_cols = ["PID", "CPR_hash", "start", "end"]
+    merged_df = base[base_cols].merge(df, on="CPR_hash", how="left")
+    lower_bound = merged_df["start"]
 
     filtered_df = merged_df[
-        (merged_df[dt_name] >= merged_df["start"] - pd.DateOffset(days=offset))
+        (merged_df[dt_name] >= lower_bound - pd.DateOffset(days=offset))
         & (merged_df[dt_name] <= merged_df["end"] + pd.DateOffset(days=offset))
     ]
     filtered_df = filtered_df.drop_duplicates().reset_index(drop=True)
@@ -157,6 +208,14 @@ def filter_vitals(vit):
     vit = vit[(vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
                 & (vit.VALUE.notnull())
                & ((vit['VALUE'].str.contains(pattern, regex=True) ) | (vit['VALUE'].dtype==float))].copy(deep=True)
+
+    # Concat pre-hospital vitals when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_VitaleVaerdier.pkl"):
+        logger.info("> Adding prehospital vitals")
+        phv = pd.read_pickle("data/interim/prehospital_VitaleVaerdier.pkl")
+        vit = pd.concat([vit, phv])
+        vit = vit.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> Vitals after prehospital merge: {len(vit)} rows")
 
     return vit
 
@@ -220,6 +279,15 @@ def filter_ita(ita):
     )
 
     ita["FEATURE"] = ita["FEATURE"].replace(to_replace=ICU_MAP)
+
+    # Concat pre-hospital GCS when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_GCS.pkl"):
+        logger.info("> Adding prehospital GCS")
+        ph_gcs = pd.read_pickle("data/interim/prehospital_GCS.pkl")
+        ita = pd.concat([ita, ph_gcs])
+        ita = ita.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> ITA after prehospital GCS merge: {len(ita)} rows")
+
     return ita
 
 

@@ -209,19 +209,30 @@ class AstraMixedDataset(Dataset):
         x_cont: np.ndarray,
         X_ts_cat: np.ndarray,
         y,
+        trajectory_lengths: Optional[np.ndarray] = None,
     ):
         self.X_ts = torch.from_numpy(np.asarray(X_ts, dtype=np.float32))
         self.x_cat = torch.from_numpy(np.asarray(x_cat, dtype=np.int64))
         self.x_cont = torch.from_numpy(np.asarray(x_cont, dtype=np.float32))
         self.X_ts_cat = torch.from_numpy(np.asarray(X_ts_cat, dtype=np.int64))
         self.y = torch.tensor(np.asarray(y, dtype=np.int64)).squeeze()
+        if trajectory_lengths is not None:
+            self.traj_lengths = torch.from_numpy(
+                np.asarray(trajectory_lengths, dtype=np.int64)
+            )
+        else:
+            # Fallback: assume full sequence length (no masking)
+            self.traj_lengths = torch.full(
+                (len(self.y),), self.X_ts.shape[-1], dtype=torch.int64
+            )
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
         return (
-            (self.X_ts[idx], (self.x_cat[idx], self.x_cont[idx]), self.X_ts_cat[idx]),
+            (self.X_ts[idx], (self.x_cat[idx], self.x_cont[idx]),
+             self.X_ts_cat[idx], self.traj_lengths[idx]),
             self.y[idx],
         )
 

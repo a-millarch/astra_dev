@@ -1,4 +1,5 @@
 import logging
+import operator
 import warnings
 from typing import List, Dict, Optional, Union
 
@@ -9,6 +10,203 @@ from astra.utils import get_bin_df
 from astra.data.filters import collect_filter
 
 logger = logging.getLogger(__name__)
+
+
+def get_effective_cat_cols(cfg: dict) -> list:
+    """Return the full list of categorical columns, including PPJ ABCD when prehospital is enabled."""
+    cat_cols = list(cfg["dataset"]["cat_cols"])
+    if cfg.get("prehospital"):
+        ppj_cat_cols = cfg["dataset"].get("ppj_cat_cols", [])
+        cat_cols.extend(c for c in ppj_cat_cols if c not in cat_cols)
+    return cat_cols
+
+
+# ============================================================================
+# Exclusion criteria
+# ============================================================================
+
+_CUSTOM_OPS = {
+    "==": operator.eq, "!=": operator.ne,
+    "<": operator.lt,  "<=": operator.le,
+    ">": operator.gt,  ">=": operator.ge,
+}
+
+
+def resolve_exclusion_criteria(cfg: dict) -> Optional[dict]:
+    """Look up the active exclusion profile from config.
+
+    Returns the criteria dict for the selected profile, or None if exclusion
+    is disabled (null / false / 0).
+    """
+    profile = cfg.get("dataset", {}).get("exclusion")
+    if not profile:
+        return None
+    profiles = cfg.get("exclusion_criteria", {})
+    if profile not in profiles:
+        raise ValueError(
+            f"Exclusion profile '{profile}' not found in exclusion_criteria. "
+            f"Available: {list(profiles.keys())}"
+        )
+    return profiles[profile]
+
+
+def _sanitize_yaml(val):
+    """Normalize YAML quirks: turn the string ``"None"`` into Python ``None``.
+
+    YAML only recognizes ``null`` / ``~`` as null — unquoted ``None`` is parsed
+    as a string.  This helper is applied recursively so that any value in a
+    criteria dict written as ``None`` in YAML behaves like ``null``.
+    """
+    if isinstance(val, str) and val.lower() == "none":
+        return None
+    if isinstance(val, dict):
+        return {k: _sanitize_yaml(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_sanitize_yaml(v) for v in val]
+    return val
+
+
+def apply_exclusion_criteria(
+    base_df: pd.DataFrame,
+    criteria: dict,
+) -> pd.DataFrame:
+    """Filter *base_df* according to a criteria dict.
+
+    Each key is optional — only applied when present and has a truthy /
+    non-empty value (``null`` / ``None`` → skip).  Returns a filtered **copy**.
+    """
+    criteria = _sanitize_yaml(criteria)
+    n_before = len(base_df)
+    mask = pd.Series(True, index=base_df.index)
+
+    # --- named criteria ------------------------------------------------
+    age_min = criteria.get("age_min")
+    if isinstance(age_min, (int, float)):
+        m = base_df["AGE"] >= age_min
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  age_min >= {age_min}: -{excluded}")
+        mask &= m
+
+    age_max = criteria.get("age_max")
+    if isinstance(age_max, (int, float)):
+        m = base_df["AGE"] <= age_max
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  age_max <= {age_max}: -{excluded}")
+        mask &= m
+
+    start_year = criteria.get("start_year")
+    if isinstance(start_year, (int, float)):
+        m = base_df["ServiceDate"].dt.year >= start_year
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  start_year >= {start_year}: -{excluded}")
+        mask &= m
+
+    end_year = criteria.get("end_year")
+    if isinstance(end_year, (int, float)):
+        m = base_df["ServiceDate"].dt.year <= end_year
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  end_year <= {end_year}: -{excluded}")
+        mask &= m
+
+    if criteria.get("lvl1tc"):
+        m = base_df["LVL1TC"] == 1
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  lvl1tc only: -{excluded}")
+        mask &= m
+
+    if criteria.get("prehospital_only"):
+        # prehospital_start is NaT for patients without PPJ data
+        col = "prehospital_start" if "prehospital_start" in base_df.columns else "prehospital_end"
+        if col in base_df.columns:
+            m = base_df[col].notna()
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  prehospital_only ({col} notna): -{excluded}")
+            mask &= m
+        else:
+            logger.warning("  exclusion  prehospital_only requested but no prehospital column found")
+
+    if criteria.get("traumatext"):
+        if "TRAUMATEXT" in base_df.columns:
+            m = base_df["TRAUMATEXT"] == True
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  traumatext (any time): -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  traumatext requested but TRAUMATEXT column "
+                "not found in base_df. Run mark_traumatext() first."
+            )
+
+    if criteria.get("traumatext_12h"):
+        if "TRAUMATEXT_12H" in base_df.columns:
+            m = base_df["TRAUMATEXT_12H"] == True
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  traumatext_12h: -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  traumatext_12h requested but TRAUMATEXT_12H column "
+                "not found in base_df. Run mark_traumatext() first."
+            )
+
+    max_dur = criteria.get("max_duration_days")
+    if isinstance(max_dur, (int, float)):
+        if "DURATION" in base_df.columns:
+            m = base_df["DURATION"] <= max_dur
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  max_duration_days <= {max_dur}: -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  max_duration_days requested but DURATION column "
+                "not found in base_df."
+            )
+
+    first_hospital = [v for v in (criteria.get("first_hospital") or []) if v is not None]
+    if first_hospital:
+        m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  first_hospital in {first_hospital}: -{excluded}")
+        mask &= m
+
+    # --- generic custom_filters ----------------------------------------
+    for filt in criteria.get("custom_filters", []) or []:
+        col = filt["column"]
+        op_str = filt["op"]
+        val = filt["value"]
+
+        if op_str == "in":
+            m = base_df[col].isin(val)
+        elif op_str == "not_in":
+            m = ~base_df[col].isin(val)
+        elif op_str in _CUSTOM_OPS:
+            m = _CUSTOM_OPS[op_str](base_df[col], val)
+        else:
+            raise ValueError(f"Unknown operator '{op_str}' in custom_filter for column '{col}'")
+
+        excluded = (~m & mask).sum()
+        if excluded:
+            logger.info(f"  exclusion  {col} {op_str} {val}: -{excluded}")
+        mask &= m
+
+    filtered = base_df.loc[mask].copy()
+    n_after = len(filtered)
+    logger.info(
+        f"Exclusion criteria applied: {n_before} → {n_after} patients "
+        f"(-{n_before - n_after})"
+    )
+    return filtered
+
 
 class AggregatedDS:
     """
@@ -50,9 +248,18 @@ class AggregatedDS:
     ):
         self.cfg = cfg
         self.target = cfg["target"]
-        #reorder by date for temporal split
-        self.base = base_df.sort_values('start').reset_index(drop=True).copy(deep=True)
         self.masking_point = masking_point
+
+        # Store unfiltered base for reset_filters()
+        self._unfiltered_base = base_df.copy()
+
+        # Apply config-driven exclusion criteria BEFORE any aggregation
+        criteria = resolve_exclusion_criteria(cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        # Reorder by date for temporal split
+        self.base = base_df.sort_values('start').reset_index(drop=True).copy(deep=True)
 
         # Try to import GPU libraries
         try:
@@ -101,14 +308,14 @@ class AggregatedDS:
         """Initialize the base tabular dataframe."""
         id_col = self.cfg["dataset"]["id_col"]
         num_cols = self.cfg["dataset"]["num_cols"]
-        cat_cols = self.cfg["dataset"]["cat_cols"]
-        
+        cat_cols = get_effective_cat_cols(self.cfg)
+
         self.tab_df = self.base[[id_col, self.target] + num_cols + cat_cols].copy()
         self.tab_df[num_cols] = self.tab_df[num_cols].astype(float)
-        
+
         self.continuous_features.extend(num_cols)
         self.categorical_features.extend(cat_cols)
-        
+
         logger.debug(f"Base tabular columns: {self.tab_df.columns.tolist()}")
 
     def _parse_masking_point(self) -> Optional[pd.Timedelta]:
@@ -513,6 +720,50 @@ class AggregatedDS:
         self.final_df.to_pickle(filepath)
         logger.info(f"Saved to {filepath}")
 
+    # --- post-hoc exclusion for experimentation -------------------------
+
+    def filter(self, criteria: dict):
+        """Apply exclusion criteria to the already-built dataset.
+
+        Filters all internal DataFrames by PID set.  Use ``reset_filters()``
+        to restore the original unfiltered state.  Returns *self* for chaining.
+        """
+        filtered_base = apply_exclusion_criteria(self.base, criteria)
+        keep_pids = set(filtered_base["PID"].unique())
+
+        self.base = filtered_base.reset_index(drop=True)
+        self._base_pids = keep_pids
+        self.tab_df = self.tab_df[self.tab_df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "final_df") and self.final_df is not None:
+            id_col = self.cfg["dataset"]["id_col"]
+            self.final_df = self.final_df[self.final_df[id_col].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "aggregated_concepts"):
+            for name, df in self.aggregated_concepts.items():
+                self.aggregated_concepts[name] = df[df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        return self
+
+    def reset_filters(self):
+        """Restore original unfiltered base_df and rebuild internal DataFrames."""
+        base_df = self._unfiltered_base.copy()
+
+        # Re-apply config exclusion if set
+        criteria = resolve_exclusion_criteria(self.cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        self.base = base_df.sort_values("start").reset_index(drop=True)
+        self._base_pids = set(self.base["PID"].unique())
+
+        self.continuous_features = []
+        self.categorical_features = []
+        self.set_tab_df()
+        self.collect_and_aggregate_concepts()
+        self.create_final_dataset()
+
+        return self
 
 
 class TSDS:
@@ -525,6 +776,15 @@ class TSDS:
     ):
         self.cfg = cfg
         self.target = cfg["target"]
+
+        # Store unfiltered base for reset_filters()
+        self._unfiltered_base = base_df.copy()
+
+        # Apply config-driven exclusion criteria BEFORE concept collection
+        criteria = resolve_exclusion_criteria(cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
         self.base = base_df
         self._base_pids = set(base_df['PID'].unique())
 
@@ -539,7 +799,8 @@ class TSDS:
             
 
     def set_tab_df(self):
-        self.tab_df = self.base[[self.cfg["dataset"]["id_col"],self.cfg["target"]]+self.cfg["dataset"]["num_cols"]+self.cfg["dataset"]["cat_cols"]].copy(deep=True)
+        cat_cols = get_effective_cat_cols(self.cfg)
+        self.tab_df = self.base[[self.cfg["dataset"]["id_col"],self.cfg["target"]]+self.cfg["dataset"]["num_cols"]+cat_cols].copy(deep=True)
         self.tab_df[self.cfg["dataset"]["num_cols"]] = self.tab_df[self.cfg["dataset"]["num_cols"]].astype(float)
         logger.debug(self.base.columns)
 
@@ -593,6 +854,43 @@ class TSDS:
             # for target and if ffill not available
             self.vitals = self.vitals.fillna(0.0)
 
+    # --- post-hoc exclusion for experimentation -------------------------
+
+    def filter(self, criteria: dict):
+        """Apply exclusion criteria to the already-built dataset.
+
+        Filters all internal DataFrames by PID set.  Use ``reset_filters()``
+        to restore the original unfiltered state.  Returns *self* for chaining.
+        """
+        filtered_base = apply_exclusion_criteria(self.base, criteria)
+        keep_pids = set(filtered_base["PID"].unique())
+
+        self.base = filtered_base.reset_index(drop=True)
+        self._base_pids = keep_pids
+        self.tab_df = self.tab_df[self.tab_df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        if hasattr(self, "concepts") and isinstance(self.concepts, dict):
+            for name, df in self.concepts.items():
+                self.concepts[name] = df[df["PID"].isin(keep_pids)].reset_index(drop=True)
+
+        return self
+
+    def reset_filters(self):
+        """Restore original unfiltered base_df and rebuild internal DataFrames."""
+        base_df = self._unfiltered_base.copy()
+
+        # Re-apply config exclusion if set
+        criteria = resolve_exclusion_criteria(self.cfg)
+        if criteria:
+            base_df = apply_exclusion_criteria(base_df, criteria)
+
+        self.base = base_df
+        self._base_pids = set(self.base["PID"].unique())
+        self.set_tab_df()
+        self.collect_concepts()
+
+        return self
+
 
 def _create_temporal_features_df(
     cfg: Dict,
@@ -616,16 +914,18 @@ def _create_temporal_features_df(
         (bin_df['bin_freq'].isin(bin_freq_include))
     ].copy()
 
-    # Merge patient start times
-    bf = bf.merge(base[['PID', 'start']], on='PID', how='left')
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
+    merge_cols = ['PID', 'start']
+    bf = bf.merge(base[merge_cols], on='PID', how='left')
 
     # Sort and assign sequential position per patient (0-indexed)
     bf = bf.sort_values(['PID', 'bin_counter'])
     bf['position'] = bf.groupby('PID').cumcount()
 
-    # Compute temporal features
+    # Compute temporal features — reference from universal trajectory start
+    ref_start = bf['start']
     bf['elapsed_hours'] = (
-        (bf['bin_start'] - bf['start']).dt.total_seconds() / 3600
+        (bf['bin_start'] - ref_start).dt.total_seconds() / 3600
         + (bf['bin_end'] - bf['bin_start']).dt.total_seconds() / 7200  # midpoint
     )
     bf['bin_width_hours'] = (
@@ -863,3 +1163,5 @@ def get_concept(concept: str, cfg: Dict, base_pids: set = None) -> Dict:
 
     return concept_dict
 
+
+# NOTE: Legacy ppjDataset class removed — replaced by astra.data.prehospital module.

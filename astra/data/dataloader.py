@@ -10,7 +10,7 @@ from sklearn.preprocessing import RobustScaler, StandardScaler
 
 from astra.utils import get_base_df, align_dataframes
 from astra.data.preprocessing import MultiHotCategoricalEncoder
-from astra.data.datasets import TSDS
+from astra.data.datasets import TSDS, get_effective_cat_cols
 
 from astra.data.mixed_dataloader import (
     df2xy_pure,
@@ -194,10 +194,8 @@ def prepare_data_and_dls(cfg):
     - Padding zeros remain as zeros after normalization
     - Model correctly distinguishes signal from padding
     """
-    # Load dataframes
+    # Load dataframes — exclusion criteria are applied inside TSDS.__init__
     base = get_base_df()
-    if cfg["dataset"]["exclusion"] == "lvl1tc":
-        base = base[base.LVL1TC == 1]
 
     concepts = cfg["concepts"]
 
@@ -266,7 +264,7 @@ def prepare_data_and_dls(cfg):
         tsds_obj.complete_cat = df[non_ts + ts]
         tsds_obj.complete_cat.attrs["timestep_cols"] = ts
 
-    cat_cols = cfg["dataset"]["cat_cols"]
+    cat_cols = get_effective_cat_cols(cfg)
     num_cols = cfg["dataset"]["num_cols"]
     logger.info(f'Categoricals: {cat_cols}\nNumericals: {num_cols}')
 
@@ -414,6 +412,7 @@ def prepare_data_and_dls(cfg):
         x_cont=trainval_x_cont,
         X_ts_cat=X_multi_hot,
         y=y,
+        trajectory_lengths=traj_lengths,
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -487,6 +486,7 @@ def prepare_data_and_dls(cfg):
         x_cont=holdout_x_cont,
         X_ts_cat=tX_multi_hot,
         y=ty,
+        trajectory_lengths=holdout_traj_lengths,
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,

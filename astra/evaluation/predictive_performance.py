@@ -136,6 +136,7 @@ class TimeDependentEvaluator:
             holdout_ds = holdout_ds.dataset
         self.holdout_x_cat = holdout_ds.x_cat.numpy()
         self.holdout_x_cont = holdout_ds.x_cont.numpy()
+        self.holdout_trajectory_lengths = data.get("holdout_trajectory_lengths")
 
         self.holdout = data["holdout"]
 
@@ -164,12 +165,20 @@ class TimeDependentEvaluator:
         X_censored = self._censor_normalized_data(self.holdout_X_normalized, censor_step)
         X_multi_hot_censored = self._censor_multihot(self.holdout_X_multi_hot, censor_step)
 
+        # Effective trajectory: min(original, censor_step + 1) per sample
+        effective_traj = None
+        if self.holdout_trajectory_lengths is not None:
+            effective_traj = np.minimum(
+                self.holdout_trajectory_lengths, censor_step + 1
+            )
+
         dataset = AstraMixedDataset(
             X_ts=X_censored,
             x_cat=self.holdout_x_cat,
             x_cont=self.holdout_x_cont,
             X_ts_cat=X_multi_hot_censored,
             y=self.holdout_y,
+            trajectory_lengths=effective_traj,
         )
         return AstraMixedDataLoader(
             dataset,

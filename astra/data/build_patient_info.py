@@ -320,23 +320,33 @@ def check_overlaps(group):
     overlaps.append(False)
     return overlaps
 
-def create_bin_df(cfg):
+def create_bin_df(cfg, base=None):
     """
     Generate time bins for each patient trajectory based on configurable binning intervals.
 
     For each patient (PID) in the base dataset, the function iterates over the trajectory start and end times,
     and divides the trajectory into time intervals ("bins") according to rules defined in cfg["bin_intervals"].
     These bins can have varying frequencies depending on the duration of the trajectory.
+
+    After the prehospital pipeline, ``start`` is the universal earliest timestamp
+    (= min(prehospital_start, inhospital_start)), so bins always begin from ``start``.
     """
     logger.info("Generating bin_df")
     bin_list = []
-    base = get_base_df()
+    if base is None:
+        base = get_base_df()
 
     # Load bin intervals from cfg
     bin_intervals = cfg["bin_intervals"]
 
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
+    start_col = "start"
+
     for _, row in base.iterrows():
-        start_time = row["start"]
+        start_time = row[start_col]
+        # Safety fallback if start is unexpectedly NaT
+        if pd.isna(start_time):
+            start_time = row.get("inhospital_start", row.get("start"))
         end_time = row["end"] + pd.Timedelta(minutes=10)
         pid = row["PID"]
 

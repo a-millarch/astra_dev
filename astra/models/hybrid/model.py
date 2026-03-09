@@ -366,11 +366,18 @@ class TimeAwarePositionalEncoding(nn.Module):
         # Learnable global time scale (initialised to 1.0)
         self.time_scale = nn.Parameter(torch.ones(1))
 
-    def forward(self, x: torch.Tensor, elapsed_hours: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        elapsed_hours: Optional[torch.Tensor] = None,
+        ts_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: [batch, seq_len + n_static_tokens, d_model]
             elapsed_hours: [batch, seq_len] raw hours, or None for zero-PE fallback.
+            ts_padding_mask: [batch, seq_len] bool, True = padding.  When provided,
+                padding positions receive zero PE instead of cos(0)=1 contamination.
         Returns:
             x + positional encoding, same shape as x.
         """
@@ -386,6 +393,9 @@ class TimeAwarePositionalEncoding(nn.Module):
             )
             # [B, T, d]  (truncate last dim in case d is odd)
             ts_pos = torch.cat([torch.sin(t * freq), torch.cos(t * freq)], dim=-1)[:, :, :d]
+            # Zero out PE at padding positions to prevent cos(0)=1 contamination
+            if ts_padding_mask is not None:
+                ts_pos = ts_pos.masked_fill(ts_padding_mask.unsqueeze(-1), 0.0)
         else:
             ts_pos = torch.zeros(bs, n_ts, d, device=x.device)
 
@@ -587,13 +597,16 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             raise ValueError(f"Unexpected number of inputs: {len(x)}")
         
         # === PARSE INPUT (FIXED FOR TSAI FORMAT) ===
+        traj_lengths = None
         if isinstance(x_input, (tuple, list)):
-            if len(x_input) == 3:
-                # TSAI format: (x_ts, x_tab, x_ts_cat)
+            if len(x_input) >= 3:
+                # TSAI format: (x_ts, x_tab, x_ts_cat) or (x_ts, x_tab, x_ts_cat, traj_lengths)
                 x_ts = x_input[0]                    # Continuous TS
                 x_tab = x_input[1]                   # Tabular (tuple)
                 x_ts_cat_multi_hot = x_input[2]      # Categorical TS
-                
+                if len(x_input) >= 4:
+                    traj_lengths = x_input[3]         # Trajectory lengths
+
                 # Unpack tabular
                 if isinstance(x_tab, (tuple, list)) and len(x_tab) == 2:
                     x_cat, x_cont = x_tab
@@ -601,7 +614,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
                     # Fallback: treat entire x_tab as categorical
                     x_cat = x_tab
                     x_cont = torch.tensor([], device=x_ts.device)
-            
+
             elif len(x_input) == 2:
                 # Format without categorical TS: (x_ts, x_tab)
                 x_ts = x_input[0]
@@ -616,8 +629,8 @@ class TSTabFusionTransformerMultiHot(nn.Module):
                     x_cont = torch.tensor([], device=x_ts.device)
             else:
                 raise ValueError(
-                    f"Expected input with 2 or 3 elements, got {len(x_input)}. "
-                    f"TSAI format should be (x_ts, x_tab, x_ts_cat) or (x_ts, x_tab)"
+                    f"Expected input with 2-4 elements, got {len(x_input)}. "
+                    f"Format: (x_ts, x_tab, x_ts_cat[, traj_lengths]) or (x_ts, x_tab)"
                 )
         else:
             # Single tensor input (backward compatibility)
@@ -627,7 +640,10 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x_cont = torch.tensor([], device=x_input.device)
         
         # === HANDLE KEY PADDING MASK ===
-        if self.key_padding_mask == "auto":
+        if traj_lengths is not None:
+            # Proper padding mask from trajectory lengths (preferred)
+            key_padding_mask = self._build_traj_padding_mask(x_ts, traj_lengths)
+        elif self.key_padding_mask == "auto":
             x_ts, key_padding_mask = self._key_padding_mask(x_ts)
         else:
             key_padding_mask = None
@@ -699,7 +715,11 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x = torch.cat([x, x_cont_proj], 1)
         
         # === TRANSFORMER ===
-        x = self.pos_enc(x, elapsed_hours=elapsed_hours)
+        # Extract temporal padding mask for sinusoidal PE (prevents cos(0)=1 contamination)
+        ts_padding_mask = None
+        if key_padding_mask is not None:
+            ts_padding_mask = key_padding_mask[:, :self.seq_len]
+        x = self.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
 
         if self.res_drop is not None:
             x = self.res_drop(x)
@@ -708,7 +728,8 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         x = self.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
         if key_padding_mask is not None:
-            x = x * torch.logical_not(key_padding_mask.unsqueeze(1))
+            # x: [batch, total_len, d_model], mask: [batch, total_len] (True=padding)
+            x = x * (~key_padding_mask).unsqueeze(-1)
 
         # === HEAD ===
         if self.temporal_head_enabled and self.temporal_pred_head is not None:
@@ -717,8 +738,32 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x = self.head(x)  # [batch, c_out]
         return x
     
+    def _build_traj_padding_mask(self, x_ts, traj_lengths):
+        """Build key_padding_mask from trajectory lengths.
+
+        Args:
+            x_ts: [batch, c_in, seq_len]
+            traj_lengths: [batch] — number of real timesteps per sample
+
+        Returns:
+            mask: [batch, total_len] where True = padding (masked out).
+                  total_len = seq_len + n_static_tokens.
+        """
+        bs, _, seq_len = x_ts.shape
+        device = x_ts.device
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)     # [1, seq_len]
+        tl = traj_lengths.to(device).unsqueeze(1)                         # [batch, 1]
+        ts_mask = positions >= tl                                         # [batch, seq_len]
+
+        # Static tokens (categorical + continuous) are never masked
+        n_static = self.pos_enc.n_static_tokens
+        if n_static > 0:
+            static_mask = torch.zeros(bs, n_static, dtype=torch.bool, device=device)
+            return torch.cat([ts_mask, static_mask], dim=1)               # [batch, total_len]
+        return ts_mask
+
     def _key_padding_mask(self, x):
-        """Handle NaN values in time series"""
+        """Handle NaN values in time series (legacy fallback)."""
         mask = torch.isnan(x)
         x[mask] = 0
         if mask.any():

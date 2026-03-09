@@ -269,8 +269,12 @@ class InferenceSession:
             x_ts, x_ts_cat, tab_df
         )
 
+        # Pass trajectory lengths so the model builds a proper key_padding_mask
+        # (matching training behavior from AstraMixedDataset)
+        traj_lengths_t = torch.tensor([traj_len], dtype=torch.long, device=self.device)
+
         with torch.no_grad():
-            logits = self.model((x_ts_t, (x_cat_t, x_cont_t), x_ts_cat_t))
+            logits = self.model((x_ts_t, (x_cat_t, x_cont_t), x_ts_cat_t, traj_lengths_t))
 
         if self.is_temporal:
             # logits: [1, seq_len]
@@ -368,8 +372,10 @@ class InferenceSession:
 
         # Wrapper with causal mask + temporal step targeting
         has_cat_ts = self.model.n_ts_cat > 0
+        traj_lengths_t = torch.tensor([traj_len], dtype=torch.long, device=self.device)
         wrapped = ModelWrapperWithRawCatTS(self.model, has_cat_ts=has_cat_ts,
-                                           eval_timestep=target_step if target_step is not None else -1)
+                                           eval_timestep=target_step if target_step is not None else -1,
+                                           traj_lengths=traj_lengths_t)
 
         # Pre-embed static categoricals (not differentiable — treated as context)
         bg_cat_emb = embed_categorical_features(self.model, self._bg['cat'])

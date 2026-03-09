@@ -45,7 +45,9 @@ def _compute_bin_elapsed_hours(
         & (bin_df["bin_freq"].isin(bin_freq_include))
     ].copy()
 
-    bf = bf.merge(base_df[["PID", "start"]], on="PID", how="left")
+    # 'start' is the universal earliest timestamp (incorporates prehospital when available)
+    merge_cols = ["PID", "start"]
+    bf = bf.merge(base_df[merge_cols], on="PID", how="left")
 
     # Sort and assign sequential position per patient (0-indexed)
     bf = bf.sort_values(["PID", "bin_counter"])
@@ -55,7 +57,8 @@ def _compute_bin_elapsed_hours(
     # Note: datasets.py uses midpoint for positional encoding; here we use
     # bin_start so masking_hours <= elapsed_hours means the EBM predates
     # the entire bin, not just its midpoint.
-    bf["elapsed_hours"] = (bf["bin_start"] - bf["start"]).dt.total_seconds() / 3600
+    ref_start = bf["start"]
+    bf["elapsed_hours"] = (bf["bin_start"] - ref_start).dt.total_seconds() / 3600
 
     return bf[["PID", "position", "elapsed_hours"]]
 

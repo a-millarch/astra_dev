@@ -1,14 +1,46 @@
 single_patient_mode: False
 
-population_file_path: data/raw/trauma_call_historic_population.csv 
+population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
 experiment_name: hpt
 run_name: highres
 
-model_name: '25022026_ebm'
-   
-target: deceased_30d
+model_name: '07032026_masking'
+
+target: deceased_90d
+
+# Pre-hospital (PPJ) data integration
+prehospital: true                     # Set true to enable pre-hospital data pipeline
+prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
+
+prehospital_config:
+  ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
+  ppj_data_paths:
+    - data/raw/ppj/                                 # Directory containing raw PPJ CSVs
+  max_hours_before_admission: 48                    # Max hours before admission to include
+  event_descriptions_path: data/external/event_descriptions_modified.xlsx
+  # Override event codes if event_descriptions not available:
+  # gcs_event_codes: []
+  # abcd_event_codes:
+  #   "A: Luftveje": ["CODE"]
+  #   "B: Respiration": ["CODE"]
+  #   "C: Cirkulation": ["CODE"]
+  #   "D: Bevidsthedsniveau": ["CODE"]
+
+# Trauma text (clinical notes) keyword marking
+traumatext_config:
+  enabled: true
+  source_file: data/interim/concepts/Notater.pkl
+  text_column: Note
+  timestamp_column: Oprettelsestidspunkt
+  time_window_hours: 12
+  keywords:
+    - traume
+    - trauma
+    - tilskadekomst
+    - traumemodtagelse
+    - traumecenter
 
 mapped_dir: data/interim/mapped
 concepts:
@@ -23,16 +55,10 @@ concepts:
   
 
 dataset:
-  exclusion: 0 #lvl1tc
-  overwrite: True 
-  max_duration_days: 365 #now cut off using bins 
+  exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  overwrite: True
+  max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
-  
-  start_year: 2017
-  end_year: 2024
-  
-  age_min: 0
-  age_max: 90
 
   id_col: PID
   ts_cat_names:
@@ -47,12 +73,42 @@ dataset:
       - SEX
       - FIRST_HOSPITAL
 
+  # Pre-hospital ABCD categorical columns (only used when prehospital: true)
+  ppj_cat_cols:
+      - A
+      - B
+      - C
+      - D
+
   num_cols:
       - AGE
       - ASMT_ELIX
       - HEIGHT
       - WEIGHT
-      
+
+# Exclusion criteria profiles — selected by dataset.exclusion
+exclusion_criteria:
+  study:
+    age_min: 0
+    age_max: 90
+    start_year: 2017
+    end_year: null
+    lvl1tc: false
+    prehospital_only: true
+    traumatext: true
+    traumatext_12h: false
+    max_duration_days: 365
+    first_hospital:
+      - null
+    custom_filters: []
+    # Example custom_filters:
+    # - column: DURATION
+    #   op: "<="
+    #   value: 365
+
+  lvl1tc:
+    lvl1tc: true
+
 pretrain:
     mask_prob_ts: 0.15
     mask_prob_cat_ts: 0.15
@@ -195,8 +251,8 @@ bin_intervals:
   72h: '4h'
   14D: '12h'
   30D: '1D'
- # 90D: '7D'
-  end: '3D'
+  90D: '7D'
+  end: '30D'
 
 bin_freq_include:
   - '10min'
@@ -205,7 +261,7 @@ bin_freq_include:
   - '4h'
   - '12h'
   - '1D'
-  #- '7D'
+  - '7D'
   #- '30D'
 
 temporal_features:
@@ -216,13 +272,13 @@ temporal_features:
   #   sinusoidal – elapsed_hours drives sinusoidal positional encoding; both temporal
   #                features are excluded from W_P (Option B). W_P operates on clinical
   #                channels only (~N(0,1)), raw hours used for sin/cos encoding.
-  mode: sinusoidal
+  mode: channel #sinusoidal
   features:
     - elapsed_hours
     - bin_width_hours
 
 ebm_feature:
-  enabled: true
+  enabled: false
   save_dir: data/interim/ebm_features
   n_folds: 5
   default_value: 0.0
@@ -230,8 +286,8 @@ ebm_feature:
 agg_func: #also for datasets, split it up
   VitaleVaerdier:
       #- first # tmp on for tab
-      - min
-      - max
+    #  - min
+    #  - max
       - mean
       - std
   ITAOversigtsrapport:

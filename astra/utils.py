@@ -54,6 +54,7 @@ class ProjectManager:
         if os.path.exists(new_workdir):
             self.workdir = new_workdir
             os.chdir(new_workdir)
+            print(f"Workdir: {new_workdir}")
         else:
             print(f"Directory does not exist: {new_workdir}")
         
@@ -208,9 +209,11 @@ def get_train_test_split(cfg, base_df=None, return_indices=False):
     if base_df is None:
         base_df = get_base_df()
 
-    # Apply exclusion if specified
-    if cfg["dataset"]["exclusion"] == "lvl1tc":
-        base_df = base_df[base_df.LVL1TC == 1]
+    # Apply exclusion criteria from config profile
+    from astra.data.datasets import resolve_exclusion_criteria, apply_exclusion_criteria
+    criteria = resolve_exclusion_criteria(cfg)
+    if criteria:
+        base_df = apply_exclusion_criteria(base_df, criteria)
 
     # Sort by date to ensure temporal ordering
     base_df = base_df.sort_values('ServiceDate').reset_index(drop=True)

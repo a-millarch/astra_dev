@@ -372,3 +372,55 @@ def classify_atc(atc_code: str) -> Optional[str]:
     if cat is None:
         cat = ATC_LVL4_REVERSE.get(atc[:4])
     return cat
+
+
+# ============================================================================
+# Pre-Hospital Journal (PPJ) mappings
+# (source: prehospital.py — PPJ extraction pipeline)
+# ============================================================================
+
+# PPJ timestamps use 3-letter English month abbreviations (e.g. "22FEB2018:13:40:02.2750")
+PPJ_MONTH_DICT = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12",
+}
+
+# PPJ vital sign subset names → ASTRA standard feature names
+PPJ_VITALS_MAP = {
+    "M_NInv Sys Blodtryk": "SBP",
+    "M_NInv Dia Blodtryk": "DBP",
+    "M_Puls": "HR",
+    "M_SpO2": "SPO2",
+}
+
+# PPJ EventCodeName → subset name for vital signs
+# NOTE: These are FALLBACK codes only, used when event_descriptions_modified.xlsx
+# is not available. The correct codes are resolved dynamically from the
+# "Eventkoder Vitaldata" sheet (typically OMI codes, not SVD codes).
+# SVD codes are secondary assessment listvalues, NOT numeric vital measurements.
+PPJ_VITAL_EVENT_CODES: Dict[str, str] = {
+    "SVD00029": "M_Puls",
+    "SVD00030": "M_NInv Sys Blodtryk",
+    "SVD00031": "M_NInv Dia Blodtryk",
+    "SVD00032": "M_SpO2",
+}
+
+# PPJ EventCodeName for GCS (legacy, resolved dynamically now)
+PPJ_GCS_EVENT_CODE = "GCS"  # subset name after ppjDataset.collect_subsets()
+
+# PPJ ABCD categorical assessment → short column names
+PPJ_ABCD_MAP: Dict[str, str] = {
+    "A: Luftveje": "A",
+    "B: Respiration": "B",
+    "C: Cirkulation": "C",
+    "D: Bevidsthedsniveau": "D",
+}
+
+# Outlier bounds for PPJ vital signs (same as triAIge clean_sequentials)
+PPJ_VITAL_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "HR": (0.0, 220.0),
+    "SPO2": (0.0, 100.0),
+    "SBP": (0.0, 300.0),
+    "DBP": (0.0, 200.0),
+}
