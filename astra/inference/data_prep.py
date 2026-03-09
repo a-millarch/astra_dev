@@ -1498,6 +1498,11 @@ def _apply_prehospital_start(
         if col in row.index:
             result[col] = row[col]
 
+    # Store batch PID so prehospital pkl data can be matched later.
+    # Batch PIDs are sequential integers; inference PIDs are string hashes.
+    if "PID" in row.index:
+        result["_batch_pid"] = row["PID"]
+
     return result
 
 
@@ -1645,7 +1650,15 @@ def _filter_concepts_for_patient(
         # Apply concept-specific filter
         # ADTHaendelser needs explicit base_df to avoid get_base_df() disk I/O.
         # All other concepts use the batch filter functions via collect_filter().
-        patient_pids = inhospital['PID'].unique() if 'PID' in inhospital.columns else None
+        patient_pids = set(inhospital['PID'].unique()) if 'PID' in inhospital.columns else None
+        # Batch filters concat prehospital pkl data keyed by batch PIDs
+        # (sequential integers), which differ from inference PIDs (string hashes).
+        # Include the batch PID so the patient's prehospital rows survive filtering.
+        if patient_pids is not None and '_batch_pid' in base_df.columns:
+            batch_pid = base_df['_batch_pid'].iloc[0]
+            if pd.notna(batch_pid):
+                patient_pids.add(batch_pid)
+
         if concept == 'ADTHaendelser':
             concept_filtered = _filter_adt(inhospital, base_df=base_df)
         else:
