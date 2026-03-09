@@ -17,12 +17,36 @@ Usage:
     session.predict(**result)
 """
 
+import time
+from contextlib import contextmanager
+
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import logging
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Timing instrumentation
+# ============================================================================
+
+@contextmanager
+def timed_stage(timing_dict: dict, stage_name: str):
+    """Record wall-clock seconds for a code block into *timing_dict*.
+
+    Usage::
+
+        timing = {}
+        with timed_stage(timing, 'continuous_build'):
+            x_ts = _build_continuous_ts(...)
+        # timing == {'continuous_build': [0.0123]}
+    """
+    start = time.perf_counter()
+    yield
+    timing_dict.setdefault(stage_name, []).append(time.perf_counter() - start)
 
 from astra.data.mappings import (
     VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP,
@@ -507,6 +531,377 @@ def _build_categorical_ts(
 
     logger.debug("_build_categorical_ts: shape=%s total_dim=%d",
                  x_ts_cat.shape, x_ts_cat.shape[0])
+    return x_ts_cat
+
+
+# ============================================================================
+# BinCache & incremental tensor builders
+# ============================================================================
+
+@dataclass
+class BinCache:
+    """Caches raw measurements per bin for incremental tensor updates.
+
+    On each refresh, only newly arriving measurements are assigned to bins
+    and only the affected ("dirty") positions are re-aggregated.
+    """
+
+    # {position: [(feature, value, timestamp)]}
+    continuous_bins: Dict[int, list] = field(default_factory=dict)
+    # {(raw_key, position): [value]}  — raw_key is 'medications'/'procedures'/'adt'
+    categorical_bins: Dict[tuple, list] = field(default_factory=dict)
+    # Positions modified since the last tensor write
+    dirty_continuous: set = field(default_factory=set)
+    dirty_categorical: set = field(default_factory=set)
+
+
+def _populate_cache_from_raw_data(
+    raw_data: dict,
+    bin_df: pd.DataFrame,
+    bundle: dict,
+) -> BinCache:
+    """Build a :class:`BinCache` from *raw_data* (used on first creation)."""
+    cache = BinCache()
+
+    # --- continuous ---
+    records = []
+    for source_key in ('vitals', 'labs', 'icu'):
+        for m in raw_data.get(source_key, []):
+            records.append({
+                'timestamp': m['timestamp'],
+                'feature': m['feature'],
+                'value': m['value'],
+            })
+    if records:
+        mdf = pd.DataFrame(records)
+        mdf['timestamp'] = pd.to_datetime(mdf['timestamp'])
+        assigned = _assign_to_bins(mdf, bin_df)
+        for _, row in assigned.iterrows():
+            pos = int(row['position'])
+            cache.continuous_bins.setdefault(pos, []).append(
+                (row['feature'], row['value'], row['timestamp'])
+            )
+
+    # --- categorical ---
+    _CAT_KEY_MAP = {'medications': 'medication', 'procedures': 'procedures', 'adt': 'ADT'}
+    for raw_key, _enc_name in _CAT_KEY_MAP.items():
+        events = raw_data.get(raw_key, [])
+        if not events:
+            continue
+        if raw_key == 'adt':
+            idf = pd.DataFrame(events)
+            if idf.empty:
+                continue
+            idf['start'] = pd.to_datetime(idf['start'])
+            idf['end'] = pd.to_datetime(idf['end'])
+            assigned = _expand_intervals_to_bins(idf, bin_df)
+        else:
+            edf = pd.DataFrame(events)
+            if edf.empty:
+                continue
+            edf['timestamp'] = pd.to_datetime(edf['timestamp'])
+            edf['feature'] = _enc_name
+            assigned = _assign_to_bins(edf, bin_df)
+        for _, row in assigned.iterrows():
+            pos = int(row['position'])
+            cache.categorical_bins.setdefault((raw_key, pos), []).append(row['value'])
+
+    # All positions are "dirty" on first build (they will be written to tensors)
+    cache.dirty_continuous = set(cache.continuous_bins.keys())
+    cache.dirty_categorical = {k for k in cache.categorical_bins.keys()}
+
+    return cache
+
+
+def _assign_and_cache_continuous(
+    new_records: List[dict],
+    bin_df: pd.DataFrame,
+    cache: BinCache,
+) -> set:
+    """Assign new continuous measurements to bins and update *cache*.
+
+    Returns the set of dirty bin positions.
+    """
+    if not new_records:
+        return set()
+
+    mdf = pd.DataFrame(new_records)
+    mdf['timestamp'] = pd.to_datetime(mdf['timestamp'])
+    assigned = _assign_to_bins(mdf, bin_df)
+
+    dirty = set()
+    for _, row in assigned.iterrows():
+        pos = int(row['position'])
+        cache.continuous_bins.setdefault(pos, []).append(
+            (row['feature'], row['value'], row['timestamp'])
+        )
+        dirty.add(pos)
+
+    cache.dirty_continuous |= dirty
+    return dirty
+
+
+def _assign_and_cache_categorical(
+    new_events: List[dict],
+    raw_key: str,
+    bin_df: pd.DataFrame,
+    cache: BinCache,
+    bundle: dict,
+) -> set:
+    """Assign new categorical events to bins and update *cache*.
+
+    Returns the set of dirty (raw_key, position) tuples.
+    """
+    _CAT_KEY_MAP = {'medications': 'medication', 'procedures': 'procedures', 'adt': 'ADT'}
+    if not new_events:
+        return set()
+
+    if raw_key == 'adt':
+        idf = pd.DataFrame(new_events)
+        if idf.empty:
+            return set()
+        idf['start'] = pd.to_datetime(idf['start'])
+        idf['end'] = pd.to_datetime(idf['end'])
+        assigned = _expand_intervals_to_bins(idf, bin_df)
+    else:
+        edf = pd.DataFrame(new_events)
+        if edf.empty:
+            return set()
+        edf['timestamp'] = pd.to_datetime(edf['timestamp'])
+        edf['feature'] = _CAT_KEY_MAP.get(raw_key, raw_key)
+        assigned = _assign_to_bins(edf, bin_df)
+
+    dirty = set()
+    for _, row in assigned.iterrows():
+        pos = int(row['position'])
+        key = (raw_key, pos)
+        cache.categorical_bins.setdefault(key, []).append(row['value'])
+        dirty.add(key)
+
+    cache.dirty_categorical |= dirty
+    return dirty
+
+
+def _reaggregate_dirty_bins(
+    cache: BinCache,
+    channel_map: dict,
+    channel_to_idx: Dict[str, int],
+    x_ts: np.ndarray,
+    dirty_positions: set,
+) -> None:
+    """Re-aggregate dirty continuous bins from cached raw values into *x_ts*.
+
+    Modifies *x_ts* in place.
+    """
+    # Build reverse lookup: (raw_feature, agg_func) → channel_name
+    feature_agg_to_channel = {}
+    for ch_name, info in channel_map.items():
+        if info['type'] == 'continuous':
+            key = (info['feature'], info['agg_func'])
+            feature_agg_to_channel[key] = ch_name
+
+    seq_len = x_ts.shape[1]
+
+    for pos in dirty_positions:
+        if pos >= seq_len:
+            continue
+        entries = cache.continuous_bins.get(pos, [])
+        if not entries:
+            continue
+
+        # Group entries by feature
+        by_feature: Dict[str, list] = {}
+        for feat, val, _ts in entries:
+            by_feature.setdefault(feat, []).append(val)
+
+        for feat, raw_vals in by_feature.items():
+            nums = pd.to_numeric(pd.Series(raw_vals), errors='coerce').dropna()
+            if nums.empty:
+                continue
+            for (f, agg_func), ch_name in feature_agg_to_channel.items():
+                if f != feat:
+                    continue
+                if ch_name not in channel_to_idx:
+                    continue
+                ch_idx = channel_to_idx[ch_name]
+
+                if agg_func == 'mean':
+                    x_ts[ch_idx, pos] = nums.mean()
+                elif agg_func == 'min':
+                    x_ts[ch_idx, pos] = nums.min()
+                elif agg_func == 'max':
+                    x_ts[ch_idx, pos] = nums.max()
+                elif agg_func == 'std':
+                    x_ts[ch_idx, pos] = nums.std() if len(nums) > 1 else np.nan
+                elif agg_func == 'sum':
+                    x_ts[ch_idx, pos] = nums.sum()
+                elif agg_func == 'count':
+                    x_ts[ch_idx, pos] = float(len(nums))
+                elif agg_func == 'first':
+                    x_ts[ch_idx, pos] = float(nums.iloc[0])
+                elif agg_func == 'last':
+                    x_ts[ch_idx, pos] = float(nums.iloc[-1])
+                else:
+                    x_ts[ch_idx, pos] = nums.mean()
+
+
+def _build_continuous_ts_incremental(
+    new_records: List[dict],
+    bin_df: pd.DataFrame,
+    bundle: dict,
+    cache: BinCache,
+    x_ts_existing: Optional[np.ndarray],
+    old_trajectory_length: int,
+    trajectory_length: int,
+    admission_time: pd.Timestamp = None,
+) -> Tuple[np.ndarray, int]:
+    """Incrementally update the continuous time series tensor.
+
+    If *x_ts_existing* is ``None``, falls back to a full build via
+    :func:`_build_continuous_ts` and populates the cache.
+
+    Otherwise, only assigns *new_records* to bins, re-aggregates dirty
+    positions, and extends the visible window.
+
+    Returns ``(x_ts, trajectory_length)``.
+    """
+    ts_channel_names = bundle['ts_channel_names']
+    seq_len = bundle['model_params']['seq_len']
+    data_config = bundle['data_config']
+    channel_map = data_config['channel_map']
+
+    n_channels = len(ts_channel_names)
+    channel_to_idx = {name: i for i, name in enumerate(ts_channel_names)}
+
+    _AUXILIARY = {'elapsed_hours', 'bin_width_hours', '_data_present', '_ebm_pred'}
+
+    if x_ts_existing is None:
+        # First build — fall back to full
+        # (cache should have been populated already by _populate_cache_from_raw_data)
+        x_ts = np.full((n_channels, seq_len), np.nan, dtype=np.float64)
+        # Re-aggregate everything in the cache
+        _reaggregate_dirty_bins(cache, channel_map, channel_to_idx, x_ts, cache.dirty_continuous)
+        cache.dirty_continuous.clear()
+    else:
+        x_ts = x_ts_existing
+        # Reveal newly visible bins: reset padding → NaN so aggregation can fill them
+        if trajectory_length > old_trajectory_length:
+            for ch_name in ts_channel_names:
+                if ch_name in _AUXILIARY:
+                    continue
+                ch_idx = channel_to_idx[ch_name]
+                x_ts[ch_idx, old_trajectory_length:trajectory_length] = np.nan
+
+        # Assign new records and re-aggregate dirty bins
+        if new_records:
+            _assign_and_cache_continuous(new_records, bin_df, cache)
+
+        if cache.dirty_continuous:
+            _reaggregate_dirty_bins(
+                cache, channel_map, channel_to_idx, x_ts,
+                cache.dirty_continuous,
+            )
+            cache.dirty_continuous.clear()
+
+    # Temporal features (always recomputed for full grid — cheap)
+    if admission_time is None:
+        admission_time = pd.Timestamp(bin_df['bin_start'].iloc[0])
+    temporal_features = _compute_temporal_features(
+        bin_df, admission_time, ts_channel_names,
+    )
+    for feat_name, values in temporal_features.items():
+        if feat_name not in channel_to_idx:
+            continue
+        ch_idx = channel_to_idx[feat_name]
+        n = min(len(values), seq_len)
+        x_ts[ch_idx, :n] = values[:n]
+
+    # Update _data_present
+    if '_data_present' in channel_to_idx:
+        dp_ch = channel_to_idx['_data_present']
+        clinical_indices = [
+            channel_to_idx[name]
+            for name in ts_channel_names
+            if name not in _AUXILIARY and name in channel_to_idx
+        ]
+        if clinical_indices:
+            has_data = ~np.all(np.isnan(x_ts[clinical_indices, :]), axis=0)
+            x_ts[dp_ch, :] = has_data.astype(np.float64)
+        else:
+            x_ts[dp_ch, :] = 0.0
+
+    # Clamp trajectory length and apply padding
+    trajectory_length = min(trajectory_length, seq_len)
+    if trajectory_length < seq_len:
+        x_ts[:, trajectory_length:] = 0.0
+
+    return x_ts, trajectory_length
+
+
+def _build_categorical_ts_incremental(
+    new_events: Dict[str, List[dict]],
+    bin_df: pd.DataFrame,
+    bundle: dict,
+    cache: BinCache,
+    x_ts_cat_existing: Optional[np.ndarray],
+    trajectory_length: int,
+) -> np.ndarray:
+    """Incrementally update the categorical time series tensor.
+
+    Multi-hot encoding is additive — new events just set additional bits.
+
+    Args:
+        new_events: ``{raw_key: [event_dicts]}`` where raw_key is
+            ``'medications'``, ``'procedures'``, or ``'adt'``.
+    """
+    seq_len = bundle['model_params']['seq_len']
+    encoding_info = bundle['encoding_info']
+    cat_encoder = bundle['cat_encoder']
+
+    total_dim = sum(
+        end - start for start, end in encoding_info['feature_ranges'].values()
+    )
+
+    if x_ts_cat_existing is None:
+        x_ts_cat = np.zeros((total_dim, seq_len), dtype=np.float32)
+    else:
+        x_ts_cat = x_ts_cat_existing
+
+    _CAT_KEY_TO_FEATURE = {
+        'medications': 'medication',
+        'procedures': 'procedures',
+        'adt': 'ADT',
+    }
+
+    # Assign new events to cache
+    for raw_key, events in new_events.items():
+        if events:
+            _assign_and_cache_categorical(events, raw_key, bin_df, cache, bundle)
+
+    # Write dirty positions to tensor
+    for (raw_key, pos) in cache.dirty_categorical:
+        if pos >= seq_len:
+            continue
+        encoder_feat_name = _CAT_KEY_TO_FEATURE.get(raw_key)
+        if encoder_feat_name is None or encoder_feat_name not in cat_encoder.encoders_:
+            continue
+
+        encoder_info = cat_encoder.encoders_[encoder_feat_name]
+        value_to_idx = encoder_info['value_to_idx']
+        dim_start, _ = encoding_info['feature_ranges'][encoder_feat_name]
+
+        for val in cache.categorical_bins.get((raw_key, pos), []):
+            if val in value_to_idx:
+                idx = value_to_idx[val]
+                x_ts_cat[dim_start + idx, pos] = 1.0
+
+    cache.dirty_categorical.clear()
+
+    # Zero out beyond visibility
+    trajectory_length = min(trajectory_length, seq_len)
+    if trajectory_length < seq_len:
+        x_ts_cat[:, trajectory_length:] = 0.0
+
     return x_ts_cat
 
 
@@ -1259,6 +1654,7 @@ def _filtered_dfs_to_raw_data(
     base_df: pd.DataFrame,
     filtered_concepts: Dict[str, pd.DataFrame],
     current_time,
+    filter_by_time: bool = False,
 ) -> dict:
     """
     Convert filtered concept DataFrames + base_df into the raw_data dict
@@ -1266,7 +1662,13 @@ def _filtered_dfs_to_raw_data(
 
     The concept-specific filters have already standardized feature names
     (VITALS_MAP, LABS_REVERSE_MAP, etc.), so no further name mapping is needed.
+
+    Args:
+        filter_by_time: When True, only include records with timestamps
+            ``<= current_time``.  ADT intervals that started before
+            *current_time* are kept but their end is clamped.
     """
+    cutoff = pd.Timestamp(current_time) if filter_by_time else None
     row = base_df.iloc[0]
 
     raw_data = {
@@ -1299,6 +1701,8 @@ def _filtered_dfs_to_raw_data(
         if concept not in filtered_concepts:
             continue
         df = filtered_concepts[concept]
+        if cutoff is not None:
+            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
         raw_data[key] = [
             {'timestamp': r['TIMESTAMP'], 'feature': r['FEATURE'], 'value': r['VALUE']}
             for _, r in df.iterrows()
@@ -1307,6 +1711,8 @@ def _filtered_dfs_to_raw_data(
     # Categorical point events: TIMESTAMP, VALUE → {timestamp, value}
     if 'Medicin' in filtered_concepts:
         df = filtered_concepts['Medicin']
+        if cutoff is not None:
+            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
         raw_data['medications'] = [
             {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
             for _, r in df.iterrows()
@@ -1314,6 +1720,8 @@ def _filtered_dfs_to_raw_data(
 
     if 'Procedurer' in filtered_concepts:
         df = filtered_concepts['Procedurer']
+        if cutoff is not None:
+            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
         raw_data['procedures'] = [
             {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
             for _, r in df.iterrows()
@@ -1322,9 +1730,67 @@ def _filtered_dfs_to_raw_data(
     # Interval events: TIMESTAMP, END_TIMESTAMP, VALUE → {start, end, value}
     if 'ADTHaendelser' in filtered_concepts:
         df = filtered_concepts['ADTHaendelser']
+        if cutoff is not None:
+            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff].copy()
+            # Clamp ongoing intervals: end = min(end, cutoff)
+            ends = pd.to_datetime(df['END_TIMESTAMP'])
+            df['END_TIMESTAMP'] = ends.clip(upper=cutoff)
         raw_data['adt'] = [
             {'start': r['TIMESTAMP'], 'end': r['END_TIMESTAMP'], 'value': r['VALUE']}
             for _, r in df.iterrows()
         ]
 
     return raw_data
+
+
+# ---- Phase 4: Time-filter raw_data dict ------------------------------------
+
+def _filter_raw_data_by_time(raw_data: dict, cutoff_time) -> dict:
+    """
+    Return a copy of *raw_data* containing only events up to *cutoff_time*.
+
+    - Point events (vitals, labs, icu, medications, procedures): keep
+      records whose ``timestamp <= cutoff_time``.
+    - Interval events (adt): keep if ``start <= cutoff_time``; clamp
+      ``end`` to ``min(end, cutoff_time)`` so ongoing stays are truncated.
+    - Identity / demographics / admission_time are preserved as-is.
+    - ``current_time`` is set to *cutoff_time*.
+
+    Does **not** mutate *raw_data*.
+    """
+    cutoff = pd.Timestamp(cutoff_time)
+
+    filtered = {
+        'pid': raw_data.get('pid'),
+        'admission_time': raw_data['admission_time'],
+        'current_time': cutoff,
+        'demographics': raw_data.get('demographics', {}),
+    }
+
+    # Point events: keep timestamp <= cutoff
+    for key in ('vitals', 'labs', 'icu'):
+        filtered[key] = [
+            m for m in raw_data.get(key, [])
+            if pd.Timestamp(m['timestamp']) <= cutoff
+        ]
+
+    for key in ('medications', 'procedures'):
+        filtered[key] = [
+            m for m in raw_data.get(key, [])
+            if pd.Timestamp(m['timestamp']) <= cutoff
+        ]
+
+    # Interval events (ADT): keep if started, clamp end
+    filtered['adt'] = []
+    for evt in raw_data.get('adt', []):
+        start = pd.Timestamp(evt['start'])
+        if start > cutoff:
+            continue
+        end = pd.Timestamp(evt['end'])
+        filtered['adt'].append({
+            'start': evt['start'],
+            'end': min(end, cutoff),
+            'value': evt['value'],
+        })
+
+    return filtered

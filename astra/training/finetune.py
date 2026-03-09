@@ -129,6 +129,7 @@ def create_split_dataloaders(data: dict, splits, cfg_dict: dict):
         x_cont=trainval_ds.x_cont.numpy(),
         X_ts_cat=trainval_ds.X_ts_cat.numpy(),
         y=trainval_ds.y.numpy(),
+        trajectory_lengths=trainval_ds.traj_lengths.numpy(),
     )
 
     return AstraMixedDataLoader(

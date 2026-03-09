@@ -1,15 +1,19 @@
 """
 PatientContext: encapsulates all patient state for repeated inference.
 
-Supports two inference modes:
+Supports three modes:
 
 1. **First-time inference** — Create a context via ``PatientContext.create()``
    or ``PatientContext.from_csv()``.  This builds the fixed 30-day bin grid,
    constructs initial tensors, and stores accumulated raw data.
 
-2. **Re-inference** — Call ``context.refresh(current_time, new_data)`` to
-   update visibility and incorporate new measurements without rebuilding
-   static patient info or recreating the bin grid.
+2. **Re-inference (real-time)** — Call ``context.refresh(current_time, new_data)``
+   to incorporate new measurements and advance the time horizon.
+
+3. **Simulation (historical)** — When created via ``from_csv()``, the full
+   trajectory is stored internally.  Calling ``refresh(new_time)`` without
+   ``new_data`` automatically reveals measurements up to *new_time* from
+   the stored trajectory, using incremental tensor updates.
 
 Usage::
 
@@ -68,10 +72,17 @@ class PatientContext:
     x_ts_cat: np.ndarray   # [n_cat_dims, seq_len]
 
     # ---- Internal bookkeeping ----------------------------------------------
-    _raw_data: dict = field(repr=False)  # accumulated raw_data dict
+    _raw_data: dict = field(repr=False)  # accumulated raw_data dict (time-filtered)
     _bundle_name: Optional[str] = field(default=None, repr=False)
     _bundle_ref: Optional[dict] = field(default=None, repr=False)
-    _ebm_context: Optional[dict] = field(default=None, repr=False)  # for EBM re-injection on refresh
+    _ebm_context: Optional[dict] = field(default=None, repr=False)
+
+    # ---- New fields for incremental / simulation ----------------------------
+    _full_trajectory_data: Optional[dict] = field(default=None, repr=False)
+    _bin_cache: Optional[Any] = field(default=None, repr=False)  # BinCache
+    _last_refresh_time: Optional[pd.Timestamp] = field(default=None, repr=False)
+    _ebm_cache: Optional[Dict[float, float]] = field(default=None, repr=False)
+    _timing: dict = field(default_factory=dict, repr=False)
 
     # ---------------------------------------------------------------------- #
     # Construction
@@ -96,8 +107,12 @@ class PatientContext:
             _build_continuous_ts,
             _build_categorical_ts,
             _build_tab_df,
+            _populate_cache_from_raw_data,
+            timed_stage,
         )
         from astra.evaluation.utils import time_to_step
+
+        timing = {}
 
         # Parse timestamps
         raw_data = copy.deepcopy(raw_data)
@@ -122,10 +137,12 @@ class PatientContext:
         )
 
         # 2. Tensors
-        x_ts, trajectory_length = _build_continuous_ts(
-            raw_data, bin_df, bundle, trajectory_length=visible_bins,
-        )
-        x_ts_cat = _build_categorical_ts(raw_data, bin_df, bundle)
+        with timed_stage(timing, 'continuous_build'):
+            x_ts, trajectory_length = _build_continuous_ts(
+                raw_data, bin_df, bundle, trajectory_length=visible_bins,
+            )
+        with timed_stage(timing, 'categorical_build'):
+            x_ts_cat = _build_categorical_ts(raw_data, bin_df, bundle)
 
         # Zero out categorical beyond visibility
         seq_len = bundle['model_params']['seq_len']
@@ -134,6 +151,11 @@ class PatientContext:
 
         # 3. Static tabular
         tab_df = _build_tab_df(raw_data, bundle)
+
+        # 4. Populate bin cache for future incremental updates
+        bin_cache = _populate_cache_from_raw_data(raw_data, bin_df, bundle)
+        bin_cache.dirty_continuous.clear()
+        bin_cache.dirty_categorical.clear()
 
         from astra.inference.data_prep import MAX_PREDICTION_WINDOW
 
@@ -151,6 +173,9 @@ class PatientContext:
             _raw_data=raw_data,
             _bundle_name=bundle.get('model_name'),
             _bundle_ref=bundle,
+            _bin_cache=bin_cache,
+            _last_refresh_time=current_time,
+            _timing=timing,
         )
 
     @classmethod
@@ -223,38 +248,55 @@ class PatientContext:
     ) -> "PatientContext":
         """Create from raw CSV files (stateless — no shared file writes).
 
-        Equivalent to ``prepare_patient_from_csv`` but returns a reusable
-        PatientContext instead of a one-shot dict.
+        Loads the **full trajectory** from CSVs and stores it in
+        ``_full_trajectory_data`` for simulation time-stepping.  Only data
+        up to *current_time* is used for the initial tensor build.
         """
         from astra.inference.data_prep import (
             _build_single_patient_base_df,
             _filter_concepts_for_patient,
             _filtered_dfs_to_raw_data,
+            _filter_raw_data_by_time,
+            timed_stage,
         )
+
+        timing = {}
 
         if cfg is None:
             from astra.utils import get_cfg
             cfg = get_cfg()
 
         # Phase 1: Build base_df (stateless)
-        base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
-        logger.info(
-            f"Built base_df for patient {cpr_hash[:8]}...: "
-            f"trajectory {base_df['start'].iloc[0]} -> {base_df['end'].iloc[0]}"
+        with timed_stage(timing, 'csv_load'):
+            base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
+            logger.info(
+                f"Built base_df for patient {cpr_hash[:8]}...: "
+                f"trajectory {base_df['start'].iloc[0]} -> {base_df['end'].iloc[0]}"
+            )
+
+            # Phase 2: Filter concepts (stateless) — loads full trajectory
+            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+            logger.info(
+                f"Filtered {len(filtered_concepts)} concepts: "
+                f"{list(filtered_concepts.keys())}"
+            )
+
+        # Phase 3a: Build full trajectory raw_data (unfiltered by time)
+        raw_data_full = _filtered_dfs_to_raw_data(
+            base_df, filtered_concepts, current_time=current_time,
+            filter_by_time=False,
         )
 
-        # Phase 2: Filter concepts (stateless)
-        filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
-        logger.info(
-            f"Filtered {len(filtered_concepts)} concepts: "
-            f"{list(filtered_concepts.keys())}"
-        )
+        # Phase 3b: Build time-filtered raw_data for initial tensors
+        with timed_stage(timing, 'time_filter'):
+            raw_data = _filter_raw_data_by_time(raw_data_full, current_time)
 
-        # Phase 3: Convert to raw_data dict
-        raw_data = _filtered_dfs_to_raw_data(base_df, filtered_concepts, current_time)
-
-        # Phase 4: Create context
+        # Phase 4: Create context from time-filtered data
         ctx = cls.create(raw_data, bundle)
+        ctx._full_trajectory_data = raw_data_full
+        # Merge timing from csv_load into context timing
+        for k, v in timing.items():
+            ctx._timing.setdefault(k, []).extend(v)
 
         # Phase 5: Inject EBM predictions if model expects them
         if '_ebm_pred' in bundle.get('ts_channel_names', []):
@@ -262,14 +304,16 @@ class PatientContext:
                 compute_ebm_predictions, inject_ebm_into_x_ts,
             )
 
-            ebm_preds = compute_ebm_predictions(
-                raw_data, filtered_concepts, base_df, cfg, ebm_models_dir,
-            )
-            ctx.x_ts = inject_ebm_into_x_ts(
-                ctx.x_ts, ebm_preds, ctx.bin_df,
-                raw_data['admission_time'], bundle,
-                trajectory_length=ctx.trajectory_length,
-            )
+            with timed_stage(ctx._timing, 'ebm_compute'):
+                ebm_preds = compute_ebm_predictions(
+                    raw_data, filtered_concepts, base_df, cfg, ebm_models_dir,
+                )
+            with timed_stage(ctx._timing, 'ebm_inject'):
+                ctx.x_ts = inject_ebm_into_x_ts(
+                    ctx.x_ts, ebm_preds, ctx.bin_df,
+                    raw_data['admission_time'], bundle,
+                    trajectory_length=ctx.trajectory_length,
+                )
 
             # Store context for EBM re-injection on refresh()
             ctx._ebm_context = {
@@ -278,6 +322,7 @@ class PatientContext:
                 'cfg': cfg,
                 'ebm_models_dir': ebm_models_dir,
             }
+            ctx._ebm_cache = dict(ebm_preds)
 
         return ctx
 
@@ -291,6 +336,13 @@ class PatientContext:
         new_data: Optional[dict] = None,
     ) -> dict:
         """Update patient state and return model-ready tensors.
+
+        **Incremental mode** (default when ``_bin_cache`` is available):
+        only processes newly arriving data and updates dirty bins.
+
+        **Simulation mode** (when ``_full_trajectory_data`` is set and no
+        *new_data* is provided): automatically reveals measurements from
+        the stored full trajectory up to *current_time*.
 
         Args:
             current_time: New time horizon for visibility masking.
@@ -306,21 +358,15 @@ class PatientContext:
         from astra.inference.data_prep import (
             _build_continuous_ts,
             _build_categorical_ts,
+            _build_continuous_ts_incremental,
+            _build_categorical_ts_incremental,
+            _filter_raw_data_by_time,
+            timed_stage,
         )
         from astra.evaluation.utils import time_to_step
 
-        self.current_time = pd.Timestamp(current_time)
-
-        # Append new data to accumulated store
-        if new_data:
-            for key in ('vitals', 'labs', 'icu', 'medications', 'procedures', 'adt'):
-                new_entries = new_data.get(key, [])
-                if new_entries:
-                    self._raw_data.setdefault(key, []).extend(new_entries)
-                    logger.info(f"Appended {len(new_entries)} {key} entries")
-
-        # Update current_time in raw_data (used by tensor builders)
-        self._raw_data['current_time'] = self.current_time
+        new_current_time = pd.Timestamp(current_time)
+        old_trajectory_length = self.trajectory_length
 
         bundle = self._bundle_ref
         if bundle is None:
@@ -331,45 +377,188 @@ class PatientContext:
 
         # Recompute visibility using cfg bin intervals
         data_config = bundle['data_config']
-        delta_minutes = (self.current_time - self.admission_time).total_seconds() / 60
+        delta_minutes = (new_current_time - self.admission_time).total_seconds() / 60
         step = time_to_step(delta_minutes, 'min', data_config=data_config)
         visible_bins = (step + 1) if step is not None else len(self.bin_df)
 
-        # Full tensor rebuild from accumulated data
-        self.x_ts, self.trajectory_length = _build_continuous_ts(
-            self._raw_data, self.bin_df, bundle, trajectory_length=visible_bins,
-        )
-        self.x_ts_cat = _build_categorical_ts(self._raw_data, self.bin_df, bundle)
+        # ----- Determine new measurements to process -----
+        incremental_records = []  # continuous point events
+        incremental_cat_events = {}  # {raw_key: [event_dicts]}
 
-        # Zero out beyond visibility
-        seq_len = bundle['model_params']['seq_len']
-        if self.trajectory_length < seq_len:
-            self.x_ts_cat[:, self.trajectory_length:] = 0.0
+        if new_data is not None:
+            # Real-time mode: use provided new_data (filter by time)
+            for key in ('vitals', 'labs', 'icu'):
+                entries = new_data.get(key, [])
+                for m in entries:
+                    if pd.Timestamp(m['timestamp']) <= new_current_time:
+                        incremental_records.append(m)
+                        self._raw_data.setdefault(key, []).append(m)
 
-        # Re-inject EBM predictions if context was built with them
+            for key in ('medications', 'procedures', 'adt'):
+                entries = new_data.get(key, [])
+                filtered_entries = []
+                for m in entries:
+                    ts_key = 'start' if key == 'adt' else 'timestamp'
+                    if pd.Timestamp(m[ts_key]) <= new_current_time:
+                        if key == 'adt':
+                            m = dict(m)
+                            m['end'] = min(pd.Timestamp(m['end']), new_current_time)
+                        filtered_entries.append(m)
+                        self._raw_data.setdefault(key, []).append(m)
+                if filtered_entries:
+                    incremental_cat_events[key] = filtered_entries
+
+        elif self._full_trajectory_data is not None:
+            # Simulation mode: reveal data from stored trajectory
+            last_time = self._last_refresh_time or self.admission_time
+            with timed_stage(self._timing, 'time_filter'):
+                for key in ('vitals', 'labs', 'icu'):
+                    for m in self._full_trajectory_data.get(key, []):
+                        ts = pd.Timestamp(m['timestamp'])
+                        if ts > last_time and ts <= new_current_time:
+                            incremental_records.append(m)
+                            self._raw_data.setdefault(key, []).append(m)
+
+                for key in ('medications', 'procedures'):
+                    entries = []
+                    for m in self._full_trajectory_data.get(key, []):
+                        ts = pd.Timestamp(m['timestamp'])
+                        if ts > last_time and ts <= new_current_time:
+                            entries.append(m)
+                            self._raw_data.setdefault(key, []).append(m)
+                    if entries:
+                        incremental_cat_events[key] = entries
+
+                # ADT: include intervals that started in (last_time, new_time]
+                # OR intervals already started that now extend into new bins
+                adt_new = []
+                for evt in self._full_trajectory_data.get('adt', []):
+                    start = pd.Timestamp(evt['start'])
+                    end = pd.Timestamp(evt['end'])
+                    if start > new_current_time:
+                        continue
+                    if start > last_time:
+                        # New interval starting in this window
+                        clamped = dict(evt)
+                        clamped['end'] = min(end, new_current_time)
+                        adt_new.append(clamped)
+                        self._raw_data.setdefault('adt', []).append(clamped)
+                    elif end > last_time:
+                        # Ongoing interval extending into newly visible bins
+                        clamped = {
+                            'start': evt['start'],
+                            'end': min(end, new_current_time),
+                            'value': evt['value'],
+                        }
+                        adt_new.append(clamped)
+                if adt_new:
+                    incremental_cat_events['adt'] = adt_new
+
+        self.current_time = new_current_time
+        self._raw_data['current_time'] = self.current_time
+
+        # ----- Incremental or full tensor update -----
+        has_new_data = bool(incremental_records) or bool(incremental_cat_events)
+
+        if self._bin_cache is not None:
+            # Incremental path
+            with timed_stage(self._timing, 'continuous_build'):
+                self.x_ts, self.trajectory_length = _build_continuous_ts_incremental(
+                    new_records=incremental_records,
+                    bin_df=self.bin_df,
+                    bundle=bundle,
+                    cache=self._bin_cache,
+                    x_ts_existing=self.x_ts,
+                    old_trajectory_length=old_trajectory_length,
+                    trajectory_length=visible_bins,
+                    admission_time=self.admission_time,
+                )
+            with timed_stage(self._timing, 'categorical_build'):
+                self.x_ts_cat = _build_categorical_ts_incremental(
+                    new_events=incremental_cat_events,
+                    bin_df=self.bin_df,
+                    bundle=bundle,
+                    cache=self._bin_cache,
+                    x_ts_cat_existing=self.x_ts_cat,
+                    trajectory_length=visible_bins,
+                )
+        else:
+            # Fallback: full rebuild (e.g. deserialized context without cache)
+            with timed_stage(self._timing, 'continuous_build'):
+                self.x_ts, self.trajectory_length = _build_continuous_ts(
+                    self._raw_data, self.bin_df, bundle,
+                    trajectory_length=visible_bins,
+                )
+            with timed_stage(self._timing, 'categorical_build'):
+                self.x_ts_cat = _build_categorical_ts(
+                    self._raw_data, self.bin_df, bundle,
+                )
+            # Zero out beyond visibility
+            seq_len = bundle['model_params']['seq_len']
+            if self.trajectory_length < seq_len:
+                self.x_ts_cat[:, self.trajectory_length:] = 0.0
+
+        # ----- EBM: only compute new intervals -----
         if '_ebm_pred' in bundle.get('ts_channel_names', []) and self._ebm_context is not None:
-            from astra.inference.ebm import (
-                compute_ebm_predictions, inject_ebm_into_x_ts,
-            )
-            ebm_preds = compute_ebm_predictions(
+            self._refresh_ebm(bundle)
+
+        self._last_refresh_time = self.current_time
+
+        logger.info(
+            f"Refreshed context: trajectory_length={self.trajectory_length}, "
+            f"current_time={self.current_time}, "
+            f"incremental={'yes' if self._bin_cache is not None else 'no'}, "
+            f"new_records={len(incremental_records)}"
+        )
+
+        return self.to_dict()
+
+    def _refresh_ebm(self, bundle: dict) -> None:
+        """Incrementally update EBM predictions — only compute new intervals."""
+        from astra.inference.ebm import (
+            compute_ebm_predictions, inject_ebm_into_x_ts,
+        )
+        from astra.inference.data_prep import timed_stage
+
+        if self._ebm_cache is None:
+            self._ebm_cache = {}
+
+        with timed_stage(self._timing, 'ebm_compute'):
+            new_preds = compute_ebm_predictions(
                 self._raw_data,
                 self._ebm_context['filtered_concepts'],
                 self._ebm_context['base_df'],
                 self._ebm_context['cfg'],
                 self._ebm_context['ebm_models_dir'],
+                cached_predictions=self._ebm_cache,
             )
+
+        self._ebm_cache.update(new_preds)
+
+        with timed_stage(self._timing, 'ebm_inject'):
             self.x_ts = inject_ebm_into_x_ts(
-                self.x_ts, ebm_preds, self.bin_df,
+                self.x_ts, self._ebm_cache, self.bin_df,
                 self.admission_time, bundle,
                 trajectory_length=self.trajectory_length,
             )
 
-        logger.info(
-            f"Refreshed context: trajectory_length={self.trajectory_length}, "
-            f"current_time={self.current_time}"
-        )
+    # ---------------------------------------------------------------------- #
+    # Timing
+    # ---------------------------------------------------------------------- #
 
-        return self.to_dict()
+    def get_timing_summary(self) -> dict:
+        """Return ``{stage: {mean_ms, total_ms, count, last_ms}}``."""
+        summary = {}
+        for stage, durations in self._timing.items():
+            total = sum(durations)
+            count = len(durations)
+            summary[stage] = {
+                'mean_ms': (total / count) * 1000 if count else 0,
+                'total_ms': total * 1000,
+                'count': count,
+                'last_ms': durations[-1] * 1000 if durations else 0,
+            }
+        return summary
 
     # ---------------------------------------------------------------------- #
     # Output helpers
@@ -412,6 +601,10 @@ class PatientContext:
             '_raw_data': self._raw_data,
             '_bundle_name': self._bundle_name,
             '_ebm_context': self._ebm_context,
+            '_full_trajectory_data': self._full_trajectory_data,
+            '_bin_cache': self._bin_cache,
+            '_last_refresh_time': self._last_refresh_time,
+            '_ebm_cache': self._ebm_cache,
         }
 
         with open(path, 'wb') as f:
@@ -449,6 +642,10 @@ class PatientContext:
             _bundle_name=state.get('_bundle_name'),
             _bundle_ref=bundle,
             _ebm_context=state.get('_ebm_context'),
+            _full_trajectory_data=state.get('_full_trajectory_data'),
+            _bin_cache=state.get('_bin_cache'),
+            _last_refresh_time=state.get('_last_refresh_time'),
+            _ebm_cache=state.get('_ebm_cache'),
         )
 
         logger.info(f"Loaded PatientContext from {path} (pid={ctx.pid})")

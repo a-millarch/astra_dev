@@ -77,6 +77,7 @@ def compute_ebm_predictions(
     base_df: pd.DataFrame,
     cfg: dict,
     ebm_models_dir: str = 'models/ebm',
+    cached_predictions: Optional[Dict[float, float]] = None,
 ) -> Dict[float, float]:
     """
     Compute EBM predictions at all relevant intervals for a single patient.
@@ -91,9 +92,13 @@ def compute_ebm_predictions(
         base_df: Single-row patient base DataFrame.
         cfg: Configuration dictionary.
         ebm_models_dir: Directory containing saved EBM deployment models.
+        cached_predictions: Previously computed predictions to skip.
+            Intervals already present in this dict will not be recomputed.
 
     Returns:
-        {masking_hours: predicted_probability}
+        Dict with only *newly computed* predictions
+        ``{masking_hours: predicted_probability}``.  Caller should merge
+        with *cached_predictions* to get the full set.
     """
     if not os.path.isdir(ebm_models_dir):
         logger.warning(
@@ -117,13 +122,22 @@ def compute_ebm_predictions(
         )
         return {}
 
+    # Skip intervals already in cache
+    _cached = cached_predictions or {}
+    intervals_to_compute = [h for h in valid_intervals if h not in _cached]
+
+    if not intervals_to_compute:
+        logger.debug("All %d EBM intervals already cached — skipping", len(valid_intervals))
+        return {}
+
     logger.info(
-        f"Computing EBM predictions at {len(valid_intervals)} intervals "
-        f"(elapsed: {(pd.Timestamp(raw_data['current_time']) - admission_time).total_seconds() / 3600:.1f}h)"
+        f"Computing EBM predictions at {len(intervals_to_compute)} NEW intervals "
+        f"({len(_cached)} cached, elapsed: "
+        f"{(pd.Timestamp(raw_data['current_time']) - admission_time).total_seconds() / 3600:.1f}h)"
     )
 
     predictions = {}
-    for masking_hours in valid_intervals:
+    for masking_hours in intervals_to_compute:
         try:
             prob = _predict_at_interval_from_raw(
                 filtered_concepts=filtered_concepts,
