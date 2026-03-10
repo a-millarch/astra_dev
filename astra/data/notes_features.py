@@ -21,10 +21,11 @@ logger = logging.getLogger(__name__)
 
 GCS_KEYWORD = r"(?:gcs|glasgow\s+coma\s+(?:scale|score))"
 GCS_FILLER = r"(?:\s+\w+){0,3}?"
-GCS_VALUE = r"[\s:=]\b([1-9]|1[0-5])\b(?!\s/\w)"
+GCS_VALUE = r"[\s:=]*\b([1-9]|1[0-5])\b(?!\s*/\w)"
 
 GCS_PATTERN = re.compile(rf"{GCS_KEYWORD}{GCS_FILLER}{GCS_VALUE}", re.IGNORECASE)
-SKIP_PATTERN = re.compile(r"(?:rp.?\s*|gentag\w\s)$", re.IGNORECASE)
+REPEAT_PREFIX = r"(?:rp\.?\s*|gentag\w*\s*)"
+SKIP_PATTERN = re.compile(rf"{REPEAT_PREFIX}$", re.IGNORECASE)
 
 FALL_PATTERN = re.compile(
     rf"(?:{GCS_KEYWORD}?\s*(?:er\s+)?(?:falder?|faldet|stiger?|steget)\s+fra|fald\s+(?:i\s+{GCS_KEYWORD}\s+)?fra)"
@@ -38,7 +39,7 @@ ARROW_PATTERN = re.compile(
 )
 
 SUBSCALE_TOTAL_PATTERN = re.compile(
-    rf"{GCS_KEYWORD}[\s:=][ØEøe]\d[^.\n\r]?=\s*\b([1-9]|1[0-5])\b",
+    rf"{GCS_KEYWORD}[\s:=]*[ØEøe]\d[^.\n\r]*?=\s*\b([1-9]|1[0-5])\b",
     re.IGNORECASE,
 )
 
@@ -122,18 +123,20 @@ def build_gcs_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 # ISS Extraction
 # ============================================================================
 
-ISS_KEYWORD = r"(?:()?\bISS(?:-?sco+re)?.?"
-ISS_SEP = r"[\s:=-]"
-ISS_FILLER = r"(?:\s\S+\s+){0,3}?"
-ISS_VALUE = r"(?:(\b[0-9]|[1-6]\d|7[0-5])\b"
+ISS_KEYWORD = r"(?:\()?\bISS(?:-?sco+re)?\.?"  # tillader "(ISS" og "ISS."
+ISS_SEP     = r"[\s:=\-]*"                    # tillader bindestreg og newline som separator
+ISS_FILLER  = r"(?:\s*\S+\s+){0,3}?"         # op til 3 vilkårlige tokens — fanger "ca.", "er", "på" osv.
+ISS_VALUE   = r"\(?(\b[0-9]|[1-6]\d|7[0-5])\b"  # tillader evt. parentes og tal
 
 ISS_PATTERN = re.compile(
     rf"{ISS_KEYWORD}{ISS_SEP}{ISS_FILLER}{ISS_VALUE}",
     re.IGNORECASE,
 )
 
+# Bagud: score efterfulgt af ISS — "pt scorer 19 på ISS"
+# \S* fanger alt ikke-whitespace så danske tegn (å,ø,æ) ikke er et problem
 ISS_BEFORE = re.compile(
-    rf"\b([0-9]|[1-6]\d|7[0-5])\b\s\S\s*\bISS\b",
+    rf"\b([0-9]|[1-6]\d|7[0-5])\b\s*\S*\s*\bISS\b",
     re.IGNORECASE,
 )
 
