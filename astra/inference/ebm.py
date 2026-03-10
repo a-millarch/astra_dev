@@ -409,7 +409,8 @@ def _aggregate_patient_features(
 
     for col in cfg.get('dataset', {}).get('num_cols', []):
         feature_row[col] = row.get(col, np.nan)
-    for col in cfg.get('dataset', {}).get('cat_cols', []):
+    from astra.data.datasets import get_effective_cat_cols
+    for col in get_effective_cat_cols(cfg):
         feature_row[col] = row.get(col, np.nan)
 
     # Process each concept

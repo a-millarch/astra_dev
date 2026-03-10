@@ -236,7 +236,12 @@ def preprocess_features(
                 for feat in expected_cat_feats
             }
             X_cat_full = pd.DataFrame(cat_data, index=X.index)
-            
+
+            # Fill NaN with sentinel string to avoid mixed dtype (object + float)
+            # causing np.isnan failures in encoder.transform/predict_proba.
+            # handle_unknown='ignore' encodes unknown categories as all-zeros.
+            X_cat_full = X_cat_full.fillna('#missing#')
+
             X_cat_encoded = encoder.transform(X_cat_full)
             
             # Generate feature names (must match training)
