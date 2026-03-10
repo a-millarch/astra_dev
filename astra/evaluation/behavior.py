@@ -3762,3 +3762,794 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
         logger.info(summary.to_string(index=False))
     
     return results
+
+
+# ============================================================================
+# INTERACTIVE PLOTLY HEATMAPS
+# ============================================================================
+# Paste this entire block at the bottom of astra/evaluation/behavior.py
+#
+# Then in astra/inference/run_inference.py, replace default_session_plot()
+# with the version in the companion snippet.
+# ============================================================================
+
+try:
+    import plotly.graph_objects as go
+    HAS_PLOTLY = True
+except ImportError:
+    HAS_PLOTLY = False
+
+
+def _build_time_axis_plotly(n_steps):
+    """Build time axis with sparse tick labels for readability."""
+    all_labels = []
+    for i in range(n_steps):
+        t = step_to_time(i)
+        all_labels.append(time_to_hours(t))
+    n_ticks = min(15, n_steps)
+    tick_vals = np.linspace(0, n_steps - 1, n_ticks, dtype=int).tolist()
+    tick_labels = [all_labels[i] for i in tick_vals]
+    return all_labels, tick_vals, tick_labels
+
+
+def _hours_to_label_plotly(hours: float) -> str:
+    if hours < 1:
+        return f"{hours * 60:.0f}min"
+    elif hours < 24:
+        return f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+    else:
+        d = hours / 24
+        return f"{int(d)}D" if d == int(d) else f"{d:.1f}D"
+
+
+def plot_continuous_ts_shap_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    eval_timestep: Optional[int] = None,
+    class_idx: int = 1,
+    height: int = 700,
+    width: int = 1100,
+    title: str = "Continuous TS SHAP Heatmap (interactive)",
+):
+    """Interactive Plotly heatmap for continuous time-series SHAP values."""
+    if not HAS_PLOTLY:
+        logger.warning("plotly not installed — falling back to matplotlib")
+        return None
+
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+
+    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+    if has_ebm:
+        ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
+    elif channel2feature:
+        ordered_idx, ordered_labels, _ = _get_grouped_channel_order(channel2feature)
+    else:
+        ordered_idx = list(range(n_ch))
+        ordered_labels = [f'Ch{i}' for i in range(n_ch)]
+
+    ts_display = ts_shap[ordered_idx]
+    vmax = max(abs(float(np.nanmin(ts_display))),
+               abs(float(np.nanmax(ts_display))), 1e-10)
+
+    hover = np.empty(ts_display.shape, dtype=object)
+    for r in range(ts_display.shape[0]):
+        for c in range(ts_display.shape[1]):
+            hover[r, c] = (
+                f"<b>{ordered_labels[r]}</b><br>"
+                f"Time: {time_labels[c]}<br>"
+                f"SHAP: {ts_display[r, c]:.5f}"
+            )
+
+    fig = go.Figure(data=go.Heatmap(
+        z=ts_display,
+        x=list(range(n_steps)),
+        y=ordered_labels,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        colorscale='RdBu_r',
+        zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="SHAP"),
+    ))
+    fig.update_layout(
+        title=title, xaxis_title="Time", yaxis_title="Channel",
+        height=height, width=width,
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        margin=dict(l=180),
+    )
+    return fig
+
+
+def plot_categorical_ts_shap_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    eval_timestep: Optional[int] = None,
+    class_idx: int = 1,
+    height: int = 600,
+    width: int = 1100,
+    title: str = "Categorical TS SHAP Heatmap (interactive)",
+):
+    """Interactive Plotly heatmap for per-category SHAP values."""
+    if not HAS_PLOTLY:
+        logger.warning("plotly not installed — falling back to matplotlib")
+        return None
+
+    cat_shap = shap_results.get('cat_ts_shap_per_category')
+    enc_info = shap_results.get('encoding_info')
+    if cat_shap is None or enc_info is None:
+        return None
+
+    data = cat_shap[sample_idx]
+    if data.ndim == 3:
+        data = data[..., min(class_idx, data.shape[-1] - 1)]
+    n_cats, n_steps = data.shape
+
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        data = data[:, :n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    cat_names = get_category_names_from_encoding_info(enc_info)
+    while len(cat_names) < n_cats:
+        cat_names.append(f"cat_{len(cat_names)}")
+    cat_names = cat_names[:n_cats]
+
+    vmax = max(abs(float(np.nanmin(data))),
+               abs(float(np.nanmax(data))), 1e-10)
+
+    hover = np.empty(data.shape, dtype=object)
+    for r in range(data.shape[0]):
+        for c in range(data.shape[1]):
+            hover[r, c] = (
+                f"<b>{cat_names[r]}</b><br>"
+                f"Time: {time_labels[c]}<br>"
+                f"SHAP: {data[r, c]:.5f}"
+            )
+
+    fig = go.Figure(data=go.Heatmap(
+        z=data,
+        x=list(range(n_steps)),
+        y=cat_names,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        colorscale='RdBu_r',
+        zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="SHAP"),
+    ))
+
+    for feat, (start, _) in enc_info.get('feature_ranges', {}).items():
+        if start > 0:
+            fig.add_hline(y=start - 0.5, line_dash="dash",
+                          line_color="black", line_width=1, opacity=0.5)
+
+    fig.update_layout(
+        title=title, xaxis_title="Time", yaxis_title="Category",
+        height=height, width=width,
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        margin=dict(l=220),
+    )
+    return fig
+
+
+def plot_ebm_contributions_plotly(
+    ebm_explanations: Dict[float, Dict],
+    top_n: int = 25,
+    height: int = 650,
+    width: int = 1100,
+    title: str = "EBM Feature Contributions (interactive)",
+):
+    """Interactive Plotly heatmap of EBM local contributions across timeframes."""
+    if not HAS_PLOTLY:
+        logger.warning("plotly not installed — falling back to matplotlib")
+        return None
+    if not ebm_explanations:
+        return None
+
+    sorted_hours = sorted(ebm_explanations.keys())
+    x_labels = [_hours_to_label_plotly(h) for h in sorted_hours]
+    x_labels_prob = [
+        f"{_hours_to_label_plotly(h)} (P={ebm_explanations[h]['predicted_prob']:.3f})"
+        for h in sorted_hours
+    ]
+
+    all_features = set()
+    for d in ebm_explanations.values():
+        all_features.update(d['feature_names'])
+    all_features_list = sorted(all_features)
+
+    feat_to_idx = {f: i for i, f in enumerate(all_features_list)}
+    matrix = np.zeros((len(all_features_list), len(sorted_hours)))
+    for col, h in enumerate(sorted_hours):
+        d = ebm_explanations[h]
+        for name, contrib in zip(d['feature_names'], d['contributions']):
+            matrix[feat_to_idx[name], col] = contrib
+
+    max_abs = np.abs(matrix).max(axis=1)
+    top_idx = np.argsort(max_abs)[::-1][:top_n]
+    top_names = [all_features_list[i] for i in top_idx]
+    top_matrix = matrix[top_idx]
+
+    vmax = max(abs(float(np.nanmin(top_matrix))),
+               abs(float(np.nanmax(top_matrix))), 1e-10)
+
+    hover = np.empty(top_matrix.shape, dtype=object)
+    for r in range(top_matrix.shape[0]):
+        feat_name = top_names[r]
+        for c in range(top_matrix.shape[1]):
+            h = sorted_hours[c]
+            d = ebm_explanations[h]
+            val_str = ""
+            if feat_name in d['feature_names']:
+                fi = list(d['feature_names']).index(feat_name)
+                fv = d.get('feature_values')
+                if fv is not None and fi < len(fv):
+                    val_str = f"<br>Value: {fv[fi]}"
+            hover[r, c] = (
+                f"<b>{feat_name}</b><br>"
+                f"Time: {x_labels[c]}<br>"
+                f"Contribution: {top_matrix[r, c]:.4f}"
+                f"{val_str}"
+            )
+
+    fig = go.Figure(data=go.Heatmap(
+        z=top_matrix,
+        x=x_labels_prob,
+        y=top_names,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        colorscale='RdBu_r',
+        zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="Contrib<br>(log-odds)"),
+    ))
+    fig.update_layout(
+        title=title, xaxis_title="EBM Timeframe", yaxis_title="Feature",
+        height=height, width=width,
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=250),
+    )
+    return fig
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# PREDICTION TRAJECTORY (Plotly)
+# ═════════════════════════════════════════════════════════════════════════
+
+
+def plot_shap_budget_plotly(shap_results, sample_idx=0, channel2feature=None,
+                            eval_timestep=None, class_idx=1, height=300, width=1100):
+    """Interactive SHAP budget over time: EBM vs Clinical."""
+    if not HAS_PLOTLY or not channel2feature or not _has_ebm_channels(channel2feature):
+        return None
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+    budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
+    if budget is None:
+        return None
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    clinical_t = budget['clinical_temporal'][:n_steps]
+    ebm_t = budget['ebm_temporal'][:n_steps]
+    x = list(range(n_steps))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=clinical_t, fill='tozeroy',
+        fillcolor='rgba(0,139,251,0.2)', line=dict(color='#008bfb', width=2),
+        name=f"Clinical: {budget['clinical_pct']:.1f}%",
+        hovertemplate='<b>%{customdata}</b><br>Clinical: %{y:.5f}<extra></extra>',
+        customdata=[time_labels[i] for i in range(n_steps)]))
+    fig.add_trace(go.Scatter(x=x, y=ebm_t, fill='tozeroy',
+        fillcolor='rgba(255,152,0,0.2)', line=dict(color='#FF9800', width=2),
+        name=f"EBM: {budget['ebm_pct']:.1f}%",
+        hovertemplate='<b>%{customdata}</b><br>EBM: %{y:.5f}<extra></extra>',
+        customdata=[time_labels[i] for i in range(n_steps)]))
+    fig.update_layout(title="SHAP Budget Over Time: EBM vs Clinical",
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        xaxis_title="Time", yaxis_title="Sum |SHAP|", height=height, width=width)
+    return fig
+
+
+def plot_shap_temporal_plotly(shap_results, sample_idx=0, channel2feature=None,
+                              eval_timestep=None, class_idx=1, height=350, width=1100):
+    """Interactive TS SHAP over time (Clinical + EBM + Categorical)."""
+    if not HAS_PLOTLY:
+        return None
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    x = list(range(n_steps))
+    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+    fig = go.Figure()
+    if has_ebm:
+        clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_ch)
+        ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
+        clinical_avg = np.abs(ts_shap[clinical_ch]).mean(axis=0)
+        fig.add_trace(go.Scatter(x=x, y=clinical_avg, fill='tozeroy',
+            fillcolor='rgba(0,139,251,0.15)', line=dict(color='#008bfb', width=2),
+            name='Clinical channels',
+            hovertemplate='<b>%{customdata}</b><br>Clinical: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)]))
+        if ebm_ch:
+            ebm_avg = np.abs(ts_shap[ebm_ch]).mean(axis=0)
+            fig.add_trace(go.Scatter(x=x, y=ebm_avg,
+                line=dict(color='#FF9800', width=2, dash='dash'), name='EBM (_ebm_pred)',
+                hovertemplate='<b>%{customdata}</b><br>EBM: %{y:.5f}<extra></extra>',
+                customdata=[time_labels[i] for i in range(n_steps)]))
+    else:
+        ts_avg = np.abs(ts_shap).mean(axis=0)
+        fig.add_trace(go.Scatter(x=x, y=ts_avg, fill='tozeroy',
+            fillcolor='rgba(255,0,81,0.2)', line=dict(color='#ff0051', width=2),
+            name='Continuous TS',
+            hovertemplate='<b>%{customdata}</b><br>|SHAP|: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)]))
+    if shap_results['cat_ts_shap'] is not None:
+        cat_ts = shap_results['cat_ts_shap'][sample_idx]
+        if cat_ts.ndim == 2:
+            cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
+        cat_ts = cat_ts[:n_steps]
+        fig.add_trace(go.Scatter(x=x, y=cat_ts,
+            line=dict(color='#00d4aa', width=2, dash='dash'), name='Categorical TS',
+            hovertemplate='<b>%{customdata}</b><br>Cat TS: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)]))
+    fig.update_layout(title="TS SHAP Over Time",
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        xaxis_title="Time", yaxis_title="Mean |SHAP|", height=height, width=width)
+    return fig
+
+
+def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
+                             eval_timestep=None, class_idx=1, top_n=20, height=450, width=1100):
+    """Interactive top-N channel importance."""
+    if not HAS_PLOTLY:
+        return None
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+        ts_shap = ts_shap[:, :eval_timestep + 1]
+    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+    ch_imp = np.abs(ts_shap).mean(axis=1)
+    if has_ebm:
+        display_ch = _get_clinical_only_channel_mask(channel2feature, n_ch)
+    else:
+        display_ch = _get_display_channel_mask(channel2feature, n_ch) if channel2feature else list(range(n_ch))
+    ch_imp_display = ch_imp[display_ch]
+    sorted_display = np.argsort(ch_imp_display)[::-1]
+    n_show = min(top_n, len(ch_imp_display))
+    sorted_idx = [display_ch[i] for i in sorted_display[:n_show]]
+    names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx] if channel2feature else [f'Ch {i}' for i in sorted_idx]
+    values = ch_imp[sorted_idx]
+    names, values = names[::-1], values[::-1]
+    hover = [f"<b>{names[i]}</b><br>Mean |SHAP|: {values[i]:.5f}" for i in range(n_show)]
+    fig = go.Figure(data=go.Bar(x=values, y=names, orientation='h',
+        marker_color='#008bfb', customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>"))
+    title = f"Top {n_show} Clinical Channels" if has_ebm else f"Top {n_show} Channels"
+    fig.update_layout(title=title, xaxis_title="Mean |SHAP|",
+        yaxis=dict(autorange="reversed"), height=height, width=width, margin=dict(l=180))
+    return fig
+
+
+def plot_static_features_plotly(shap_results, sample_idx=0, feature_names_cat=None,
+                                feature_names_cont=None, class_idx=1, height=350, width=1100):
+    """Interactive static features (categorical + continuous)."""
+    if not HAS_PLOTLY:
+        return None
+    from plotly.subplots import make_subplots
+    has_cat = shap_results.get('cat_shap') is not None and shap_results['cat_shap'].size > 0
+    has_cont = shap_results.get('cont_shap') is not None and shap_results['cont_shap'].size > 0
+    if not has_cat and not has_cont:
+        return None
+    cols = int(has_cat) + int(has_cont)
+    subtitles = []
+    if has_cat: subtitles.append("Static Categorical")
+    if has_cont: subtitles.append("Static Continuous")
+    fig = make_subplots(rows=1, cols=cols, subplot_titles=subtitles)
+    col_idx = 1
+    if has_cat:
+        cat_shap = shap_results['cat_shap'][sample_idx]
+        cat_data = shap_results['test_data']['cat'][sample_idx]
+        if cat_shap.ndim == 2:
+            cat_shap = cat_shap[..., min(class_idx, cat_shap.shape[-1] - 1)]
+        n = len(cat_shap)
+        nms = list(feature_names_cat)[:n] if feature_names_cat else [f'Cat_{i}' for i in range(n)]
+        while len(nms) < n: nms.append(f'Cat_{len(nms)}')
+        labels = []
+        for i in range(n):
+            try: labels.append(f"{nms[i]} (val={int(cat_data[i])})" if i < len(cat_data) else nms[i])
+            except: labels.append(nms[i])
+        colors = ['#ff0051' if v > 0 else '#008bfb' for v in cat_shap]
+        hover = [f"<b>{labels[i]}</b><br>SHAP: {cat_shap[i]:.5f}" for i in range(n)]
+        fig.add_trace(go.Bar(x=cat_shap, y=labels, orientation='h', marker_color=colors,
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>", showlegend=False), row=1, col=col_idx)
+        col_idx += 1
+    if has_cont:
+        cont_shap = shap_results['cont_shap'][sample_idx]
+        cont_data = shap_results['test_data']['cont'][sample_idx]
+        if cont_shap.ndim == 2:
+            cont_shap = cont_shap[..., min(class_idx, cont_shap.shape[-1] - 1)]
+        n = len(cont_shap)
+        nms = list(feature_names_cont)[:n] if feature_names_cont else [f'Cont_{i}' for i in range(n)]
+        while len(nms) < n: nms.append(f'Cont_{len(nms)}')
+        labels = []
+        for i in range(n):
+            try: labels.append(f"{nms[i]} (val={float(cont_data[i]):.2f})" if i < len(cont_data) else nms[i])
+            except: labels.append(nms[i])
+        colors = ['#ff0051' if v > 0 else '#008bfb' for v in cont_shap]
+        hover = [f"<b>{labels[i]}</b><br>SHAP: {cont_shap[i]:.5f}" for i in range(n)]
+        fig.add_trace(go.Bar(x=cont_shap, y=labels, orientation='h', marker_color=colors,
+            customdata=hover, hovertemplate="%{customdata}<extra></extra>", showlegend=False), row=1, col=col_idx)
+    fig.update_layout(height=height, width=width)
+    return fig
+
+
+def plot_prediction_trajectory_plotly(
+    result, ctx, model_name=None, height=350, width=1100, title=None,
+):
+    """Interactive Plotly prediction trajectory (temporal + non-temporal)."""
+    if not HAS_PLOTLY:
+        return None
+
+    hours, probs = None, None
+
+    if result.predictions_over_time is not None:
+        traj_len = result.trajectory_length
+        bin_df = ctx.bin_df
+        admission = ctx.admission_time
+        hours = [
+            (row.bin_start - admission).total_seconds() / 3600
+            + (row.bin_end - row.bin_start).total_seconds() / 7200
+            for _, row in bin_df.iterrows()
+        ]
+        hours = hours[:traj_len]
+        probs = result.predictions_over_time[:traj_len]
+    else:
+        if model_name is None:
+            return None
+        csv_path = f"reports/predictions/preds_df_{model_name}.csv"
+        if not os.path.exists(csv_path):
+            return None
+        preds_df = pd.read_csv(csv_path)
+        cohort_pid = None
+        try:
+            from astra.utils import get_base_df, make_inference_pid
+            base = get_base_df()
+            pid_map = {
+                make_inference_pid(row.CPR_hash, row.ServiceDate): row.PID
+                for _, row in base[["PID", "CPR_hash", "ServiceDate"]].iterrows()
+            }
+            cohort_pid = pid_map.get(str(ctx.pid))
+        except Exception:
+            pass
+        if cohort_pid is not None:
+            patient_df = preds_df[preds_df["PID"] == cohort_pid].sort_values("time_hours")
+        else:
+            patient_df = preds_df[preds_df["PID"] == ctx.pid].sort_values("time_hours")
+            if patient_df.empty:
+                patient_df = preds_df[preds_df["PID"].astype(str) == str(ctx.pid)].sort_values("time_hours")
+        if patient_df.empty:
+            return None
+        admission = ctx.admission_time
+        bin_df = ctx.bin_df
+        max_hours = (
+            (bin_df.iloc[min(ctx.trajectory_length, len(bin_df)) - 1].bin_end - admission)
+            .total_seconds() / 3600
+        )
+        patient_df = patient_df[patient_df["time_hours"] <= max_hours]
+        hours = patient_df["time_hours"].values.tolist()
+        probs = patient_df["pred"].values.tolist()
+
+    if not hours or not probs:
+        return None
+    if title is None:
+        title = f"Prediction trajectory — Patient {ctx.pid}"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hours, y=probs,
+        fill="tozeroy", fillcolor="rgba(70,130,180,0.15)",
+        line=dict(color="steelblue", width=2),
+        mode="lines+markers", marker=dict(size=4),
+        name="P(deceased 30d)",
+        hovertemplate="<b>%{x:.1f}h</b><br>P(deceased): %{y:.4f}<extra></extra>",
+    ))
+    fig.add_hline(y=0.5, line_dash="dash", line_color="gray", opacity=0.5,
+                  annotation_text="0.5 threshold", annotation_position="top right")
+    fig.update_layout(
+        title=title, xaxis_title="Hours since admission",
+        yaxis_title="P(deceased 30d)", yaxis=dict(range=[-0.02, 1.02]),
+        height=height, width=width, showlegend=False,
+    )
+    return fig
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# DATA COMPLETENESS (Plotly)
+# ═════════════════════════════════════════════════════════════════════════
+
+def plot_data_completeness_plotly(
+    shap_results, sample_idx=0, channel2feature=None,
+    height_density=250, height_heatmap=500, height_bars=400, width=1100,
+):
+    """Interactive Plotly data completeness. Returns dict of figures."""
+    if not HAS_PLOTLY:
+        return None
+
+    ts_data = shap_results["test_data"]["ts"][sample_idx]
+    n_channels, n_steps_full = ts_data.shape
+    eval_timestep = shap_results.get("eval_timestep")
+    if eval_timestep is not None and 0 <= eval_timestep < n_steps_full:
+        n_steps = eval_timestep + 1
+        ts_data = ts_data[:, :n_steps]
+    else:
+        n_steps = n_steps_full
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+
+    _EXCLUDED = {"elapsed_hours", "bin_width_hours", "_data_present"}
+    _EBM_SET = {"_ebm_pred"}
+    dp_idx, eh_idx = None, None
+    if channel2feature:
+        for idx_ch, name in channel2feature.items():
+            if name == "_data_present": dp_idx = idx_ch
+            elif name == "elapsed_hours": eh_idx = idx_ch
+
+    trajectory_mask = None
+    if dp_idx is not None:
+        raw_mask = ts_data[dp_idx] > 0.5
+        if np.any(raw_mask):
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            idxs = np.where(raw_mask)[0]
+            trajectory_mask[idxs[0]:idxs[-1]+1] = True
+    if trajectory_mask is None and eh_idx is not None:
+        eh = ts_data[eh_idx]
+        raw_mask = ~np.isnan(eh) & (np.abs(eh) > 1e-8)
+        trajectory_mask = np.zeros(n_steps, dtype=bool)
+        idxs = np.where(raw_mask)[0]
+        if len(idxs) > 0:
+            trajectory_mask[idxs[0]:idxs[-1]+1] = True
+    if trajectory_mask is None:
+        traj_explicit = shap_results.get("trajectory_length")
+        if traj_explicit is not None:
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            trajectory_mask[:min(int(traj_explicit), n_steps)] = True
+        else:
+            any_present = np.any(~np.isnan(ts_data), axis=0)
+            trajectory_mask = np.zeros(n_steps, dtype=bool)
+            idxs = np.where(any_present)[0]
+            if len(idxs) > 0:
+                trajectory_mask[idxs[0]:idxs[-1]+1] = True
+
+    traj_len = int(trajectory_mask.sum())
+
+    if channel2feature:
+        groups = classify_channels(channel2feature)
+        ordered_indices, ordered_labels = [], []
+        group_boundaries = OrderedDict()
+        row = 0
+        for gname, channels in groups.items():
+            start = row
+            for ch_idx, feat_name in channels:
+                ordered_indices.append(ch_idx)
+                ordered_labels.append(feat_name)
+                row += 1
+            if row > start:
+                group_boundaries[gname] = (start, row)
+    else:
+        ordered_indices = list(range(n_channels))
+        ordered_labels = [f"Ch{i}" for i in range(n_channels)]
+        group_boundaries = OrderedDict([("All", (0, n_channels))])
+
+    n_display = len(ordered_indices)
+    ts_subset = ts_data[ordered_indices]
+    is_present = ~np.isnan(ts_subset)
+    traj_broadcast = np.broadcast_to(trajectory_mask, (n_display, n_steps))
+    presence = np.where(~traj_broadcast, 0, np.where(is_present, 2, 1)).astype(int)
+
+    if traj_len > 0:
+        completeness = np.array([(presence[r][trajectory_mask] == 2).sum() / traj_len
+                                 for r in range(n_display)])
+    else:
+        completeness = np.zeros(n_display)
+
+    clinical_rows = [r for r, ch in enumerate(ordered_indices)
+                     if not channel2feature or channel2feature.get(ch, "") not in (_EXCLUDED | _EBM_SET)]
+    if not clinical_rows:
+        clinical_rows = list(range(n_display))
+
+    figs = {}
+
+    # 1. Density
+    density = np.array([(presence[clinical_rows][:, t] == 2).sum() / len(clinical_rows)
+                        for t in range(n_steps)]) * 100
+    fig_d = go.Figure()
+    fig_d.add_trace(go.Scatter(
+        x=list(range(n_steps)), y=density,
+        fill="tozeroy", fillcolor="rgba(33,150,243,0.3)",
+        line=dict(color="#1565C0", width=2), mode="lines",
+        hovertemplate="<b>%{customdata}</b><br>%{y:.1f}%<extra></extra>",
+        customdata=[time_labels[i] for i in range(n_steps)],
+    ))
+    if traj_len > 0 and traj_len < n_steps:
+        fig_d.add_vline(x=np.where(trajectory_mask)[0][-1]+0.5,
+                        line_dash="dash", line_color="red", opacity=0.7,
+                        annotation_text="Trajectory end")
+    fig_d.update_layout(title="Data density over time",
+                        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+                        yaxis=dict(range=[0, 105]),
+                        xaxis_title="Time", yaxis_title="% channels with data",
+                        height=height_density, width=width)
+    figs["density"] = fig_d
+
+    # 2. Presence heatmap
+    colorscale = [[0, "#E0E0E0"], [0.33, "#E0E0E0"],
+                  [0.33, "#FF8A65"], [0.66, "#FF8A65"],
+                  [0.66, "#4CAF50"], [1.0, "#4CAF50"]]
+    state_names = {0: "Padding", 1: "Missing", 2: "Present"}
+    hover_p = np.empty(presence.shape, dtype=object)
+    for r in range(presence.shape[0]):
+        for c in range(presence.shape[1]):
+            hover_p[r, c] = f"<b>{ordered_labels[r]}</b><br>Time: {time_labels[c]}<br>{state_names[presence[r,c]]}"
+    fig_p = go.Figure(data=go.Heatmap(
+        z=presence, x=list(range(n_steps)), y=ordered_labels,
+        customdata=hover_p, hovertemplate="%{customdata}<extra></extra>",
+        colorscale=colorscale, zmin=0, zmax=2, showscale=False))
+    for gname, (s, e) in group_boundaries.items():
+        if s > 0:
+            fig_p.add_hline(y=s-0.5, line_dash="dash", line_color="black", line_width=1, opacity=0.5)
+    fig_p.update_layout(title="Data presence (green=present, orange=missing, gray=padding)",
+                        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+                        yaxis=dict(autorange="reversed"),
+                        xaxis_title="Time", yaxis_title="Channel",
+                        height=height_heatmap, width=width, margin=dict(l=180))
+    figs["presence"] = fig_p
+
+    # 3. Categorical
+    enc_info = shap_results.get("encoding_info")
+    has_cat = "ts_cat" in shap_results.get("test_data", {}) and enc_info is not None
+    if has_cat:
+        cat_ts = shap_results["test_data"]["ts_cat"][sample_idx][:, :n_steps]
+        cat_names = get_category_names_from_encoding_info(enc_info)
+        n_cats = cat_ts.shape[0]
+        while len(cat_names) < n_cats:
+            cat_names.append(f"Cat_{len(cat_names)}")
+        cat_names = cat_names[:n_cats]
+        cat_pres = np.where(cat_ts > 0, 2, 1).astype(int)
+        for t in range(n_steps):
+            if not trajectory_mask[t]:
+                cat_pres[:, t] = 0
+        cat_cs = [[0,"#E0E0E0"],[0.33,"#E0E0E0"],[0.33,"#FFF9C4"],[0.66,"#FFF9C4"],[0.66,"#66BB6A"],[1.0,"#66BB6A"]]
+        cat_sn = {0: "Padding", 1: "No activity", 2: "Active"}
+        hc = np.empty(cat_pres.shape, dtype=object)
+        for r in range(cat_pres.shape[0]):
+            for c in range(cat_pres.shape[1]):
+                hc[r,c] = f"<b>{cat_names[r]}</b><br>Time: {time_labels[c]}<br>{cat_sn[cat_pres[r,c]]}"
+        fig_c = go.Figure(data=go.Heatmap(
+            z=cat_pres, x=list(range(n_steps)), y=cat_names,
+            customdata=hc, hovertemplate="%{customdata}<extra></extra>",
+            colorscale=cat_cs, zmin=0, zmax=2, showscale=False))
+        for feat, (s, _) in enc_info.get("feature_ranges", {}).items():
+            if s > 0:
+                fig_c.add_hline(y=s-0.5, line_dash="dash", line_color="black", line_width=1, opacity=0.5)
+        fig_c.update_layout(title="Categorical TS (green=active, yellow=inactive, gray=padding)",
+                            xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+                            yaxis=dict(autorange="reversed"),
+                            xaxis_title="Time", yaxis_title="Category",
+                            height=height_heatmap, width=width, margin=dict(l=220))
+        figs["categorical"] = fig_c
+    else:
+        figs["categorical"] = None
+
+    # 4. Bars
+    si = np.argsort(completeness)
+    sl = [ordered_labels[i] for i in si]
+    sc = completeness[si] * 100
+    colors = ["#4CAF50" if c >= 80 else "#FF9800" if c >= 40 else "#f44336" for c in sc]
+    hb = [f"<b>{sl[i]}</b><br>{sc[i]:.1f}%" for i in range(len(sl))]
+    fig_b = go.Figure(data=go.Bar(
+        x=sc, y=sl, orientation="h", marker_color=colors,
+        customdata=hb, hovertemplate="%{customdata}<extra></extra>"))
+    fig_b.update_layout(title="Channel completeness within trajectory",
+                        xaxis=dict(range=[0, 105]), xaxis_title="% Completeness",
+                        yaxis=dict(autorange="reversed"),
+                        height=max(height_bars, n_display*18), width=width, margin=dict(l=180))
+    figs["bars"] = fig_b
+
+    # Summary
+    traj_hours = 0
+    if traj_len > 0:
+        t_min = step_to_time(np.where(trajectory_mask)[0][-1])
+        traj_hours = t_min / 60 if t_min else 0
+    figs["summary"] = {
+        "trajectory_steps": traj_len, "trajectory_hours": round(traj_hours, 1),
+        "n_channels": n_display, "overall_completeness": round(float(completeness.mean()*100), 1),
+        "completeness": dict(zip(ordered_labels, completeness.tolist())),
+    }
+    return figs
+
+
+def visualize_shap_individual_interactive(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    feature_names_cat: Optional[List[str]] = None,
+    feature_names_cont: Optional[List[str]] = None,
+    ebm_explanations: Optional[Dict[float, Dict]] = None,
+    eval_timestep: Optional[int] = None,
+    class_idx: int = 1,
+    width: int = 1100,
+):
+    """
+    Interactive replacement for visualize_shap_individual's heatmaps.
+
+    Produces the same three heatmaps as the matplotlib version but with
+    Plotly hover tooltips. Non-heatmap plots (bar charts, line plots) are
+    still rendered via the original matplotlib function.
+
+    Called automatically by default_session_plot when plotly is available.
+    """
+    if not HAS_PLOTLY:
+        logger.warning("plotly not installed — call visualize_shap_individual() instead")
+        return
+
+    # 1. Continuous TS SHAP
+    plot_continuous_ts_shap_plotly(
+        shap_results, sample_idx=sample_idx,
+        channel2feature=channel2feature,
+        eval_timestep=eval_timestep,
+        class_idx=class_idx, width=width,
+    )
+
+    # 2. Categorical TS SHAP
+    plot_categorical_ts_shap_plotly(
+        shap_results, sample_idx=sample_idx,
+        eval_timestep=eval_timestep,
+        class_idx=class_idx, width=width,
+    )
+
+    # 3. EBM contributions
+    if ebm_explanations:
+        plot_ebm_contributions_plotly(
+            ebm_explanations, width=width,
+        )
+
+    # 4. Keep the original matplotlib plots for bar charts / line plots
+    visualize_shap_individual(
+        shap_results, sample_idx=sample_idx,
+        channel2feature=channel2feature,
+        feature_names_cat=feature_names_cat,
+        feature_names_cont=feature_names_cont,
+        class_idx=class_idx,
+        eval_timestep=eval_timestep,
+    )

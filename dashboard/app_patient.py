@@ -8,17 +8,16 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import numpy as np
 
-
-pm_andreas = ProjectManager('andreas.skov.millarch/repos/astra/')
+pm = ProjectManager(workdir='josefine.schoening/repos/astra/')
 from astra.utils import get_base_df
 from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt
-
 
 @st.cache_data(show_spinner="Indlæser base-data …")
 def load_data() -> pd.DataFrame:
     return get_base_df()
 
 df = load_data()
+
 
 # ── Sideopsætning ─────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -960,7 +959,7 @@ with tab_notater:
         noter_pid = noter_pid.sort_values(["ID", "Linjenummer"])
         noter_pid = (
             noter_pid.groupby(["ID", "Oprettelsestidspunkt", "Redigeringstidspunkt",
-                               "Notetype", "Speciale"], as_index=False)
+                               "Notetype", "Speciale"], as_index=False, dropna=False)
             .agg({"Note": lambda x: " ".join(x.astype(str))})
         )
         noter_pid["Oprettelsestidspunkt"] = pd.to_datetime(noter_pid["Oprettelsestidspunkt"])
