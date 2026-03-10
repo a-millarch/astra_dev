@@ -253,12 +253,12 @@ def filter_ita(ita):
 
 
 def filter_ews(ews):
-    """Filter EWS: remove vitals (handled by filter_vitals) and return EWS scores."""
+    """Filter EWS: keep only mapped EWS features, vitals are handled by filter_vitals."""
     ews = ews.copy()
 
-    # Remove vital measurements (those are handled by filter_vitals via extract_ews_vitals)
-    vital_keys = set(EWS_TO_VITAL_PARAMETRE.keys())
-    ews = ews[~ews["EWS_Måling"].isin(vital_keys)]
+    # Keep only features explicitly in EWS_MAP (e.g. 'EWS korr. total score')
+    # Vitals are handled by filter_vitals via extract_ews_vitals
+    ews = ews[ews["EWS_Måling"].isin(EWS_MAP.keys())]
 
     ews.rename(
         columns={
