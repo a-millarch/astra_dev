@@ -123,16 +123,16 @@ class PatientContext:
         current_time = raw_data['current_time']
         data_config = bundle['data_config']
 
-        # 1. Fixed 30-day bin grid
+        # 1. Fixed bin grid (window derived from bin_intervals config)
         bin_df = _create_patient_bins(admission_time, data_config)
 
         # Convert elapsed time to step index using cfg bin intervals
         delta_minutes = (current_time - admission_time).total_seconds() / 60
         step = time_to_step(delta_minutes, 'min', data_config=data_config)
-        visible_bins = (step + 1) if step is not None else len(bin_df)
+        visible_bins = min(step + 1, len(bin_df)) if step is not None else len(bin_df)
 
         logger.info(
-            f"PatientContext: {len(bin_df)} bins (30-day grid), "
+            f"PatientContext: {len(bin_df)} bins, "
             f"{visible_bins} visible at {current_time}"
         )
 
@@ -157,12 +157,12 @@ class PatientContext:
         bin_cache.dirty_continuous.clear()
         bin_cache.dirty_categorical.clear()
 
-        from astra.inference.data_prep import MAX_PREDICTION_WINDOW
+        from astra.inference.data_prep import _max_prediction_window
 
         return cls(
             pid=raw_data.get('pid'),
             admission_time=admission_time,
-            max_time=admission_time + MAX_PREDICTION_WINDOW,
+            max_time=admission_time + _max_prediction_window(data_config),
             demographics=raw_data.get('demographics', {}),
             tab_df=tab_df,
             bin_df=bin_df,
@@ -379,7 +379,7 @@ class PatientContext:
         data_config = bundle['data_config']
         delta_minutes = (new_current_time - self.admission_time).total_seconds() / 60
         step = time_to_step(delta_minutes, 'min', data_config=data_config)
-        visible_bins = (step + 1) if step is not None else len(self.bin_df)
+        visible_bins = min(step + 1, len(self.bin_df)) if step is not None else len(self.bin_df)
 
         # ----- Determine new measurements to process -----
         incremental_records = []  # continuous point events

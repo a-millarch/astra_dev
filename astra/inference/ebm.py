@@ -581,7 +581,7 @@ def inject_ebm_into_x_ts(
     # Use caller-provided trajectory length (visible bins) or fall back to full grid
     if trajectory_length is None:
         trajectory_length = min(len(bin_df), seq_len)
-    trajectory_length = min(trajectory_length, seq_len)
+    trajectory_length = min(trajectory_length, seq_len, len(elapsed_hours))
 
     # Sort interval keys for forward-fill
     intervals_hours = sorted(ebm_predictions.keys())

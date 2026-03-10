@@ -60,7 +60,22 @@ from astra.data.mappings import (
 # Time binning
 # ============================================================================
 
-MAX_PREDICTION_WINDOW = pd.Timedelta(days=30)
+def _max_prediction_window(data_config: dict) -> pd.Timedelta:
+    """Derive the maximum prediction window from bin_intervals config.
+
+    Returns the largest named interval boundary (excluding the open-ended
+    'end' key).  E.g. for ``{6h: 10min, ..., 90D: 7D, end: 30D}`` → 90 days.
+    """
+    max_td = pd.Timedelta(0)
+    for key in data_config.get('bin_intervals', {}):
+        if key == 'end':
+            continue
+        td = pd.Timedelta(key)
+        if td > max_td:
+            max_td = td
+    if max_td == pd.Timedelta(0):
+        max_td = pd.Timedelta(days=30)  # safe fallback
+    return max_td
 
 
 def _create_patient_bins(
@@ -70,7 +85,8 @@ def _create_patient_bins(
     """
     Create the full fixed-duration bin grid for a single patient trajectory.
 
-    Always creates bins spanning [admission_time, admission_time + 30 days].
+    Creates bins spanning [admission_time, admission_time + max_window] where
+    max_window is derived from the largest named interval in bin_intervals.
     This makes the bin grid stable across re-inferences: position N always
     maps to the same time window regardless of when inference is called.
 
@@ -85,7 +101,7 @@ def _create_patient_bins(
     bin_freq_include = data_config['bin_freq_include']
 
     start_time = admission_time
-    end_time = admission_time + MAX_PREDICTION_WINDOW
+    end_time = admission_time + _max_prediction_window(data_config)
 
     current = start_time
     bin_counter = 1
