@@ -336,6 +336,22 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 
+def build_trauma_assessment_pkl():
+    """Build TraumaAssessment concept from Notater.pkl.
+
+    Extracts ISS scores and Intubation status from clinical notes
+    and saves as data/interim/concepts/TraumaAssessment.pkl.
+
+    Called from make_data.py AFTER filter_subsets_inhospital() (Notater.pkl must exist).
+    """
+    notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
+    iss_df = build_iss_from_notes(notater)
+    intub_df = build_intubation_from_notes(notater)
+    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
+    trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
+    logger.info(f"Saved TraumaAssessment.pkl: {len(trauma)} rows, {trauma['PID'].nunique()} patients")
+
+
 def build_notes_features(
     notater: pd.DataFrame,
     ita: pd.DataFrame
