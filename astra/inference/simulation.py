@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
+from astra.utils import ensure_parent_dir
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,6 +142,7 @@ class SimulationResult:
 
         plt.tight_layout()
         if save_path:
+            ensure_parent_dir(save_path)
             fig.savefig(save_path, dpi=150, bbox_inches='tight')
             logger.info(f"Saved simulation plot to {save_path}")
         if show:

@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 
-from astra.utils import get_bin_df
+from astra.utils import get_bin_df, ensure_parent_dir
 from astra.data.filters import collect_filter
 
 logger = logging.getLogger(__name__)
@@ -712,11 +712,13 @@ class AggregatedDS:
 
     def to_csv(self, filepath: str):
         """Save to CSV."""
+        ensure_parent_dir(filepath)
         self.final_df.to_csv(filepath, index=False)
         logger.info(f"Saved to {filepath}")
     
     def to_pickle(self, filepath: str):
         """Save to pickle."""
+        ensure_parent_dir(filepath)
         self.final_df.to_pickle(filepath)
         logger.info(f"Saved to {filepath}")
 

@@ -156,6 +156,10 @@ def save_figure(fig, filename, save_dir='reports/studyfigs'):
     png_path = os.path.join(save_dir, f'{filename}.png')
     fig.savefig(png_path, dpi=1200, bbox_inches='tight')
 
+def ensure_parent_dir(path):
+    """Create parent directory of *path* if it does not exist."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
 def get_cfg(cfg_path=None):
     import yaml
     if cfg_path is None:

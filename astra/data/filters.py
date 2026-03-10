@@ -4,7 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from astra.utils import cfg, get_base_df, mark_keywords_in_df
+from astra.utils import cfg, get_base_df, mark_keywords_in_df, ensure_parent_dir
 from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_to_kg
 
 from astra.data.mappings import (
@@ -131,6 +131,7 @@ def filter_subsets_inhospital(cfg, base=None):
 
         filtered_df = filter_inhospital(base, df, cfg, dt_name, offset=offset)
         # TODO: add valuefilter layer
+        ensure_parent_dir(f"data/interim/concepts/{filename}.pkl")
         filtered_df.to_pickle(f"data/interim/concepts/{filename}.pkl", protocol=4)
 
 

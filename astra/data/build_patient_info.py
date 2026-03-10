@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import subprocess
 
-from astra.utils import cfg, get_base_df, create_enumerated_id, is_file_present
+from astra.utils import cfg, get_base_df, create_enumerated_id, is_file_present, ensure_parent_dir
 from astra.utils import ensure_datetime,count_csv_rows, inches_to_cm, ounces_to_kg
 try:
     from astra.data.collectors import collect_procedures, population_filter_parquet
@@ -53,6 +53,7 @@ def create_base_df(cfg, result_path=None):
     result = add_elixhauser(result) 
     
     logger.info(f"Saving file at{result_path}")
+    ensure_parent_dir(result_path)
     result.to_pickle(result_path, protocol=4)
     return result
     
@@ -82,10 +83,12 @@ def define_historic_population(cfg=cfg):
     traumepatienter = dtr_procedure[dtr_procedure["ProcedureCode"] == "BWST1F"][
         ["CPR_hash", "ServiceDate"]
     ]
+    ensure_parent_dir(cfg["population_file_path"])
     traumepatienter.to_csv(cfg["population_file_path"])
 
 def define_single_patient(cfg):
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
+    ensure_parent_dir(cfg["trauma_call_file_path"])
     pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
     'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv(cfg["trauma_call_file_path"])
 
@@ -388,6 +391,7 @@ def create_bin_df(cfg, base=None):
     )
 
     # Save DataFrame to pickle file
+    ensure_parent_dir(cfg["bin_df_path"])
     bin_df.to_pickle(cfg["bin_df_path"], protocol=4)
     logger.info(f'>> Saved at {cfg["bin_df_path"]}')
 
@@ -474,6 +478,7 @@ def create_bin_df_with_mortality_masking(cfg, base):
     if len(missing) > 0:
         logger.error(f"⚠️  {len(missing)} patients missing from bin_df!")
     
+    ensure_parent_dir(cfg["bin_df_path"])
     bin_df.to_pickle(cfg["bin_df_path"])
     logger.info(f'Saved to {cfg["bin_df_path"]}')
     
@@ -552,6 +557,7 @@ def prepare_long_df(base):
     # Dropping duplicates if necessary (since each row is expanded per group)
     result_df = result_df.drop_duplicates(subset="PID").reset_index(drop=True)
 
+    ensure_parent_dir("data/interim/ISS_ELIX/diagnoses_long.csv")
     result_df.to_csv("data/interim/ISS_ELIX/diagnoses_long.csv")
 
 
@@ -656,6 +662,7 @@ def prepare_elix_df(base):
     )
 
     logger.info(f"Result after merging and filtering: {e_df.groupby('PID').ngroups}")
+    ensure_parent_dir("data/interim/pre_elix_df.csv")
     e_df[["PID", "AGE", "Diagnosekode"]].to_csv("data/interim/pre_elix_df.csv")
 
 
@@ -678,6 +685,7 @@ def create_elixhauser(base):
         output_df=base[['CPR_hash',"PID"]].copy(deep=True) #also CPR_hash?
         output_df["elixscore"] = np.nan
         
+        ensure_parent_dir("data/interim/computed_elix_df.csv")
         output_df.to_csv("data/interim/computed_elix_df.csv")
 
 def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):    

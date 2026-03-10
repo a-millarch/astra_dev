@@ -2,7 +2,7 @@ from azureml.core import Dataset
 
 import pandas as pd
 
-from astra.utils import add_categorical_variable, cfg
+from astra.utils import add_categorical_variable, cfg, ensure_parent_dir
 
 pd.options.mode.chained_assignment = None
 # move to config
@@ -148,6 +148,7 @@ def add_cc_hc(path=cfg["raw_file_path"], base=None, save_file=False):
 
     res = add_from_diagnoses(diag, base)
     if save_file:
+        ensure_parent_dir("data/interim/base_df.csv")
         res.to_csv("data/interim/base_df.csv")
     else:
         return res

@@ -10,7 +10,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
-from astra.utils import cfg
+from astra.utils import cfg, ensure_parent_dir
 from astra.utils import save_figure
 from astra.evaluation.utils import prepare_model
 from astra.visualize.evaluation import plot_evaluation
@@ -151,6 +151,7 @@ def run_eval_with_calibration(
         logger.info(f"✓ Evaluated at {len(results)} time points")
         
         # Save predictions
+        ensure_parent_dir(f'data/processed/preds_df_{model_name}.csv')
         preds_df.to_csv(f'data/processed/preds_df_{model_name}.csv', index=False)
         logger.info(f"✓ Predictions saved to CSV")
         
@@ -555,6 +556,7 @@ def plot_calibration_curve(
     plt.tight_layout()
     
     if save_path:
+        ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Calibration plot saved to {save_path}")
     
@@ -625,6 +627,7 @@ def plot_calibration_comparison(
     plt.tight_layout()
     
     if save_path:
+        ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Calibration comparison saved to {save_path}")
     
@@ -736,6 +739,7 @@ def plot_calibration_over_time(
     plt.tight_layout()
     
     if save_path:
+        ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Calibration over time plot saved to {save_path}")
     

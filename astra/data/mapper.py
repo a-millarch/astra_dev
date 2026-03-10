@@ -4,7 +4,7 @@ from typing import List, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 
-from astra.utils import get_bin_df
+from astra.utils import get_bin_df, ensure_parent_dir
 from astra.data.filters import collect_filter
 
 logger = logging.getLogger(__name__)
@@ -238,6 +238,7 @@ def map_concept(
         logger.warning(f"Concept {concept} failed - no features processed")
         bin_df["FEATURE"] = np.nan
         bin_df["VALUE"] = np.nan
+        ensure_parent_dir(f"{output_path}_{agg_func}.pkl")
         bin_df.to_pickle(f"{output_path}_{agg_func}.pkl", protocol=4)
         bin_df.to_csv(f"{output_path}_{agg_func}.csv", index=False)
     else:
@@ -298,6 +299,7 @@ def map_concept(
                 logger.info(f"Average values per bin: {avg_values_per_bin:.2f}")
         
         logger.info(f"Saving file to {output_path}")
+        ensure_parent_dir(f"{output_path}_{agg_func}.pkl")
         filtered_df.to_pickle(f"{output_path}_{agg_func}.pkl", protocol=4)
         filtered_df.to_csv(f"{output_path}_{agg_func}.csv", index=False)
 
@@ -934,6 +936,7 @@ def map_concept_optimized(
         logger.warning(f"Concept {concept} failed - no features processed")
         bin_df["FEATURE"] = np.nan
         bin_df["VALUE"] = np.nan
+        ensure_parent_dir(f"{output_path}_{agg_func}.pkl")
         bin_df.to_pickle(f"{output_path}_{agg_func}.pkl", protocol=4)
         bin_df.to_csv(f"{output_path}_{agg_func}.csv", index=False)
         return
@@ -974,6 +977,7 @@ def map_concept_optimized(
     # Save
     t0 = time.time()
     logger.info(f"Saving to {output_path}...")
+    ensure_parent_dir(f"{output_path}_{agg_func}.pkl")
     filtered_df.to_pickle(f"{output_path}_{agg_func}.pkl", protocol=4)
     filtered_df.to_csv(f"{output_path}_{agg_func}.csv", index=False)
     logger.info(f"[{time.time()-t0:.1f}s] Saved")

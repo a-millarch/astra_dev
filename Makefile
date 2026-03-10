@@ -87,6 +87,12 @@ sweep_arch:
 sweep_train:
 	python -m $(PROJECT_NAME).training.train --sweep-train --n-train-trials 50 --eval
 
+## Full CPU pipeline: data → EBM models → data cache (overwrites all)
+all_cpu:
+	$(PYTHON_INTERPRETER) $(PROJECT_NAME)/make_data.py --overwrite
+	$(PYTHON_INTERPRETER) -m $(PROJECT_NAME).models.ebm.generate_ebm_feature
+	$(PYTHON_INTERPRETER) -c "from astra.utils import cfg, setup_logging; setup_logging(); from astra.data.caching import prepare_data_and_dls_cached; prepare_data_and_dls_cached(cfg, force_refresh=True)"
+
 ### Convenience
 stash cfg:
 	git stash push -m "cfg conflict" configs/defaults.yaml

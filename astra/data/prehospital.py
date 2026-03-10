@@ -21,7 +21,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from astra.utils import cfg, get_base_df, is_file_present, setup_logging
+from astra.utils import cfg, get_base_df, is_file_present, setup_logging, ensure_parent_dir
 from astra.data.mappings import (
     PPJ_MONTH_DICT,
     PPJ_VITALS_MAP,
@@ -378,6 +378,7 @@ def extract_ppj_vitals(
     )
 
     # Save
+    ensure_parent_dir("data/interim/prehospital_VitaleVaerdier.pkl")
     vitals.to_pickle("data/interim/prehospital_VitaleVaerdier.pkl", protocol=4)
     return vitals
 
@@ -445,6 +446,7 @@ def extract_ppj_gcs(
         f"across {gcs['PID'].nunique()} patients"
     )
 
+    ensure_parent_dir("data/interim/prehospital_GCS.pkl")
     gcs.to_pickle("data/interim/prehospital_GCS.pkl", protocol=4)
     return gcs
 
@@ -604,6 +606,7 @@ def extract_ppj_abcd(
         f"D: {abcd['D'].notna().sum() if 'D' in abcd else 0})"
     )
 
+    ensure_parent_dir("data/interim/ppj_base_df.pkl")
     abcd.to_pickle("data/interim/ppj_base_df.pkl", protocol=4)
     return abcd
 
@@ -806,6 +809,7 @@ if __name__ == "__main__":
         base = run_prehospital_pipeline(cfg)
         print(f"[prehospital __main__] Pipeline returned, base shape: {base.shape}")
         sys.stdout.flush()
+        ensure_parent_dir(cfg["base_df_path"])
         base.to_pickle(cfg["base_df_path"], protocol=4)
         print(f"[prehospital __main__] Saved to {cfg['base_df_path']}")
     except BaseException as e:

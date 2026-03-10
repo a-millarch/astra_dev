@@ -18,7 +18,7 @@ import logging
 import pickle
 from pathlib import Path
 
-from astra.utils import cfg
+from astra.utils import cfg, ensure_parent_dir
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours, get_total_steps
@@ -2544,6 +2544,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     plt.tight_layout()
     if save_path:
+        ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.show()
 
@@ -3450,7 +3451,7 @@ class TemporalSHAPAnalyzer:
         fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data)',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        if save_path: plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
+        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
         return fig
     
     def plot_stability_heatmap(self, results: TemporalSHAPResults, figsize=(24, 20), save_path=None):
@@ -3611,11 +3612,12 @@ class TemporalSHAPAnalyzer:
                     fontsize=14, fontweight='bold', y=1.02)
         
         plt.tight_layout()
-        if save_path: 
+        if save_path:
+            ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved: {save_path}")
         return fig
-    
+
     def plot_correlation_analysis(self, results: TemporalSHAPResults, reference='full',
                                   max_features=20, figsize=(20, 16), save_path=None):
         """
@@ -3831,11 +3833,12 @@ class TemporalSHAPAnalyzer:
                     f'Reference: {reference}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        if save_path: 
+        if save_path:
+            ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
             print(f"Saved: {save_path}")
         return fig
-    
+
     def plot_feature_trajectory(self, results: TemporalSHAPResults, feature_names=None,
                                top_k=10, figsize=(14, 8), save_path=None):
         """Track feature importance across timeframes."""
@@ -3873,9 +3876,9 @@ class TemporalSHAPAnalyzer:
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        if save_path: plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
+        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
         return fig
-    
+
     def generate_summary_report(self, results: TemporalSHAPResults) -> pd.DataFrame:
         """
         Comprehensive summary DataFrame with metrics per timeframe for ALL feature types.

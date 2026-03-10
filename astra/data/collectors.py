@@ -8,7 +8,7 @@ from azureml.core import Workspace, Datastore, Dataset, Environment
 
 import logging 
 
-from astra.utils import  is_file_present, are_files_present
+from astra.utils import  is_file_present, are_files_present, ensure_parent_dir
 from astra.utils import cfg, get_base_df
 #from src.common.log_config import setup_logging, clear_log
 #from src.data.downloader import download_to_local
@@ -74,6 +74,7 @@ def collect_procedures(cfg=cfg):
     df_procedure = Dataset.Tabular.from_parquet_files(path=path)
     dtr_procedure = df_procedure.to_pandas_dataframe()
     traumepatienter = dtr_procedure[dtr_procedure['ProcedureCode'] == "BWST1F"][["CPR_hash", "ServiceDate"]]
+    ensure_parent_dir("data/raw/Procedurer_population.csv")
     traumepatienter.to_csv("data/raw/Procedurer_population.csv")
 
 
@@ -100,6 +101,7 @@ def chunk_filter_parquet(filename, base = None, chunk_size = 4000000):
         print(f">>{chunk_n} of {num_chunks}chunks", end='\r')
         chunk_df = batch.to_pandas() 
         chunk_df = chunk_df[chunk_df.CPR_hash.isin(poplist)]
+        ensure_parent_dir(output_path)
         chunk_df.to_csv(output_path, mode='a', header= not os.path.exists(output_path))
     logger.info(f'Finished, saved file at: {output_path}')
         
@@ -120,6 +122,7 @@ def population_filter_parquet(filename, base =None, blobstore_uri=None):
     df = df[df.CPR_hash.isin(base.CPR_hash)]
     logger.info(f'loaded {len(df)} rows. Saving file.')
 
+    ensure_parent_dir(f"data/raw/{filename}.csv")
     df.to_csv(f"data/raw/{filename}.csv")
 
 
