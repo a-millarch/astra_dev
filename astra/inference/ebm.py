@@ -567,12 +567,14 @@ def inject_ebm_into_x_ts(
         x_ts[ebm_channel_idx, :] = 0.0
         return x_ts
 
-    # Compute elapsed hours per bin position
-    # Same formula as ebm_features.py:48-51
+    # Compute elapsed hours at bin_start — matches batch pipeline
+    # (ebm_features.py:60).  Using bin_start (not midpoint) ensures the
+    # forward-fill comparison ``masking_hours <= elapsed_hours`` is strictly
+    # conservative: an EBM trained at masking time M is only applied from the
+    # first bin that STARTS at or after M.
     admission_time = pd.Timestamp(admission_time)
     elapsed_hours = (
         (bin_df['bin_start'] - admission_time).dt.total_seconds() / 3600
-        + (bin_df['bin_end'] - bin_df['bin_start']).dt.total_seconds() / 7200
     ).values
 
     # Use caller-provided trajectory length (visible bins) or fall back to full grid
@@ -582,7 +584,10 @@ def inject_ebm_into_x_ts(
 
     # Sort interval keys for forward-fill
     intervals_hours = sorted(ebm_predictions.keys())
-    default_value = 0.0
+    # NaN for positions before the first EBM interval — matches batch pipeline
+    # (ebm_features.py:177).  NaN is treated as missing by normalization (→ 0.0),
+    # whereas a raw 0.0 would normalize to (0 - mean) / std ≠ 0.
+    default_value = np.nan
 
     # Forward-fill predictions to bin positions
     filled = _forward_fill_predictions(
@@ -598,11 +603,14 @@ def inject_ebm_into_x_ts(
     if trajectory_length < seq_len:
         x_ts[ebm_channel_idx, trajectory_length:] = 0.0
 
-    n_nonzero = np.count_nonzero(filled)
+    measured = filled[~np.isnan(filled)]
+    n_measured = len(measured)
+    n_nonzero = np.count_nonzero(measured)
+    val_range = f"[{measured.min():.3f}, {measured.max():.3f}]" if n_measured > 0 else "N/A"
     logger.info(
         f"Injected EBM predictions into channel {ebm_channel_idx}: "
-        f"{n_nonzero}/{trajectory_length} non-zero positions, "
-        f"range [{filled.min():.3f}, {filled.max():.3f}]"
+        f"{n_nonzero}/{trajectory_length} non-zero positions "
+        f"({trajectory_length - n_measured} NaN pre-EBM), range {val_range}"
     )
 
     return x_ts
