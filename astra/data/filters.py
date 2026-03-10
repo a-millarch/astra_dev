@@ -9,6 +9,7 @@ from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_t
 
 from astra.data.mappings import (
     VITALS_MAP, TEMP_FAHRENHEIT,BP_TYPES, HEIGHT_WEIGHT_MAP,
+    EWS_TO_VITALS_MAP,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
     ICU_MAP, EWS_MAP,
     ATC_LVL3_MAP, ATC_LVL4_MAP, MEDICATION_ACTION_LIST,
@@ -354,6 +355,101 @@ def filter_adt(adt, base_df=None):
 
     logger.info(f"Using {len(adt)} ADT observations")
     return adt
+
+
+# ============================================================================
+# EWS Vitals Augmentation
+# ============================================================================
+
+
+def augment_vitals_from_ews(ews: pd.DataFrame, vitals: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract raw vital measurements from EWS dataset and merge with VitaleVaerdier.
+
+    Maps EWS measurements to standard vital parameter names:
+    - SAT (score) → SPO2
+    - Puls score → HR
+    - Temp. (score) → TEMP
+    - BT (score) → SBP, DBP (split on /)
+    - RF (score) → RESPIRATORYRATE
+
+    Args:
+        ews: EWS dataframe with columns [PID, EWS_Måling, Værdi, Målingstidspunkt, ...]
+        vitals: VitaleVaerdier dataframe with columns [PID, TIMESTAMP, FEATURE, VALUE]
+
+    Returns:
+        Merged and deduplicated VitaleVaerdier dataframe.
+    """
+    ews = ews.copy()
+    vitals = vitals.copy()
+
+    # Filter to EWS vitals only
+    ews = ews[ews["EWS_Måling"].isin(EWS_TO_VITALS_MAP.keys())]
+
+    if len(ews) == 0:
+        logger.warning("No EWS vital measurements found")
+        return vitals
+
+    # Ensure datetime
+    ews["Målingstidspunkt"] = pd.to_datetime(ews["Målingstidspunkt"], errors="coerce")
+
+    # Map EWS_Måling to FEATURE
+    ews["FEATURE"] = ews["EWS_Måling"].map(EWS_TO_VITALS_MAP)
+
+    # Parse: remove score in parentheses "120/70 (0)" → "120/70"
+    ews["Værdi"] = ews["Værdi"].astype(str).str.split("(").str[0].str.strip()
+
+    # Convert to numeric, coercing errors to NaN
+    ews["VALUE"] = pd.to_numeric(ews["Værdi"], errors="coerce")
+
+    # Drop rows with invalid values
+    ews = ews.dropna(subset=["VALUE"])
+
+    if len(ews) == 0:
+        logger.warning("No valid EWS vital records extracted")
+        return vitals
+
+    # Rename columns to standard format
+    ews_vitals = ews[["PID", "Målingstidspunkt", "FEATURE", "VALUE"]].rename(
+        columns={"Målingstidspunkt": "TIMESTAMP"}
+    ).reset_index(drop=True)
+
+    # Split BP — uses BP_TYPES from mappings
+    for bt in BP_TYPES:
+        mask = ews_vitals["FEATURE"] == bt
+        if len(ews_vitals.loc[mask]) > 0:
+            split_values = ews_vitals.loc[mask, "VALUE"].astype(str).str.split("/", n=1, expand=True)
+
+            # Update systolic
+            ews_vitals.loc[mask, "FEATURE"] = "SBP"
+            ews_vitals.loc[mask, "VALUE"] = pd.to_numeric(split_values[0], errors="coerce")
+
+            # Create diastolic rows
+            diastolic_rows = ews_vitals[mask].copy()
+            diastolic_rows["FEATURE"] = "DBP"
+            diastolic_rows["VALUE"] = pd.to_numeric(split_values[1], errors="coerce")
+
+            # Concatenate
+            ews_vitals = pd.concat([ews_vitals, diastolic_rows], ignore_index=True)
+
+    # Final cleanup: drop any NaN values that appeared from splitting
+    ews_vitals = ews_vitals.dropna(subset=["VALUE"]).reset_index(drop=True)
+    logger.info(f"Extracted {len(ews_vitals)} EWS vital measurements from {ews_vitals['PID'].nunique()} patients")
+
+    # Combine
+    vitals_merged = pd.concat([vitals, ews_vitals], ignore_index=True).reset_index(drop=True)
+
+    # Remove duplicates: keep first occurrence of [PID, TIMESTAMP, FEATURE, VALUE]
+    n_before = len(vitals_merged)
+    vitals_merged = vitals_merged.drop_duplicates(
+        subset=["PID", "TIMESTAMP", "FEATURE", "VALUE"],
+        keep="first"
+    ).reset_index(drop=True)
+    n_after = len(vitals_merged)
+
+    logger.info(f"Deduplicated: {n_before} → {n_after} ({n_before - n_after} duplicates removed)")
+
+    return vitals_merged
 
 
 def collect_filter(concept: str):

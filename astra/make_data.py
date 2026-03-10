@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
-from astra.data.filters import filter_subsets_inhospital
+from astra.data.filters import filter_subsets_inhospital, augment_vitals_from_ews
 from astra.data.mapper import map_concept, map_concept_optimized
 from astra.data.notes_features import build_notes_features
 
@@ -136,10 +136,23 @@ if __name__ =='__main__':
 
     proces_inhospital_concepts(cfg, reset=False)
 
+    # Augment VitaleVaerdier with raw measurements from EWS
+    logger.info("Augmenting VitaleVaerdier with EWS measurements...")
+    ews = pd.read_pickle("data/interim/concepts/EWS.pkl")
+    vitals = pd.read_pickle("data/interim/concepts/VitaleVaerdier.pkl")
+    vitals_augmented = augment_vitals_from_ews(ews, vitals)
+    vitals_augmented.to_pickle("data/interim/concepts/VitaleVaerdier.pkl", protocol=4)
+    logger.info("VitaleVaerdier.pkl updated with EWS measurements")
+
     # Build features from notes (GCS, ISS, Intubation)
     if not is_file_present("data/interim/concepts/TraumaAssessment.pkl"):
         logger.info("Building features from notes...")
-        build_notes_features()
+        notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
+        ita = pd.read_pickle("data/interim/concepts/ITAOversigtsrapport.pkl")
+        ita_merged, trauma = build_notes_features(notater, ita)
+        ita_merged.to_pickle("data/interim/concepts/ITAOversigtsrapport.pkl", protocol=4)
+        trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
+        logger.info("Notes features saved to pickle files")
     else:
         logger.info("TraumaAssessment.pkl already exists, skipping")
 

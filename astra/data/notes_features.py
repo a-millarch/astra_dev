@@ -336,27 +336,35 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 # ============================================================================
 
 
-def build_notes_features() -> None:
+def build_notes_features(
+    notater: pd.DataFrame,
+    ita: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Build GCS, ISS, and Intubation from notes and integrate into pipeline.
+    Extract and build GCS, ISS, and Intubation from notes.
 
-    Assumes Notater.pkl and ITAOversigtsrapport.pkl already exist
-    (i.e., filter_subsets_inhospital has run).
+    Parameters
+    ----------
+    notater : pd.DataFrame
+        Notes dataframe with columns [PID, Note, Redigeringstidspunkt, Notetype].
+    ita : pd.DataFrame
+        Existing ITAOversigtsrapport dataframe [PID, TIMESTAMP, FEATURE, VALUE].
+
+    Returns
+    -------
+    ita_merged : pd.DataFrame
+        ITAOversigtsrapport with GCS values from notes merged in.
+    trauma : pd.DataFrame
+        New TraumaAssessment dataframe [PID, TIMESTAMP, FEATURE, VALUE]
+        containing ISS and INTUBATED observations.
     """
     logger.info("Building notes-based features...")
-
-    # Load notes
-    notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
 
     # ── GCS ─────────────────────────────────────────────────────────────────
     logger.info("Extracting GCS from notes...")
     gcs_df = build_gcs_from_notes(notater)
-
-    # Load existing ITAOversigtsrapport and merge
-    ita = pd.read_pickle("data/interim/concepts/ITAOversigtsrapport.pkl")
     ita_merged = pd.concat([ita, gcs_df], ignore_index=True).reset_index(drop=True)
-    ita_merged.to_pickle("data/interim/concepts/ITAOversigtsrapport.pkl", protocol=4)
-    logger.info(f"Merged {len(gcs_df)} GCS observations into ITAOversigtsrapport.pkl")
+    logger.info(f"Merged {len(gcs_df)} GCS observations into ITAOversigtsrapport")
 
     # ── ISS + Intubation ────────────────────────────────────────────────────
     logger.info("Extracting ISS and Intubation from notes...")
@@ -364,7 +372,7 @@ def build_notes_features() -> None:
     intub_df = build_intubation_from_notes(notater)
 
     trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-    trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
-    logger.info(f"Saved {len(trauma)} TraumaAssessment observations")
+    logger.info(f"Built {len(trauma)} TraumaAssessment observations")
 
     logger.info("Notes features built successfully")
+    return ita_merged, trauma

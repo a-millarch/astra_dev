@@ -39,6 +39,15 @@ HEIGHT_WEIGHT_MAP = {
     'Vægt': 'WEIGHT',
 }
 
+# EWS measurements → VitaleVaerdier feature names (raw measurements from EWS dataset)
+EWS_TO_VITALS_MAP = {
+    "SAT (score)": "SPO2",
+    "Puls score": "HR",
+    "Temp. (score)": "TEMP",
+    "BT (score)": "BT",  # Special: will be split to SBP, DBP
+    "RF (score)": "RESPIRATORYRATE",
+}
+
 
 # ============================================================================
 # Lab tests: Danish test names → standardized feature names
