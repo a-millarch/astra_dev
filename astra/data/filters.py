@@ -116,7 +116,8 @@ def filter_subsets_inhospital(cfg, base=None):
     if base is None:
         base = get_base_df()
 
-    for filename in metadata.filename:
+    intended_files = cfg["default_load_filenames"] + cfg["large_load_filenames"]
+    for filename in intended_files:
         del df
         gc.collect()
         logger.debug(f"Filtering {filename}")
