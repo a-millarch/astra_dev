@@ -508,6 +508,15 @@ def prepare_data_and_dls(cfg):
     c_in = X_normalized.shape[1]
     seq_len = X_normalized.shape[2]
 
+    # Validate seq_len matches config-derived total
+    from astra.evaluation.utils import get_total_steps
+    expected_steps = get_total_steps()
+    if seq_len != expected_steps:
+        logger.warning(
+            f"seq_len from data ({seq_len}) != config-derived total ({expected_steps}). "
+            f"Re-run 'make data' to regenerate bin_df."
+        )
+
     return {
         "base": base,
         "trainval": trainval,

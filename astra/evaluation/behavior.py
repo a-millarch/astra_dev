@@ -21,7 +21,7 @@ from pathlib import Path
 from astra.utils import cfg
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
-from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours
+from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours, get_total_steps
 from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
 logger = logging.getLogger(__name__)
@@ -306,7 +306,7 @@ def _parse_ebm_time_label(label: str) -> float:
 
 def load_ebm_global_importances(
     models_dir: str = 'models/ebm',
-    n_steps: int = 114,
+    n_steps: int = None,
     top_n: int = 20,
 ) -> Optional[Dict]:
     """
@@ -316,6 +316,8 @@ def load_ebm_global_importances(
     (forward-filled to match how _ebm_pred is populated), or None if no
     models are found.
     """
+    if n_steps is None:
+        n_steps = get_total_steps()
     models_path = Path(models_dir)
     model_files = sorted(models_path.glob('ebm_model_*.pkl'))
     if not model_files:
@@ -447,7 +449,7 @@ def _draw_ebm_importance_lines(ax, ebm_imp: Dict, n_steps: int,
     ax.grid(True, alpha=0.3)
 
 
-def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = 114,
+def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = None,
                                eval_timestep: Optional[int] = None,
                                save_path: Optional[str] = None,
                                title_suffix: str = ''):
@@ -459,13 +461,15 @@ def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = 114,
 
     Args:
         ebm_importances: Dict from load_ebm_global_importances().
-        n_steps: Total number of bin steps (default 114).
+        n_steps: Total number of bin steps (derived from config if None).
         eval_timestep: Crop time axis to this step (optional).
         save_path: Path to save the figure (optional).
         title_suffix: Appended to plot titles (e.g. ' (PID: 123)').
     """
     if ebm_importances is None:
         return
+    if n_steps is None:
+        n_steps = get_total_steps()
 
     # Respect eval_timestep cropping
     if eval_timestep is not None and 0 <= eval_timestep < n_steps:

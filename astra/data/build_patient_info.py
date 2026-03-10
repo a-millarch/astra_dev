@@ -368,7 +368,6 @@ def create_bin_df(cfg, base=None):
                 start=current_time,
                 end=min(interval_end, end_time),
                 freq=freq,
-                inclusive="left",
             )
 
             # Add bins to the list
@@ -441,9 +440,8 @@ def create_bin_df_with_mortality_masking(cfg, base):
                 start=current_time,
                 end=min(interval_end, end_time),
                 freq=freq,
-                inclusive="left",
             )
-            
+
             if len(bins) < 2:
                 continue
             

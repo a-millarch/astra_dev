@@ -95,7 +95,7 @@ def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
             continue
         duration = end_min - start_min
         n_exact = duration / bin_min
-        n_bins = math.ceil(n_exact)
+        n_bins = duration // bin_min
         status = "OK" if duration % bin_min == 0 else f"PARTIAL ({n_exact:.3g} bins)"
         if duration % bin_min != 0:
             all_ok = False
@@ -124,6 +124,37 @@ def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
     else:
         print("WARNING: partial bins detected — fix the interval boundaries in bin_intervals config.")
     return all_ok
+
+
+def get_total_steps(data_config=None):
+    """Compute total number of bin steps from config.
+
+    This is the canonical source of truth for sequence length.
+    All code that needs the number of time steps should call this
+    rather than hardcoding a value.
+
+    Args:
+        data_config: Optional dict with ``'bin_intervals'`` and
+            ``'bin_freq_include'`` keys.  When *None*, reads from
+            the global ``cfg``.
+
+    Returns:
+        int: Total number of time steps.
+    """
+    if data_config is not None:
+        intervals = _get_intervals(
+            data_config['bin_intervals'],
+            data_config.get('bin_freq_include'),
+        )
+    else:
+        intervals = _get_intervals_from_cfg()
+
+    total = 0
+    for start_min, end_min, bin_min in intervals:
+        if end_min is None:
+            continue
+        total += (end_min - start_min) // bin_min
+    return total
 
 
 def time_to_step(time_value, time_unit='min', data_config=None):
@@ -165,7 +196,7 @@ def time_to_step(time_value, time_unit='min', data_config=None):
             for j in range(i):
                 s, e, b = intervals[j]
                 if e is not None:
-                    bins_cum += math.ceil((e - s) / b)
+                    bins_cum += (e - s) // b
             return bins_cum + step_offset
     return None
 
@@ -190,7 +221,7 @@ def step_to_time(step, data_config=None):
     bins_cum = [0]
     for start_min, end_min, bin_min in intervals:
         if end_min is not None:
-            bins_cum.append(bins_cum[-1] + math.ceil((end_min - start_min) / bin_min))
+            bins_cum.append(bins_cum[-1] + (end_min - start_min) // bin_min)
         else:
             bins_cum.append(float('inf'))
 

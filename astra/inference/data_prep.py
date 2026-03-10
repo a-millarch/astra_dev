@@ -120,7 +120,6 @@ def _create_patient_bins(
             start=current,
             end=min(interval_end, end_time),
             freq=freq,
-            inclusive="left",
         )
 
         bin_list.extend(
