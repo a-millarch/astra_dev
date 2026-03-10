@@ -12,7 +12,7 @@ from astra.data.mappings import (
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
     ICU_MAP, EWS_MAP,
     ATC_LVL3_MAP, ATC_LVL4_MAP, MEDICATION_ACTION_LIST,
-    PROCEDURE_MAP, PROCEDURE_REVERSE_MAP, PROCEDURE_INCLUDE_LIST,
+    PROCEDURE_MAP, PROCEDURE_PREFIXES,
     ADT_PATTERNS, classify_department,
 )
 
@@ -161,15 +161,23 @@ def filter_vitals(vit):
     return vit
 
 def filter_procedures(proc):
-    # Uses PROCEDURE_INCLUDE_LIST and PROCEDURE_REVERSE_MAP from mappings
-    proc = proc[proc["ProcedureCode"].isin(PROCEDURE_INCLUDE_LIST)].copy(deep=True)
+    # Uses PROCEDURE_MAP and PROCEDURE_PREFIXES from mappings
+    prefix_tuple = tuple(PROCEDURE_PREFIXES)
+    mask = proc["ProcedureCode"].str.startswith(prefix_tuple)
+    proc = proc[mask].copy(deep=True)
 
     proc.rename(
         columns={"ProcedureCode": "VALUE", "ServiceDatetime": "TIMESTAMP"},
         inplace=True,
     )
 
-    proc.VALUE = proc.VALUE.replace(PROCEDURE_REVERSE_MAP)
+    def _map_prefix(code):
+        for prefix in PROCEDURE_PREFIXES:
+            if code.startswith(prefix):
+                return PROCEDURE_MAP[prefix]
+        return code
+
+    proc["VALUE"] = proc["VALUE"].map(_map_prefix)
     logger.info(f"Using {len(proc)} observations of procedures")
     proc["FEATURE"] = "procedures"
     return proc
@@ -236,6 +244,15 @@ def filter_ews(ews):
     )
     ews["FEATURE"] = ews["FEATURE"].replace(to_replace=EWS_MAP)
     return ews
+
+
+def filter_trauma_assessment(df):
+    """Filter for TraumaAssessment (ISS, INTUBATED from notes).
+
+    Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE],
+    so no additional mapping needed.
+    """
+    return df
 
 
 def reverse_dict_replace(original_dict, df, atc_level):
@@ -348,6 +365,7 @@ def collect_filter(concept: str):
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
         "EWS": filter_ews,
+        "TraumaAssessment": filter_trauma_assessment,
     }
 
     return filter_funcs[concept]

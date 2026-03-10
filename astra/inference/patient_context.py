@@ -167,6 +167,7 @@ class PatientContext:
             _standardize_vitals,
             _standardize_labs,
             _standardize_icu,
+            _standardize_ews,
             _standardize_medications,
             _standardize_procedures,
             _standardize_adt,
@@ -206,6 +207,7 @@ class PatientContext:
             'medications': _standardize_medications(raw_ehr.get('medications', [])),
             'procedures': _standardize_procedures(raw_ehr.get('procedures', [])),
             'adt': _standardize_adt(raw_ehr.get('adt', [])),
+            'ews': _standardize_ews(raw_ehr.get('ews', [])),
         }
 
         return cls.create(raw_data, bundle)

@@ -13,6 +13,7 @@ from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
 from astra.data.filters import filter_subsets_inhospital
 from astra.data.mapper import map_concept, map_concept_optimized
+from astra.data.notes_features import build_notes_features
 
 from astra.data.datasets import TSDS
 
@@ -70,27 +71,48 @@ def map_data_optimized(cfg):
     """Updated to use optimized mapper."""
     logger.info("Mapping data to bins")
     map_dir = "data/interim/mapped/"
-    
+
     for concept in cfg["concepts"]:
         for agg_func in cfg["agg_func"][concept]:
             output_file = f"{map_dir}{concept}_{agg_func}.csv"
-            
+
             if os.path.exists(output_file):
                 logger.info(f"Skipping {concept}_{agg_func} (already exists)")
                 continue
-            
+
             logger.info(f"Processing {concept} with {agg_func}")
-            
+
             is_categorical = concept in cfg["dataset"]["ts_cat_names"]
             is_multi_label = concept in cfg["dataset"]["ts_categorical_multi_label"]
-                        
+
             map_concept_optimized(
-                cfg, 
-                concept, 
-                agg_func, 
-                is_categorical, 
+                cfg,
+                concept,
+                agg_func,
+                is_categorical,
                 is_multi_label
-            )            
+            )
+
+
+def _forward_fill_concept(cfg: dict, concept: str) -> None:
+    """Forward-fill time columns in mapped concept pickle.
+
+    Ensures semi-static features (ISS, INTUBATED) propagate forward from
+    first observation. ffill on axis=1 is inherently forward-only.
+    """
+    map_dir = "data/interim/mapped/"
+    for agg_func in cfg["agg_func"][concept]:
+        path = f"{map_dir}{concept}_{agg_func}.pkl"
+        if not os.path.exists(path):
+            logger.warning(f"Forward-fill skipped: {path} not found")
+            continue
+
+        df = pd.read_pickle(path)
+        time_cols = [c for c in df.columns if c not in ("PID", "FEATURE")]
+        df[time_cols] = df[time_cols].ffill(axis=1)
+        df.to_pickle(path, protocol=4)
+        logger.info(f"Forward-filled {concept}_{agg_func}")
+
 if __name__ =='__main__':
     pm = ProjectManager()
     setup_logging()
@@ -113,8 +135,20 @@ if __name__ =='__main__':
 
 
     proces_inhospital_concepts(cfg, reset=False)
+
+    # Build features from notes (GCS, ISS, Intubation)
+    if not is_file_present("data/interim/concepts/TraumaAssessment.pkl"):
+        logger.info("Building features from notes...")
+        build_notes_features()
+    else:
+        logger.info("TraumaAssessment.pkl already exists, skipping")
+
     #map_data(cfg)
     map_data_optimized(cfg)
+
+    # Forward-fill TraumaAssessment (semi-static features)
+    _forward_fill_concept(cfg, "TraumaAssessment")
+
     logger.info("Creating TSDS")
     tsds = TSDS(cfg, base)
     logger.info(tsds.concepts.keys())

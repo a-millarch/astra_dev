@@ -1,0 +1,367 @@
+"""
+Extract clinical features from unstructured notes: GCS, ISS, Intubation.
+
+These are fitted into the standard pipeline format [PID, TIMESTAMP, FEATURE, VALUE]
+and saved as pickle files ready for mapper.py.
+
+Entry point: build_notes_features()
+"""
+
+import re
+import logging
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# GCS Extraction
+# ============================================================================
+
+GCS_KEYWORD = r"(?:gcs|glasgow\s+coma\s+(?:scale|score))"
+GCS_FILLER = r"(?:\s+\w+){0,3}?"
+GCS_VALUE = r"[\s:=]\b([1-9]|1[0-5])\b(?!\s/\w)"
+
+GCS_PATTERN = re.compile(rf"{GCS_KEYWORD}{GCS_FILLER}{GCS_VALUE}", re.IGNORECASE)
+SKIP_PATTERN = re.compile(r"(?:rp.?\s*|gentag\w\s)$", re.IGNORECASE)
+
+FALL_PATTERN = re.compile(
+    rf"(?:{GCS_KEYWORD}?\s*(?:er\s+)?(?:falder?|faldet|stiger?|steget)\s+fra|fald\s+(?:i\s+{GCS_KEYWORD}\s+)?fra)"
+    rf"\s+(?:{GCS_KEYWORD}\s+)?\b(\d+)\b\s+ti?l\s+(?:{GCS_KEYWORD}\s+)?\b(\d+)\b",
+    re.IGNORECASE,
+)
+
+ARROW_PATTERN = re.compile(
+    rf"{GCS_KEYWORD}[^.\n\r]?(?:fra\s+)?\d+(?:\s(?:→|->|->)\s*\d+)+",
+    re.IGNORECASE,
+)
+
+SUBSCALE_TOTAL_PATTERN = re.compile(
+    rf"{GCS_KEYWORD}[\s:=][ØEøe]\d[^.\n\r]?=\s*\b([1-9]|1[0-5])\b",
+    re.IGNORECASE,
+)
+
+THRESHOLD_RE = re.compile(r"til\s+under\s+(?:gcs\s*)?\d+", re.IGNORECASE)
+HISTORICAL_RE = re.compile(
+    r"(?:gcs[^.\n\r]{0,50}for\s+\d+\s+dage?\s+siden|for\s+\d+\s+dage?\s+siden[^.\n\r]{0,50}gcs)",
+    re.IGNORECASE,
+)
+
+
+def extract_gcs_from_text(text: str) -> list[int]:
+    """Extract GCS values from a text note, handling various formats."""
+    results = []
+    for line in re.split(r"[\n\r.]+", text):
+        # Remove threshold fragments
+        if THRESHOLD_RE.search(line):
+            line = THRESHOLD_RE.sub("", line)
+        # Skip lines with historical references
+        if HISTORICAL_RE.search(line):
+            continue
+
+        # Process: fra X til Y → keep only Y
+        line = FALL_PATTERN.sub(lambda m: f"GCS {m.group(2)}", line)
+
+        # Process: arrow notation → keep only last value
+        def replace_arrow(m):
+            last = re.findall(r"\d+", m.group(0))[-1]
+            return f"GCS {last}"
+
+        line = ARROW_PATTERN.sub(replace_arrow, line)
+
+        # Process: subskala notation with total → keep total
+        line = SUBSCALE_TOTAL_PATTERN.sub(lambda m: f"GCS {m.group(1)}", line)
+
+        # Extract GCS values
+        for m in GCS_PATTERN.finditer(line):
+            window = line[max(0, m.start() - 30) : m.start()]
+            if SKIP_PATTERN.search(window.rstrip()):
+                continue
+            val = int(m.group(1))
+            if 3 <= val <= 15:
+                results.append(val)
+
+    return results
+
+
+def build_gcs_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract GCS from notes and format as [PID, TIMESTAMP, FEATURE, VALUE].
+
+    Pre-filters notes containing GCS keyword for efficiency.
+    One row per GCS value found.
+    """
+    df = notater_df.copy()
+    df["Redigeringstidspunkt"] = pd.to_datetime(df["Redigeringstidspunkt"], errors="coerce")
+
+    # Pre-filter
+    mask = df["Note"].str.contains(r"gcs|glasgow", case=False, na=False, regex=True)
+    df = df[mask]
+    logger.info(f"GCS: {mask.sum()} notes containing GCS keyword")
+
+    # Extract
+    df["_gcs_scores"] = df["Note"].astype(str).apply(extract_gcs_from_text)
+    df = df[df["_gcs_scores"].map(len) > 0]
+    df = df.explode("_gcs_scores").reset_index(drop=True)
+
+    result = df[["PID", "Redigeringstidspunkt", "_gcs_scores"]].rename(
+        columns={
+            "_gcs_scores": "VALUE",
+            "Redigeringstidspunkt": "TIMESTAMP",
+        }
+    )
+    result["FEATURE"] = "GCS"
+    result["VALUE"] = result["VALUE"].astype(float)
+
+    logger.info(f"GCS: {len(result)} values extracted from {result['PID'].nunique()} patients")
+    return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
+
+
+# ============================================================================
+# ISS Extraction
+# ============================================================================
+
+ISS_KEYWORD = r"(?:()?\bISS(?:-?sco+re)?.?"
+ISS_SEP = r"[\s:=-]"
+ISS_FILLER = r"(?:\s\S+\s+){0,3}?"
+ISS_VALUE = r"(?:(\b[0-9]|[1-6]\d|7[0-5])\b"
+
+ISS_PATTERN = re.compile(
+    rf"{ISS_KEYWORD}{ISS_SEP}{ISS_FILLER}{ISS_VALUE}",
+    re.IGNORECASE,
+)
+
+ISS_BEFORE = re.compile(
+    rf"\b([0-9]|[1-6]\d|7[0-5])\b\s\S\s*\bISS\b",
+    re.IGNORECASE,
+)
+
+
+def extract_iss_from_text(text: str) -> list[int]:
+    """Extract ISS scores (0-75) from text, handling various formats."""
+    scores = []
+    for m in ISS_PATTERN.finditer(text):
+        scores.append(int(m.group(1)))
+    for m in ISS_BEFORE.finditer(text):
+        scores.append(int(m.group(1)))
+    return scores
+
+
+def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract ISS from notes and format as [PID, TIMESTAMP, FEATURE, VALUE].
+
+    Returns ALL observations (mapper will aggregate with max per bin).
+    """
+    df = notater_df.copy()
+    df["Redigeringstidspunkt"] = pd.to_datetime(df["Redigeringstidspunkt"], errors="coerce")
+
+    # Combine notes per patient+timestamp (multi-row notes)
+    df = (
+        df.fillna({"Note": ""})
+        .groupby(["PID", "Redigeringstidspunkt"], as_index=False)
+        .agg({"Note": lambda x: "\n".join(x.astype(str))})
+    )
+    df = df.sort_values(["PID", "Redigeringstidspunkt"]).reset_index(drop=True)
+
+    records = []
+    for _, row in df.iterrows():
+        note_text = str(row["Note"]) if pd.notna(row["Note"]) else ""
+        for score in extract_iss_from_text(note_text):
+            records.append(
+                {
+                    "PID": row["PID"],
+                    "TIMESTAMP": row["Redigeringstidspunkt"],
+                    "FEATURE": "ISS",
+                    "VALUE": float(score),
+                }
+            )
+
+    result = pd.DataFrame(records)
+    logger.info(f"ISS: {len(result)} values extracted from {result['PID'].nunique()} patients")
+    return result
+
+
+# ============================================================================
+# Intubation Extraction
+# ============================================================================
+
+PRIMARY_NOTETYPES = {
+    "AKA-vurderingsnotater",
+    "AKA afsluttende notat for akut ambulante",
+    "AKA-Skadenotat",
+    "AKA-notater",
+    "AKA-Traumenotat",
+    "AKA Epikrise",
+    "Præhopital patient notat (PPJ)",
+}
+FALLBACK_NOTETYPES = {"AOP"}
+
+INTUBATION_PATTERN = re.compile(
+    r"\b(?:"
+    r"intub\w+"
+    r"|[Tt]uben?\b"
+    r"|tubet"
+    r"|tubeplacering\w*"
+    r"|OTI"
+    r"|RSI"
+    r"|ETT"
+    r"|respirator\b\w*"
+    r"|ventilator\w+"
+    r"|mekanisk\s+ventil\w+"
+    r")\b",
+    re.IGNORECASE,
+)
+
+NEGATION_PATTERN = re.compile(
+    r"\b(?:ikke|ej|uden|planlæg\w+|overvej\w+|forsøg\w+|forsøgt|evt.?|eventuelt|undlad\w+|undladt)\b",
+    re.IGNORECASE,
+)
+
+SPECIFIC_INTUBATION = re.compile(
+    r"intuberet[s]?\s+(?:i\s+TC|præhospitalt)",
+    re.IGNORECASE,
+)
+
+
+def is_intubated(text: str) -> bool:
+    """Check if text mentions intubation (without negation)."""
+    for m in INTUBATION_PATTERN.finditer(text):
+        window = text[max(0, m.start() - 15) : m.start()]
+        if not NEGATION_PATTERN.search(window):
+            return True
+    return False
+
+
+def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFrame:
+    """
+    Return one row per patient with intubation status and timestamp.
+    For intubated patients: first note where intubation matches.
+    For others: first note of given type.
+    """
+    subset = (
+        notes[notes["Notetype"].isin(notetypes)]
+        .fillna({"Note": ""})
+        .groupby(["PID", "Redigeringstidspunkt", "Notetype"], as_index=False)
+        .agg({"Note": lambda x: "\n".join(x.astype(str))})
+        .sort_values(["PID", "Redigeringstidspunkt"])
+    )
+
+    subset["intubated"] = subset["Note"].apply(lambda t: is_intubated(t))
+
+    # Intubated patients: first matching note
+    first_match = (
+        subset[subset["intubated"]]
+        .groupby("PID", as_index=False)
+        .first()[["PID", "intubated", "Redigeringstidspunkt"]]
+    )
+
+    # Others: first note of the type
+    first_any = (
+        subset[~subset["PID"].isin(first_match["PID"])]
+        .groupby("PID", as_index=False)
+        .first()[["PID", "intubated", "Redigeringstidspunkt"]]
+    )
+
+    return pd.concat([first_match, first_any], ignore_index=True)
+
+
+def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract intubation status from notes as [PID, TIMESTAMP, FEATURE, VALUE].
+
+    VALUE = 1.0 for intubated, 0.0 for not intubated (verified).
+    Includes all patients with relevant notetype.
+    """
+    notes = notater_df.copy()
+    notes["Redigeringstidspunkt"] = pd.to_datetime(
+        notes["Redigeringstidspunkt"], errors="coerce"
+    )
+
+    # Primary notetyeps
+    primary = get_first_intubation_note(notes, PRIMARY_NOTETYPES)
+
+    # Fallback
+    pids_with_primary = set(primary["PID"])
+    fallback = get_first_intubation_note(
+        notes[~notes["PID"].isin(pids_with_primary)], FALLBACK_NOTETYPES
+    )
+
+    result = pd.concat([primary, fallback], ignore_index=True)
+
+    # Add all patients (fill missing with False)
+    all_pids = pd.DataFrame({"PID": notes["PID"].unique()})
+    result = all_pids.merge(result, on="PID", how="left")
+    result["intubated"] = result["intubated"].fillna(False)
+
+    # Supplement: check other notetypes for specific patterns
+    pids_still_false = set(result[result["intubated"] == False]["PID"])
+    exclude = PRIMARY_NOTETYPES | FALLBACK_NOTETYPES
+    other_notes = (
+        notes[notes["PID"].isin(pids_still_false) & ~notes["Notetype"].isin(exclude)]
+        .fillna({"Note": ""})
+        .sort_values(["PID", "Redigeringstidspunkt"])
+    )
+
+    specific_hits = other_notes[
+        other_notes["Note"].apply(lambda t: bool(SPECIFIC_INTUBATION.search(str(t))))
+    ]
+
+    first_specific = specific_hits.groupby("PID", as_index=False).first()[
+        ["PID", "Redigeringstidspunkt"]
+    ]
+
+    for _, row in first_specific.iterrows():
+        mask = result["PID"] == row["PID"]
+        result.loc[mask, "intubated"] = True
+        result.loc[mask, "Redigeringstidspunkt"] = row["Redigeringstidspunkt"]
+
+    # Format output
+    result = result[["PID", "Redigeringstidspunkt", "intubated"]].rename(
+        columns={"Redigeringstidspunkt": "TIMESTAMP"}
+    )
+    result["FEATURE"] = "INTUBATED"
+    result["VALUE"] = result["intubated"].astype(float)
+
+    logger.info(f"Intubation: {result['VALUE'].sum()} intubated of {len(result)} patients")
+    return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
+
+
+# ============================================================================
+# Master Function
+# ============================================================================
+
+
+def build_notes_features() -> None:
+    """
+    Build GCS, ISS, and Intubation from notes and integrate into pipeline.
+
+    Assumes Notater.pkl and ITAOversigtsrapport.pkl already exist
+    (i.e., filter_subsets_inhospital has run).
+    """
+    logger.info("Building notes-based features...")
+
+    # Load notes
+    notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
+
+    # ── GCS ─────────────────────────────────────────────────────────────────
+    logger.info("Extracting GCS from notes...")
+    gcs_df = build_gcs_from_notes(notater)
+
+    # Load existing ITAOversigtsrapport and merge
+    ita = pd.read_pickle("data/interim/concepts/ITAOversigtsrapport.pkl")
+    ita_merged = pd.concat([ita, gcs_df], ignore_index=True).reset_index(drop=True)
+    ita_merged.to_pickle("data/interim/concepts/ITAOversigtsrapport.pkl", protocol=4)
+    logger.info(f"Merged {len(gcs_df)} GCS observations into ITAOversigtsrapport.pkl")
+
+    # ── ISS + Intubation ────────────────────────────────────────────────────
+    logger.info("Extracting ISS and Intubation from notes...")
+    iss_df = build_iss_from_notes(notater)
+    intub_df = build_intubation_from_notes(notater)
+
+    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
+    trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
+    logger.info(f"Saved {len(trauma)} TraumaAssessment observations")
+
+    logger.info("Notes features built successfully")
