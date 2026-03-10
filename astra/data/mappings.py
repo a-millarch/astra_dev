@@ -39,13 +39,14 @@ HEIGHT_WEIGHT_MAP = {
     'Vægt': 'WEIGHT',
 }
 
-# EWS measurements → VitaleVaerdier feature names (raw measurements from EWS dataset)
-EWS_TO_VITALS_MAP = {
-    "SAT (score)": "SPO2",
-    "Puls score": "HR",
-    "Temp. (score)": "TEMP",
-    "BT (score)": "BT",  # Special: will be split to SBP, DBP
-    "RF (score)": "RESPIRATORYRATE",
+# EWS measurements → Vital_parametre names (original VitaleVaerdier column names)
+# These are then standardized by VITALS_MAP in filter_vitals()
+EWS_TO_VITAL_PARAMETRE = {
+    "SAT (score)": "Saturation",
+    "Puls score": "Puls",
+    "Temp. (score)": "Temperatur",
+    "BT (score)": "BT",
+    "RF (score)": "Resp.frekvens",
 }
 
 

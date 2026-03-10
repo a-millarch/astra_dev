@@ -184,7 +184,13 @@ class AggregatedDS:
 
         # Apply concept-specific filter (now on reduced dataset)
         filter_function = collect_filter(concept)
-        filtered_df = filter_function(df)
+        if concept == "VitaleVaerdier":
+            ews = pd.read_pickle("data/interim/concepts/EWS.pkl")
+            if 'PID' in ews.columns:
+                ews = ews[ews['PID'].isin(self._base_pids)]
+            filtered_df = filter_function(df, ews=ews)
+        else:
+            filtered_df = filter_function(df)
 
         # Ensure TIMESTAMP is datetime
         if 'TIMESTAMP' in filtered_df.columns:
