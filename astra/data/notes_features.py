@@ -2,15 +2,12 @@
 Extract clinical features from unstructured notes: GCS, ISS, Intubation.
 
 These are fitted into the standard pipeline format [PID, TIMESTAMP, FEATURE, VALUE]
-and saved as pickle files ready for mapper.py.
-
-Entry point: build_notes_features()
+and used by mapper.py for cross-concept augmentation.
 """
 
 import re
 import logging
 import pandas as pd
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +152,8 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     """
     Extract ISS from notes and format as [PID, TIMESTAMP, FEATURE, VALUE].
 
-    Returns ALL observations (mapper will aggregate with max per bin).
+    Keeps only ONE ISS per patient: the max value at the earliest timestamp.
+    ISS is a one-time trauma severity assessment — forward-fill propagates it.
     """
     df = notater_df.copy()
     df["Redigeringstidspunkt"] = pd.to_datetime(df["Redigeringstidspunkt"], errors="coerce")
@@ -182,7 +180,15 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
             )
 
     result = pd.DataFrame(records)
-    logger.info(f"ISS: {len(result)} values extracted from {result['PID'].nunique()} patients")
+    if len(result) == 0:
+        logger.info("ISS: No values found")
+        return result
+
+    # Keep only earliest ISS per patient (max value if multiple at same timestamp)
+    n_raw = len(result)
+    result = result.sort_values(["PID", "TIMESTAMP", "VALUE"], ascending=[True, True, False])
+    result = result.drop_duplicates(subset=["PID"], keep="first").reset_index(drop=True)
+    logger.info(f"ISS: {len(result)} patients with ISS (reduced from {n_raw} raw extractions)")
     return result
 
 
@@ -272,20 +278,21 @@ def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFra
 
 def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Extract intubation status from notes as [PID, TIMESTAMP, FEATURE, VALUE].
+    Extract intubation from notes as [PID, TIMESTAMP, FEATURE, VALUE].
 
-    VALUE = 1.0 for intubated, 0.0 for not intubated (verified).
-    Includes all patients with relevant notetype.
+    Only returns rows for intubated patients (VALUE=1.0).
+    Non-intubated patients have no row — consistent with pipeline convention
+    where absence = NaN (same as no medication, no procedure, etc.).
     """
     notes = notater_df.copy()
     notes["Redigeringstidspunkt"] = pd.to_datetime(
         notes["Redigeringstidspunkt"], errors="coerce"
     )
 
-    # Primary notetyeps
+    # Primary notetypes
     primary = get_first_intubation_note(notes, PRIMARY_NOTETYPES)
 
-    # Fallback
+    # Fallback — only for patients without primary notetype
     pids_with_primary = set(primary["PID"])
     fallback = get_first_intubation_note(
         notes[~notes["PID"].isin(pids_with_primary)], FALLBACK_NOTETYPES
@@ -293,16 +300,14 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat([primary, fallback], ignore_index=True)
 
-    # Add all patients (fill missing with False)
-    all_pids = pd.DataFrame({"PID": notes["PID"].unique()})
-    result = all_pids.merge(result, on="PID", how="left")
-    result["intubated"] = result["intubated"].fillna(False)
-
-    # Supplement: check other notetypes for specific patterns
-    pids_still_false = set(result[result["intubated"] == False]["PID"])
+    # Supplement: check ALL non-intubated PIDs (including those without
+    # primary/fallback notetypes) for specific patterns in other notetypes
+    pids_intubated = set(result[result["intubated"]]["PID"])
+    all_pids = set(notes["PID"].unique())
+    pids_to_check = all_pids - pids_intubated
     exclude = PRIMARY_NOTETYPES | FALLBACK_NOTETYPES
     other_notes = (
-        notes[notes["PID"].isin(pids_still_false) & ~notes["Notetype"].isin(exclude)]
+        notes[notes["PID"].isin(pids_to_check) & ~notes["Notetype"].isin(exclude)]
         .fillna({"Note": ""})
         .sort_values(["PID", "Redigeringstidspunkt"])
     )
@@ -310,85 +315,21 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     specific_hits = other_notes[
         other_notes["Note"].apply(lambda t: bool(SPECIFIC_INTUBATION.search(str(t))))
     ]
+    if len(specific_hits) > 0:
+        first_specific = specific_hits.groupby("PID", as_index=False).first()
+        supplement = first_specific[["PID", "Redigeringstidspunkt"]].copy()
+        supplement["intubated"] = True
+        result = pd.concat([result, supplement], ignore_index=True)
 
-    first_specific = specific_hits.groupby("PID", as_index=False).first()[
-        ["PID", "Redigeringstidspunkt"]
-    ]
-
-    for _, row in first_specific.iterrows():
-        mask = result["PID"] == row["PID"]
-        result.loc[mask, "intubated"] = True
-        result.loc[mask, "Redigeringstidspunkt"] = row["Redigeringstidspunkt"]
+    # Keep only intubated patients
+    result = result[result["intubated"] == True].copy()
 
     # Format output
-    result = result[["PID", "Redigeringstidspunkt", "intubated"]].rename(
+    result = result[["PID", "Redigeringstidspunkt"]].rename(
         columns={"Redigeringstidspunkt": "TIMESTAMP"}
     )
     result["FEATURE"] = "INTUBATED"
-    result["VALUE"] = result["intubated"].astype(float)
+    result["VALUE"] = 1.0
 
-    logger.info(f"Intubation: {result['VALUE'].sum()} intubated of {len(result)} patients")
+    logger.info(f"Intubation: {len(result)} intubated patients")
     return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
-
-
-# ============================================================================
-# Master Function
-# ============================================================================
-
-
-def build_trauma_assessment_pkl():
-    """Build TraumaAssessment concept from Notater.pkl.
-
-    Extracts ISS scores and Intubation status from clinical notes
-    and saves as data/interim/concepts/TraumaAssessment.pkl.
-
-    Called from make_data.py AFTER filter_subsets_inhospital() (Notater.pkl must exist).
-    """
-    notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
-    iss_df = build_iss_from_notes(notater)
-    intub_df = build_intubation_from_notes(notater)
-    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-    trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
-    logger.info(f"Saved TraumaAssessment.pkl: {len(trauma)} rows, {trauma['PID'].nunique()} patients")
-
-
-def build_notes_features(
-    notater: pd.DataFrame,
-    ita: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Extract and build GCS, ISS, and Intubation from notes.
-
-    Parameters
-    ----------
-    notater : pd.DataFrame
-        Notes dataframe with columns [PID, Note, Redigeringstidspunkt, Notetype].
-    ita : pd.DataFrame
-        Existing ITAOversigtsrapport dataframe [PID, TIMESTAMP, FEATURE, VALUE].
-
-    Returns
-    -------
-    ita_merged : pd.DataFrame
-        ITAOversigtsrapport with GCS values from notes merged in.
-    trauma : pd.DataFrame
-        New TraumaAssessment dataframe [PID, TIMESTAMP, FEATURE, VALUE]
-        containing ISS and INTUBATED observations.
-    """
-    logger.info("Building notes-based features...")
-
-    # ── GCS ─────────────────────────────────────────────────────────────────
-    logger.info("Extracting GCS from notes...")
-    gcs_df = build_gcs_from_notes(notater)
-    ita_merged = pd.concat([ita, gcs_df], ignore_index=True).reset_index(drop=True)
-    logger.info(f"Merged {len(gcs_df)} GCS observations into ITAOversigtsrapport")
-
-    # ── ISS + Intubation ────────────────────────────────────────────────────
-    logger.info("Extracting ISS and Intubation from notes...")
-    iss_df = build_iss_from_notes(notater)
-    intub_df = build_intubation_from_notes(notater)
-
-    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-    logger.info(f"Built {len(trauma)} TraumaAssessment observations")
-
-    logger.info("Notes features built successfully")
-    return ita_merged, trauma

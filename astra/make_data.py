@@ -16,7 +16,6 @@ from astra.data.filters import filter_subsets_inhospital, mark_traumatext
 from astra.data.mapper import map_concept, map_concept_optimized
 
 from astra.data.datasets import TSDS
-from astra.data.notes_features import build_trauma_assessment_pkl
 
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
@@ -159,12 +158,6 @@ if __name__ =='__main__':
         base.to_pickle(cfg["base_df_path"], protocol=4)
         logger.info(f"Updated base_df with TRAUMATEXT columns at {cfg['base_df_path']}")
 
-    
-    # Build derived concept: TraumaAssessment (ISS + INTUBATION from notes)
-    if not is_file_present("data/interim/concepts/TraumaAssessment.pkl"):
-        build_trauma_assessment_pkl()
-
-    #map_data(cfg)
     map_data_optimized(cfg, overwrite=overwrite)
 
     # Forward-fill TraumaAssessment (semi-static features)

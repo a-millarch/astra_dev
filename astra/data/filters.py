@@ -351,6 +351,14 @@ def filter_trauma_assessment(df):
     return df
 
 
+def filter_events(df):
+    """Filter for Events (cardiac_arrest from notes).
+
+    Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE].
+    """
+    return df
+
+
 def reverse_dict_replace(original_dict, df, atc_level):
     # Invert the dictionary
     inverted_dict = {}
@@ -523,6 +531,7 @@ def collect_filter(concept: str):
         "ADTHaendelser": filter_adt,
         "EWS": filter_ews,
         "TraumaAssessment": filter_trauma_assessment,
+        "Events": filter_events,
     }
 
     return filter_funcs[concept]

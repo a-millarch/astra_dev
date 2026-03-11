@@ -165,7 +165,7 @@ def initialize_session(cpr_hash, service_date, current_time, model_name,
 
     return session
 
-def default_session_plot(session, prediction_curve=None, interactive=False):
+def default_session_plot(session, prediction_curve=None, interactive =False):
     ctx = session.ctx
     result = session.predict_from_context(ctx)
 
@@ -215,16 +215,10 @@ def default_session_plot(session, prediction_curve=None, interactive=False):
             ihs_step = time_to_step(delta_min, 'min')
             if ihs_step is not None:
                 shap_dict['test_data']['inhospital_start_steps'] = np.array([ihs_step])
-
-    visualize_shap_individual(shap_dict,
-                            sample_idx=0,
-                            channel2feature=channel2feature,
-                            feature_names_cat=feature_names_cat,
-                            feature_names_cont=feature_names_cont,
-    )
     if interactive:
+
     
-        # ---- EBM explanations (if available) ----
+    # ---- EBM explanations (if available) ----
         ebm_explanations = None
         if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
             logger.info("Computing EBM feature importance...")
@@ -239,6 +233,12 @@ def default_session_plot(session, prediction_curve=None, interactive=False):
             feature_names_cont=feature_names_cont,
             ebm_explanations=ebm_explanations,
         )
+    else:
+        visualize_shap_individual(            shap_dict,
+            sample_idx=0,
+            channel2feature=channel2feature,
+            feature_names_cat=feature_names_cat,
+            feature_names_cont=feature_names_cont)
 
     # ---- Data completeness (matplotlib — unchanged) ----
     visualize_data_completeness(
