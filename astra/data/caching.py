@@ -31,6 +31,7 @@ def _get_cache_key(cfg):
 
     key_params = {
         "_cache_version": _CACHE_VERSION,
+        "target": cfg.get("target"),
         "dataset": cfg.get("dataset", {}),
         "exclusion_criteria_resolved": resolved_exclusion,
         "prehospital": cfg.get("prehospital", False),

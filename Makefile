@@ -87,6 +87,14 @@ sweep_arch:
 sweep_train:
 	python -m $(PROJECT_NAME).training.train --sweep-train --n-train-trials 50 --eval
 
+## Train EBM models at all time intervals
+ebm_models:
+	$(PYTHON_INTERPRETER) -m $(PROJECT_NAME).models.ebm.generate_ebm_feature
+
+## Delete trained EBM models
+clear_ebm_models:
+	rm -rf models/ebm/*
+
 ## Full CPU pipeline: data → EBM models → data cache (overwrites all)
 all_cpu:
 	$(PYTHON_INTERPRETER) $(PROJECT_NAME)/make_data.py --overwrite
