@@ -2,15 +2,12 @@
 Extract clinical features from unstructured notes: GCS, ISS, Intubation.
 
 These are fitted into the standard pipeline format [PID, TIMESTAMP, FEATURE, VALUE]
-and saved as pickle files ready for mapper.py.
-
-Entry point: build_notes_features()
+and used by mapper.py for cross-concept augmentation.
 """
 
 import re
 import logging
 import pandas as pd
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -336,66 +333,3 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 
     logger.info(f"Intubation: {len(result)} intubated patients")
     return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
-
-
-# ============================================================================
-# Master Function
-# ============================================================================
-
-
-def build_trauma_assessment_pkl():
-    """Build TraumaAssessment concept from Notater.pkl.
-
-    Extracts ISS scores and Intubation status from clinical notes
-    and saves as data/interim/concepts/TraumaAssessment.pkl.
-
-    Called from make_data.py AFTER filter_subsets_inhospital() (Notater.pkl must exist).
-    """
-    notater = pd.read_pickle("data/interim/concepts/Notater.pkl")
-    iss_df = build_iss_from_notes(notater)
-    intub_df = build_intubation_from_notes(notater)
-    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-    trauma.to_pickle("data/interim/concepts/TraumaAssessment.pkl", protocol=4)
-    logger.info(f"Saved TraumaAssessment.pkl: {len(trauma)} rows, {trauma['PID'].nunique()} patients")
-
-
-def build_notes_features(
-    notater: pd.DataFrame,
-    ita: pd.DataFrame
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Extract and build GCS, ISS, and Intubation from notes.
-
-    Parameters
-    ----------
-    notater : pd.DataFrame
-        Notes dataframe with columns [PID, Note, Redigeringstidspunkt, Notetype].
-    ita : pd.DataFrame
-        Existing ITAOversigtsrapport dataframe [PID, TIMESTAMP, FEATURE, VALUE].
-
-    Returns
-    -------
-    ita_merged : pd.DataFrame
-        ITAOversigtsrapport with GCS values from notes merged in.
-    trauma : pd.DataFrame
-        New TraumaAssessment dataframe [PID, TIMESTAMP, FEATURE, VALUE]
-        containing ISS and INTUBATED observations.
-    """
-    logger.info("Building notes-based features...")
-
-    # ── GCS ─────────────────────────────────────────────────────────────────
-    logger.info("Extracting GCS from notes...")
-    gcs_df = build_gcs_from_notes(notater)
-    ita_merged = pd.concat([ita, gcs_df], ignore_index=True).reset_index(drop=True)
-    logger.info(f"Merged {len(gcs_df)} GCS observations into ITAOversigtsrapport")
-
-    # ── ISS + Intubation ────────────────────────────────────────────────────
-    logger.info("Extracting ISS and Intubation from notes...")
-    iss_df = build_iss_from_notes(notater)
-    intub_df = build_intubation_from_notes(notater)
-
-    trauma = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-    logger.info(f"Built {len(trauma)} TraumaAssessment observations")
-
-    logger.info("Notes features built successfully")
-    return ita_merged, trauma

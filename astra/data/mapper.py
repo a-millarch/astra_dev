@@ -901,6 +901,13 @@ def map_concept_optimized(
         notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
         iss_df = build_iss_from_notes(notater_df)
         intub_df = build_intubation_from_notes(notater_df)
+        # Restrict intubation to notes within 24h of admission
+        admission = bin_df.groupby("PID")["BIN_START"].min().rename("admission")
+        n_before = len(intub_df)
+        intub_df = intub_df.merge(admission, on="PID", how="left")
+        intub_df = intub_df[intub_df["TIMESTAMP"] <= intub_df["admission"] + pd.Timedelta(hours=24)]
+        intub_df = intub_df.drop(columns=["admission"])
+        logger.info(f"Intubation: {n_before} → {len(intub_df)} after 24h admission cutoff")
         concept_df = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
         concept_df = filter_function(concept_df)
     else:
