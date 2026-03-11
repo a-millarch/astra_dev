@@ -95,6 +95,25 @@ def map_data_optimized(cfg, overwrite=False):
             )            
 
 
+def process_prehospital(cfg, base, overwrite=False):
+    """Extract pre-hospital PPJ data and merge into base_df when enabled."""
+    if not cfg.get("prehospital"):
+        return base
+
+    from astra.data.prehospital import run_prehospital_pipeline
+
+    if not overwrite and "prehospital_start" in base.columns:
+        logger.info("Pre-hospital columns already present in base_df, skipping")
+        return base
+
+    logger.info("Pre-hospital pipeline enabled — extracting PPJ data")
+    base = run_prehospital_pipeline(cfg, base=base)
+    ensure_parent_dir(cfg["base_df_path"])
+    base.to_pickle(cfg["base_df_path"], protocol=4)
+    logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
+    return base
+
+
 def _forward_fill_concept(cfg: dict, concept: str) -> None:
     """Forward-fill time columns in mapped concept pickle.
 
@@ -132,15 +151,10 @@ if __name__ =='__main__':
     else:
         base = bpi.create_base_df(cfg)
 
+    proces_raw_concepts(cfg, base= base, reset=False)
+
     # Pre-hospital data extraction (when enabled)
-    if cfg.get("prehospital"):
-        from astra.data.prehospital import run_prehospital_pipeline
-        logger.info("Pre-hospital pipeline enabled — extracting PPJ data")
-        base = run_prehospital_pipeline(cfg, base=base)
-        # Re-save base_df with prehospital_start + ABCD columns
-        ensure_parent_dir(cfg["base_df_path"])
-        base.to_pickle(cfg["base_df_path"], protocol=4)
-        logger.info(f"Updated base_df saved at {cfg['base_df_path']}")
+    base = process_prehospital(cfg, base, overwrite=overwrite)
 
     # bin_df (now uses prehospital_start if available)
     if not overwrite and is_file_present(cfg['bin_df_path']):
