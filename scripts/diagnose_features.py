@@ -44,7 +44,15 @@ def compare_all_features(data, session, ctx, cpr_hash):
         return
 
     sample_idx = holdout_pids.index(batch_pid)
+
+    # Check if patient is deceased (mask_mortality applies in batch only)
+    patient_row = matches.iloc[0]
+    is_deceased = pd.notna(patient_row.get("DOD"))
+
     print(f"Patient: CPR={cpr_hash[:8]}... batch_PID={batch_pid} holdout_idx={sample_idx}")
+    if is_deceased:
+        print(f"  ** Deceased patient (DOD={patient_row['DOD']}) — trajectory length "
+              f"diff expected (mask_mortality in batch only)")
 
     # ---- 2. Get batch tensors (normalized, what model sees in training) ----
     holdout_ds = data["holdout_mixed_dls"]._train_ds
@@ -61,7 +69,13 @@ def compare_all_features(data, session, ctx, cpr_hash):
     x_ts_cat_i = x_ts_cat_i.cpu().squeeze(0)
 
     traj = min(int(traj_b), traj_i)
-    print(f"Trajectory lengths: batch={int(traj_b)} inference={traj_i}")
+    traj_diff = traj_i - int(traj_b)
+    traj_note = ""
+    if traj_diff != 0 and is_deceased:
+        traj_note = " (expected: mask_mortality in batch only)"
+    elif traj_diff != 0:
+        traj_note = " (UNEXPECTED for alive patient)"
+    print(f"Trajectory lengths: batch={int(traj_b)} inference={traj_i}{traj_note}")
 
     # ---- 4. Compare tabular categorical ----
     print(f"\n{'='*50}")

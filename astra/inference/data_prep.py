@@ -1702,10 +1702,33 @@ def _filter_concepts_for_patient(
             if pd.notna(batch_pid):
                 patient_pids.add(batch_pid)
 
+        filter_fn = collect_filter(concept)
+
         if concept == 'ADTHaendelser':
             concept_filtered = _filter_adt(inhospital, base_df=base_df)
+        elif concept == 'VitaleVaerdier' and 'EWS' in cfg.get('concepts', []):
+            # Cross-concept augmentation: merge EWS vitals into VitaleVaerdier
+            # (mirrors batch pipeline in mapper.py:891-894)
+            ews_meta = metadata[metadata['filename'] == 'EWS']
+            if not ews_meta.empty:
+                ews_dt = str(ews_meta['dt_colname'].iat[0])
+                ews_offset = int(ews_meta['ts_offset'].iat[0])
+                try:
+                    ews_raw = pd.read_csv(
+                        f"{data_dir}/EWS.csv", low_memory=False, index_col=0
+                    )
+                    ews_inhospital = filter_inhospital(
+                        base_df, ews_raw, cfg, ews_dt, offset=ews_offset
+                    )
+                    concept_filtered = filter_fn(inhospital, ews=ews_inhospital)
+                except FileNotFoundError:
+                    logger.warning(
+                        "EWS CSV not found — processing VitaleVaerdier without EWS"
+                    )
+                    concept_filtered = filter_fn(inhospital)
+            else:
+                concept_filtered = filter_fn(inhospital)
         else:
-            filter_fn = collect_filter(concept)
             concept_filtered = filter_fn(inhospital)
 
         # Batch filters may concat population-level prehospital data;

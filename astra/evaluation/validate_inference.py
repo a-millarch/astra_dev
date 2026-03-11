@@ -105,7 +105,17 @@ def validate_pipeline_consistency(
 
     sample_idx = holdout_pids.index(pid)
     y_true = data["ty"][sample_idx]
-    logger.info("Validating PID=%s (holdout idx=%d, y=%s)", pid, sample_idx, y_true)
+    # Check if patient is deceased (mask_mortality applies in batch only)
+    holdout_base = data["holdout"].base
+    is_deceased = False
+    if 'DOD' in holdout_base.columns:
+        dod = holdout_base.loc[holdout_base.PID == pid, 'DOD']
+        is_deceased = bool(dod.notna().any())
+
+    logger.info(
+        "Validating PID=%s (holdout idx=%d, y=%s, deceased=%s)",
+        pid, sample_idx, y_true, is_deceased,
+    )
 
     # ================================================================
     # 2. Training pipeline: pre-processed tensors from holdout dataset
@@ -160,10 +170,25 @@ def validate_pipeline_consistency(
         (x_cont_train - x_cont_inf.cpu().squeeze(0)).abs().max()
     ) if x_cont_train.numel() > 0 else 0.0
 
+    # Trajectory length mismatch is expected for deceased patients:
+    # mask_mortality shortens batch trajectories but is intentionally
+    # NOT applied in inference (real-world: DOD unknown at inference time).
+    traj_len_diff = traj_len_inf - traj_len_train_int
+    traj_len_diff_expected = is_deceased and traj_len_diff > 0
+
+    if traj_len_diff_expected:
+        logger.info(
+            "Trajectory length diff=%d (batch=%d, inf=%d) — expected for "
+            "deceased patient (mask_mortality in batch only)",
+            traj_len_diff, traj_len_train_int, traj_len_inf,
+        )
+
     norm_result = {
         "traj_len_training": traj_len_train_int,
         "traj_len_inference": traj_len_inf,
         "traj_len_match": traj_len_train_int == traj_len_inf,
+        "is_deceased": is_deceased,
+        "traj_len_diff_expected": traj_len_diff_expected,
         "ts_max_diff": float(norm_diff[:, :traj].max()) if traj > 0 else 0.0,
         "ts_mean_diff": float(norm_diff[:, :traj].mean()) if traj > 0 else 0.0,
         "tab_cat_match": x_cat_match,
