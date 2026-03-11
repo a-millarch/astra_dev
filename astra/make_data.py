@@ -95,7 +95,6 @@ def map_data_optimized(cfg, overwrite=False):
             )            
 
 
-
 def _forward_fill_concept(cfg: dict, concept: str) -> None:
     """Forward-fill time columns in mapped concept pickle.
 
