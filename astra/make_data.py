@@ -16,6 +16,7 @@ from astra.data.filters import filter_subsets_inhospital, mark_traumatext
 from astra.data.mapper import map_concept, map_concept_optimized
 
 from astra.data.datasets import TSDS
+from astra.data.notes_features import build_trauma_assessment_pkl
 
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
@@ -80,20 +81,44 @@ def map_data_optimized(cfg, overwrite=False):
             if not overwrite and os.path.exists(output_file):
                 logger.info(f"Skipping {concept}_{agg_func} (already exists)")
                 continue
-            
+
             logger.info(f"Processing {concept} with {agg_func}")
-            
+
             is_categorical = concept in cfg["dataset"]["ts_cat_names"]
             is_multi_label = concept in cfg["dataset"]["ts_categorical_multi_label"]
-                        
+
             map_concept_optimized(
-                cfg, 
-                concept, 
-                agg_func, 
-                is_categorical, 
+                cfg,
+                concept,
+                agg_func,
+                is_categorical,
                 is_multi_label
             )            
-if __name__ == '__main__':
+
+
+def _forward_fill_concept(cfg: dict, concept: str) -> None:
+    """Forward-fill time columns in mapped concept pickle.
+
+    Ensures semi-static features (ISS, INTUBATED) propagate forward from
+    first observation. ffill on axis=1 is inherently forward-only.
+    """
+    map_dir = "data/interim/mapped/"
+    for agg_func in cfg["agg_func"][concept]:
+        path = f"{map_dir}{concept}_{agg_func}.pkl"
+        if not os.path.exists(path):
+            logger.warning(f"Forward-fill skipped: {path} not found")
+            continue
+
+        df = pd.read_pickle(path)
+        time_cols = [c for c in df.columns if c not in ("PID", "FEATURE")]
+        df[time_cols] = df[time_cols].ffill(axis=1)
+        df.to_pickle(path, protocol=4)
+        logger.info(f"Forward-filled {concept}_{agg_func}")
+
+if __name__ =='__main__':
+    pm = ProjectManager()
+    setup_logging()
+    
     parser = argparse.ArgumentParser(description="ASTRA data pipeline")
     parser.add_argument(
         "--overwrite", action="store_true",
@@ -101,9 +126,6 @@ if __name__ == '__main__':
     )
     args = parser.parse_args()
     overwrite = args.overwrite
-
-    pm = ProjectManager()
-    setup_logging()
 
     # Cohort mode
     if not overwrite and is_file_present(cfg['base_df_path']):
@@ -137,7 +159,17 @@ if __name__ == '__main__':
         base.to_pickle(cfg["base_df_path"], protocol=4)
         logger.info(f"Updated base_df with TRAUMATEXT columns at {cfg['base_df_path']}")
 
+    
+    # Build derived concept: TraumaAssessment (ISS + INTUBATION from notes)
+    if not is_file_present("data/interim/concepts/TraumaAssessment.pkl"):
+        build_trauma_assessment_pkl()
+
+    #map_data(cfg)
     map_data_optimized(cfg, overwrite=overwrite)
+
+    # Forward-fill TraumaAssessment (semi-static features)
+    _forward_fill_concept(cfg, "TraumaAssessment")
+
     logger.info("Creating TSDS")
     tsds = TSDS(cfg, base)
     logger.info(tsds.concepts.keys())

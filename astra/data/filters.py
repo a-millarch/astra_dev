@@ -9,10 +9,11 @@ from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_t
 
 from astra.data.mappings import (
     VITALS_MAP, TEMP_FAHRENHEIT,BP_TYPES, HEIGHT_WEIGHT_MAP,
+    EWS_TO_VITAL_PARAMETRE,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
-    ICU_MAP,
+    ICU_MAP, EWS_MAP,
     ATC_LVL3_MAP, ATC_LVL4_MAP, MEDICATION_ACTION_LIST,
-    PROCEDURE_MAP, PROCEDURE_REVERSE_MAP, PROCEDURE_INCLUDE_LIST,
+    PROCEDURE_MAP, PROCEDURE_PREFIXES,
     ADT_PATTERNS, classify_department,
 )
 
@@ -122,7 +123,7 @@ def filter_subsets_inhospital(cfg, base=None):
         gc.collect()
         logger.debug(f"Filtering {filename}")
         df = pd.read_csv(f"data/raw/{filename}.csv", low_memory=False, index_col=0)
-        
+
         dt_name = str(
             metadata.loc[metadata["filename"] == filename]["dt_colname"].iat[0]
         )
@@ -162,9 +163,23 @@ def filter_inhospital(
 
 ### CONCEPT SPECIFICS
 
-def filter_vitals(vit):
+def filter_vitals(vit, ews=None):
     # Create a copy to avoid SettingWithCopyWarning
     vit = vit.copy()
+
+    # Augment with vital measurements from EWS (if provided)
+    if ews is not None:
+        n_original = len(vit)
+        ews_vitals, _ = extract_ews_vitals(ews)
+        if len(ews_vitals) > 0:
+            vit = pd.concat([vit, ews_vitals], ignore_index=True)
+            vit = vit.drop_duplicates(
+                subset=["PID", "Registreringstidspunkt", "Vital_parametre", "Værdi"],
+                keep="first"
+            ).reset_index(drop=True)
+            n_new = len(vit) - n_original
+            n_dupes = len(ews_vitals) - n_new
+            logger.info(f"Vitals without EWS: {n_original} | With EWS: {len(vit)} (+{n_new} new, {n_dupes} duplicates)")
 
     def fahrenheit_to_celsius(f):
         return (f - 32) * 5.0 / 9.0
@@ -218,19 +233,33 @@ def filter_vitals(vit):
         vit = pd.concat([vit, phv])
         vit = vit.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
         logger.info(f">> Vitals after prehospital merge: {len(vit)} rows")
+        
+    # Remove duplicates (same patient, time, feature, value)
+    vit = vit.drop_duplicates(
+        subset=["PID", "TIMESTAMP", "FEATURE", "VALUE"],
+        keep="first"
+    ).reset_index(drop=True)
 
     return vit
 
 def filter_procedures(proc):
-    # Uses PROCEDURE_INCLUDE_LIST and PROCEDURE_REVERSE_MAP from mappings
-    proc = proc[proc["ProcedureCode"].isin(PROCEDURE_INCLUDE_LIST)].copy(deep=True)
+    # Uses PROCEDURE_MAP and PROCEDURE_PREFIXES from mappings
+    prefix_tuple = tuple(PROCEDURE_PREFIXES)
+    mask = proc["ProcedureCode"].str.startswith(prefix_tuple)
+    proc = proc[mask].copy(deep=True)
 
     proc.rename(
         columns={"ProcedureCode": "VALUE", "ServiceDatetime": "TIMESTAMP"},
         inplace=True,
     )
 
-    proc.VALUE = proc.VALUE.replace(PROCEDURE_REVERSE_MAP)
+    def _map_prefix(code):
+        for prefix in PROCEDURE_PREFIXES:
+            if code.startswith(prefix):
+                return PROCEDURE_MAP[prefix]
+        return code
+
+    proc["VALUE"] = proc["VALUE"].map(_map_prefix)
     logger.info(f"Using {len(proc)} observations of procedures")
     proc["FEATURE"] = "procedures"
     return proc
@@ -291,6 +320,35 @@ def filter_ita(ita):
         logger.info(f">> ITA after prehospital GCS merge: {len(ita)} rows")
 
     return ita
+
+
+def filter_ews(ews):
+    """Filter EWS: keep only mapped EWS features, vitals are handled by filter_vitals."""
+    ews = ews.copy()
+
+    # Keep only features explicitly in EWS_MAP (e.g. 'EWS korr. total score')
+    # Vitals are handled by filter_vitals via extract_ews_vitals
+    ews = ews[ews["EWS_Måling"].isin(EWS_MAP.keys())]
+
+    ews.rename(
+        columns={
+            "EWS_Måling": "FEATURE",
+            "Værdi": "VALUE",
+            "Målingstidspunkt": "TIMESTAMP",
+        },
+        inplace=True,
+    )
+    ews["FEATURE"] = ews["FEATURE"].replace(to_replace=EWS_MAP)
+    return ews
+
+
+def filter_trauma_assessment(df):
+    """Filter for TraumaAssessment (ISS, INTUBATED from notes).
+
+    Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE],
+    so no additional mapping needed.
+    """
+    return df
 
 
 def reverse_dict_replace(original_dict, df, atc_level):
@@ -394,6 +452,67 @@ def filter_adt(adt, base_df=None):
     return adt
 
 
+# ============================================================================
+# EWS Vitals Extraction
+# ============================================================================
+
+
+def extract_ews_vitals(ews):
+    """
+    Extract vital measurements from EWS and return both vitals and rest.
+
+    Vital measurements are converted to original VitaleVaerdier format
+    [CPR_hash, Registreringstidspunkt, Vital_parametre, Værdi, Værdi_Omregnet, PID].
+
+    Args:
+        ews: Raw EWS dataframe after filter_inhospital.
+
+    Returns:
+        tuple: (ews_vitals_formatted, ews_rest)
+            ews_vitals_formatted: EWS vitals in original VitaleVaerdier format
+            ews_rest: Remaining EWS data (non-vitals) as self-contained concept
+    """
+    ews = ews.copy()
+    ews["Målingstidspunkt"] = pd.to_datetime(ews["Målingstidspunkt"], errors="coerce")
+
+    # Separate vitals from rest
+    vital_keys = set(EWS_TO_VITAL_PARAMETRE.keys())
+    ews_vitals_mask = ews["EWS_Måling"].isin(vital_keys)
+    ews_vitals = ews[ews_vitals_mask].copy()
+    ews_rest = ews[~ews_vitals_mask].copy()
+
+    if len(ews_vitals) > 0:
+        # Parse: remove score in parentheses "120/70 (0)" → "120/70"
+        ews_vitals["Værdi"] = ews_vitals["Værdi"].astype(str).str.split("(").str[0].str.strip()
+
+        # Map EWS_Måling to Vital_parametre
+        ews_vitals["Vital_parametre"] = ews_vitals["EWS_Måling"].map(EWS_TO_VITAL_PARAMETRE)
+
+        # Add Værdi_Omregnet (always NaN for now)
+        ews_vitals["Værdi_Omregnet"] = np.nan
+
+        # Select and reorder columns to match VitaleVaerdier format
+        ews_vitals_formatted = ews_vitals[
+            ["CPR_hash", "Målingstidspunkt", "Vital_parametre", "Værdi", "Værdi_Omregnet", "PID"]
+        ].rename(
+            columns={"Målingstidspunkt": "Registreringstidspunkt"}
+        ).reset_index(drop=True)
+
+        logger.info(f"EWS: Extracted {len(ews_vitals_formatted)} vital measurements from {ews_vitals_formatted['PID'].nunique()} patients")
+    else:
+        logger.warning("EWS: No vital measurements found")
+        ews_vitals_formatted = pd.DataFrame(
+            columns=["CPR_hash", "Registreringstidspunkt", "Vital_parametre", "Værdi", "Værdi_Omregnet", "PID"]
+        )
+
+    if len(ews_rest) > 0:
+        logger.info(f"EWS: {len(ews_rest)} non-vital measurements retained as EWS concept")
+
+    return ews_vitals_formatted, ews_rest
+
+
+
+
 def collect_filter(concept: str):
     filter_funcs = {
         "VitaleVaerdier": filter_vitals,
@@ -402,6 +521,8 @@ def collect_filter(concept: str):
         "Medicin": filter_medicin,
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
+        "EWS": filter_ews,
+        "TraumaAssessment": filter_trauma_assessment,
     }
 
     return filter_funcs[concept]

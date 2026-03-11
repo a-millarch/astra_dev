@@ -883,7 +883,21 @@ def map_concept_optimized(
     t0 = time.time()
     concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
     filter_function = collect_filter(concept)
-    concept_df = filter_function(concept_df)
+
+    # Cross-concept augmentation
+    if concept == "VitaleVaerdier":
+        ews_df = pd.read_pickle("data/interim/concepts/EWS.pkl")
+        concept_df = filter_function(concept_df, ews=ews_df)
+    elif concept == "ITAOversigtsrapport":
+        concept_df = filter_function(concept_df)
+        # Augment with GCS extracted from clinical notes
+        from astra.data.notes_features import build_gcs_from_notes
+        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
+        gcs_df = build_gcs_from_notes(notater_df)
+        concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
+        logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
+    else:
+        concept_df = filter_function(concept_df)
     logger.info(f"[{time.time()-t0:.1f}s] Loaded concept: {len(concept_df)} rows, {concept_df['PID'].nunique()} patients")
 
     # Expand interval events (e.g., ADT with start+end timestamps) to per-bin rows

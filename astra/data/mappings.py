@@ -39,6 +39,16 @@ HEIGHT_WEIGHT_MAP = {
     'Vægt': 'WEIGHT',
 }
 
+# EWS measurements → Vital_parametre names (original VitaleVaerdier column names)
+# These are then standardized by VITALS_MAP in filter_vitals()
+EWS_TO_VITAL_PARAMETRE = {
+    "SAT (score)": "Saturation",
+    "Puls score": "Puls",
+    "Temp. (score)": "Temperatur",
+    "BT (score)": "BT",
+    "RF (score)": "Resp.frekvens",
+}
+
 
 # ============================================================================
 # Lab tests: Danish test names → standardized feature names
@@ -86,6 +96,15 @@ ICU_MAP = {
     'Glasgow Coma Score': 'GCS',
     'SAPS 3 SCORE': 'SAPS3',
     'SOFA total score': 'SOFA',
+}
+
+# ============================================================================
+# EWS: measurement names → standardized feature names
+# (source: filter_ews in filters.py)
+# ============================================================================
+
+EWS_MAP = {
+    'EWS korr. total score': 'EWS_SCORE',
 }
 
 
@@ -142,72 +161,27 @@ MEDICATION_ACTION_LIST = [
 # ============================================================================
 
 PROCEDURE_MAP = {
-    'neuro_major': (
-        'KAAA27', 'KAAD05', 'KAAF00A', 'KAAD00', 'KAAD15', 'KAAA20',
-        'KAAA40', 'KAAC00', 'KAAA99', 'KAAD40', 'KAAL11', 'KAAB30',
-        'KAAD10', 'KABC60', 'KAAD30', 'KAWD00', 'KAAK35', 'KAAK00', 'KAAK10',
-    ),
-    'abdominal_major': (
-        'KNHJ63', 'KJBA00', 'KPCT20', 'KPCT99', 'KJDH70', 'KJJA96',
-        'KKBV02A', 'KJJW96', 'KKAH00', 'KJKB30', 'KKAD10', 'KKAC00',
-        'KPCT30', 'KJJA50', 'KJJB00',
-    ),
-    'vascular_major': (
-        'KFNG05A', 'KFNG02A', 'KPBH20', 'KPET11', 'KPEA12', 'KPBC30',
-        'KPHC23', 'KPDC30', 'KPBB30', 'KPDG10', 'KPDT30', 'KPEH12',
-        'KPBC10', 'KPBN20', 'KACB22', 'KPAC20', 'KPBE30', 'KPDF10',
-        'KPEA10', 'KPBA20', 'KPHH99', 'KFCA70', 'KFCA50', 'KPBU82',
-        'KPHP30', 'KPEN11', 'KPEH20', 'KPFN30', 'KPEC12', 'KNDL41',
-        'KPDQ10', 'KPAP21', 'KPCH30', 'KPFC10', 'KPHC22', 'KPAQ21',
-        'KPBC20', 'KPEP11', 'KPEU87', 'KPFE10',
-    ),
-    'thorax_major': (
-        'KGAB10', 'KGAA31', 'KGAB20', 'KGDB11', 'KGAC10', 'KFLC00',
-        'KFXE00', 'KFEB10', 'KFXD00', 'KFWW96', 'KGDA40', 'KGAE30',
-        'KUGC02', 'KFJB00', 'KGAE03', 'KGDB10', 'KGDA41', 'KFEW96',
-        'KGDB96', 'KGAE96',
-    ),
-    'orto_major': (
-        'KNGJ22', 'KNAG73', 'KNAG40', 'KNFJ54', 'KNAG70', 'KNGM09',
-        'KNEJ29', 'KNGJ29', 'KNGJ52', 'KNFJ25', 'KNDL40A', 'KNEJ69',
-        'KACB23', 'KNGJ21', 'KNCJ45', 'KNCJ27', 'KACB29', 'KNAG71',
-        'KNDA02', 'KACC51', 'KNHJ45', 'KNFJ51', 'KNAG72', 'KNDM09',
-        'KNHJ62', 'KNDJ42', 'KNFJ43', 'KNBQ03', 'KNCJ65', 'KNGQ19',
-        'KNAG76', 'KNGJ40', 'KABC56', 'KPBB99', 'KACB21', 'KNGJ61',
-        'KNDL40', 'KNFQ19', 'KNAN00', 'KNBJ41', 'KNBJ61', 'KNCJ88',
-        'KNBA02', 'KNHJ80', 'KNDJ43', 'KNHJ47', 'KNGE29', 'KNHJ23',
-        'KNHJ71', 'KACA13', 'KNFJ10', 'KNFJ70', 'KNFJ73', 'KNHN09',
-        'KNCJ67', 'KNGJ71', 'KNCJ26', 'KNCJ60', 'KNCJ42', 'KNAN03',
-        'KNFJ52', 'KNCE22', 'KNDQ99', 'KNHQ22', 'KNCL49', 'KQCG30',
-        'KNCJ64', 'KNAN02', 'KNAK12', 'KNHJ72', 'KABA00', 'KNCJ28',
-        'KNCJ80', 'KNFJ44', 'KNHJ82', 'KNFJ55', 'KNEJ89', 'KNAJ12',
-        'KACC29', 'KNDJ11', 'KNDU39', 'KNDJ70', 'KNBJ51', 'KNHJ22',
-        'KNHL49', 'KNHE99', 'KNFM09', 'KNGJ80', 'KQAA10', 'KNHJ14',
-        'KNHJ44', 'KNDL41A', 'KNAK10', 'KNBJ62', 'KNBJ21', 'KNCJ47',
-        'KNAJ00', 'KACA19', 'KNFQ99', 'KNFJ50', 'KNGJ73', 'KNHJ81',
-        'KNGM99', 'KECB40', 'KNGD22', 'KNCJ05', 'KNHJ25', 'KACC53',
-        'KNHJ24', 'KNCM09', 'KNDH12', 'KNAN04', 'KNFJ65', 'KNDH02',
-        'KNHJ41', 'KNHJ74', 'KNCJ66', 'KNGJ63', 'KNHJ42', 'KNFJ45',
-        'KNGJ42', 'KNAG41', 'KNFA02A',
-    ),
-    'ønh_major': (
-        'KEFB20', 'KEDC38', 'KEEC25', 'KEEC35', 'KDLD30', 'KEWE00',
-        'KECB20A', 'KDQE00', 'KEDC36', 'KGBA00', 'KGAB00', 'KDWE00',
-        'KENC00', 'KDHD30', 'KDJD20', 'KDAD30', 'KDWA00', 'KDQW99',
-        'KEMC00', 'KEDC39B', 'KDLD20',
-    ),
+    'KA': 'neuro',
+    'KB': 'endokrin',
+    'KC': 'øje',
+    'KD': 'ønh',
+    'KE': 'oral',
+    'KF': 'kardio',
+    'KG': 'thorax',
+    'KH': 'mamma',
+    'KJ': 'abdomen',
+    'KK': 'uro',
+    'KL': 'gyn',
+    'KM': 'obstetrik',
+    'KN': 'orto',
+    'KP': 'vaskulær',
+    'KQ': 'hud',
+    'BGD': 'respirator',
+    'BGA': 'sonde_tube',
 }
 
-# Reverse lookup: procedure code → category name
-PROCEDURE_REVERSE_MAP: Dict[str, str] = {}
-for _cat, _codes in PROCEDURE_MAP.items():
-    for _code in _codes:
-        PROCEDURE_REVERSE_MAP[_code] = _cat
-
-# Flat include list of all procedure codes
-PROCEDURE_INCLUDE_LIST: List[str] = [
-    code for codes in PROCEDURE_MAP.values() for code in codes
-]
+# Ordered list of prefixes (longest first so 3-char prefixes match before 2-char)
+PROCEDURE_PREFIXES: List[str] = sorted(PROCEDURE_MAP.keys(), key=len, reverse=True)
 
 
 # ============================================================================
