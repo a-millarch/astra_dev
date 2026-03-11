@@ -281,20 +281,21 @@ def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFra
 
 def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Extract intubation status from notes as [PID, TIMESTAMP, FEATURE, VALUE].
+    Extract intubation from notes as [PID, TIMESTAMP, FEATURE, VALUE].
 
-    VALUE = 1.0 for intubated, 0.0 for not intubated (verified).
-    Includes all patients with relevant notetype.
+    Only returns rows for intubated patients (VALUE=1.0).
+    Non-intubated patients have no row — consistent with pipeline convention
+    where absence = NaN (same as no medication, no procedure, etc.).
     """
     notes = notater_df.copy()
     notes["Redigeringstidspunkt"] = pd.to_datetime(
         notes["Redigeringstidspunkt"], errors="coerce"
     )
 
-    # Primary notetyeps
+    # Primary notetypes
     primary = get_first_intubation_note(notes, PRIMARY_NOTETYPES)
 
-    # Fallback
+    # Fallback — only for patients without primary notetype
     pids_with_primary = set(primary["PID"])
     fallback = get_first_intubation_note(
         notes[~notes["PID"].isin(pids_with_primary)], FALLBACK_NOTETYPES
@@ -302,16 +303,12 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat([primary, fallback], ignore_index=True)
 
-    # Add all patients (fill missing with False)
-    all_pids = pd.DataFrame({"PID": notes["PID"].unique()})
-    result = all_pids.merge(result, on="PID", how="left")
-    result["intubated"] = result["intubated"].fillna(False)
-
     # Supplement: check other notetypes for specific patterns
-    pids_still_false = set(result[result["intubated"] == False]["PID"])
+    pids_intubated = set(result[result["intubated"]]["PID"])
+    pids_not_intubated = set(result[~result["intubated"]]["PID"]) - pids_intubated
     exclude = PRIMARY_NOTETYPES | FALLBACK_NOTETYPES
     other_notes = (
-        notes[notes["PID"].isin(pids_still_false) & ~notes["Notetype"].isin(exclude)]
+        notes[notes["PID"].isin(pids_not_intubated) & ~notes["Notetype"].isin(exclude)]
         .fillna({"Note": ""})
         .sort_values(["PID", "Redigeringstidspunkt"])
     )
@@ -319,41 +316,23 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     specific_hits = other_notes[
         other_notes["Note"].apply(lambda t: bool(SPECIFIC_INTUBATION.search(str(t))))
     ]
+    if len(specific_hits) > 0:
+        first_specific = specific_hits.groupby("PID", as_index=False).first()
+        supplement = first_specific[["PID", "Redigeringstidspunkt"]].copy()
+        supplement["intubated"] = True
+        result = pd.concat([result, supplement], ignore_index=True)
 
-    first_specific = specific_hits.groupby("PID", as_index=False).first()[
-        ["PID", "Redigeringstidspunkt"]
-    ]
-
-    for _, row in first_specific.iterrows():
-        mask = result["PID"] == row["PID"]
-        result.loc[mask, "intubated"] = True
-        result.loc[mask, "Redigeringstidspunkt"] = row["Redigeringstidspunkt"]
-
-    # Fill missing timestamps: patients without primary/fallback/supplement
-    # notetypes get their earliest note timestamp (so they can be mapped to bins)
-    missing_ts = result["Redigeringstidspunkt"].isna()
-    if missing_ts.any():
-        earliest_note = (
-            notes.groupby("PID")["Redigeringstidspunkt"]
-            .min()
-            .reset_index()
-        )
-        fill_map = earliest_note.set_index("PID")["Redigeringstidspunkt"]
-        result.loc[missing_ts, "Redigeringstidspunkt"] = (
-            result.loc[missing_ts, "PID"].map(fill_map).values
-        )
-        logger.info(f"Intubation: filled {missing_ts.sum()} missing timestamps with earliest note time")
+    # Keep only intubated patients
+    result = result[result["intubated"] == True].copy()
 
     # Format output
-    result = result[["PID", "Redigeringstidspunkt", "intubated"]].rename(
+    result = result[["PID", "Redigeringstidspunkt"]].rename(
         columns={"Redigeringstidspunkt": "TIMESTAMP"}
     )
     result["FEATURE"] = "INTUBATED"
-    result["VALUE"] = result["intubated"].astype(float)
+    result["VALUE"] = 1.0
 
-    n_intubated = int(result["VALUE"].sum())
-    n_total = len(result)
-    logger.info(f"Intubation: {n_intubated} intubated of {n_total} patients ({n_total - n_intubated} not intubated)")
+    logger.info(f"Intubation: {len(result)} intubated patients")
     return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 
