@@ -1,0 +1,151 @@
+name: astra_gpu
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  # ── Python ────────────────────────────────────────────────────────────────
+  - python=3.10.14
+  - pip>=24.0
+  - setuptools<=81
+  - wheel>=0.43
+
+  # ── PyTorch (CUDA 12.1 – Tesla T4, compute capability 7.5) ─────────────
+  - pytorch::pytorch=2.3.1
+  - pytorch::pytorch-cuda=12.1
+
+  # ── Core scientific stack (strictly pinned) ───────────────────────────────
+  - conda-forge::libstdcxx-ng>=13
+  - numpy=1.26.4
+  - pandas=2.2.2
+  - scipy=1.13.1
+  - scikit-learn=1.7.2
+  - matplotlib=3.8.1
+  - seaborn=0.13.2
+  - scikit-image=0.23.2
+
+  # ── Numba (CPU, must match llvmlite) ─────────────────────────────────────
+  - numba=0.60.0
+  - llvmlite=0.43.0
+
+  # ── Jupyter / IPython ─────────────────────────────────────────────────────
+  - ipykernel=6.29.4
+  - ipython=8.25.0
+  - jupyter_client=8.6.2
+  - jupyter_core=5.7.2
+
+  # ── Utilities (conda-managed) ─────────────────────────────────────────────
+  - pyyaml>=6.0
+  - tqdm>=4.66
+  - joblib>=1.4
+  - requests>=2.32
+  - cryptography>=42.0
+  - openssl=3.3.1
+  - ca-certificates>=2024.6
+
+  - pip:
+      - azure-ai-ml
+      - azure-common
+      - azure-core
+      - azure-graphrbac
+      - azure-identity
+      - azure-mgmt-authorization
+      - azure-mgmt-containerregistry
+      - azure-mgmt-core
+      - azure-mgmt-keyvault
+      - azure-mgmt-network
+      - azure-mgmt-resource
+      - azure-mgmt-storage
+      - azure-storage-blob
+      - azure-storage-file-datalake
+      - azure-storage-file-share
+      - azureml-core
+      - azureml-dataprep
+      - azureml-dataprep-native
+      - azureml-dataprep-rslex
+      - azureml-fsspec
+      - azureml-mlflow
+      - msal
+      - msal-extensions
+      - adal
+      - msrest
+      - msrestazure
+
+      # ── MLflow ────────────────────────────────────────────────────────────
+      - mlflow
+      - mlflow-skinny
+      - mldesigner
+      - mltable
+
+      # ── ML / Modelling (strictly pinned) ─────────────────────────────────
+      - interpret==0.7.5
+      - interpret-core==0.7.5
+      - optuna==4.7.0
+      - xgboost==3.2.0
+      - shap==0.49.1
+      - imbalanced-learn
+      - salib
+      - aplr==10.21.0
+
+      # ── Plotting / Dash / CLI ───────────────────────────────────────────────────
+      - plotly
+      - dash
+      - dash-core-components
+      - dash-html-components
+      - dash-table
+      - dash-cytoscape
+      - rich
+      - IProgress
+
+      # ── Data / IO ─────────────────────────────────────────────────────────
+      - pyarrow
+      - dask
+      - fsspec
+      - narwhals
+      - sqlalchemy
+      - openpyxl
+
+      # ── Parallel / async ──────────────────────────────────────────────────
+      - ray==2.2.0
+      - dill
+      - multiprocess
+      - cloudpickle
+      - gevent
+      - greenlet
+
+      # ── Networking / Auth ─────────────────────────────────────────────────
+      - oauthlib
+      - requests-oauthlib
+      - cffi
+      - pyjwt
+      - pyopenssl
+      - ndg-httpsclient
+      - pyasn1
+      - pyasn1-modules
+      - rsa
+      - pynacl
+      - paramiko
+      - bcrypt
+      - pysocks
+
+      # ── Observability ─────────────────────────────────────────────────────
+      - opencensus
+      - opencensus-context
+      - opencensus-ext-azure
+      - opencensus-ext-logging
+      - opentelemetry-api
+      - opentelemetry-sdk
+      - opentelemetry-semantic-conventions
+
+      # ── Flask / API ───────────────────────────────────────────────────────
+      - flask
+      - werkzeug
+      - gunicorn
+      - itsdangerous
+      - jinja2
+      - markupsafe
+      - blinker
+      - click
+
+      - ruamel.yaml>=0.17.0

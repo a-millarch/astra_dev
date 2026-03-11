@@ -416,6 +416,13 @@ class SimulationRunner:
 
         result = self.run_from_context(ctx, end_hours=end_hours)
         result.wall_clock_seconds = time.perf_counter() - wall_start
+
+        # Store state so inspect() and .result work after run()
+        self.context = ctx
+        self._steps = list(result.steps)
+        self._prediction_curve = result.prediction_curve.copy() if result.prediction_curve is not None else None
+        self.session.ctx = ctx
+
         return result
 
     def run_from_context(
