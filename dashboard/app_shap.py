@@ -100,7 +100,8 @@ def list_config_files():
 @st.cache_resource
 def load_config(config_path):
     mods = _load_astra_modules()
-    mods["ProjectManager"](workdir="josefine.schoening/repos/astra/")
+    os.chdir(REPO_ROOT)
+    mods["ProjectManager"]()
     cfg = mods["get_cfg"](config_path)
     return cfg
 

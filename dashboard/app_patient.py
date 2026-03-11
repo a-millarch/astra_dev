@@ -8,7 +8,12 @@ import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import numpy as np
 
-pm = ProjectManager(workdir='josefine.schoening/repos/astra/')
+import os, sys
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+os.chdir(REPO_ROOT)
+pm = ProjectManager()
 from astra.utils import get_base_df
 from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt
 
