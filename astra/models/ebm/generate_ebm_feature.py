@@ -16,46 +16,96 @@ from astra.data.datasets import AggregatedDS
 logger = logging.getLogger(__name__)
 
 
+def _parse_duration_to_hours(s: str) -> float:
+    """Parse a duration string like '10min', '4h', '6D' to hours."""
+    if s.endswith("min"):
+        return float(s[:-3]) / 60
+    elif s.endswith("h"):
+        return float(s[:-1])
+    elif s.endswith("D"):
+        return float(s[:-1]) * 24
+    else:
+        raise ValueError(f"Cannot parse duration: {s!r}")
+
+
 def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
     """
     Generate EBM training intervals in hours.
 
-    Schedule:
-    - Early: 10min, 30min, 1h, 2h, 3h, 4h
-    - 4h-72h: every 2 hours
-    - Post-72h: derived from cfg bin_intervals (one EBM per bin width)
+    If ``ebm_feature.interval_schedule`` is defined in config, uses that to
+    generate the full schedule.  Otherwise falls back to the legacy hardcoded
+    early schedule + bin_intervals-derived post-72h schedule.
 
-    All generated times are exact multiples of the active bin resolutions,
-    so they land on bin boundaries.  The forward-fill in create_ebm_feature_df
-    then uses bin_start for each step, so an EBM at time M is applied from the
-    first bin whose start >= M — no data from that bin leaks into the EBM.
+    The ``interval_schedule`` format mirrors ``bin_intervals``::
 
-    Note: the final interval (e.g. 30D) may be generated but never applied,
-    because no bin has bin_start == trajectory_end.  This is harmless.
+        interval_schedule:
+          30min: '10min'   # 0 → 30min, step 10min
+          4h: '1h'         # 30min → 4h, step 1h
+          ...
+
+    Each range starts at the next clean multiple of the step above the
+    previous boundary so intervals land on round numbers.
 
     Returns:
         Sorted list of masking times in hours.
     """
+    import math
+
+    ebm_cfg = cfg_dict.get("ebm_feature", {})
+    schedule = ebm_cfg.get("interval_schedule")
+
+    if schedule:
+        return _intervals_from_schedule(schedule)
+
+    # Legacy fallback: hardcoded early + bin_intervals post-72h
+    return _intervals_legacy(cfg_dict)
+
+
+def _intervals_from_schedule(schedule: dict) -> List[float]:
+    """Generate intervals from an explicit interval_schedule config dict."""
+    import math
+
+    sorted_keys = sorted(schedule.keys(), key=_parse_duration_to_hours)
+    intervals: List[float] = []
+    prev_boundary_h = 0.0
+
+    for key in sorted_keys:
+        end_h = _parse_duration_to_hours(key)
+        step_h = _parse_duration_to_hours(schedule[key])
+
+        # Start at the first clean multiple of step_h above prev_boundary_h
+        first = math.ceil(prev_boundary_h / step_h) * step_h
+        if first == prev_boundary_h and first > 0:
+            first += step_h
+
+        t = first
+        while t <= end_h + 1e-9:  # small epsilon for float precision
+            intervals.append(round(t, 6))
+            t += step_h
+
+        prev_boundary_h = end_h
+
+    return sorted(set(intervals))
+
+
+def _intervals_legacy(cfg_dict: dict) -> List[float]:
+    """Legacy interval generation: hardcoded early + bin_intervals post-72h."""
     intervals = [10 / 60, 30 / 60, 1, 2, 3, 4]
     intervals += list(range(6, 73, 2))  # 6h to 72h, step 2h
 
-    # Post-72h: derive from cfg bin_intervals
     bin_intervals = cfg_dict.get("bin_intervals", {})
     bin_freq_include = set(cfg_dict.get("bin_freq_include", []))
 
     sorted_keys = sorted(
         [k for k in bin_intervals.keys() if k != "end"],
-        key=lambda k: float(k[:-1]) * (24 if k.endswith("D") else 1),
+        key=_parse_duration_to_hours,
     )
 
-    def _key_to_hours(k):
-        return float(k[:-1]) * (24 if k.endswith("D") else 1)
-
     for i, key in enumerate(sorted_keys):
-        end_h = _key_to_hours(key)
+        end_h = _parse_duration_to_hours(key)
 
         if i > 0:
-            start_h = _key_to_hours(sorted_keys[i - 1])
+            start_h = _parse_duration_to_hours(sorted_keys[i - 1])
         else:
             start_h = 0
 
@@ -68,14 +118,7 @@ def generate_ebm_intervals(cfg_dict: dict) -> List[float]:
         if resolution_str not in bin_freq_include:
             continue
 
-        if resolution_str.endswith("min"):
-            res_h = float(resolution_str[:-3]) / 60
-        elif resolution_str.endswith("h"):
-            res_h = float(resolution_str[:-1])
-        elif resolution_str.endswith("D"):
-            res_h = float(resolution_str[:-1]) * 24
-        else:
-            continue
+        res_h = _parse_duration_to_hours(resolution_str)
 
         t = start_h + res_h
         while t <= end_h:
@@ -101,9 +144,14 @@ def _create_aggregated_dataset(
     base_df: pd.DataFrame,
     cfg_dict: dict,
     masking_hours: float,
+    concept_cache: Optional[dict] = None,
 ) -> Tuple[pd.DataFrame, np.ndarray, list, list]:
     """
     Create AggregatedDS at a masking point and extract X, y with PIDs.
+
+    Args:
+        concept_cache: Optional pre-loaded concept data (from preload_concept_cache).
+            Avoids reloading concept pkls from disk for every interval.
 
     Returns:
         X (DataFrame with PID column), y (array), categorical_features, continuous_features
@@ -117,10 +165,50 @@ def _create_aggregated_dataset(
         agg_funcs=["first", "last", "min", "max", "mean", "std"],
         concepts=cfg_dict["concepts"],
         default_mode=True,
+        concept_cache=concept_cache,
     )
 
     X, y = agg_ds.get_X_y(include_id=True)
     return X, np.asarray(y), agg_ds.categorical_features, agg_ds.continuous_features
+
+
+def preload_concept_cache(
+    base_df: pd.DataFrame,
+    cfg_dict: dict,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Pre-load and filter concept data for a patient set.
+
+    Performs the expensive disk I/O and concept-specific filtering (e.g.,
+    filter_vitals with prehospital concat) once. The returned cache can be
+    passed to _create_aggregated_dataset / AggregatedDS for every masking
+    interval, skipping repeated pkl reads.
+
+    Args:
+        base_df: Patient base DataFrame (trainval or holdout).
+        cfg_dict: Configuration dictionary.
+
+    Returns:
+        Dict mapping concept name -> filtered DataFrame with columns
+        [PID, FEATURE, VALUE, TIMESTAMP].
+    """
+    # Create a non-default-mode AggregatedDS just to access loading infrastructure
+    agg = AggregatedDS(
+        cfg=cfg_dict,
+        base_df=base_df,
+        default_mode=False,
+        concepts=cfg_dict["concepts"],
+    )
+    cache = {}
+    for concept in agg.concepts:
+        try:
+            df = agg._load_and_filter_concept(concept)
+            if len(df) > 0:
+                cache[concept] = df
+                logger.info(f"Cached {concept}: {len(df)} rows")
+        except Exception as e:
+            logger.warning(f"Failed to cache {concept}: {e}")
+    return cache
 
 
 def _pad_to_reference_features(
@@ -440,6 +528,7 @@ def predict_holdout_with_deployment_model(
     final_model_dict: dict,
     ref_cat_feats: Optional[list] = None,
     ref_cont_feats: Optional[list] = None,
+    concept_cache: Optional[dict] = None,
 ) -> Dict[int, float]:
     """
     Generate predictions for holdout patients using the deployment model.
@@ -455,12 +544,14 @@ def predict_holdout_with_deployment_model(
         final_model_dict: Deployment model dict from train_final_ebm_at_timepoint().
         ref_cat_feats: Reference categorical features for consistent feature space.
         ref_cont_feats: Reference continuous features for consistent feature space.
+        concept_cache: Pre-loaded concept data for holdout patients.
 
     Returns:
         {PID: predicted_probability}
     """
     X_full, y_full, cat_feats, cont_feats = _create_aggregated_dataset(
-        holdout_df, cfg_dict, masking_hours
+        holdout_df, cfg_dict, masking_hours,
+        concept_cache=concept_cache,
     )
 
     id_col = cfg_dict["dataset"]["id_col"]
@@ -530,6 +621,127 @@ def train_final_ebm_at_timepoint(
     }
 
 
+def _train_deployment_from_dataset(
+    X_full: pd.DataFrame,
+    y_full: np.ndarray,
+    cat_feats: list,
+    cont_feats: list,
+    cfg_dict: dict,
+    ebm_params: dict,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
+) -> dict:
+    """
+    Train deployment EBM from a pre-computed dataset (no disk I/O).
+
+    Same logic as train_final_ebm_at_timepoint but accepts pre-built X/y
+    so the caller can share dataset creation with K-fold training.
+    """
+    id_col = cfg_dict["dataset"]["id_col"]
+    X_features = X_full.drop(columns=[id_col])
+
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, cat_feats, cont_feats = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
+
+    X_processed, encoder, feature_names = preprocess_features(
+        X_features, cat_feats, cont_feats, encoder=None, fit=True
+    )
+
+    ebm = ExplainableBoostingClassifier(
+        feature_names=feature_names,
+        **ebm_params,
+    )
+    ebm.fit(X_processed, y_full)
+
+    return {
+        "model": ebm,
+        "encoder": encoder,
+        "expected_cat_feats": cat_feats,
+        "expected_cont_feats": cont_feats,
+        "feature_names": feature_names,
+    }
+
+
+def _train_kfold_from_dataset(
+    X_full: pd.DataFrame,
+    y_full: np.ndarray,
+    cat_feats: list,
+    cont_feats: list,
+    cfg_dict: dict,
+    masking_hours: float,
+    n_folds: int = 5,
+    ebm_params: Optional[dict] = None,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
+) -> Tuple[Dict[int, float], list, list, list]:
+    """
+    K-fold EBM training from a pre-computed dataset (no disk I/O).
+
+    Same logic as train_ebm_kfold_at_timepoint but accepts pre-built X/y
+    so the caller can share dataset creation with the deployment model.
+    """
+    if ebm_params is None:
+        ebm_params = _get_default_ebm_params()
+
+    id_col = cfg_dict["dataset"]["id_col"]
+    pids = X_full[id_col].values
+    X_features = X_full.drop(columns=[id_col])
+
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, cat_feats, cont_feats = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
+
+    X_processed, global_encoder, feature_names = preprocess_features(
+        X_features, cat_feats, cont_feats, encoder=None, fit=True
+    )
+
+    oof_preds = {}
+    fold_models = []
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X_processed, y_full)):
+        X_train = X_processed.iloc[train_idx]
+        y_train = y_full[train_idx]
+        X_val = X_processed.iloc[val_idx]
+        y_val = y_full[val_idx]
+        val_pids = pids[val_idx]
+
+        if len(set(y_train)) < 2:
+            logger.warning(
+                f"  Fold {fold_idx}: insufficient class diversity in train, skipping"
+            )
+            for pid in val_pids:
+                oof_preds[pid] = 0.0
+            continue
+
+        if X_train.shape[1] != X_val.shape[1]:
+            logger.error(
+                f"  Fold {fold_idx}: Shape mismatch! Train={X_train.shape}, Val={X_val.shape}"
+            )
+            for pid in val_pids:
+                oof_preds[pid] = 0.0
+            continue
+
+        ebm = ExplainableBoostingClassifier(
+            feature_names=feature_names,
+            **ebm_params,
+        )
+        ebm.fit(X_train, y_train)
+
+        y_proba = ebm.predict_proba(X_val)[:, 1]
+
+        for pid, prob in zip(val_pids, y_proba):
+            oof_preds[pid] = float(prob)
+
+        fold_models.append((ebm, global_encoder, cat_feats, cont_feats))
+
+    return oof_preds, fold_models, cat_feats, cont_feats
+
+
 def _model_filename(masking_hours: float) -> str:
     """Generate a stable filename for a given interval's deployment model."""
     label = _format_hours(masking_hours)
@@ -573,13 +785,22 @@ def generate_ebm_feature(
     logger.info(f"EBM intervals: {len(intervals)} time points")
     logger.info(f"  Range: {intervals[0]:.2f}h to {intervals[-1]:.1f}h")
 
+    # Pre-load concept data once to avoid re-reading pkls for every interval.
+    # This is the main performance optimization: concept loading + filtering
+    # (including prehospital data concat) happens once instead of ~3× per interval.
+    logger.info("Pre-loading concept data for trainval and holdout...")
+    trainval_concept_cache = preload_concept_cache(trainval_df, cfg_dict)
+    holdout_concept_cache = preload_concept_cache(holdout_df, cfg_dict)
+    logger.info(f"Cached {len(trainval_concept_cache)} trainval + {len(holdout_concept_cache)} holdout concepts")
+
     # Determine reference feature set from the latest interval (maximum masking time).
     # This ensures all EBM models share the same feature space regardless of how
     # sparse data is at early time points. Features that don't exist at a given
     # time point are zero-filled, so the EBM can still accept them at inference.
     logger.info("Determining reference feature set from latest interval...")
     _, _, ref_cat_feats, ref_cont_feats = _create_aggregated_dataset(
-        trainval_df, cfg_dict, intervals[-1]
+        trainval_df, cfg_dict, intervals[-1],
+        concept_cache=trainval_concept_cache,
     )
     logger.info(
         f"Reference features: {len(ref_cont_feats)} cont + {len(ref_cat_feats)} cat "
@@ -623,15 +844,20 @@ def generate_ebm_feature(
         logger.info(f"\n[{i + 1}/{len(intervals)}] Training EBMs at {label}...")
 
         try:
+            # Build trainval dataset ONCE for this interval (shared by
+            # deployment model + K-fold training).
+            X_trainval, y_trainval, cat_feats_tv, cont_feats_tv = \
+                _create_aggregated_dataset(
+                    trainval_df, cfg_dict, masking_hours,
+                    concept_cache=trainval_concept_cache,
+                )
+
             # Train deployment model FIRST so holdout predictions use the same
             # model that inference will load, eliminating model-identity divergence.
-            final_model_dict = train_final_ebm_at_timepoint(
-                trainval_df,
-                cfg_dict,
-                masking_hours,
-                ebm_params,
-                ref_cat_feats=ref_cat_feats,
-                ref_cont_feats=ref_cont_feats,
+            final_model_dict = _train_deployment_from_dataset(
+                X_trainval, y_trainval, cat_feats_tv, cont_feats_tv,
+                cfg_dict, ebm_params,
+                ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
             )
             # Save deployment model as individual file
             model_path = os.path.join(models_dir, _model_filename(masking_hours))
@@ -642,12 +868,14 @@ def generate_ebm_feature(
             hold_preds = predict_holdout_with_deployment_model(
                 holdout_df, cfg_dict, masking_hours, final_model_dict,
                 ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
+                concept_cache=holdout_concept_cache,
             )
 
             # K-fold training for trainval OOF (must stay K-fold to avoid leakage)
             oof_preds, fold_models, expected_cat_feats, expected_cont_feats = \
-                train_ebm_kfold_at_timepoint(
-                    trainval_df, cfg_dict, masking_hours,
+                _train_kfold_from_dataset(
+                    X_trainval, y_trainval, cat_feats_tv, cont_feats_tv,
+                    cfg_dict, masking_hours,
                     n_folds=n_folds, ebm_params=ebm_params,
                     ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
                 )

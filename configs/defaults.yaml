@@ -47,7 +47,16 @@ ebm_feature:
   save_dir: data/interim/ebm_features
   n_folds: 5
   default_value: 0.0
-  
+  interval_schedule:  # EBM masking intervals: {boundary: step_size}
+    30min: '10min'    # 0 → 30min: every 10min  (~3 intervals)
+    4h: '1h'          # 30min → 4h: every 1h    (~4 intervals)
+    24h: '4h'         # 4h → 24h: every 4h      (~5 intervals)
+    72h: '6h'         # 24h → 72h: every 6h     (~8 intervals)
+    6D: '12h'         # 72h → 6D: every 12h     (~6 intervals)
+    14D: '1D'         # 6D → 14D: every 1D      (~8 intervals)
+    30D: '3D'         # 14D → 30D: every 3D     (~5 intervals)
+    90D: '7D'         # 30D → 90D: every 7D     (~9 intervals)
+
 
 # Trauma text (clinical notes) keyword marking
 traumatext_config:

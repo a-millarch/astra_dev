@@ -245,6 +245,7 @@ class AggregatedDS:
         concepts: Optional[List[str]] = None,
         use_gpu: bool = True,
         default_mode: bool = True,
+        concept_cache: Optional[Dict[str, pd.DataFrame]] = None,
     ):
         self.cfg = cfg
         self.target = cfg["target"]
@@ -301,7 +302,7 @@ class AggregatedDS:
 
         if default_mode:
             self.set_tab_df()
-            self.collect_and_aggregate_concepts()
+            self.collect_and_aggregate_concepts(concept_cache=concept_cache)
             self.create_final_dataset()
 
     def set_tab_df(self):
@@ -328,17 +329,28 @@ class AggregatedDS:
             return pd.Timedelta(self.masking_point)
         raise ValueError(f"Invalid masking_point type: {type(self.masking_point)}")
 
-    def collect_and_aggregate_concepts(self):
-        """Collect, filter, mask, and aggregate all concepts."""
+    def collect_and_aggregate_concepts(self, concept_cache=None):
+        """Collect, filter, mask, and aggregate all concepts.
+
+        Args:
+            concept_cache: Optional dict mapping concept name to pre-loaded
+                DataFrames (output of _load_and_filter_concept). When provided,
+                skips disk I/O and concept-specific filtering, only applying
+                masking and aggregation. Used by generate_ebm_feature to avoid
+                reloading concept pkls for every masking interval.
+        """
         self.aggregated_concepts = {}
         masking_delta = self._parse_masking_point()
-        
+
         for concept in self.concepts:
             logger.info(f"Processing concept: {concept}")
-            
+
             try:
-                # Load and filter
-                concept_data = self._load_and_filter_concept(concept)
+                # Use cache if available, otherwise load from disk
+                if concept_cache is not None and concept in concept_cache:
+                    concept_data = concept_cache[concept]
+                else:
+                    concept_data = self._load_and_filter_concept(concept)
                 
                 if len(concept_data) == 0:
                     logger.warning(f"No data for {concept}")
