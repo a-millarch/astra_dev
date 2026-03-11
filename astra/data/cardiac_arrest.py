@@ -74,7 +74,7 @@ _DATE_PREFIX_RE = re.compile(
 # ---------------------------------------------------------------------------
 EXCLUDED_NOTATTYPER = re.compile(
     r"mors-?notat|forskningsnotat|udskrivningsresum[eé]|samtalenotat|historisk"
-    r"|behandlingsniveau|konferencenotat",
+    r"|behandlingsniveau|konferencenotat|helbredsforhold",
     re.IGNORECASE,
 )
 
