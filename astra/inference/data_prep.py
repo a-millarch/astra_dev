@@ -1310,6 +1310,15 @@ def prepare_patient_from_csv(
         f"trajectory {base_df['start'].iloc[0]} → {base_df['end'].iloc[0]}"
     )
 
+    # Clamp current_time to patient's actual trajectory end so that
+    # visible bins match the batch path (which is bounded by data extent).
+    patient_end = base_df['end'].iloc[0]
+    if pd.notna(patient_end):
+        clamped = min(pd.Timestamp(current_time), pd.Timestamp(patient_end))
+        if clamped < pd.Timestamp(current_time):
+            logger.info(f"Clamped current_time from {current_time} to {clamped} (patient end)")
+        current_time = clamped
+
     # Phase 2: Filter concepts
     filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
     logger.info(

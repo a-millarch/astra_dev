@@ -422,11 +422,11 @@ def _aggregate_patient_features(
 
         if is_categorical:
             _aggregate_categorical_concept(
-                concept_df, concept_name, cutoff, feature_row
+                concept_df, concept_name, cutoff, feature_row, cfg=cfg
             )
         else:
             _aggregate_continuous_concept(
-                concept_df, concept_name, cutoff, feature_row
+                concept_df, concept_name, cutoff, feature_row, cfg=cfg
             )
 
     return pd.DataFrame([feature_row])
@@ -437,6 +437,7 @@ def _aggregate_continuous_concept(
     concept_name: str,
     cutoff: pd.Timestamp,
     feature_row: dict,
+    cfg: dict = None,
 ) -> None:
     """
     Aggregate continuous concept data up to cutoff time.
@@ -445,6 +446,12 @@ def _aggregate_continuous_concept(
     Matches AggregatedDS._aggregate_numeric_cpu (datasets.py:439).
     """
     df = concept_df.copy()
+
+    # Apply drop_features filter (matches AggregatedDS._aggregate_concept_optimized)
+    if cfg and "drop_features" in cfg:
+        drop_list = cfg["drop_features"].get(concept_name, [])
+        if drop_list:
+            df = df[~df['FEATURE'].isin(drop_list)]
 
     # Ensure TIMESTAMP is datetime
     if not pd.api.types.is_datetime64_any_dtype(df['TIMESTAMP']):
@@ -492,6 +499,7 @@ def _aggregate_categorical_concept(
     concept_name: str,
     cutoff: pd.Timestamp,
     feature_row: dict,
+    cfg: dict = None,
 ) -> None:
     """
     Aggregate categorical concept data up to cutoff time.
@@ -500,6 +508,14 @@ def _aggregate_categorical_concept(
     Matches AggregatedDS._aggregate_categorical_optimized (datasets.py:289-290).
     """
     df = concept_df.copy()
+
+    # Apply drop_features filter (matches AggregatedDS._aggregate_concept_optimized)
+    if cfg and "drop_features" in cfg:
+        drop_list = cfg["drop_features"].get(concept_name, [])
+        if drop_list and 'FEATURE' in df.columns:
+            df = df[~df['FEATURE'].isin(drop_list)]
+        elif drop_list and 'VALUE' in df.columns:
+            df = df[~df['VALUE'].isin(drop_list)]
 
     # Determine timestamp column
     ts_col = 'TIMESTAMP'

@@ -78,6 +78,7 @@ class PatientContext:
     _ebm_context: Optional[dict] = field(default=None, repr=False)
 
     # ---- New fields for incremental / simulation ----------------------------
+    patient_end_time: Optional[pd.Timestamp] = field(default=None, repr=False)
     _full_trajectory_data: Optional[dict] = field(default=None, repr=False)
     _bin_cache: Optional[Any] = field(default=None, repr=False)  # BinCache
     _last_refresh_time: Optional[pd.Timestamp] = field(default=None, repr=False)
@@ -281,6 +282,15 @@ class PatientContext:
                 f"{list(filtered_concepts.keys())}"
             )
 
+        # Clamp current_time to patient's actual trajectory end so that
+        # visible bins match the batch path (which is bounded by data extent).
+        patient_end = base_df['end'].iloc[0]
+        if pd.notna(patient_end):
+            clamped = min(pd.Timestamp(current_time), pd.Timestamp(patient_end))
+            if clamped < pd.Timestamp(current_time):
+                logger.info(f"Clamped current_time from {current_time} to {clamped} (patient end)")
+            current_time = clamped
+
         # Phase 3a: Build full trajectory raw_data (unfiltered by time)
         raw_data_full = _filtered_dfs_to_raw_data(
             base_df, filtered_concepts, current_time=current_time,
@@ -293,6 +303,7 @@ class PatientContext:
 
         # Phase 4: Create context from time-filtered data
         ctx = cls.create(raw_data, bundle)
+        ctx.patient_end_time = pd.Timestamp(patient_end) if pd.notna(patient_end) else None
         ctx._full_trajectory_data = raw_data_full
         # Merge timing from csv_load into context timing
         for k, v in timing.items():
@@ -366,6 +377,9 @@ class PatientContext:
         from astra.evaluation.utils import time_to_step
 
         new_current_time = pd.Timestamp(current_time)
+        if self.patient_end_time is not None and new_current_time > self.patient_end_time:
+            logger.info(f"Clamped refresh current_time from {new_current_time} to {self.patient_end_time}")
+            new_current_time = self.patient_end_time
         old_trajectory_length = self.trajectory_length
 
         bundle = self._bundle_ref

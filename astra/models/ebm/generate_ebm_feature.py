@@ -432,6 +432,61 @@ def predict_holdout(
 
     return {pid: float(prob) for pid, prob in zip(pids, all_proba)}
 
+
+def predict_holdout_with_deployment_model(
+    holdout_df: pd.DataFrame,
+    cfg_dict: dict,
+    masking_hours: float,
+    final_model_dict: dict,
+    ref_cat_feats: Optional[list] = None,
+    ref_cont_feats: Optional[list] = None,
+) -> Dict[int, float]:
+    """
+    Generate predictions for holdout patients using the deployment model.
+
+    Uses the same model that will be loaded at inference time, ensuring
+    holdout predictions in ebm_predictions.pkl match inference predictions
+    for the same patient data.
+
+    Args:
+        holdout_df: Holdout patients base_df.
+        cfg_dict: Configuration dictionary.
+        masking_hours: Time point in hours.
+        final_model_dict: Deployment model dict from train_final_ebm_at_timepoint().
+        ref_cat_feats: Reference categorical features for consistent feature space.
+        ref_cont_feats: Reference continuous features for consistent feature space.
+
+    Returns:
+        {PID: predicted_probability}
+    """
+    X_full, y_full, cat_feats, cont_feats = _create_aggregated_dataset(
+        holdout_df, cfg_dict, masking_hours
+    )
+
+    id_col = cfg_dict["dataset"]["id_col"]
+    pids = X_full[id_col].values
+    X_features = X_full.drop(columns=[id_col])
+
+    # Pad to reference features if provided
+    if ref_cat_feats is not None and ref_cont_feats is not None:
+        X_features, _, _ = _pad_to_reference_features(
+            X_features, cat_feats, cont_feats, ref_cat_feats, ref_cont_feats,
+        )
+
+    X_processed, _, _ = preprocess_features(
+        X_features,
+        cat_feats=cat_feats,
+        cont_feats=cont_feats,
+        encoder=final_model_dict['encoder'],
+        fit=False,
+        expected_cat_feats=final_model_dict['expected_cat_feats'],
+        expected_cont_feats=final_model_dict['expected_cont_feats'],
+    )
+
+    proba = final_model_dict['model'].predict_proba(X_processed)[:, 1]
+    return {pid: float(p) for pid, p in zip(pids, proba)}
+
+
 def train_final_ebm_at_timepoint(
     train_df: pd.DataFrame,
     cfg_dict: dict,
@@ -568,20 +623,8 @@ def generate_ebm_feature(
         logger.info(f"\n[{i + 1}/{len(intervals)}] Training EBMs at {label}...")
 
         try:
-            oof_preds, fold_models, expected_cat_feats, expected_cont_feats = \
-                train_ebm_kfold_at_timepoint(
-                    trainval_df, cfg_dict, masking_hours,
-                    n_folds=n_folds, ebm_params=ebm_params,
-                    ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
-                )
-
-            hold_preds = predict_holdout(
-                holdout_df, cfg_dict, masking_hours, fold_models,
-                expected_cat_feats, expected_cont_feats,
-                ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
-            )
-
-            # Train final deployment model on full trainval
+            # Train deployment model FIRST so holdout predictions use the same
+            # model that inference will load, eliminating model-identity divergence.
             final_model_dict = train_final_ebm_at_timepoint(
                 trainval_df,
                 cfg_dict,
@@ -594,6 +637,20 @@ def generate_ebm_feature(
             model_path = os.path.join(models_dir, _model_filename(masking_hours))
             with open(model_path, "wb") as f:
                 pickle.dump(final_model_dict, f)
+
+            # Holdout predictions using deployment model (matches inference)
+            hold_preds = predict_holdout_with_deployment_model(
+                holdout_df, cfg_dict, masking_hours, final_model_dict,
+                ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
+            )
+
+            # K-fold training for trainval OOF (must stay K-fold to avoid leakage)
+            oof_preds, fold_models, expected_cat_feats, expected_cont_feats = \
+                train_ebm_kfold_at_timepoint(
+                    trainval_df, cfg_dict, masking_hours,
+                    n_folds=n_folds, ebm_params=ebm_params,
+                    ref_cat_feats=ref_cat_feats, ref_cont_feats=ref_cont_feats,
+                )
 
             for pid, prob in oof_preds.items():
                 trainval_preds.setdefault(pid, {})[masking_hours] = prob
