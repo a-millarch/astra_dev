@@ -881,6 +881,10 @@ def map_concept_optimized(
     t0 = time.time()
     filter_function = collect_filter(concept)
 
+    # Load Notater.pkl once for concepts that need it
+    notes_concepts = ("ITAOversigtsrapport", "TraumaAssessment", "Events")
+    notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl") if concept in notes_concepts else None
+
     # Cross-concept augmentation
     if concept == "VitaleVaerdier":
         concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
@@ -889,16 +893,12 @@ def map_concept_optimized(
     elif concept == "ITAOversigtsrapport":
         concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
         concept_df = filter_function(concept_df)
-        # Augment with GCS extracted from clinical notes
         from astra.data.notes_features import build_gcs_from_notes
-        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
         gcs_df = build_gcs_from_notes(notater_df)
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
     elif concept == "TraumaAssessment":
-        # Built on-the-fly from notes (no raw TraumaAssessment file)
         from astra.data.notes_features import build_iss_from_notes, build_intubation_from_notes
-        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
         iss_df = build_iss_from_notes(notater_df)
         intub_df = build_intubation_from_notes(notater_df)
         # Restrict intubation to within 24h of admission
@@ -909,6 +909,10 @@ def map_concept_optimized(
         intub_df = intub_df.drop(columns=["bin_start"])
         logger.info(f"Intubation: {n_before} → {len(intub_df)} after 24h admission cutoff")
         concept_df = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
+        concept_df = filter_function(concept_df)
+    elif concept == "Events":
+        from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+        concept_df = build_cardiac_arrest_from_notes(notater_df)
         concept_df = filter_function(concept_df)
     else:
         concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")

@@ -20,6 +20,7 @@ concepts:
   - ADTHaendelser
   - EWS
   - TraumaAssessment
+  - Events
   #- IndUd
   #- ITARespirator
   
@@ -256,6 +257,8 @@ agg_func: #also for datasets, split it up
       - max
   TraumaAssessment:
       - max
+  Events:
+      - max
 
 # Mapping
 npartitions:
@@ -267,6 +270,7 @@ npartitions:
   Medicin: 4
   EWS: 1
   TraumaAssessment: 1
+  Events: 1
 
 mapping:
  Diagnoser: cat
@@ -297,6 +301,8 @@ drop_features:
   EWS:
     - nan
   TraumaAssessment:
+    - nan
+  Events:
     - nan
 
 
