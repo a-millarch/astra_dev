@@ -155,7 +155,8 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     """
     Extract ISS from notes and format as [PID, TIMESTAMP, FEATURE, VALUE].
 
-    Returns ALL observations (mapper will aggregate with max per bin).
+    Keeps only ONE ISS per patient: the max value at the earliest timestamp.
+    ISS is a one-time trauma severity assessment — forward-fill propagates it.
     """
     df = notater_df.copy()
     df["Redigeringstidspunkt"] = pd.to_datetime(df["Redigeringstidspunkt"], errors="coerce")
@@ -182,7 +183,15 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
             )
 
     result = pd.DataFrame(records)
-    logger.info(f"ISS: {len(result)} values extracted from {result['PID'].nunique()} patients")
+    if len(result) == 0:
+        logger.info("ISS: No values found")
+        return result
+
+    # Keep only earliest ISS per patient (max value if multiple at same timestamp)
+    n_raw = len(result)
+    result = result.sort_values(["PID", "TIMESTAMP", "VALUE"], ascending=[True, True, False])
+    result = result.drop_duplicates(subset=["PID"], keep="first").reset_index(drop=True)
+    logger.info(f"ISS: {len(result)} patients with ISS (reduced from {n_raw} raw extractions)")
     return result
 
 
@@ -320,6 +329,21 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
         result.loc[mask, "intubated"] = True
         result.loc[mask, "Redigeringstidspunkt"] = row["Redigeringstidspunkt"]
 
+    # Fill missing timestamps: patients without primary/fallback/supplement
+    # notetypes get their earliest note timestamp (so they can be mapped to bins)
+    missing_ts = result["Redigeringstidspunkt"].isna()
+    if missing_ts.any():
+        earliest_note = (
+            notes.groupby("PID")["Redigeringstidspunkt"]
+            .min()
+            .reset_index()
+        )
+        fill_map = earliest_note.set_index("PID")["Redigeringstidspunkt"]
+        result.loc[missing_ts, "Redigeringstidspunkt"] = (
+            result.loc[missing_ts, "PID"].map(fill_map).values
+        )
+        logger.info(f"Intubation: filled {missing_ts.sum()} missing timestamps with earliest note time")
+
     # Format output
     result = result[["PID", "Redigeringstidspunkt", "intubated"]].rename(
         columns={"Redigeringstidspunkt": "TIMESTAMP"}
@@ -327,7 +351,9 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     result["FEATURE"] = "INTUBATED"
     result["VALUE"] = result["intubated"].astype(float)
 
-    logger.info(f"Intubation: {result['VALUE'].sum()} intubated of {len(result)} patients")
+    n_intubated = int(result["VALUE"].sum())
+    n_total = len(result)
+    logger.info(f"Intubation: {n_intubated} intubated of {n_total} patients ({n_total - n_intubated} not intubated)")
     return result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 

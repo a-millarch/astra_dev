@@ -15,7 +15,6 @@ from astra.data.filters import filter_subsets_inhospital
 from astra.data.mapper import map_concept, map_concept_optimized
 
 from astra.data.datasets import TSDS
-from astra.data.notes_features import build_trauma_assessment_pkl
 
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
@@ -135,10 +134,6 @@ if __name__ =='__main__':
 
 
     proces_inhospital_concepts(cfg, reset=False)
-
-    # Build derived concept: TraumaAssessment (ISS + INTUBATION from notes)
-    if not is_file_present("data/interim/concepts/TraumaAssessment.pkl"):
-        build_trauma_assessment_pkl()
 
     #map_data(cfg)
     map_data_optimized(cfg)

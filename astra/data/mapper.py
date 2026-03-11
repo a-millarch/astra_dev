@@ -879,14 +879,15 @@ def map_concept_optimized(
     
     # Load and filter concept
     t0 = time.time()
-    concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
     filter_function = collect_filter(concept)
 
     # Cross-concept augmentation
     if concept == "VitaleVaerdier":
+        concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
         ews_df = pd.read_pickle("data/interim/concepts/EWS.pkl")
         concept_df = filter_function(concept_df, ews=ews_df)
     elif concept == "ITAOversigtsrapport":
+        concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
         concept_df = filter_function(concept_df)
         # Augment with GCS extracted from clinical notes
         from astra.data.notes_features import build_gcs_from_notes
@@ -894,7 +895,16 @@ def map_concept_optimized(
         gcs_df = build_gcs_from_notes(notater_df)
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
+    elif concept == "TraumaAssessment":
+        # Built on-the-fly from notes (no raw TraumaAssessment file)
+        from astra.data.notes_features import build_iss_from_notes, build_intubation_from_notes
+        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
+        iss_df = build_iss_from_notes(notater_df)
+        intub_df = build_intubation_from_notes(notater_df)
+        concept_df = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
+        concept_df = filter_function(concept_df)
     else:
+        concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
         concept_df = filter_function(concept_df)
     logger.info(f"[{time.time()-t0:.1f}s] Loaded concept: {len(concept_df)} rows, {concept_df['PID'].nunique()} patients")
 
