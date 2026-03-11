@@ -146,6 +146,8 @@ class TabularEncoder:
                     df[col].dropna().unique().tolist(),
                     key=lambda v: str(v),
                 )
+                # Prevent duplicate '#na#' when fillna('#na#') makes it a data value
+                unique_vals = [v for v in unique_vals if v != '#na#']
             self.classes[col] = ['#na#'] + unique_vals
             self.cat_mappings[col] = {v: i for i, v in enumerate(self.classes[col])}
 

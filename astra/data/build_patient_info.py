@@ -342,6 +342,12 @@ def create_bin_df(cfg, base=None):
     # Load bin intervals from cfg
     bin_intervals = cfg["bin_intervals"]
 
+    # Margin: use the largest bin frequency so the last bin is always created,
+    # even for coarse intervals (e.g. 1D, 7D). The old +10min margin failed
+    # for bin frequencies larger than 10min.
+    freq_values = [f for f in bin_intervals.values() if f != 'end']
+    max_freq = max(pd.Timedelta(f) for f in freq_values) if freq_values else pd.Timedelta(minutes=10)
+
     # 'start' is the universal earliest timestamp (incorporates prehospital when available)
     start_col = "start"
 
@@ -350,7 +356,7 @@ def create_bin_df(cfg, base=None):
         # Safety fallback if start is unexpectedly NaT
         if pd.isna(start_time):
             start_time = row.get("inhospital_start", row.get("start"))
-        end_time = row["end"] + pd.Timedelta(minutes=10)
+        end_time = row["end"] + max_freq
         pid = row["PID"]
 
         current_time = start_time

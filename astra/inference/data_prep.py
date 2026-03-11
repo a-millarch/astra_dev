@@ -1736,6 +1736,34 @@ def _filter_concepts_for_patient(
         if patient_pids is not None and 'PID' in concept_filtered.columns:
             concept_filtered = concept_filtered[concept_filtered['PID'].isin(patient_pids)]
 
+        # Normalize PIDs and re-deduplicate.
+        # filter_vitals() concats prehospital pkl (batch PIDs) with inhospital
+        # data (inference PIDs). The dedup inside filter_vitals misses
+        # cross-source duplicates because PIDs don't match.
+        # Fix: unify PIDs and re-dedup.
+        if patient_pids is not None and 'PID' in concept_filtered.columns:
+            inference_pid = base_df['PID'].iloc[0]
+            concept_filtered = concept_filtered.copy()
+            concept_filtered['PID'] = inference_pid
+
+            dedup_cols = ['PID', 'TIMESTAMP', 'FEATURE', 'VALUE']
+            if all(c in concept_filtered.columns for c in dedup_cols):
+                # Normalize numeric VALUE strings for consistent dedup
+                # (pkl may store "72.0", CSV may store "72")
+                numeric = pd.to_numeric(concept_filtered['VALUE'], errors='coerce')
+                mask = numeric.notna()
+                concept_filtered.loc[mask, 'VALUE'] = numeric[mask].astype(str)
+
+                n_before = len(concept_filtered)
+                concept_filtered = concept_filtered.drop_duplicates(
+                    subset=dedup_cols, keep='first'
+                ).reset_index(drop=True)
+                n_removed = n_before - len(concept_filtered)
+                if n_removed:
+                    logger.debug(
+                        f"{concept}: PID-normalized dedup removed {n_removed} rows"
+                    )
+
         if concept_filtered.empty:
             logger.info(f"No {concept} data after concept filter")
             continue
