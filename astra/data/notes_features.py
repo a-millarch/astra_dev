@@ -303,12 +303,14 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 
     result = pd.concat([primary, fallback], ignore_index=True)
 
-    # Supplement: check other notetypes for specific patterns
+    # Supplement: check ALL non-intubated PIDs (including those without
+    # primary/fallback notetypes) for specific patterns in other notetypes
     pids_intubated = set(result[result["intubated"]]["PID"])
-    pids_not_intubated = set(result[~result["intubated"]]["PID"]) - pids_intubated
+    all_pids = set(notes["PID"].unique())
+    pids_to_check = all_pids - pids_intubated
     exclude = PRIMARY_NOTETYPES | FALLBACK_NOTETYPES
     other_notes = (
-        notes[notes["PID"].isin(pids_not_intubated) & ~notes["Notetype"].isin(exclude)]
+        notes[notes["PID"].isin(pids_to_check) & ~notes["Notetype"].isin(exclude)]
         .fillna({"Note": ""})
         .sort_values(["PID", "Redigeringstidspunkt"])
     )
