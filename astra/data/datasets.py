@@ -403,7 +403,22 @@ class AggregatedDS:
 
         # Apply concept-specific filter (now on reduced dataset)
         filter_function = collect_filter(concept)
-        filtered_df = filter_function(df)
+        if concept == "VitaleVaerdier":
+            ews = pd.read_pickle("data/interim/concepts/EWS.pkl")
+            if 'PID' in ews.columns:
+                ews = ews[ews['PID'].isin(self._base_pids)]
+            filtered_df = filter_function(df, ews=ews)
+        elif concept == "ITAOversigtsrapport":
+            filtered_df = filter_function(df)
+            # Augment with GCS extracted from clinical notes
+            from astra.data.notes_features import build_gcs_from_notes
+            notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
+            if 'PID' in notater_df.columns:
+                notater_df = notater_df[notater_df['PID'].isin(self._base_pids)]
+            gcs_df = build_gcs_from_notes(notater_df)
+            filtered_df = pd.concat([filtered_df, gcs_df], ignore_index=True)
+        else:
+            filtered_df = filter_function(df)
 
         # Ensure TIMESTAMP is datetime
         if 'TIMESTAMP' in filtered_df.columns:

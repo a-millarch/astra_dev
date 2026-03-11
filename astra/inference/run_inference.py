@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 from astra.inference import InferenceSession, PatientContext
-from astra.evaluation.behavior import visualize_shap_individual, visualize_data_completeness
+from astra.evaluation.behavior import visualize_shap_individual, visualize_data_completeness, visualize_shap_individual_interactive, plot_prediction_trajectory_plotly
 from astra.visualize.inference import plot_prediction_trajectory
 from astra.utils import make_inference_pid
 
@@ -165,7 +165,7 @@ def initialize_session(cpr_hash, service_date, current_time, model_name,
 
     return session
 
-def default_session_plot(session, prediction_curve=None):
+def default_session_plot(session, prediction_curve=None, interactive =False):
     ctx = session.ctx
     result = session.predict_from_context(ctx)
 
@@ -192,7 +192,7 @@ def default_session_plot(session, prediction_curve=None):
         model_name=model_name,
     )
 
-    # ---- 5. SHAP explanation ----
+    # ---- SHAP explanation ----
     logger.info("Computing SHAP explanation...")
     shap_result = session.explain_from_context(ctx)
 
@@ -215,23 +215,37 @@ def default_session_plot(session, prediction_curve=None):
             ihs_step = time_to_step(delta_min, 'min')
             if ihs_step is not None:
                 shap_dict['test_data']['inhospital_start_steps'] = np.array([ihs_step])
+    if interactive:
 
-    visualize_shap_individual(
+    
+    # ---- EBM explanations (if available) ----
+        ebm_explanations = None
+        if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
+            logger.info("Computing EBM feature importance...")
+            ebm_explanations = session.explain_ebm(ctx, save_path=None)
+
+        # ---- Interactive Plotly heatmaps + matplotlib fallback ----
+        visualize_shap_individual_interactive(
+            shap_dict,
+            sample_idx=0,
+            channel2feature=channel2feature,
+            feature_names_cat=feature_names_cat,
+            feature_names_cont=feature_names_cont,
+            ebm_explanations=ebm_explanations,
+        )
+    else:
+        visualize_shap_individual(            shap_dict,
+            sample_idx=0,
+            channel2feature=channel2feature,
+            feature_names_cat=feature_names_cat,
+            feature_names_cont=feature_names_cont)
+
+    # ---- Data completeness (matplotlib — unchanged) ----
+    visualize_data_completeness(
         shap_dict,
-        sample_idx=0,
         channel2feature=channel2feature,
-        feature_names_cat=feature_names_cat,
-        feature_names_cont=feature_names_cont,
         save_path=None,
     )
-
-    visualize_data_completeness(shap_dict,
-                            channel2feature=channel2feature, save_path='reports/tst2.png')
-
-    # ---- EBM feature importance (if EBM enabled) ----
-    if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
-        logger.info("Computing EBM feature importance...")
-        session.explain_ebm(ctx, save_path=None)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(

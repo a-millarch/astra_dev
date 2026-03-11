@@ -49,9 +49,9 @@ def timed_stage(timing_dict: dict, stage_name: str):
     timing_dict.setdefault(stage_name, []).append(time.perf_counter() - start)
 
 from astra.data.mappings import (
-    VITALS_MAP, BP_TYPES, LABS_REVERSE_MAP, ICU_MAP,
+    VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP, EWS_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
-    PROCEDURE_REVERSE_MAP, SEX_MAP,
+    PROCEDURE_MAP, PROCEDURE_PREFIXES, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
 )
 
@@ -1123,6 +1123,23 @@ def _standardize_icu(raw_icu: List[dict]) -> List[dict]:
     return result
 
 
+def _standardize_ews(raw_ews: List[dict]) -> List[dict]:
+    """Convert raw EWS measurements to standardized format.
+
+    Input:  [{'timestamp': ..., 'measurement': 'EWS korr. total score', 'value': 3}, ...]
+    Output: [{'timestamp': ..., 'feature': 'EWS_SCORE', 'value': 3.0}, ...]
+    """
+    result = []
+    for e in raw_ews:
+        ts = e['timestamp']
+        measurement = e.get('measurement', e.get('feature', ''))
+        feature = EWS_MAP.get(measurement, measurement)
+        val = parse_numeric(str(e['value']))
+        if val is not None:
+            result.append({'timestamp': ts, 'feature': feature, 'value': val})
+    return result
+
+
 def _standardize_medications(raw_meds: List[dict]) -> List[dict]:
     """Convert raw ATC codes to medication category names.
 
@@ -1140,18 +1157,19 @@ def _standardize_medications(raw_meds: List[dict]) -> List[dict]:
 
 
 def _standardize_procedures(raw_procs: List[dict]) -> List[dict]:
-    """Convert raw procedure codes to category names.
+    """Convert raw procedure codes to category names via prefix matching.
 
     Input:  [{'timestamp': ..., 'code': 'KNGJ22'}, ...]
-    Output: [{'timestamp': ..., 'value': 'orto_major'}, ...]
+    Output: [{'timestamp': ..., 'value': 'orto'}, ...]
     """
     result = []
     for p in raw_procs:
         ts = p['timestamp']
         code = str(p.get('code', p.get('value', '')))
-        category = PROCEDURE_REVERSE_MAP.get(code)
-        if category is not None:
-            result.append({'timestamp': ts, 'value': category})
+        for prefix in PROCEDURE_PREFIXES:
+            if code.startswith(prefix):
+                result.append({'timestamp': ts, 'value': PROCEDURE_MAP[prefix]})
+                break
     return result
 
 
@@ -1257,6 +1275,7 @@ def prepare_from_raw_ehr(
         'medications': _standardize_medications(raw_ehr.get('medications', [])),
         'procedures': _standardize_procedures(raw_ehr.get('procedures', [])),
         'adt': _standardize_adt(raw_ehr.get('adt', [])),
+        'ews': _standardize_ews(raw_ehr.get('ews', [])),
     }
 
     return prepare_single_patient(raw_data, bundle)
