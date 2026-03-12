@@ -102,6 +102,10 @@ dataset:
       - Medicin
       - Procedurer
       - ADTHaendelser
+  cat_encoder_names:
+      Medicin: medication
+      Procedurer: procedures
+      ADTHaendelser: ADT
   cat_cols:
       - SEX
       - FIRST_HOSPITAL

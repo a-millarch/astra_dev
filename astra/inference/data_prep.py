@@ -56,6 +56,12 @@ from astra.data.mappings import (
 )
 
 
+# Keys in raw_data that are metadata, not concept event lists.
+_RAW_DATA_META_KEYS = frozenset({
+    'pid', 'admission_time', 'current_time', 'demographics',
+})
+
+
 # ============================================================================
 # Time binning
 # ============================================================================
@@ -385,15 +391,24 @@ def _build_continuous_ts(
     # Initialize with NaN (missing measurement)
     x_ts = np.full((n_channels, seq_len), np.nan, dtype=np.float64)
 
-    # Combine all point measurements into a single DataFrame
+    # Combine all continuous concept measurements into a single DataFrame.
+    # Continuous concepts have records with 'feature' key (vs categorical
+    # which only have 'value').  Classification is config-driven via
+    # ts_cat_names stored in bundle['data_config'].
+    ts_cat_names = set(data_config.get('ts_cat_names', []))
     records = []
-    for source_key in ('vitals', 'labs', 'icu'):
-        for m in raw_data.get(source_key, []):
-            records.append({
-                'timestamp': m['timestamp'],
-                'feature': m['feature'],
-                'value': m['value'],
-            })
+    for key, items in raw_data.items():
+        if key in _RAW_DATA_META_KEYS or key in ts_cat_names:
+            continue
+        if not isinstance(items, list):
+            continue
+        for m in items:
+            if 'feature' in m:
+                records.append({
+                    'timestamp': m['timestamp'],
+                    'feature': m['feature'],
+                    'value': m['value'],
+                })
 
     if records:
         measurements_df = pd.DataFrame(records)
@@ -462,14 +477,6 @@ def _build_continuous_ts(
 # Categorical time series
 # ============================================================================
 
-# Mapping from raw_data keys to encoder feature names (as used in training)
-_CAT_KEY_TO_FEATURE = {
-    'medications': 'medication',
-    'procedures': 'procedures',
-    'adt': 'ADT',
-}
-
-
 def _build_categorical_ts(
     raw_data: dict,
     bin_df: pd.DataFrame,
@@ -479,7 +486,9 @@ def _build_categorical_ts(
     Build multi-hot encoded categorical time series tensor.
 
     Constructs the multi-hot array directly using encoder internals
-    rather than building a wide-format DataFrame.
+    rather than building a wide-format DataFrame.  Categorical concepts
+    and their encoder feature names are read from the bundle's
+    ``data_config['cat_encoder_names']`` (config-driven).
 
     Returns:
         np.ndarray of shape [n_cat_dims, seq_len].
@@ -487,6 +496,7 @@ def _build_categorical_ts(
     seq_len = bundle['model_params']['seq_len']
     encoding_info = bundle['encoding_info']
     cat_encoder = bundle['cat_encoder']
+    cat_encoder_names = bundle['data_config'].get('cat_encoder_names', {})
 
     # Total categorical dimensions
     total_dim = sum(
@@ -494,15 +504,15 @@ def _build_categorical_ts(
     )
     x_ts_cat = np.zeros((total_dim, seq_len), dtype=np.float32)
 
-    for raw_key, encoder_feat_name in _CAT_KEY_TO_FEATURE.items():
-        events = raw_data.get(raw_key, [])
+    for concept_name, encoder_feat_name in cat_encoder_names.items():
+        events = raw_data.get(concept_name, [])
         if not events:
             continue
 
         # Check encoder has this feature
         if encoder_feat_name not in cat_encoder.encoders_:
             logger.warning(
-                f"Encoder has no feature '{encoder_feat_name}' — skipping {raw_key}"
+                f"Encoder has no feature '{encoder_feat_name}' — skipping {concept_name}"
             )
             continue
 
@@ -510,9 +520,12 @@ def _build_categorical_ts(
         value_to_idx = encoder_info['value_to_idx']
         dim_start, dim_end = encoding_info['feature_ranges'][encoder_feat_name]
 
+        # Detect interval vs point events from data structure
+        is_interval = 'start' in events[0]
+
         # Assign events to bins
-        if raw_key == 'adt':
-            # Interval-based events
+        if is_interval:
+            # Interval-based events (e.g. ADTHaendelser)
             intervals_df = pd.DataFrame(events)
             if intervals_df.empty:
                 continue
@@ -520,7 +533,7 @@ def _build_categorical_ts(
             intervals_df['end'] = pd.to_datetime(intervals_df['end'])
             assigned = _expand_intervals_to_bins(intervals_df, bin_df)
         else:
-            # Point events
+            # Point events (e.g. Medicin, Procedurer)
             events_df = pd.DataFrame(events)
             if events_df.empty:
                 continue
@@ -563,7 +576,7 @@ class BinCache:
 
     # {position: [(feature, value, timestamp)]}
     continuous_bins: Dict[int, list] = field(default_factory=dict)
-    # {(raw_key, position): [value]}  — raw_key is 'medications'/'procedures'/'adt'
+    # {(concept_name, position): [value]}  — concept_name from cfg['concepts']
     categorical_bins: Dict[tuple, list] = field(default_factory=dict)
     # Positions modified since the last tensor write
     dirty_continuous: set = field(default_factory=set)
@@ -577,16 +590,24 @@ def _populate_cache_from_raw_data(
 ) -> BinCache:
     """Build a :class:`BinCache` from *raw_data* (used on first creation)."""
     cache = BinCache()
+    data_config = bundle['data_config']
+    ts_cat_names = set(data_config.get('ts_cat_names', []))
+    cat_encoder_names = data_config.get('cat_encoder_names', {})
 
-    # --- continuous ---
+    # --- continuous: iterate all non-meta, non-categorical keys ---
     records = []
-    for source_key in ('vitals', 'labs', 'icu'):
-        for m in raw_data.get(source_key, []):
-            records.append({
-                'timestamp': m['timestamp'],
-                'feature': m['feature'],
-                'value': m['value'],
-            })
+    for key, items in raw_data.items():
+        if key in _RAW_DATA_META_KEYS or key in ts_cat_names:
+            continue
+        if not isinstance(items, list):
+            continue
+        for m in items:
+            if 'feature' in m:
+                records.append({
+                    'timestamp': m['timestamp'],
+                    'feature': m['feature'],
+                    'value': m['value'],
+                })
     if records:
         mdf = pd.DataFrame(records)
         mdf['timestamp'] = pd.to_datetime(mdf['timestamp'])
@@ -597,13 +618,13 @@ def _populate_cache_from_raw_data(
                 (row['feature'], row['value'], row['timestamp'])
             )
 
-    # --- categorical ---
-    _CAT_KEY_MAP = {'medications': 'medication', 'procedures': 'procedures', 'adt': 'ADT'}
-    for raw_key, _enc_name in _CAT_KEY_MAP.items():
-        events = raw_data.get(raw_key, [])
+    # --- categorical: iterate concepts from cat_encoder_names ---
+    for concept_name, _enc_name in cat_encoder_names.items():
+        events = raw_data.get(concept_name, [])
         if not events:
             continue
-        if raw_key == 'adt':
+        is_interval = 'start' in events[0]
+        if is_interval:
             idf = pd.DataFrame(events)
             if idf.empty:
                 continue
@@ -619,7 +640,7 @@ def _populate_cache_from_raw_data(
             assigned = _assign_to_bins(edf, bin_df)
         for _, row in assigned.iterrows():
             pos = int(row['position'])
-            cache.categorical_bins.setdefault((raw_key, pos), []).append(row['value'])
+            cache.categorical_bins.setdefault((concept_name, pos), []).append(row['value'])
 
     # All positions are "dirty" on first build (they will be written to tensors)
     cache.dirty_continuous = set(cache.continuous_bins.keys())
@@ -658,20 +679,23 @@ def _assign_and_cache_continuous(
 
 def _assign_and_cache_categorical(
     new_events: List[dict],
-    raw_key: str,
+    concept_name: str,
     bin_df: pd.DataFrame,
     cache: BinCache,
     bundle: dict,
 ) -> set:
     """Assign new categorical events to bins and update *cache*.
 
-    Returns the set of dirty (raw_key, position) tuples.
+    Returns the set of dirty (concept_name, position) tuples.
     """
-    _CAT_KEY_MAP = {'medications': 'medication', 'procedures': 'procedures', 'adt': 'ADT'}
+    cat_encoder_names = bundle['data_config'].get('cat_encoder_names', {})
     if not new_events:
         return set()
 
-    if raw_key == 'adt':
+    # Detect interval vs point events from data structure
+    is_interval = 'start' in new_events[0]
+
+    if is_interval:
         idf = pd.DataFrame(new_events)
         if idf.empty:
             return set()
@@ -683,13 +707,13 @@ def _assign_and_cache_categorical(
         if edf.empty:
             return set()
         edf['timestamp'] = pd.to_datetime(edf['timestamp'])
-        edf['feature'] = _CAT_KEY_MAP.get(raw_key, raw_key)
+        edf['feature'] = cat_encoder_names.get(concept_name, concept_name)
         assigned = _assign_to_bins(edf, bin_df)
 
     dirty = set()
     for _, row in assigned.iterrows():
         pos = int(row['position'])
-        key = (raw_key, pos)
+        key = (concept_name, pos)
         cache.categorical_bins.setdefault(key, []).append(row['value'])
         dirty.add(key)
 
@@ -866,12 +890,13 @@ def _build_categorical_ts_incremental(
     Multi-hot encoding is additive — new events just set additional bits.
 
     Args:
-        new_events: ``{raw_key: [event_dicts]}`` where raw_key is
-            ``'medications'``, ``'procedures'``, or ``'adt'``.
+        new_events: ``{concept_name: [event_dicts]}`` keyed by concept name
+            (e.g. ``'Medicin'``, ``'Procedurer'``, ``'ADTHaendelser'``).
     """
     seq_len = bundle['model_params']['seq_len']
     encoding_info = bundle['encoding_info']
     cat_encoder = bundle['cat_encoder']
+    cat_encoder_names = bundle['data_config'].get('cat_encoder_names', {})
 
     total_dim = sum(
         end - start for start, end in encoding_info['feature_ranges'].values()
@@ -882,22 +907,16 @@ def _build_categorical_ts_incremental(
     else:
         x_ts_cat = x_ts_cat_existing
 
-    _CAT_KEY_TO_FEATURE = {
-        'medications': 'medication',
-        'procedures': 'procedures',
-        'adt': 'ADT',
-    }
-
     # Assign new events to cache
-    for raw_key, events in new_events.items():
+    for concept_name, events in new_events.items():
         if events:
-            _assign_and_cache_categorical(events, raw_key, bin_df, cache, bundle)
+            _assign_and_cache_categorical(events, concept_name, bin_df, cache, bundle)
 
     # Write dirty positions to tensor
-    for (raw_key, pos) in cache.dirty_categorical:
+    for (concept_name, pos) in cache.dirty_categorical:
         if pos >= seq_len:
             continue
-        encoder_feat_name = _CAT_KEY_TO_FEATURE.get(raw_key)
+        encoder_feat_name = cat_encoder_names.get(concept_name)
         if encoder_feat_name is None or encoder_feat_name not in cat_encoder.encoders_:
             continue
 
@@ -905,7 +924,7 @@ def _build_categorical_ts_incremental(
         value_to_idx = encoder_info['value_to_idx']
         dim_start, _ = encoding_info['feature_ranges'][encoder_feat_name]
 
-        for val in cache.categorical_bins.get((raw_key, pos), []):
+        for val in cache.categorical_bins.get((concept_name, pos), []):
             if val in value_to_idx:
                 idx = value_to_idx[val]
                 x_ts_cat[dim_start + idx, pos] = 1.0
@@ -1257,6 +1276,7 @@ def prepare_from_raw_ehr(
     if hosp is None and raw_ehr.get('first_department'):
         hosp = derive_first_hospital(raw_ehr['first_department'])
 
+    # Map API short keys → concept names used throughout the pipeline.
     raw_data = {
         'pid': raw_ehr.get('pid'),
         'admission_time': raw_ehr['admission_time'],
@@ -1269,13 +1289,13 @@ def prepare_from_raw_ehr(
             'WEIGHT': raw_ehr.get('weight_kg'),
             'ASMT_ELIX': raw_ehr.get('elixhauser_score'),
         },
-        'vitals': _standardize_vitals(raw_ehr.get('vitals', [])),
-        'labs': _standardize_labs(raw_ehr.get('labs', [])),
-        'icu': _standardize_icu(raw_ehr.get('icu_scores', [])),
-        'medications': _standardize_medications(raw_ehr.get('medications', [])),
-        'procedures': _standardize_procedures(raw_ehr.get('procedures', [])),
-        'adt': _standardize_adt(raw_ehr.get('adt', [])),
-        'ews': _standardize_ews(raw_ehr.get('ews', [])),
+        'VitaleVaerdier': _standardize_vitals(raw_ehr.get('vitals', [])),
+        'Labsvar': _standardize_labs(raw_ehr.get('labs', [])),
+        'ITAOversigtsrapport': _standardize_icu(raw_ehr.get('icu_scores', [])),
+        'Medicin': _standardize_medications(raw_ehr.get('medications', [])),
+        'Procedurer': _standardize_procedures(raw_ehr.get('procedures', [])),
+        'ADTHaendelser': _standardize_adt(raw_ehr.get('adt', [])),
+        'EWS': _standardize_ews(raw_ehr.get('ews', [])),
     }
 
     return prepare_single_patient(raw_data, bundle)
@@ -1346,7 +1366,7 @@ def prepare_patient_from_csv(
     )
 
     # Phase 3: Convert to raw_data dict
-    raw_data = _filtered_dfs_to_raw_data(base_df, filtered_concepts, current_time)
+    raw_data = _filtered_dfs_to_raw_data(base_df, filtered_concepts, current_time, cfg)
 
     # Phase 4: Build tensors via existing prepare_single_patient
     result = prepare_single_patient(raw_data, bundle)
@@ -1664,9 +1684,89 @@ def _filter_concepts_for_patient(
 
     metadata = pd.read_csv("data/external/metadata.csv")
     filtered = {}
+    patient_cpr = base_df['CPR_hash'].iloc[0]
+
+    # Concepts that are derived from Notater (clinical notes), not raw CSVs
+    _NOTES_DERIVED_CONCEPTS = {'TraumaAssessment', 'Events'}
+    _NOTES_AUGMENTED_CONCEPTS = {'ITAOversigtsrapport'}
+    _ALL_NOTES_CONCEPTS = _NOTES_DERIVED_CONCEPTS | _NOTES_AUGMENTED_CONCEPTS
+
+    # Pre-load and filter Notater once if any notes-dependent concepts are needed
+    # (mirrors mapper.py:886-888 loading Notater.pkl once)
+    notater_inhospital = None
+    if _ALL_NOTES_CONCEPTS & set(cfg['concepts']):
+        notater_meta = metadata[metadata['filename'] == 'Notater']
+        if not notater_meta.empty:
+            try:
+                notater_raw = pd.read_csv(
+                    f"{data_dir}/Notater.csv", low_memory=False, index_col=0
+                )
+                # Pre-filter by CPR_hash to minimise memory for large files
+                if 'CPR_hash' in notater_raw.columns:
+                    notater_raw = notater_raw[notater_raw['CPR_hash'] == patient_cpr]
+                if not notater_raw.empty:
+                    n_dt = str(notater_meta['dt_colname'].iat[0])
+                    n_offset = int(notater_meta['ts_offset'].iat[0])
+                    notater_inhospital = filter_inhospital(
+                        base_df, notater_raw, cfg, n_dt, offset=n_offset
+                    )
+                    if notater_inhospital.empty:
+                        notater_inhospital = None
+                    else:
+                        logger.info(
+                            f"Loaded Notater: {len(notater_inhospital)} rows for patient"
+                        )
+            except FileNotFoundError:
+                logger.warning(
+                    "Notater CSV not found — notes-based features will be unavailable"
+                )
 
     for concept in cfg['concepts']:
-        # Get metadata for this concept
+        # --- Notes-derived concepts: built entirely from Notater, no CSV ---
+        if concept == 'TraumaAssessment':
+            # ISS + intubation from notes (mirrors mapper.py:902-914)
+            if notater_inhospital is not None and not notater_inhospital.empty:
+                from astra.data.notes_features import (
+                    build_iss_from_notes, build_intubation_from_notes,
+                )
+                filter_fn = collect_filter(concept)
+                iss_df = build_iss_from_notes(notater_inhospital)
+                intub_df = build_intubation_from_notes(notater_inhospital)
+                # Restrict intubation to within 24h of admission
+                admission_start = base_df['start'].iloc[0]
+                if not intub_df.empty:
+                    intub_df = intub_df[
+                        pd.to_datetime(intub_df['TIMESTAMP'])
+                        <= admission_start + pd.Timedelta(hours=24)
+                    ]
+                concept_filtered = pd.concat(
+                    [iss_df, intub_df], ignore_index=True
+                ).reset_index(drop=True)
+                concept_filtered = filter_fn(concept_filtered)
+                if not concept_filtered.empty:
+                    filtered[concept] = concept_filtered
+                    logger.info(
+                        f"TraumaAssessment from notes: {len(concept_filtered)} rows"
+                    )
+            else:
+                logger.info("No Notater data — skipping TraumaAssessment")
+            continue
+
+        if concept == 'Events':
+            # Cardiac arrest from notes (mirrors mapper.py:915-918)
+            if notater_inhospital is not None and not notater_inhospital.empty:
+                from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+                filter_fn = collect_filter(concept)
+                concept_filtered = build_cardiac_arrest_from_notes(notater_inhospital)
+                concept_filtered = filter_fn(concept_filtered)
+                if not concept_filtered.empty:
+                    filtered[concept] = concept_filtered
+                    logger.info(f"Events from notes: {len(concept_filtered)} rows")
+            else:
+                logger.info("No Notater data — skipping Events")
+            continue
+
+        # --- Standard concepts: loaded from raw CSV ---
         meta_row = metadata[metadata['filename'] == concept]
         if meta_row.empty:
             logger.warning(f"No metadata for concept '{concept}', skipping")
@@ -1675,13 +1775,19 @@ def _filter_concepts_for_patient(
         dt_name = str(meta_row['dt_colname'].iat[0])
         offset = int(meta_row['ts_offset'].iat[0])
 
-        # Load raw CSV
         csv_path = f"{data_dir}/{concept}.csv"
         try:
             raw_df = pd.read_csv(csv_path, low_memory=False, index_col=0)
         except FileNotFoundError:
             logger.warning(f"Raw CSV not found: {csv_path}, skipping '{concept}'")
             continue
+
+        # Pre-filter by CPR_hash to minimise memory for large population files
+        if 'CPR_hash' in raw_df.columns:
+            raw_df = raw_df[raw_df['CPR_hash'] == patient_cpr]
+            if raw_df.empty:
+                logger.info(f"No {concept} data for this patient (CPR pre-filter)")
+                continue
 
         # Time-filter to this patient's trajectory
         inhospital = filter_inhospital(base_df, raw_df, cfg, dt_name, offset=offset)
@@ -1717,6 +1823,9 @@ def _filter_concepts_for_patient(
                     ews_raw = pd.read_csv(
                         f"{data_dir}/EWS.csv", low_memory=False, index_col=0
                     )
+                    # Pre-filter by CPR_hash
+                    if 'CPR_hash' in ews_raw.columns:
+                        ews_raw = ews_raw[ews_raw['CPR_hash'] == patient_cpr]
                     ews_inhospital = filter_inhospital(
                         base_df, ews_raw, cfg, ews_dt, offset=ews_offset
                     )
@@ -1728,6 +1837,21 @@ def _filter_concepts_for_patient(
                     concept_filtered = filter_fn(inhospital)
             else:
                 concept_filtered = filter_fn(inhospital)
+        elif concept == 'ITAOversigtsrapport':
+            # Normal filter first, then augment with GCS from notes
+            # (mirrors mapper.py:895-901)
+            concept_filtered = filter_fn(inhospital)
+            if notater_inhospital is not None and not notater_inhospital.empty:
+                from astra.data.notes_features import build_gcs_from_notes
+                gcs_df = build_gcs_from_notes(notater_inhospital)
+                if not gcs_df.empty:
+                    concept_filtered = pd.concat(
+                        [concept_filtered, gcs_df], ignore_index=True
+                    )
+                    logger.info(
+                        f"Augmented ITAOversigtsrapport with "
+                        f"{len(gcs_df)} GCS values from notes"
+                    )
         else:
             concept_filtered = filter_fn(inhospital)
 
@@ -1736,12 +1860,14 @@ def _filter_concepts_for_patient(
         if patient_pids is not None and 'PID' in concept_filtered.columns:
             concept_filtered = concept_filtered[concept_filtered['PID'].isin(patient_pids)]
 
-        # Normalize PIDs and re-deduplicate.
-        # filter_vitals() concats prehospital pkl (batch PIDs) with inhospital
-        # data (inference PIDs). The dedup inside filter_vitals misses
-        # cross-source duplicates because PIDs don't match.
-        # Fix: unify PIDs and re-dedup.
-        if patient_pids is not None and 'PID' in concept_filtered.columns:
+        # Normalize PIDs and re-deduplicate (prehospital cross-source dedup).
+        # Only apply when prehospital is enabled, to avoid over-deduplication
+        # from numeric VALUE normalization in non-prehospital scenarios.
+        if (
+            cfg.get('prehospital', False)
+            and patient_pids is not None
+            and 'PID' in concept_filtered.columns
+        ):
             inference_pid = base_df['PID'].iloc[0]
             concept_filtered = concept_filtered.copy()
             concept_filtered['PID'] = inference_pid
@@ -1779,22 +1905,26 @@ def _filtered_dfs_to_raw_data(
     base_df: pd.DataFrame,
     filtered_concepts: Dict[str, pd.DataFrame],
     current_time,
+    cfg: dict,
     filter_by_time: bool = False,
 ) -> dict:
     """
     Convert filtered concept DataFrames + base_df into the raw_data dict
     format expected by prepare_single_patient().
 
-    The concept-specific filters have already standardized feature names
-    (VITALS_MAP, LABS_REVERSE_MAP, etc.), so no further name mapping is needed.
+    Uses concept names as dict keys (config-driven). Continuous vs categorical
+    classification is derived from ``cfg['dataset']['ts_cat_names']``.
+    Interval vs point events are detected from DataFrame columns.
 
     Args:
+        cfg: Configuration dictionary (needs ``dataset.ts_cat_names``).
         filter_by_time: When True, only include records with timestamps
             ``<= current_time``.  ADT intervals that started before
             *current_time* are kept but their end is clamped.
     """
     cutoff = pd.Timestamp(current_time) if filter_by_time else None
     row = base_df.iloc[0]
+    ts_cat_names = set(cfg.get('dataset', {}).get('ts_cat_names', []))
 
     raw_data = {
         'pid': row.get('PID', 1),
@@ -1803,62 +1933,43 @@ def _filtered_dfs_to_raw_data(
         # Include all base_df columns as demographics so _build_tab_df()
         # can find any tabular feature the model needs (e.g., prehospital ABCD).
         'demographics': {col: row[col] for col in row.index},
-        'vitals': [],
-        'labs': [],
-        'icu': [],
-        'medications': [],
-        'procedures': [],
-        'adt': [],
     }
 
-    # Continuous concepts: TIMESTAMP, FEATURE, VALUE → {timestamp, feature, value}
-    _CONTINUOUS_MAP = {
-        'VitaleVaerdier': 'vitals',
-        'Labsvar': 'labs',
-        'ITAOversigtsrapport': 'icu',
-    }
-    for concept, key in _CONTINUOUS_MAP.items():
-        if concept not in filtered_concepts:
+    for concept, df in filtered_concepts.items():
+        if df.empty:
             continue
-        df = filtered_concepts[concept]
+
+        is_categorical = concept in ts_cat_names
+        has_intervals = 'END_TIMESTAMP' in df.columns
+
         if cutoff is not None:
             df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
-        raw_data[key] = [
-            {'timestamp': r['TIMESTAMP'], 'feature': r['FEATURE'], 'value': r['VALUE']}
-            for _, r in df.iterrows()
-        ]
+            if has_intervals:
+                df = df.copy()
+                ends = pd.to_datetime(df['END_TIMESTAMP'])
+                df['END_TIMESTAMP'] = ends.clip(upper=cutoff)
 
-    # Categorical point events: TIMESTAMP, VALUE → {timestamp, value}
-    if 'Medicin' in filtered_concepts:
-        df = filtered_concepts['Medicin']
-        if cutoff is not None:
-            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
-        raw_data['medications'] = [
-            {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
-            for _, r in df.iterrows()
-        ]
+        if df.empty:
+            continue
 
-    if 'Procedurer' in filtered_concepts:
-        df = filtered_concepts['Procedurer']
-        if cutoff is not None:
-            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff]
-        raw_data['procedures'] = [
-            {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
-            for _, r in df.iterrows()
-        ]
-
-    # Interval events: TIMESTAMP, END_TIMESTAMP, VALUE → {start, end, value}
-    if 'ADTHaendelser' in filtered_concepts:
-        df = filtered_concepts['ADTHaendelser']
-        if cutoff is not None:
-            df = df[pd.to_datetime(df['TIMESTAMP']) <= cutoff].copy()
-            # Clamp ongoing intervals: end = min(end, cutoff)
-            ends = pd.to_datetime(df['END_TIMESTAMP'])
-            df['END_TIMESTAMP'] = ends.clip(upper=cutoff)
-        raw_data['adt'] = [
-            {'start': r['TIMESTAMP'], 'end': r['END_TIMESTAMP'], 'value': r['VALUE']}
-            for _, r in df.iterrows()
-        ]
+        if is_categorical and has_intervals:
+            # Interval events (e.g. ADTHaendelser)
+            raw_data[concept] = [
+                {'start': r['TIMESTAMP'], 'end': r['END_TIMESTAMP'], 'value': r['VALUE']}
+                for _, r in df.iterrows()
+            ]
+        elif is_categorical:
+            # Categorical point events (e.g. Medicin, Procedurer)
+            raw_data[concept] = [
+                {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
+                for _, r in df.iterrows()
+            ]
+        else:
+            # Continuous concepts (e.g. VitaleVaerdier, Labsvar, EWS, etc.)
+            raw_data[concept] = [
+                {'timestamp': r['TIMESTAMP'], 'feature': r['FEATURE'], 'value': r['VALUE']}
+                for _, r in df.iterrows()
+            ]
 
     return raw_data
 
@@ -1887,30 +1998,42 @@ def _filter_raw_data_by_time(raw_data: dict, cutoff_time) -> dict:
         'demographics': raw_data.get('demographics', {}),
     }
 
-    # Point events: keep timestamp <= cutoff
-    for key in ('vitals', 'labs', 'icu'):
-        filtered[key] = [
-            m for m in raw_data.get(key, [])
-            if pd.Timestamp(m['timestamp']) <= cutoff
-        ]
-
-    for key in ('medications', 'procedures'):
-        filtered[key] = [
-            m for m in raw_data.get(key, [])
-            if pd.Timestamp(m['timestamp']) <= cutoff
-        ]
-
-    # Interval events (ADT): keep if started, clamp end
-    filtered['adt'] = []
-    for evt in raw_data.get('adt', []):
-        start = pd.Timestamp(evt['start'])
-        if start > cutoff:
+    # Generic iteration: filter all concept event lists by time.
+    # Event type is detected from data structure:
+    #   - 'start' key → interval event (keep if started, clamp end)
+    #   - 'timestamp' key → point event (keep if timestamp <= cutoff)
+    for key, items in raw_data.items():
+        if key in _RAW_DATA_META_KEYS:
             continue
-        end = pd.Timestamp(evt['end'])
-        filtered['adt'].append({
-            'start': evt['start'],
-            'end': min(end, cutoff),
-            'value': evt['value'],
-        })
+        if not isinstance(items, list):
+            continue
+
+        if not items:
+            filtered[key] = []
+            continue
+
+        sample = items[0]
+        if 'start' in sample:
+            # Interval events: keep if started, clamp end
+            filtered[key] = []
+            for evt in items:
+                start = pd.Timestamp(evt['start'])
+                if start > cutoff:
+                    continue
+                end = pd.Timestamp(evt['end'])
+                filtered[key].append({
+                    'start': evt['start'],
+                    'end': min(end, cutoff),
+                    'value': evt['value'],
+                })
+        elif 'timestamp' in sample:
+            # Point events (continuous or categorical)
+            filtered[key] = [
+                m for m in items
+                if pd.Timestamp(m['timestamp']) <= cutoff
+            ]
+        else:
+            # Unknown event format — copy as-is
+            filtered[key] = list(items)
 
     return filtered

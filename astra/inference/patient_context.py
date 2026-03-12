@@ -23,8 +23,8 @@ Usage::
     ctx = PatientContext.create(raw_data, session.bundle)
     result = session.predict_from_context(ctx)
 
-    # Later — new data arrives
-    new_data = {'vitals': [...], 'labs': [...]}
+    # Later — new data arrives (keys are concept names)
+    new_data = {'VitaleVaerdier': [...], 'Labsvar': [...]}
     ctx.refresh(current_time="2026-02-18 14:00", new_data=new_data)
     result = session.predict_from_context(ctx)
 
@@ -215,6 +215,10 @@ class PatientContext:
         if hosp is None and raw_ehr.get('first_department'):
             hosp = derive_first_hospital(raw_ehr['first_department'])
 
+        # Map API short keys → concept names used throughout the pipeline.
+        # The external API uses readable keys (vitals, labs, etc.); internally
+        # we use concept names (VitaleVaerdier, Labsvar, etc.) for config-driven
+        # processing.
         raw_data = {
             'pid': raw_ehr.get('pid'),
             'admission_time': raw_ehr['admission_time'],
@@ -227,13 +231,13 @@ class PatientContext:
                 'WEIGHT': raw_ehr.get('weight_kg'),
                 'ASMT_ELIX': raw_ehr.get('elixhauser_score'),
             },
-            'vitals': _standardize_vitals(raw_ehr.get('vitals', [])),
-            'labs': _standardize_labs(raw_ehr.get('labs', [])),
-            'icu': _standardize_icu(raw_ehr.get('icu_scores', [])),
-            'medications': _standardize_medications(raw_ehr.get('medications', [])),
-            'procedures': _standardize_procedures(raw_ehr.get('procedures', [])),
-            'adt': _standardize_adt(raw_ehr.get('adt', [])),
-            'ews': _standardize_ews(raw_ehr.get('ews', [])),
+            'VitaleVaerdier': _standardize_vitals(raw_ehr.get('vitals', [])),
+            'Labsvar': _standardize_labs(raw_ehr.get('labs', [])),
+            'ITAOversigtsrapport': _standardize_icu(raw_ehr.get('icu_scores', [])),
+            'Medicin': _standardize_medications(raw_ehr.get('medications', [])),
+            'Procedurer': _standardize_procedures(raw_ehr.get('procedures', [])),
+            'ADTHaendelser': _standardize_adt(raw_ehr.get('adt', [])),
+            'EWS': _standardize_ews(raw_ehr.get('ews', [])),
         }
 
         return cls.create(raw_data, bundle)
@@ -296,7 +300,7 @@ class PatientContext:
         # Phase 3a: Build full trajectory raw_data (unfiltered by time)
         raw_data_full = _filtered_dfs_to_raw_data(
             base_df, filtered_concepts, current_time=current_time,
-            filter_by_time=False,
+            cfg=cfg, filter_by_time=False,
         )
 
         # Phase 3b: Build time-filtered raw_data for initial tensors
@@ -398,77 +402,84 @@ class PatientContext:
         visible_bins = min(step + 1, len(self.bin_df)) if step is not None else len(self.bin_df)
 
         # ----- Determine new measurements to process -----
+        # Classification is config-driven: ts_cat_names distinguishes
+        # categorical concepts from continuous; interval vs point is detected
+        # from data structure ('start' key = interval, 'feature' key = continuous).
+        from astra.inference.data_prep import _RAW_DATA_META_KEYS
+        ts_cat_names = set(data_config.get('ts_cat_names', []))
+
         incremental_records = []  # continuous point events
-        incremental_cat_events = {}  # {raw_key: [event_dicts]}
+        incremental_cat_events = {}  # {concept_name: [event_dicts]}
 
         if new_data is not None:
             # Real-time mode: use provided new_data (filter by time)
-            for key in ('vitals', 'labs', 'icu'):
-                entries = new_data.get(key, [])
+            for key, entries in new_data.items():
+                if key in _RAW_DATA_META_KEYS or not isinstance(entries, list):
+                    continue
                 for m in entries:
-                    if pd.Timestamp(m['timestamp']) <= new_current_time:
+                    is_interval = 'start' in m
+                    ts_val = pd.Timestamp(m['start'] if is_interval else m['timestamp'])
+                    if ts_val > new_current_time:
+                        continue
+                    if is_interval:
+                        m = dict(m)
+                        m['end'] = min(pd.Timestamp(m['end']), new_current_time)
+                    if key in ts_cat_names:
+                        incremental_cat_events.setdefault(key, []).append(m)
+                    else:
                         incremental_records.append(m)
-                        self._raw_data.setdefault(key, []).append(m)
-
-            for key in ('medications', 'procedures', 'adt'):
-                entries = new_data.get(key, [])
-                filtered_entries = []
-                for m in entries:
-                    ts_key = 'start' if key == 'adt' else 'timestamp'
-                    if pd.Timestamp(m[ts_key]) <= new_current_time:
-                        if key == 'adt':
-                            m = dict(m)
-                            m['end'] = min(pd.Timestamp(m['end']), new_current_time)
-                        filtered_entries.append(m)
-                        self._raw_data.setdefault(key, []).append(m)
-                if filtered_entries:
-                    incremental_cat_events[key] = filtered_entries
+                    self._raw_data.setdefault(key, []).append(m)
 
         elif self._full_trajectory_data is not None:
             # Simulation mode: reveal data from stored trajectory
             last_time = self._last_refresh_time or self.admission_time
             with timed_stage(self._timing, 'time_filter'):
-                for key in ('vitals', 'labs', 'icu'):
-                    for m in self._full_trajectory_data.get(key, []):
-                        ts = pd.Timestamp(m['timestamp'])
-                        if ts > last_time and ts <= new_current_time:
-                            incremental_records.append(m)
-                            self._raw_data.setdefault(key, []).append(m)
-
-                for key in ('medications', 'procedures'):
-                    entries = []
-                    for m in self._full_trajectory_data.get(key, []):
-                        ts = pd.Timestamp(m['timestamp'])
-                        if ts > last_time and ts <= new_current_time:
-                            entries.append(m)
-                            self._raw_data.setdefault(key, []).append(m)
-                    if entries:
-                        incremental_cat_events[key] = entries
-
-                # ADT: include intervals that started in (last_time, new_time]
-                # OR intervals already started that now extend into new bins
-                adt_new = []
-                for evt in self._full_trajectory_data.get('adt', []):
-                    start = pd.Timestamp(evt['start'])
-                    end = pd.Timestamp(evt['end'])
-                    if start > new_current_time:
+                for key, items in self._full_trajectory_data.items():
+                    if key in _RAW_DATA_META_KEYS or not isinstance(items, list):
                         continue
-                    if start > last_time:
-                        # New interval starting in this window
-                        clamped = dict(evt)
-                        clamped['end'] = min(end, new_current_time)
-                        adt_new.append(clamped)
-                        self._raw_data.setdefault('adt', []).append(clamped)
-                    elif end > last_time:
-                        # Ongoing interval extending into newly visible bins
-                        clamped = {
-                            'start': evt['start'],
-                            'end': min(end, new_current_time),
-                            'value': evt['value'],
-                        }
-                        adt_new.append(clamped)
-                if adt_new:
-                    incremental_cat_events['adt'] = adt_new
+                    if not items:
+                        continue
+
+                    sample = items[0]
+                    is_interval = 'start' in sample
+                    is_categorical = key in ts_cat_names
+
+                    if is_interval:
+                        # Interval events: include intervals that started in
+                        # (last_time, new_time] OR ongoing intervals extending
+                        # into newly visible bins.
+                        new_entries = []
+                        for evt in items:
+                            start = pd.Timestamp(evt['start'])
+                            end = pd.Timestamp(evt['end'])
+                            if start > new_current_time:
+                                continue
+                            if start > last_time:
+                                clamped = dict(evt)
+                                clamped['end'] = min(end, new_current_time)
+                                new_entries.append(clamped)
+                                self._raw_data.setdefault(key, []).append(clamped)
+                            elif end > last_time:
+                                clamped = {
+                                    'start': evt['start'],
+                                    'end': min(end, new_current_time),
+                                    'value': evt['value'],
+                                }
+                                new_entries.append(clamped)
+                        if new_entries:
+                            incremental_cat_events[key] = new_entries
+                    else:
+                        # Point events (continuous or categorical)
+                        new_entries = []
+                        for m in items:
+                            ts = pd.Timestamp(m['timestamp'])
+                            if ts > last_time and ts <= new_current_time:
+                                new_entries.append(m)
+                                self._raw_data.setdefault(key, []).append(m)
+                        if is_categorical and new_entries:
+                            incremental_cat_events[key] = new_entries
+                        elif new_entries:
+                            incremental_records.extend(new_entries)
 
         self.current_time = new_current_time
         self._raw_data['current_time'] = self.current_time

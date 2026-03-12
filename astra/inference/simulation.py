@@ -552,7 +552,10 @@ def _generate_bin_aligned_times(
 
 def _count_raw_data(raw_data: dict) -> int:
     """Total record count across all event types in raw_data."""
+    from astra.inference.data_prep import _RAW_DATA_META_KEYS
     total = 0
-    for key in ('vitals', 'labs', 'icu', 'medications', 'procedures', 'adt'):
-        total += len(raw_data.get(key, []))
+    for key, items in raw_data.items():
+        if key in _RAW_DATA_META_KEYS or not isinstance(items, list):
+            continue
+        total += len(items)
     return total
