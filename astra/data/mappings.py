@@ -399,6 +399,7 @@ VITALS_BOUNDS: Dict[str, Tuple[float, float]] = {
     "HR":              (0.0, 250.0),
     "SPO2":            (0.0, 100.0),
     "RESPIRATORYRATE": (0.0, 80.0),
+    "TEMP":            (25.0, 43.0),
     "HEIGHT":          (50.0, 230.0),
     "WEIGHT":          (2.0, 300.0),
 }
