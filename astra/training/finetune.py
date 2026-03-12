@@ -503,7 +503,7 @@ def train_one_epoch(
         if enable_masking and torch.rand(1).item() < masking_prob:
             x_ts = inputs[0]
             x_ts = _apply_progressive_time_masking(x_ts, min_timesteps=min_timesteps)
-            inputs = (x_ts,) + inputs[1:]
+            inputs = [x_ts] + inputs[1:]
 
         optimizer.zero_grad()
         logits = model(inputs)
