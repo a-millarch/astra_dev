@@ -1059,16 +1059,31 @@ def _get_long_concept_df_single_label(
         
         # Pivot the dataframe (safe because single-label = no duplicates)
         pivoted_df = df.pivot(
-            index=["PID", "FEATURE"], 
-            columns="bin_counter", 
+            index=["PID", "FEATURE"],
+            columns="bin_counter",
             values="VALUE"
         )
-        
+
         pivoted_df = pivoted_df.reset_index()
         pivoted_df.columns.name = None
-        pivoted_df.columns = ["PID", "FEATURE"] + [
-            f"{i}" for i in range(len(pivoted_df.columns) - 2)
+        # Rename counter columns to 0-based positions (counter - 1).
+        # Using sequential range(len) is WRONG for sparse concepts where
+        # not all bin_counters appear across the population — missing
+        # columns collapse the grid and shift positions.
+        counter_cols = pivoted_df.columns[2:]  # bin_counter values (ints)
+        pivoted_df.columns = list(pivoted_df.columns[:2]) + [
+            f"{int(c) - 1}" for c in counter_cols
         ]
+        # Ensure all positions from 0..max exist (fill missing with NaN)
+        max_pos = max(int(c) - 1 for c in counter_cols)
+        all_pos_cols = [f"{i}" for i in range(max_pos + 1)]
+        missing_cols = [c for c in all_pos_cols if c not in pivoted_df.columns]
+        if missing_cols:
+            for c in missing_cols:
+                pivoted_df[c] = np.nan
+            pivoted_df = pivoted_df[
+                list(pivoted_df.columns[:2]) + all_pos_cols
+            ]
         
         pivoted_df = pivoted_df.sort_values(["PID", "FEATURE"]).reset_index(drop=True)
         
