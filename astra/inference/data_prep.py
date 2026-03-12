@@ -498,6 +498,17 @@ def _build_categorical_ts(
     cat_encoder = bundle['cat_encoder']
     cat_encoder_names = bundle['data_config'].get('cat_encoder_names', {})
 
+    if not cat_encoder_names:
+        logger.warning(
+            "Bundle has NO cat_encoder_names — categorical TS will be all zeros! "
+            "Regenerate bundle with updated save_deployment_bundle()."
+        )
+
+    logger.info(
+        f"_build_categorical_ts: cat_encoder_names={cat_encoder_names}, "
+        f"raw_data keys={[k for k in raw_data if k not in _RAW_DATA_META_KEYS]}"
+    )
+
     # Total categorical dimensions
     total_dim = sum(
         end - start for start, end in encoding_info['feature_ranges'].values()
@@ -507,6 +518,7 @@ def _build_categorical_ts(
     for concept_name, encoder_feat_name in cat_encoder_names.items():
         events = raw_data.get(concept_name, [])
         if not events:
+            logger.info(f"  {concept_name}: no events in raw_data")
             continue
 
         # Check encoder has this feature
@@ -543,9 +555,12 @@ def _build_categorical_ts(
             assigned = _assign_to_bins(events_df, bin_df)
 
         if assigned.empty:
+            logger.info(f"  {concept_name}: {len(events)} events but none assigned to bins")
             continue
 
         # Set multi-hot values
+        n_matched = 0
+        n_unknown = 0
         for _, row in assigned.iterrows():
             pos = int(row['position'])
             if pos >= seq_len:
@@ -554,11 +569,18 @@ def _build_categorical_ts(
             if val in value_to_idx:
                 idx = value_to_idx[val]
                 x_ts_cat[dim_start + idx, pos] = 1.0
+                n_matched += 1
             else:
+                n_unknown += 1
                 logger.debug(f"Unknown category '{val}' for {encoder_feat_name} — skipping")
 
-    logger.debug("_build_categorical_ts: shape=%s total_dim=%d",
-                 x_ts_cat.shape, x_ts_cat.shape[0])
+        logger.info(
+            f"  {concept_name}: {len(events)} events → {len(assigned)} assigned → "
+            f"{n_matched} encoded, {n_unknown} unknown"
+        )
+
+    nonzero = int(np.count_nonzero(x_ts_cat))
+    logger.info(f"_build_categorical_ts: shape={x_ts_cat.shape} nonzero={nonzero}")
     return x_ts_cat
 
 
