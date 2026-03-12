@@ -8,7 +8,7 @@ from astra.utils import cfg, get_base_df, mark_keywords_in_df, ensure_parent_dir
 from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_to_kg
 
 from astra.data.mappings import (
-    VITALS_MAP, TEMP_FAHRENHEIT,BP_TYPES, HEIGHT_WEIGHT_MAP,
+    VITALS_MAP, VITALS_BOUNDS, TEMP_FAHRENHEIT, BP_TYPES, HEIGHT_WEIGHT_MAP,
     EWS_TO_VITAL_PARAMETRE,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
     ICU_MAP, EWS_MAP,
@@ -219,12 +219,37 @@ def filter_vitals(vit, ews=None):
     vit["FEATURE"] = vit["FEATURE"].replace(to_replace=HEIGHT_WEIGHT_MAP)
     vit.loc[vit.FEATURE == 'HEIGHT', 'VALUE'] = inches_to_cm(vit[vit.FEATURE == 'HEIGHT'].VALUE.astype(float))
     vit.loc[vit.FEATURE == 'WEIGHT','VALUE'] = ounces_to_kg(vit[vit.FEATURE == 'WEIGHT'].VALUE.astype(float))
-    vit[(vit.FEATURE.isin(list(set(HEIGHT_WEIGHT_MAP.values()))))]
+
+    # Apply bounds to HEIGHT/WEIGHT before they are filtered out by VITALS_MAP
+    for feat in HEIGHT_WEIGHT_MAP.values():
+        if feat in VITALS_BOUNDS:
+            lo, hi = VITALS_BOUNDS[feat]
+            mask = vit["FEATURE"] == feat
+            numeric_vals = pd.to_numeric(vit.loc[mask, "VALUE"], errors="coerce")
+            invalid = mask & ((numeric_vals < lo) | (numeric_vals > hi))
+            n_invalid = invalid.sum()
+            if n_invalid > 0:
+                logger.info(f"Vitals bounds: removed {n_invalid} {feat} values outside [{lo}, {hi}]")
+                vit = vit[~invalid]
 
     pattern = r'([<>]\s*)?[-+]?\d*\.\d+|\d+\.?\d*'
     vit = vit[(vit.FEATURE.isin(list(set(VITALS_MAP.values()))))
                 & (vit.VALUE.notnull())
                & ((vit['VALUE'].str.contains(pattern, regex=True) ) | (vit['VALUE'].dtype==float))].copy(deep=True)
+
+    # Apply physiological bounds — remove out-of-range values
+    n_before_bounds = len(vit)
+    vit["_numeric"] = pd.to_numeric(vit["VALUE"], errors="coerce")
+    for feat, (lo, hi) in VITALS_BOUNDS.items():
+        mask = vit["FEATURE"] == feat
+        if mask.any():
+            invalid = mask & ((vit["_numeric"] < lo) | (vit["_numeric"] > hi))
+            n_invalid = invalid.sum()
+            if n_invalid > 0:
+                logger.info(f"Vitals bounds: removed {n_invalid} {feat} values outside [{lo}, {hi}]")
+                vit = vit[~invalid]
+    vit = vit.drop(columns=["_numeric"]).reset_index(drop=True)
+    logger.info(f"Vitals bounds: {n_before_bounds} → {len(vit)} rows ({n_before_bounds - len(vit)} removed)")
 
     # Concat pre-hospital vitals when enabled
     if cfg.get("prehospital") and is_file_present("data/interim/prehospital_VitaleVaerdier.pkl"):
