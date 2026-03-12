@@ -1861,8 +1861,11 @@ def _filter_concepts_for_patient(
             concept_filtered = concept_filtered[concept_filtered['PID'].isin(patient_pids)]
 
         # Normalize PIDs and re-deduplicate (prehospital cross-source dedup).
-        # Only apply when prehospital is enabled, to avoid over-deduplication
-        # from numeric VALUE normalization in non-prehospital scenarios.
+        # Only needed when prehospital is enabled, since hospital CSV and
+        # prehospital PKL may contribute overlapping measurements.
+        # NOTE: We do NOT normalize VALUE types (string vs float) because
+        # the batch pipeline preserves type distinction during dedup —
+        # normalizing would over-deduplicate and lose measurements.
         if (
             cfg.get('prehospital', False)
             and patient_pids is not None
@@ -1874,12 +1877,6 @@ def _filter_concepts_for_patient(
 
             dedup_cols = ['PID', 'TIMESTAMP', 'FEATURE', 'VALUE']
             if all(c in concept_filtered.columns for c in dedup_cols):
-                # Normalize numeric VALUE strings for consistent dedup
-                # (pkl may store "72.0", CSV may store "72")
-                numeric = pd.to_numeric(concept_filtered['VALUE'], errors='coerce')
-                mask = numeric.notna()
-                concept_filtered.loc[mask, 'VALUE'] = numeric[mask].astype(str)
-
                 n_before = len(concept_filtered)
                 concept_filtered = concept_filtered.drop_duplicates(
                     subset=dedup_cols, keep='first'
