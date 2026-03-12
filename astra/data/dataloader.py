@@ -101,7 +101,7 @@ def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
     return X_normalized
 
 
-def get_trajectory_lengths(X, padding_value=0.0):
+def get_trajectory_lengths(X, padding_value=0.0, exclude_channels=None):
     """
     Get the actual trajectory length for each sample (last timestep with data).
 
@@ -112,11 +112,20 @@ def get_trajectory_lengths(X, padding_value=0.0):
     Args:
         X: Array of shape [n_samples, n_channels, seq_len]
         padding_value: Value used for padding (typically 0.0)
+        exclude_channels: Optional list of channel indices to ignore when
+            determining trajectory length.  Used to prevent derived channels
+            (e.g. EBM predictions) from artificially extending the trajectory
+            beyond where clinical measurements exist.
 
     Returns:
         trajectory_lengths: Array [n_samples] with length of each trajectory
     """
     n_samples, n_channels, seq_len = X.shape
+
+    # Exclude specified channels (e.g. EBM) so they cannot inflate trajectory length
+    if exclude_channels:
+        keep = [c for c in range(n_channels) if c not in exclude_channels]
+        X = X[:, keep, :]
 
     # A value is "absent" if NaN or equal to padding_value
     is_absent = np.isnan(X) | np.isclose(X, padding_value, atol=1e-8)
@@ -312,8 +321,12 @@ def prepare_data_and_dls(cfg):
     # 1. CONTINUOUS TIME SERIES SCALER
     ts_scaler = StandardScaler()
 
-    # Get trajectory lengths (works with NaN for missing measurements)
-    traj_lengths = get_trajectory_lengths(X, padding_value=0.0)
+    # Get trajectory lengths (works with NaN for missing measurements).
+    # Exclude EBM channel so forward-filled predictions cannot extend
+    # the trajectory beyond where clinical measurements exist.
+    ebm_enabled = cfg.get('ebm_feature', {}).get('enabled', False)
+    traj_exclude_chs = [ebm_channel_idx] if ebm_enabled else None
+    traj_lengths = get_trajectory_lengths(X, padding_value=0.0, exclude_channels=traj_exclude_chs)
     logger.info(f'Trajectory lengths - min: {traj_lengths.min()}, max: {traj_lengths.max()}, '
                f'mean: {traj_lengths.mean():.1f}')
 
@@ -442,7 +455,7 @@ def prepare_data_and_dls(cfg):
     # ============================================================================
     logger.info("Applying normalization to holdout (preserving padding)...")
 
-    holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0)
+    holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0, exclude_channels=traj_exclude_chs)
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
                f'max: {holdout_traj_lengths.max()}, mean: {holdout_traj_lengths.mean():.1f}')
 
@@ -591,14 +604,14 @@ def load_normalization_artifacts(model_name, load_dir='models/scalers'):
     return artifacts
 
 
-def normalize_new_patient(patient_ts_data, patient_tab_data, artifacts):
+def normalize_new_patient(patient_ts_data, patient_tab_data, artifacts, exclude_channels=None):
     """
     Apply saved normalization to new patient data, preserving padding.
     """
     if patient_ts_data.ndim == 2:
         patient_ts_data = patient_ts_data[np.newaxis, ...]
 
-    traj_lens = get_trajectory_lengths(patient_ts_data, padding_value=0.0)
+    traj_lens = get_trajectory_lengths(patient_ts_data, padding_value=0.0, exclude_channels=exclude_channels)
     ts_normalized = normalize_with_padding_mask(
         patient_ts_data,
         artifacts['ts_scaler'],
@@ -748,6 +761,7 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'channel_map': _build_channel_map(ts_channel_names, cfg),
             'ts_cat_names': list(cfg['dataset'].get('ts_cat_names', [])),
             'temporal_features': cfg.get('temporal_features', {}),
+            'ebm_channel_idx': data.get('ebm_channel_idx'),
         },
 
         # --- Metadata ---

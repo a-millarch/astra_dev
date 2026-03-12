@@ -195,9 +195,14 @@ class InferenceSession:
                 if col in tab_df.columns and pd.isna(tab_df[col].iloc[0]):
                     tab_df.loc[tab_df.index[0], col] = tab_scaler.mean_[i]
 
+        # Exclude EBM channel from trajectory length computation so forward-filled
+        # predictions cannot extend the trajectory beyond clinical measurements.
+        ebm_ch_idx = self.bundle.get('data_config', {}).get('ebm_channel_idx')
+        traj_exclude_chs = [ebm_ch_idx] if ebm_ch_idx is not None else None
+
         # Normalize continuous TS + tabular using saved scalers
         ts_norm, tab_norm = normalize_new_patient(
-            x_ts, tab_df, self.bundle
+            x_ts, tab_df, self.bundle, exclude_channels=traj_exclude_chs
         )
 
         # Restore raw elapsed_hours — sinusoidal PE requires actual hours (0–720),
@@ -210,7 +215,7 @@ class InferenceSession:
         if trajectory_length is not None:
             traj_len = int(trajectory_length)
         else:
-            traj_len = int(get_trajectory_lengths(x_ts)[0])
+            traj_len = int(get_trajectory_lengths(x_ts, exclude_channels=traj_exclude_chs)[0])
 
         # Convert to tensors
         x_ts_t = torch.from_numpy(ts_norm).float().to(self.device)
