@@ -194,14 +194,14 @@ def _assign_to_bins(
     # searchsorted: find which bin each timestamp falls into
     indices = np.searchsorted(bin_starts, timestamps, side='right') - 1
 
-    # Validate: index in range and timestamp < bin_end
+    # Validate: index in range and timestamp < bin_end (strict, matching batch pipeline)
     valid_mask = (indices >= 0) & (indices < len(bin_df))
     valid_idx = np.where(valid_mask)[0]
 
     if len(valid_idx) == 0:
         return measurements.assign(position=pd.Series(dtype=int)).iloc[0:0]
 
-    within_bin = timestamps[valid_idx] <= bin_ends[indices[valid_idx]]
+    within_bin = timestamps[valid_idx] < bin_ends[indices[valid_idx]]
     final_idx = valid_idx[within_bin]
 
     if len(final_idx) == 0:

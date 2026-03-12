@@ -14,8 +14,8 @@ from astra.data.collectors import collect_subsets
 import astra.data.build_patient_info as bpi
 from astra.data.filters import filter_subsets_inhospital, mark_traumatext
 from astra.data.mapper import map_concept, map_concept_optimized
+from astra.data.caching import prepare_data_and_dls_cached
 
-from astra.data.datasets import TSDS
 
 def generate_base_df():
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
@@ -176,7 +176,5 @@ if __name__ =='__main__':
 
     # Forward-fill TraumaAssessment (semi-static features)
     _forward_fill_concept(cfg, "TraumaAssessment")
-
-    logger.info("Creating TSDS")
-    tsds = TSDS(cfg, base)
-    logger.info(tsds.concepts.keys())
+  
+    data = prepare_data_and_dls_cached(cfg)
