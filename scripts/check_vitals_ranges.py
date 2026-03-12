@@ -16,13 +16,13 @@ from astra.utils import cfg
 # ── Proposed physiological bounds per feature ──────────────────────────
 # Adjust these as you see fit before re-running
 PROPOSED_BOUNDS = {
-    "SBP":             (20, 300),
-    "DBP":             (10, 200),
-    "MAP":             (20, 300),
-    "HR":              (10, 300),
-    "SPO2":            (20, 100),
-    "RESPIRATORYRATE": (2, 80),
-    "TEMP":            (25, 45),
+    "SBP":             (0, 300),
+    "DBP":             (0, 200),
+    "MAP":             (0, 300),
+    "HR":              (0, 300),
+    "SPO2":            (0, 100),
+    "RESPIRATORYRATE": (0, 80),
+    "TEMP":            (0, 45),
 }
 
 def main():
