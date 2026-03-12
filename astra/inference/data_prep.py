@@ -49,7 +49,7 @@ def timed_stage(timing_dict: dict, stage_name: str):
     timing_dict.setdefault(stage_name, []).append(time.perf_counter() - start)
 
 from astra.data.mappings import (
-    VITALS_MAP, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP, EWS_MAP,
+    VITALS_MAP, VITALS_BOUNDS, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP, EWS_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
     PROCEDURE_MAP, PROCEDURE_PREFIXES, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
@@ -1125,6 +1125,16 @@ def _standardize_vitals(raw_vitals: List[dict]) -> List[dict]:
         val = parse_numeric(value_str)
         if val is not None:
             result.append({'timestamp': ts, 'feature': feature, 'value': val})
+
+    # Apply physiological bounds (same as batch pipeline in filters.py)
+    n_before = len(result)
+    result = [
+        r for r in result
+        if r['feature'] not in VITALS_BOUNDS
+        or VITALS_BOUNDS[r['feature']][0] <= r['value'] <= VITALS_BOUNDS[r['feature']][1]
+    ]
+    if len(result) < n_before:
+        logger.debug(f"Vitals bounds: removed {n_before - len(result)} out-of-range values")
 
     return result
 

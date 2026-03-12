@@ -63,10 +63,6 @@ cover/
 *.mo
 *.pot
 
-# Claude
-CLAUDE.md
-.claude
-
 # Django stuff:
 *.log
 local_settings.py

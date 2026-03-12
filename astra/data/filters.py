@@ -364,7 +364,20 @@ def filter_ews(ews):
         inplace=True,
     )
     ews["FEATURE"] = ews["FEATURE"].replace(to_replace=EWS_MAP)
-    return ews
+
+    # Coerce VALUE to numeric (EWS_SCORE is numeric; string would cause
+    # lexicographic aggregation in mapper, e.g. "9" > "10")
+    ews["VALUE"] = pd.to_numeric(ews["VALUE"], errors="coerce")
+    ews = ews.dropna(subset=["VALUE"])
+
+    # Deduplicate (consistent with filter_vitals pattern)
+    ews = ews.drop_duplicates(
+        subset=["PID", "TIMESTAMP", "FEATURE", "VALUE"],
+        keep="first"
+    ).reset_index(drop=True)
+
+    logger.info(f"Using {len(ews)} EWS score observations")
+    return ews[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 
 def filter_trauma_assessment(df):
