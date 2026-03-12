@@ -10,8 +10,8 @@ sys.path.insert(0, ".")
 import pandas as pd
 import numpy as np
 from astra.data.filters import filter_vitals
-from astra.data.mappings import VITALS_MAP
-from astra.utils import cfg
+from astra.data.mappings import VITALS_MAP, HEIGHT_WEIGHT_MAP
+from astra.utils import cfg, inches_to_cm, ounces_to_kg
 
 # ── Proposed physiological bounds per feature ──────────────────────────
 # Adjust these as you see fit before re-running
@@ -23,6 +23,8 @@ PROPOSED_BOUNDS = {
     "SPO2":            (0, 100),
     "RESPIRATORYRATE": (0, 80),
     "TEMP":            (0, 45),
+    "HEIGHT":          (50, 230),
+    "WEIGHT":          (2, 300),
 }
 
 def main():
@@ -38,9 +40,23 @@ def main():
     except FileNotFoundError:
         print("No EWS file found, skipping EWS augmentation\n")
 
+    # Extract HEIGHT/WEIGHT before filter_vitals drops them
+    # (filter_vitals only keeps VITALS_MAP features, not HEIGHT_WEIGHT_MAP)
+    raw_vit = vit.copy()
+    raw_vit.rename(columns={"Værdi": "VALUE", "Vital_parametre": "FEATURE", "Registreringstidspunkt": "TIMESTAMP"}, inplace=True)
+    raw_vit["FEATURE"] = raw_vit["FEATURE"].replace(to_replace=HEIGHT_WEIGHT_MAP)
+    hw = raw_vit[raw_vit["FEATURE"].isin(HEIGHT_WEIGHT_MAP.values())][["TIMESTAMP", "PID", "FEATURE", "VALUE"]].copy()
+    hw["VALUE"] = pd.to_numeric(hw["VALUE"], errors="coerce")
+    hw.loc[hw.FEATURE == "HEIGHT", "VALUE"] = inches_to_cm(hw.loc[hw.FEATURE == "HEIGHT", "VALUE"])
+    hw.loc[hw.FEATURE == "WEIGHT", "VALUE"] = ounces_to_kg(hw.loc[hw.FEATURE == "WEIGHT", "VALUE"])
+    hw["VALUE"] = hw["VALUE"].astype(str)
+
     # Apply filter_vitals (same as make_data pipeline)
     vit = filter_vitals(vit, ews=ews)
     print(f"After filter_vitals: {len(vit):,} rows\n")
+
+    # Append HEIGHT/WEIGHT
+    vit = pd.concat([vit, hw], ignore_index=True)
 
     # Convert VALUE to numeric
     vit["VALUE_NUM"] = pd.to_numeric(vit["VALUE"], errors="coerce")

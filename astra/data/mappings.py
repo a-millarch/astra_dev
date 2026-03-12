@@ -391,6 +391,18 @@ PPJ_ABCD_MAP: Dict[str, str] = {
     "D: Bevidsthedsniveau": "D",
 }
 
+# Outlier bounds for in-hospital vital signs
+VITALS_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "SBP":             (0.0, 300.0),
+    "DBP":             (0.0, 200.0),
+    "MAP":             (0.0, 300.0),
+    "HR":              (0.0, 300.0),
+    "SPO2":            (0.0, 100.0),
+    "RESPIRATORYRATE": (0.0, 80.0),
+    "HEIGHT":          (50.0, 230.0),
+    "WEIGHT":          (2.0, 300.0),
+}
+
 # Outlier bounds for PPJ vital signs (same as triAIge clean_sequentials)
 PPJ_VITAL_BOUNDS: Dict[str, Tuple[float, float]] = {
     "HR": (0.0, 220.0),
