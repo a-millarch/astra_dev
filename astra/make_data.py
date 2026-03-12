@@ -162,8 +162,8 @@ if __name__ =='__main__':
     else:
         bpi.create_bin_df(cfg, base=base)
 
-    # Raw data + inhospital filtering are deterministic from source — never overwrite
-    proces_inhospital_concepts(cfg, reset=False)
+    # Inhospital filtering depends on base_df — must reset when overwriting
+    proces_inhospital_concepts(cfg, reset=overwrite)
 
     # Mark trauma text keywords on base (requires Notater.pkl from step above)
     if cfg.get("traumatext_config", {}).get("enabled", False):

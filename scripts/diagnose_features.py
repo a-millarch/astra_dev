@@ -1,8 +1,7 @@
 """
-Extended diagnostic: compare ALL model inputs (tabular + categorical TS)
-between batch training pipeline and from-CSV inference pipeline.
+Extended diagnostic: compare ALL model inputs (tabular, continuous TS,
+categorical TS) between batch training pipeline and from-CSV inference pipeline.
 
-Run after the existing diagnostic confirms continuous TS matches.
 Requires: data cache loaded, session loaded, PatientContext built.
 
 Usage (in notebook after existing diagnostic):
@@ -143,7 +142,58 @@ def compare_all_features(data, session, ctx, cpr_hash):
                     print(f"    step {s}: batch={int(x_ts_cat_b[dim, s])} "
                           f"inf={int(x_ts_cat_i[dim, s])}")
 
-    # ---- 7. Direct model forward pass comparison ----
+    # ---- 7. Compare continuous TS ----
+    print(f"\n{'='*50}")
+    print("CONTINUOUS TS")
+    print(f"{'='*50}")
+    ts_channel_names = session.bundle.get('ts_channel_names', [])
+    print(f"Shape: batch={x_ts_b.shape} inf={x_ts_i.shape}")
+    ts_diff = (x_ts_b[:, :traj].float() - x_ts_i[:, :traj].float()).abs()
+    n_ts_diff = int((ts_diff > 1e-4).sum())
+    print(f"Max diff: {ts_diff.max():.6f}, Positions with diff (>1e-4): {n_ts_diff}")
+
+    # Per-channel summary
+    n_channels = x_ts_b.shape[0]
+    channels_ok = 0
+    channels_diff = []
+    for ch in range(n_channels):
+        ch_name = ts_channel_names[ch] if ch < len(ts_channel_names) else f"ch_{ch}"
+        ch_diff = ts_diff[ch]  # [traj]
+        ch_max = float(ch_diff.max())
+        ch_n_diff = int((ch_diff > 1e-4).sum())
+        if ch_n_diff == 0:
+            channels_ok += 1
+        else:
+            channels_diff.append((ch, ch_name, ch_max, ch_n_diff))
+
+    print(f"Channels matching: {channels_ok}/{n_channels}")
+    if channels_diff:
+        print(f"Channels with differences:")
+        for ch, ch_name, ch_max, ch_n_diff in channels_diff:
+            # Count non-zero values in each to understand sparsity
+            b_nonzero = int((x_ts_b[ch, :traj].abs() > 1e-6).sum())
+            i_nonzero = int((x_ts_i[ch, :traj].abs() > 1e-6).sum())
+            print(f"  {ch_name} (ch={ch}): max_diff={ch_max:.6f}, "
+                  f"n_diff={ch_n_diff}/{traj}, "
+                  f"nonzero batch={b_nonzero} inf={i_nonzero}")
+            # Show first few differing timesteps
+            diff_steps = torch.where(ch_diff > 1e-4)[0].tolist()
+            for s in diff_steps[:5]:
+                print(f"    step {s}: batch={float(x_ts_b[ch, s]):.6f} "
+                      f"inf={float(x_ts_i[ch, s]):.6f} "
+                      f"diff={float(ch_diff[s]):.6f}")
+            if len(diff_steps) > 5:
+                print(f"    ... and {len(diff_steps) - 5} more steps")
+
+    # Check padding region (beyond shared trajectory)
+    if traj < x_ts_b.shape[1] or traj < x_ts_i.shape[1]:
+        b_pad_nonzero = int((x_ts_b[:, traj:].abs() > 1e-6).sum()) if traj < x_ts_b.shape[1] else 0
+        i_pad_nonzero = int((x_ts_i[:, traj:].abs() > 1e-6).sum()) if traj < x_ts_i.shape[1] else 0
+        if b_pad_nonzero > 0 or i_pad_nonzero > 0:
+            print(f"  WARNING: non-zero values in padding region: "
+                  f"batch={b_pad_nonzero} inf={i_pad_nonzero}")
+
+    # ---- 8. Direct model forward pass comparison ----
     print(f"\n{'='*50}")
     print("MODEL PREDICTIONS (direct forward pass)")
     print(f"{'='*50}")
@@ -173,7 +223,7 @@ def compare_all_features(data, session, ctx, cpr_hash):
     print(f"Inference tensors: P={p_i:.6f} (traj_len={traj_i})")
     print(f"Difference:        {abs(p_b - p_i):.6f}")
 
-    # ---- 8. Hybrid test: batch tensors but swap in inference tabular ----
+    # ---- 9. Hybrid tests: swap individual components to isolate impact ----
     if not cat_match or (x_cont_b.numel() > 0 and cont_diff.max() > 1e-4):
         print(f"\n{'='*50}")
         print("HYBRID: batch TS + inference tabular")
@@ -211,3 +261,22 @@ def compare_all_features(data, session, ctx, cpr_hash):
                 p_h2 = float(torch.softmax(logits_h2, dim=1)[0, 1])
         print(f"Hybrid prediction: P={p_h2:.6f}")
         print(f"  vs batch P={p_b:.6f} (diff={abs(p_b - p_h2):.6f})")
+
+    if n_ts_diff > 0:
+        print(f"\n{'='*50}")
+        print("HYBRID: inference continuous TS + batch everything else")
+        print(f"{'='*50}")
+        with torch.no_grad():
+            logits_h3 = session.model((
+                x_ts_i.unsqueeze(0).float().to(device),
+                (x_cat_b.unsqueeze(0).to(device),
+                 x_cont_b.unsqueeze(0).float().to(device)),
+                x_ts_cat_b.unsqueeze(0).float().to(device),
+                traj_b.unsqueeze(0).to(device),
+            ))
+            if session.is_temporal:
+                p_h3 = float(torch.sigmoid(logits_h3)[0, traj - 1])
+            else:
+                p_h3 = float(torch.softmax(logits_h3, dim=1)[0, 1])
+        print(f"Hybrid prediction: P={p_h3:.6f}")
+        print(f"  vs batch P={p_b:.6f} (diff={abs(p_b - p_h3):.6f})")
