@@ -249,6 +249,9 @@ def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFra
     For intubated patients: first note where intubation matches.
     For others: first note of given type.
     """
+    if notes.empty:
+        return pd.DataFrame(columns=["PID", "intubated", "Redigeringstidspunkt"])
+
     subset = (
         notes[notes["Notetype"].isin(notetypes)]
         .fillna({"Note": ""})
