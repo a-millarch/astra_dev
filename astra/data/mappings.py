@@ -43,7 +43,6 @@ HEIGHT_WEIGHT_MAP = {
 # These are then standardized by VITALS_MAP in filter_vitals()
 EWS_TO_VITAL_PARAMETRE = {
     "SAT (score)": "Saturation",
-    "Puls score": "Puls",
     "Temp. (score)": "Temperatur",
     "BT (score)": "BT",
     "RF (score)": "Resp.frekvens",
