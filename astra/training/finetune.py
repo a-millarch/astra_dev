@@ -781,7 +781,7 @@ def run_finetune_v2(
     y_arr = np.array(data["y"])
     n_pos = y_arr.sum()
     n_neg = len(y_arr) - n_pos
-    imbalance_ratio = n_neg / max(n_pos, 1)
+    imbalance_ratio = float(n_neg / max(n_pos, 1))
     logger.info(f"Class distribution: {int(n_neg)} neg / {int(n_pos)} pos "
                 f"(ratio={imbalance_ratio:.1f}:1)")
 
@@ -799,10 +799,14 @@ def run_finetune_v2(
     else:
         # Standard head: weighted cross-entropy for class imbalance
         factor = finetune_cfg.pos_weight_factor
-        cw = torch.tensor([1.0, imbalance_ratio * factor], device=device)
-        phase_kwargs = dict(class_weights=cw)
-        logger.info(f"Standard head: class_weights={cw.tolist()} "
-                     f"(pos_weight_factor={factor})")
+        if factor > 0:
+            cw = torch.tensor([1.0, imbalance_ratio * factor], device=device)
+            phase_kwargs = dict(class_weights=cw)
+            logger.info(f"Standard head: class_weights={cw.tolist()} "
+                         f"(pos_weight_factor={factor})")
+        else:
+            phase_kwargs = dict(class_weights=None)
+            logger.info("Standard head: no class weighting (pos_weight_factor=0)")
 
     # ========================================================================
     # 4. Phase 1: Head-only training

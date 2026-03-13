@@ -221,7 +221,7 @@ finetune:
     label_smoothing: 0.1
 
     # Class imbalance
-    pos_weight_factor: 0.7       # scale factor for positive class weight (n_neg/n_pos * factor)
+    pos_weight_factor: 0.0       # scale factor for positive class weight (n_neg/n_pos * factor)
 
     # Validation / early stopping
     patience: 7

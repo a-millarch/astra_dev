@@ -185,62 +185,96 @@ class AstraScaler:
         return dict(Counter(self.channel_methods_.values()))
 
 
-def _create_adaptive_tab_scaler(tab_df, num_cols, norm_cfg):
-    """Create a per-column adaptive tabular scaler using sklearn ColumnTransformer.
+class AdaptiveTabScaler:
+    """Per-column adaptive tabular scaler.  Pickle-safe.
 
-    Selects normalization method per tabular numeric column based on
-    skewness/kurtosis, matching AstraScaler adaptive thresholds.
-
-    The returned transformer exposes a ``.mean_`` attribute for backward
-    compatibility with the inference pipeline's missing-value fill logic.
+    Selects normalization method per column based on skewness/kurtosis
+    (same thresholds as ``AstraScaler``).  Exposes ``.mean_`` for the
+    inference pipeline's missing-value fill logic.
     """
-    from sklearn.compose import ColumnTransformer
 
+    def __init__(self, num_cols, n_quantiles=1000, quantile_output='normal'):
+        self.num_cols = list(num_cols)
+        self.n_quantiles = n_quantiles
+        self.quantile_output = quantile_output
+        self.col_scalers_ = {}   # col → fitted sklearn scaler
+        self.col_methods_ = {}   # col → method name
+        self.mean_ = None        # backward-compat: column means for fill
+
+    def fit(self, X, y=None):
+        """Fit on a DataFrame (or ndarray) of numeric columns."""
+        for i, col in enumerate(self.num_cols):
+            vals = X[col].dropna().values.astype(float) if hasattr(X, '__getitem__') and isinstance(col, str) else X[:, i]
+            vals = vals[~np.isnan(vals)]
+
+            if len(vals) < 3:
+                method = 'standard'
+            else:
+                method = AstraScaler._select_method(vals)
+            self.col_methods_[col] = method
+
+            if method == 'quantile':
+                sc = QuantileTransformer(
+                    n_quantiles=min(self.n_quantiles, len(vals)),
+                    output_distribution=self.quantile_output,
+                )
+            elif method == 'power':
+                sc = PowerTransformer(method='yeo-johnson')
+            elif method == 'robust':
+                sc = RobustScaler()
+            else:
+                sc = StandardScaler()
+
+            sc.fit(vals.reshape(-1, 1))
+            self.col_scalers_[col] = sc
+
+        # Populate .mean_ for inference fill-value compat
+        means = []
+        for col in self.num_cols:
+            if hasattr(X, '__getitem__') and isinstance(col, str):
+                vals = X[col].dropna().values
+            else:
+                vals = X[:, self.num_cols.index(col)]
+                vals = vals[~np.isnan(vals)]
+            means.append(float(vals.mean()) if len(vals) > 0 else 0.0)
+        self.mean_ = np.array(means)
+        return self
+
+    def transform(self, X):
+        """Transform numeric columns.  Accepts DataFrame or ndarray."""
+        if hasattr(X, 'values'):
+            out = X.copy()
+            for col in self.num_cols:
+                vals = out[col].values.astype(np.float64).reshape(-1, 1)
+                out[col] = self.col_scalers_[col].transform(vals).ravel()
+            return out.values if hasattr(out, 'values') else out
+        else:
+            out = X.copy().astype(np.float64)
+            for i, col in enumerate(self.num_cols):
+                out[:, i] = self.col_scalers_[col].transform(
+                    out[:, i].reshape(-1, 1)
+                ).ravel()
+            return out
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X, y).transform(X)
+
+
+def _create_adaptive_tab_scaler(tab_df, num_cols, norm_cfg):
+    """Create a per-column adaptive tabular scaler."""
     if not num_cols:
         return StandardScaler()
 
     nq = norm_cfg.get('n_quantiles', 1000)
     qout = norm_cfg.get('quantile_output', 'normal')
-    transformers = []
+    scaler = AdaptiveTabScaler(num_cols, n_quantiles=nq, quantile_output=qout)
 
     for col in num_cols:
         vals = tab_df[col].dropna().values.astype(float)
-        if len(vals) < 3:
-            method = 'standard'
-        else:
-            method = AstraScaler._select_method(vals)
-
-        if method == 'quantile':
-            t = QuantileTransformer(
-                n_quantiles=min(nq, len(vals)),
-                output_distribution=qout,
-            )
-        elif method == 'power':
-            t = PowerTransformer(method='yeo-johnson')
-        elif method == 'robust':
-            t = RobustScaler()
-        else:
-            t = StandardScaler()
-
-        transformers.append((f'{col}_{method}', t, [col]))
+        method = AstraScaler._select_method(vals) if len(vals) >= 3 else 'standard'
         logger.info(f"  Tabular {col}: {method} (skew={_skew(vals):.2f})")
 
-    ct = ColumnTransformer(transformers, remainder='passthrough')
-    # Wrap with backward-compat .mean_ (populated after fit via monkey-patch)
-    _original_fit = ct.fit
-
-    def _fit_with_compat(X, y=None):
-        result = _original_fit(X, y)
-        # Compute column means for missing-value fill in inference
-        means = []
-        for col in num_cols:
-            vals = X[col].dropna().values
-            means.append(float(vals.mean()) if len(vals) > 0 else 0.0)
-        ct.mean_ = np.array(means)
-        return result
-
-    ct.fit = _fit_with_compat
-    return ct
+    return scaler
 
 
 # ============================================================================
