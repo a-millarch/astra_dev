@@ -204,16 +204,15 @@ class SimulationRunner:
         """
         from astra.inference.patient_context import PatientContext
 
-        admission_start = pd.Timestamp(service_date)
-
         self.context = PatientContext.from_csv(
             cpr_hash=cpr_hash,
             service_date=service_date,
-            current_time=admission_start + pd.Timedelta(hours=start_hours),
+            current_time=pd.Timestamp(service_date),
             bundle=self.session.bundle,
             cfg=cfg,
             data_dir=data_dir,
             ebm_models_dir=ebm_models_dir,
+            start_hours=start_hours,
         )
 
         self._time_points = _generate_bin_aligned_times(
@@ -400,18 +399,19 @@ class SimulationRunner:
 
         wall_start = time.perf_counter()
 
-        # Create context at admission time — loads full trajectory
-        admission_start = pd.Timestamp(service_date)
-
-        # Use from_csv which stores _full_trajectory_data for simulation
+        # Use from_csv which stores _full_trajectory_data for simulation.
+        # Pass start_hours so from_csv derives current_time from the actual
+        # admission_time (base_df['start']), avoiding mismatch when
+        # service_date differs (e.g. prehospital shifts start earlier).
         ctx = PatientContext.from_csv(
             cpr_hash=cpr_hash,
             service_date=service_date,
-            current_time=admission_start + pd.Timedelta(hours=start_hours),
+            current_time=pd.Timestamp(service_date),
             bundle=self.session.bundle,
             cfg=cfg,
             data_dir=data_dir,
             ebm_models_dir=ebm_models_dir,
+            start_hours=start_hours,
         )
 
         result = self.run_from_context(ctx, end_hours=end_hours)

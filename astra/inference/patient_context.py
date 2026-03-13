@@ -252,12 +252,20 @@ class PatientContext:
         cfg: dict = None,
         data_dir: str = 'data/raw',
         ebm_models_dir: str = 'models/ebm',
+        start_hours: float = None,
     ) -> "PatientContext":
         """Create from raw CSV files (stateless — no shared file writes).
 
         Loads the **full trajectory** from CSVs and stores it in
         ``_full_trajectory_data`` for simulation time-stepping.  Only data
         up to *current_time* is used for the initial tensor build.
+
+        Args:
+            start_hours: If provided, derive *current_time* as
+                ``admission_time + start_hours`` using the actual admission
+                time from ``base_df['start']``.  This avoids misalignment
+                when ``service_date`` (date-only) differs from the true
+                admission timestamp (e.g. with prehospital data).
         """
         from astra.inference.data_prep import (
             _build_single_patient_base_df,
@@ -287,6 +295,13 @@ class PatientContext:
                 f"Filtered {len(filtered_concepts)} concepts: "
                 f"{list(filtered_concepts.keys())}"
             )
+
+        # If start_hours given, derive current_time from actual admission
+        # (avoids mismatch when service_date differs from base_df['start'],
+        # e.g. prehospital shifting the trajectory start earlier).
+        if start_hours is not None:
+            admission_time = pd.Timestamp(base_df['start'].iloc[0])
+            current_time = admission_time + pd.Timedelta(hours=start_hours)
 
         # Clamp current_time to patient's actual trajectory end so that
         # visible bins match the batch path (which is bounded by data extent).
