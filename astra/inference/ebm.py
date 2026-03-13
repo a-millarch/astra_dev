@@ -28,8 +28,6 @@ import pandas as pd
 import logging
 logger = logging.getLogger(__name__)
 
-# Default aggregation functions (must match AggregatedDS defaults)
-_AGG_FUNCS = ['first', 'last', 'min', 'max', 'mean', 'std']
 
 
 def _get_valid_ebm_intervals(
@@ -376,174 +374,52 @@ def _aggregate_patient_features(
     cfg: dict,
 ) -> pd.DataFrame:
     """
-    Create a single-row feature DataFrame matching AggregatedDS output.
+    Create a single-row feature DataFrame using the batch AggregatedDS path.
 
-    Replicates AggregatedDS.set_tab_df() + collect_and_aggregate_concepts()
-    for one patient at one masking point, using in-memory filtered data
-    instead of reading from disk.
-
-    Feature naming matches AggregatedDS:
-    - Continuous: {FEATURE}_{concept}_{agg_func}  (datasets.py:439)
-    - Categorical: {VALUE_cleaned}_{concept}_count and _given  (datasets.py:289-290)
+    Delegates to _create_aggregated_dataset() with a concept_cache built from
+    the in-memory filtered_concepts, ensuring perfect feature parity with the
+    batch EBM pipeline (same masking, aggregation, fillna, and naming logic).
 
     Args:
         filtered_concepts: {concept_name: DataFrame} with columns
             [PID, FEATURE, VALUE, TIMESTAMP] for continuous,
             [PID, VALUE, TIMESTAMP] for categorical.
         base_df: Single-row patient DataFrame with demographics.
-        admission_time: Patient admission time.
+        admission_time: Patient admission time (unused — AggregatedDS reads
+            start from base_df directly).
         masking_hours: Hours from admission to mask data at.
         ts_cat_names: Set of categorical concept names (from cfg).
         cfg: Configuration dictionary.
 
     Returns:
-        Single-row DataFrame with all features.
+        Single-row DataFrame with all features (including PID column).
     """
-    cutoff = admission_time + pd.Timedelta(hours=masking_hours)
-    row = base_df.iloc[0]
+    from astra.models.ebm.generate_ebm_feature import _create_aggregated_dataset
 
-    # Start with demographics (matches AggregatedDS.set_tab_df)
-    feature_row = {}
-    id_col = cfg.get('dataset', {}).get('id_col', 'PID')
-    feature_row[id_col] = row.get('PID', 1)
+    # Build concept_cache in the format AggregatedDS expects:
+    # {concept_name: DataFrame[PID, FEATURE, VALUE, TIMESTAMP]}
+    # ALL config concepts must have an entry (even if empty) to prevent
+    # AggregatedDS from falling back to disk I/O for missing concepts.
+    required_cols = ['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']
+    empty_df = pd.DataFrame(columns=required_cols)
+    concept_cache = {c: empty_df for c in cfg.get('concepts', [])}
 
-    for col in cfg.get('dataset', {}).get('num_cols', []):
-        feature_row[col] = row.get(col, np.nan)
-    from astra.data.datasets import get_effective_cat_cols
-    for col in get_effective_cat_cols(cfg):
-        feature_row[col] = row.get(col, np.nan)
-
-    # Process each concept
-    for concept_name, concept_df in filtered_concepts.items():
-        if concept_df.empty:
+    for concept, df in filtered_concepts.items():
+        if df.empty:
             continue
+        df_std = df.copy()
+        # Categorical concepts may lack FEATURE column — add fallback so
+        # AggregatedDS can process them uniformly.
+        if 'FEATURE' not in df_std.columns:
+            df_std['FEATURE'] = concept
+        # Keep only the standard columns (drop END_TIMESTAMP, extras)
+        available = [c for c in required_cols if c in df_std.columns]
+        concept_cache[concept] = df_std[available]
 
-        is_categorical = concept_name in ts_cat_names
-
-        if is_categorical:
-            _aggregate_categorical_concept(
-                concept_df, concept_name, cutoff, feature_row, cfg=cfg
-            )
-        else:
-            _aggregate_continuous_concept(
-                concept_df, concept_name, cutoff, feature_row, cfg=cfg
-            )
-
-    return pd.DataFrame([feature_row])
-
-
-def _aggregate_continuous_concept(
-    concept_df: pd.DataFrame,
-    concept_name: str,
-    cutoff: pd.Timestamp,
-    feature_row: dict,
-    cfg: dict = None,
-) -> None:
-    """
-    Aggregate continuous concept data up to cutoff time.
-
-    Naming: {FEATURE}_{concept_name}_{agg_func}
-    Matches AggregatedDS._aggregate_numeric_cpu (datasets.py:439).
-    """
-    df = concept_df.copy()
-
-    # Apply drop_features filter (matches AggregatedDS._aggregate_concept_optimized)
-    if cfg and "drop_features" in cfg:
-        drop_list = cfg["drop_features"].get(concept_name, [])
-        if drop_list:
-            df = df[~df['FEATURE'].isin(drop_list)]
-
-    # Ensure TIMESTAMP is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['TIMESTAMP']):
-        df['TIMESTAMP'] = pd.to_datetime(df['TIMESTAMP'])
-
-    # Mask to before cutoff
-    df = df[df['TIMESTAMP'] <= cutoff]
-    if df.empty:
-        return
-
-    # Convert VALUE to numeric
-    df['VALUE_numeric'] = pd.to_numeric(df['VALUE'], errors='coerce')
-    df = df.dropna(subset=['VALUE_numeric'])
-    if df.empty:
-        return
-
-    # Sort by timestamp for first/last
-    df = df.sort_values('TIMESTAMP')
-
-    # Aggregate per FEATURE
-    for feature, group in df.groupby('FEATURE'):
-        vals = group['VALUE_numeric']
-        if len(vals) == 0:
-            continue
-
-        for agg_func in _AGG_FUNCS:
-            col_name = f'{feature}_{concept_name}_{agg_func}'
-
-            if agg_func == 'first':
-                feature_row[col_name] = float(vals.iloc[0])
-            elif agg_func == 'last':
-                feature_row[col_name] = float(vals.iloc[-1])
-            elif agg_func == 'min':
-                feature_row[col_name] = float(vals.min())
-            elif agg_func == 'max':
-                feature_row[col_name] = float(vals.max())
-            elif agg_func == 'mean':
-                feature_row[col_name] = float(vals.mean())
-            elif agg_func == 'std':
-                feature_row[col_name] = float(vals.std()) if len(vals) > 1 else 0.0
-
-
-def _aggregate_categorical_concept(
-    concept_df: pd.DataFrame,
-    concept_name: str,
-    cutoff: pd.Timestamp,
-    feature_row: dict,
-    cfg: dict = None,
-) -> None:
-    """
-    Aggregate categorical concept data up to cutoff time.
-
-    Naming: {VALUE_cleaned}_{concept_name}_count and _given
-    Matches AggregatedDS._aggregate_categorical_optimized (datasets.py:289-290).
-    """
-    df = concept_df.copy()
-
-    # Apply drop_features filter (matches AggregatedDS._aggregate_concept_optimized)
-    if cfg and "drop_features" in cfg:
-        drop_list = cfg["drop_features"].get(concept_name, [])
-        if drop_list and 'FEATURE' in df.columns:
-            df = df[~df['FEATURE'].isin(drop_list)]
-        elif drop_list and 'VALUE' in df.columns:
-            df = df[~df['VALUE'].isin(drop_list)]
-
-    # Determine timestamp column
-    ts_col = 'TIMESTAMP'
-    if ts_col not in df.columns:
-        # ADTHaendelser may not have TIMESTAMP directly
-        return
-
-    if not pd.api.types.is_datetime64_any_dtype(df[ts_col]):
-        df[ts_col] = pd.to_datetime(df[ts_col])
-
-    # Mask to before cutoff
-    df = df[df[ts_col] <= cutoff]
-    if df.empty:
-        return
-
-    # Drop NaN values
-    df = df[df['VALUE'].notna()]
-    if df.empty:
-        return
-
-    # Count occurrences per VALUE
-    value_counts = df['VALUE'].value_counts()
-
-    for value, count in value_counts.items():
-        # Clean value name (matches datasets.py:286-288)
-        cleaned = str(value).replace(' ', '_').replace('/', '_').replace('-', '_')
-        feature_row[f'{cleaned}_{concept_name}_count'] = float(count)
-        feature_row[f'{cleaned}_{concept_name}_given'] = 1.0
+    X, y, cat_feats, cont_feats = _create_aggregated_dataset(
+        base_df, cfg, masking_hours, concept_cache=concept_cache,
+    )
+    return X
 
 
 def inject_ebm_into_x_ts(
