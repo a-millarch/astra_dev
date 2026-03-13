@@ -114,10 +114,54 @@ def process_prehospital(cfg, base, overwrite=False):
     return base
 
 
+def _save_notater_derived_concepts(cfg):
+    """Extract ISS/Events from Notater.pkl and save as concept pickles.
+
+    These concepts are derived from clinical notes rather than having their own
+    raw CSVs, so filter_subsets_inhospital() does not create them.  Saving them
+    as standard concept pickles makes all downstream consumers (AggregatedDS,
+    inference) work without special-casing.
+    """
+    notater_path = "data/interim/concepts/Notater.pkl"
+    if not os.path.exists(notater_path):
+        logger.warning("Notater.pkl not found, skipping derived concept extraction")
+        return
+
+    notater_df = pd.read_pickle(notater_path)
+    bin_df = pd.read_pickle(cfg["bin_df_path"])
+
+    if "ISS" in cfg["concepts"]:
+        from astra.data.notes_features import build_iss_from_notes
+        iss_df = build_iss_from_notes(notater_df)
+        ensure_parent_dir("data/interim/concepts/ISS.pkl")
+        iss_df.to_pickle("data/interim/concepts/ISS.pkl", protocol=4)
+        logger.info(f"Saved ISS concept: {len(iss_df)} rows, {iss_df['PID'].nunique() if len(iss_df) else 0} patients")
+
+    if "Events" in cfg["concepts"]:
+        from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+        from astra.data.notes_features import build_intubation_from_notes
+        ca_df = build_cardiac_arrest_from_notes(notater_df)
+        intub_df = build_intubation_from_notes(notater_df)
+        # 24h admission cutoff for intubation
+        n_before = len(intub_df)
+        start_times = bin_df.groupby("PID")["bin_start"].min()
+        intub_df = intub_df.merge(start_times, on="PID", how="left")
+        intub_df = intub_df[intub_df["TIMESTAMP"] <= intub_df["bin_start"] + pd.Timedelta(hours=24)]
+        intub_df = intub_df.drop(columns=["bin_start"])
+        logger.info(f"Intubation: {n_before} → {len(intub_df)} after 24h admission cutoff")
+        events_df = pd.concat([ca_df, intub_df], ignore_index=True)
+        # Reformat for categorical: FEATURE=constant, VALUE=event_type
+        events_df["VALUE"] = events_df["FEATURE"]  # 'cardiac_arrest' or 'INTUBATED'
+        events_df["FEATURE"] = "event"
+        ensure_parent_dir("data/interim/concepts/Events.pkl")
+        events_df.to_pickle("data/interim/concepts/Events.pkl", protocol=4)
+        logger.info(f"Saved Events concept: {len(events_df)} rows, {events_df['PID'].nunique() if len(events_df) else 0} patients")
+
+
 def _forward_fill_concept(cfg: dict, concept: str) -> None:
     """Forward-fill time columns in mapped concept pickle.
 
-    Ensures semi-static features (ISS, INTUBATED) propagate forward from
+    Ensures semi-static features (ISS) propagate forward from
     first observation. ffill on axis=1 is inherently forward-only.
     """
     map_dir = "data/interim/mapped/"
@@ -172,9 +216,12 @@ if __name__ =='__main__':
         base.to_pickle(cfg["base_df_path"], protocol=4)
         logger.info(f"Updated base_df with TRAUMATEXT columns at {cfg['base_df_path']}")
 
+    # Extract Notater-derived concepts (ISS, Events) before mapping
+    _save_notater_derived_concepts(cfg)
+
     map_data_optimized(cfg, overwrite=overwrite)
 
-    # Forward-fill TraumaAssessment (semi-static features)
-    _forward_fill_concept(cfg, "TraumaAssessment")
+    # Forward-fill ISS (semi-static feature)
+    _forward_fill_concept(cfg, "ISS")
   
     data = prepare_data_and_dls_cached(cfg)

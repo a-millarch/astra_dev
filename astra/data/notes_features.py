@@ -156,6 +156,13 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     ISS is a one-time trauma severity assessment — forward-fill propagates it.
     """
     df = notater_df.copy()
+    logger.info(f"ISS extraction: Notater shape={df.shape}, columns={df.columns.tolist()}")
+    if "Redigeringstidspunkt" not in df.columns:
+        logger.warning("ISS: 'Redigeringstidspunkt' column missing from Notater — returning empty")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
+    if "Note" not in df.columns:
+        logger.warning("ISS: 'Note' column missing from Notater — returning empty")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
     df["Redigeringstidspunkt"] = pd.to_datetime(df["Redigeringstidspunkt"], errors="coerce")
 
     # Combine notes per patient+timestamp (multi-row notes)
@@ -288,6 +295,10 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     where absence = NaN (same as no medication, no procedure, etc.).
     """
     notes = notater_df.copy()
+    logger.info(f"Intubation extraction: Notater shape={notes.shape}")
+    if "Redigeringstidspunkt" not in notes.columns or "Note" not in notes.columns:
+        logger.warning("Intubation: required columns missing from Notater — returning empty")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
     notes["Redigeringstidspunkt"] = pd.to_datetime(
         notes["Redigeringstidspunkt"], errors="coerce"
     )

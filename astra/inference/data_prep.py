@@ -1719,7 +1719,7 @@ def _filter_concepts_for_patient(
     patient_cpr = base_df['CPR_hash'].iloc[0]
 
     # Concepts that are derived from Notater (clinical notes), not raw CSVs
-    _NOTES_DERIVED_CONCEPTS = {'TraumaAssessment', 'Events'}
+    _NOTES_DERIVED_CONCEPTS = {'ISS', 'Events'}
     _NOTES_AUGMENTED_CONCEPTS = {'ITAOversigtsrapport'}
     _ALL_NOTES_CONCEPTS = _NOTES_DERIVED_CONCEPTS | _NOTES_AUGMENTED_CONCEPTS
 
@@ -1755,14 +1755,27 @@ def _filter_concepts_for_patient(
 
     for concept in cfg['concepts']:
         # --- Notes-derived concepts: built entirely from Notater, no CSV ---
-        if concept == 'TraumaAssessment':
-            # ISS + intubation from notes (mirrors mapper.py:902-914)
+        if concept == 'ISS':
+            # ISS from notes (mirrors mapper.py)
             if notater_inhospital is not None and not notater_inhospital.empty:
-                from astra.data.notes_features import (
-                    build_iss_from_notes, build_intubation_from_notes,
-                )
+                from astra.data.notes_features import build_iss_from_notes
                 filter_fn = collect_filter(concept)
-                iss_df = build_iss_from_notes(notater_inhospital)
+                concept_filtered = build_iss_from_notes(notater_inhospital)
+                concept_filtered = filter_fn(concept_filtered)
+                if not concept_filtered.empty:
+                    filtered[concept] = concept_filtered
+                    logger.info(f"ISS from notes: {len(concept_filtered)} rows")
+            else:
+                logger.info("No Notater data — skipping ISS")
+            continue
+
+        if concept == 'Events':
+            # Cardiac arrest + intubation from notes (mirrors mapper.py)
+            if notater_inhospital is not None and not notater_inhospital.empty:
+                from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+                from astra.data.notes_features import build_intubation_from_notes
+                filter_fn = collect_filter(concept)
+                ca_df = build_cardiac_arrest_from_notes(notater_inhospital)
                 intub_df = build_intubation_from_notes(notater_inhospital)
                 # Restrict intubation to within 24h of admission
                 admission_start = base_df['start'].iloc[0]
@@ -1772,24 +1785,11 @@ def _filter_concepts_for_patient(
                         <= admission_start + pd.Timedelta(hours=24)
                     ]
                 concept_filtered = pd.concat(
-                    [iss_df, intub_df], ignore_index=True
+                    [ca_df, intub_df], ignore_index=True
                 ).reset_index(drop=True)
-                concept_filtered = filter_fn(concept_filtered)
-                if not concept_filtered.empty:
-                    filtered[concept] = concept_filtered
-                    logger.info(
-                        f"TraumaAssessment from notes: {len(concept_filtered)} rows"
-                    )
-            else:
-                logger.info("No Notater data — skipping TraumaAssessment")
-            continue
-
-        if concept == 'Events':
-            # Cardiac arrest from notes (mirrors mapper.py:915-918)
-            if notater_inhospital is not None and not notater_inhospital.empty:
-                from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
-                filter_fn = collect_filter(concept)
-                concept_filtered = build_cardiac_arrest_from_notes(notater_inhospital)
+                # Reformat for categorical: FEATURE=constant, VALUE=event_type
+                concept_filtered["VALUE"] = concept_filtered["FEATURE"]
+                concept_filtered["FEATURE"] = "event"
                 concept_filtered = filter_fn(concept_filtered)
                 if not concept_filtered.empty:
                     filtered[concept] = concept_filtered

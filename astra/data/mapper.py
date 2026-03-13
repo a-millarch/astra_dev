@@ -201,12 +201,19 @@ def map_concept(
     """
 
     
+    # Notater-derived concepts must use map_concept_optimized
+    _NOTATER_DERIVED = {"ISS", "Events"}
+    if concept in _NOTATER_DERIVED:
+        raise ValueError(
+            f"'{concept}' is derived from Notater.pkl. Use map_concept_optimized() instead."
+        )
+
     output_path = f"data/interim/mapped/{concept}"
-    
+
     # Load binning DataFrame
     bin_df = get_bin_df()
     logger.info(f"Prepared bin df for {concept} (categorical={is_categorical}, multi_label={is_multi_label})")
-    
+
     # Load and filter concept
     concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")
     filter_function = collect_filter(concept)
@@ -884,7 +891,7 @@ def map_concept_optimized(
     filter_function = collect_filter(concept)
 
     # Load Notater.pkl once for concepts that need it
-    notes_concepts = ("ITAOversigtsrapport", "TraumaAssessment", "Events")
+    notes_concepts = ("ITAOversigtsrapport", "ISS", "Events")
     notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl") if concept in notes_concepts else None
 
     # Cross-concept augmentation
@@ -899,9 +906,14 @@ def map_concept_optimized(
         gcs_df = build_gcs_from_notes(notater_df)
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
-    elif concept == "TraumaAssessment":
-        from astra.data.notes_features import build_iss_from_notes, build_intubation_from_notes
-        iss_df = build_iss_from_notes(notater_df)
+    elif concept == "ISS":
+        from astra.data.notes_features import build_iss_from_notes
+        concept_df = build_iss_from_notes(notater_df)
+        concept_df = filter_function(concept_df)
+    elif concept == "Events":
+        from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+        from astra.data.notes_features import build_intubation_from_notes
+        ca_df = build_cardiac_arrest_from_notes(notater_df)
         intub_df = build_intubation_from_notes(notater_df)
         # Restrict intubation to within 24h of admission
         n_before = len(intub_df)
@@ -910,11 +922,10 @@ def map_concept_optimized(
         intub_df = intub_df[intub_df["TIMESTAMP"] <= intub_df["bin_start"] + pd.Timedelta(hours=24)]
         intub_df = intub_df.drop(columns=["bin_start"])
         logger.info(f"Intubation: {n_before} → {len(intub_df)} after 24h admission cutoff")
-        concept_df = pd.concat([iss_df, intub_df], ignore_index=True).reset_index(drop=True)
-        concept_df = filter_function(concept_df)
-    elif concept == "Events":
-        from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
-        concept_df = build_cardiac_arrest_from_notes(notater_df)
+        concept_df = pd.concat([ca_df, intub_df], ignore_index=True).reset_index(drop=True)
+        # Reformat for categorical: FEATURE=constant, VALUE=event_type
+        concept_df["VALUE"] = concept_df["FEATURE"]  # 'cardiac_arrest' or 'INTUBATED'
+        concept_df["FEATURE"] = "event"
         concept_df = filter_function(concept_df)
     else:
         concept_df = pd.read_pickle(f"data/interim/concepts/{concept}.pkl")

@@ -692,6 +692,10 @@ def build_cardiac_arrest_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
     Patients can have multiple events.
     """
     notes = notater_df.copy()
+    logger.info(f"Cardiac arrest extraction: Notater shape={notes.shape}, columns={notes.columns.tolist()}")
+    if "Redigeringstidspunkt" not in notes.columns or "Note" not in notes.columns:
+        logger.warning("Cardiac arrest: required columns missing from Notater — returning empty")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
     notes["Redigeringstidspunkt"] = pd.to_datetime(
         notes["Redigeringstidspunkt"], errors="coerce"
     )

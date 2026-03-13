@@ -380,8 +380,8 @@ def filter_ews(ews):
     return ews[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 
-def filter_trauma_assessment(df):
-    """Filter for TraumaAssessment (ISS, INTUBATED from notes).
+def filter_iss(df):
+    """Filter for ISS (Injury Severity Score from notes).
 
     Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE],
     so no additional mapping needed.
@@ -390,7 +390,7 @@ def filter_trauma_assessment(df):
 
 
 def filter_events(df):
-    """Filter for Events (cardiac_arrest from notes).
+    """Filter for Events (cardiac_arrest, INTUBATED from notes).
 
     Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE].
     """
@@ -568,7 +568,7 @@ def collect_filter(concept: str):
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
         "EWS": filter_ews,
-        "TraumaAssessment": filter_trauma_assessment,
+        "ISS": filter_iss,
         "Events": filter_events,
     }
 

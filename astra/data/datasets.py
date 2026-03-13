@@ -387,8 +387,16 @@ class AggregatedDS:
 
         Optimized: Filter to relevant PIDs BEFORE applying expensive
         concept-specific filters (regex, string ops, etc.).
+
+        ISS and Events are derived from Notater.pkl (clinical notes) rather
+        than having their own raw CSVs, so they are built on-the-fly here.
         """
-        # Load
+        # Notater-derived concepts: build from clinical notes
+        _NOTATER_DERIVED = {"ISS", "Events"}
+        if concept in _NOTATER_DERIVED:
+            return self._build_notater_derived_concept(concept)
+
+        # Standard concepts: load from interim pickle
         concept_path = f"data/interim/concepts/{concept}.pkl"
         try:
             df = pd.read_pickle(concept_path)
@@ -426,6 +434,40 @@ class AggregatedDS:
                 filtered_df['TIMESTAMP'] = pd.to_datetime(filtered_df['TIMESTAMP'])
 
         logger.debug(f"Loaded & filtered {concept}: {len(filtered_df)} rows")
+        return filtered_df[['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']]
+
+    def _build_notater_derived_concept(self, concept: str) -> pd.DataFrame:
+        """Build ISS or Events concept from Notater.pkl (clinical notes)."""
+        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
+        if 'PID' in notater_df.columns:
+            notater_df = notater_df[notater_df['PID'].isin(self._base_pids)]
+
+        if concept == "ISS":
+            from astra.data.notes_features import build_iss_from_notes
+            filtered_df = build_iss_from_notes(notater_df)
+        elif concept == "Events":
+            from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
+            from astra.data.notes_features import build_intubation_from_notes
+            ca_df = build_cardiac_arrest_from_notes(notater_df)
+            intub_df = build_intubation_from_notes(notater_df)
+            # 24h admission cutoff for intubation
+            bin_df = get_bin_df()
+            start_times = bin_df.groupby("PID")["bin_start"].min()
+            intub_df = intub_df.merge(start_times, on="PID", how="left")
+            intub_df = intub_df[intub_df["TIMESTAMP"] <= intub_df["bin_start"] + pd.Timedelta(hours=24)]
+            intub_df = intub_df.drop(columns=["bin_start"])
+            filtered_df = pd.concat([ca_df, intub_df], ignore_index=True)
+            # Reformat for categorical: FEATURE=constant, VALUE=event_type
+            filtered_df["VALUE"] = filtered_df["FEATURE"]
+            filtered_df["FEATURE"] = "event"
+        else:
+            raise ValueError(f"Unknown Notater-derived concept: {concept}")
+
+        if 'TIMESTAMP' in filtered_df.columns:
+            if not pd.api.types.is_datetime64_any_dtype(filtered_df['TIMESTAMP']):
+                filtered_df['TIMESTAMP'] = pd.to_datetime(filtered_df['TIMESTAMP'])
+
+        logger.debug(f"Built {concept} from Notater: {len(filtered_df)} rows")
         return filtered_df[['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']]
 
     def _apply_masking_vectorized(
