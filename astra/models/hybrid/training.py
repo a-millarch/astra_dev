@@ -45,6 +45,7 @@ def get_backbone(
         temporal_head_dropout=temporal_head_dropout,
         temporal_channel_idx=temporal_channel_idx,
         exclude_channel_indices=exclude_channel_indices or [],
+        head_pool=cfg["model"].get("head_pool", "flatten"),
     )
     return backbone
 

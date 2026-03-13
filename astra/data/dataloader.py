@@ -6,7 +6,13 @@ import pickle
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler, StandardScaler
+from scipy.stats import skew as _skew, kurtosis as _kurtosis
+from sklearn.preprocessing import (
+    PowerTransformer,
+    QuantileTransformer,
+    RobustScaler,
+    StandardScaler,
+)
 
 from astra.utils import get_base_df, align_dataframes
 from astra.data.preprocessing import MultiHotCategoricalEncoder
@@ -23,7 +29,222 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# FIXED: Masked Normalization Functions
+# Adaptive Per-Channel Scaler
+# ============================================================================
+
+class AstraScaler:
+    """Per-channel scaler supporting multiple normalization methods.
+
+    Wraps sklearn transformers per-channel for 3D time series data
+    [n_samples, n_channels, seq_len].  Pickle-serializable.
+
+    Methods
+    -------
+    standard  – z-score (mean / std), original behaviour.
+    quantile  – QuantileTransformer → normal or uniform output.
+    power     – PowerTransformer (Yeo-Johnson).
+    robust    – median / IQR scaling.
+    adaptive  – auto-select per channel from skewness & kurtosis.
+    """
+
+    # Adaptive thresholds (matching diagnose_distributions.py logic)
+    _SKEW_NORMAL = 0.5
+    _SKEW_MODERATE = 2.0
+    _KURT_NORMAL = 3.0
+    _KURT_MODERATE = 7.0
+
+    def __init__(self, method='adaptive', n_quantiles=1000,
+                 quantile_output='normal'):
+        self.method = method
+        self.n_quantiles = n_quantiles
+        self.quantile_output = quantile_output
+
+        # Populated during fit
+        self.channel_scalers_ = {}   # ch_idx → fitted object / dict
+        self.channel_methods_ = {}   # ch_idx → method name used
+        self.n_channels_ = None
+
+        # Backward-compat attributes expected by inference pipeline
+        self.mean_ = None
+        self.scale_ = None
+        self.var_ = None
+        self.n_features_in_ = None
+
+    # ------------------------------------------------------------------
+    # Adaptive method selection
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _select_method(values):
+        """Pick normalisation method from distribution shape."""
+        s = abs(float(_skew(values, nan_policy='omit')))
+        k = float(_kurtosis(values, nan_policy='omit'))  # excess
+        if s < AstraScaler._SKEW_NORMAL and k < AstraScaler._KURT_NORMAL:
+            return 'standard'
+        elif s < AstraScaler._SKEW_MODERATE and k < AstraScaler._KURT_MODERATE:
+            return 'power'
+        return 'quantile'
+
+    # ------------------------------------------------------------------
+    # Per-channel fit / transform
+    # ------------------------------------------------------------------
+    def fit_channel(self, ch_idx, values):
+        """Fit one channel on its measured (non-NaN, non-padding) values."""
+        if len(values) < 3:
+            self.channel_methods_[ch_idx] = 'standard'
+            self.channel_scalers_[ch_idx] = {'mean': 0.0, 'std': 1.0}
+            return
+
+        method = (self._select_method(values)
+                  if self.method == 'adaptive' else self.method)
+        self.channel_methods_[ch_idx] = method
+
+        if method == 'standard':
+            m, s = float(values.mean()), float(values.std())
+            if s == 0 or np.isnan(s):
+                s = 1.0
+            self.channel_scalers_[ch_idx] = {'mean': m, 'std': s}
+
+        elif method == 'quantile':
+            nq = min(self.n_quantiles, len(values))
+            qt = QuantileTransformer(
+                n_quantiles=nq,
+                output_distribution=self.quantile_output,
+            )
+            qt.fit(values.reshape(-1, 1))
+            self.channel_scalers_[ch_idx] = qt
+
+        elif method == 'power':
+            pt = PowerTransformer(method='yeo-johnson')
+            try:
+                pt.fit(values.reshape(-1, 1))
+                self.channel_scalers_[ch_idx] = pt
+            except Exception:
+                # Fallback: constant or pathological channel
+                m, s = float(values.mean()), float(values.std())
+                if s == 0 or np.isnan(s):
+                    s = 1.0
+                self.channel_scalers_[ch_idx] = {'mean': m, 'std': s}
+                self.channel_methods_[ch_idx] = 'standard'
+
+        elif method == 'robust':
+            med = float(np.median(values))
+            q75, q25 = float(np.percentile(values, 75)), float(np.percentile(values, 25))
+            iqr = q75 - q25
+            if iqr == 0:
+                iqr = 1.0
+            self.channel_scalers_[ch_idx] = {'median': med, 'iqr': iqr}
+
+        else:
+            raise ValueError(f"Unknown normalization method: {method}")
+
+    def transform_channel(self, ch_idx, values):
+        """Transform measured values for one channel.  Returns 1-D array."""
+        sc = self.channel_scalers_[ch_idx]
+        method = self.channel_methods_[ch_idx]
+
+        if method == 'standard':
+            return (values - sc['mean']) / sc['std']
+        elif method in ('quantile', 'power'):
+            return sc.transform(values.reshape(-1, 1)).ravel()
+        elif method == 'robust':
+            return (values - sc['median']) / sc['iqr']
+        else:
+            raise ValueError(f"Unknown method for channel {ch_idx}: {method}")
+
+    # ------------------------------------------------------------------
+    # Populate backward-compat attributes after all channels are fitted
+    # ------------------------------------------------------------------
+    def _populate_compat_attrs(self, n_channels):
+        """Set .mean_ / .scale_ arrays for inference pipeline compat."""
+        self.n_channels_ = n_channels
+        self.n_features_in_ = n_channels
+        means = np.zeros(n_channels)
+        scales = np.ones(n_channels)
+        for ch in range(n_channels):
+            method = self.channel_methods_.get(ch, 'standard')
+            sc = self.channel_scalers_.get(ch)
+            if sc is None:
+                continue
+            if method == 'standard':
+                means[ch] = sc['mean']
+                scales[ch] = sc['std']
+            elif method == 'robust':
+                means[ch] = sc['median']
+                scales[ch] = sc['iqr']
+            else:
+                # quantile / power: output is ~N(0,1)
+                means[ch] = 0.0
+                scales[ch] = 1.0
+        self.mean_ = means
+        self.scale_ = scales
+        self.var_ = scales ** 2
+
+    def summary(self):
+        """Return dict of method → count for logging."""
+        from collections import Counter
+        return dict(Counter(self.channel_methods_.values()))
+
+
+def _create_adaptive_tab_scaler(tab_df, num_cols, norm_cfg):
+    """Create a per-column adaptive tabular scaler using sklearn ColumnTransformer.
+
+    Selects normalization method per tabular numeric column based on
+    skewness/kurtosis, matching AstraScaler adaptive thresholds.
+
+    The returned transformer exposes a ``.mean_`` attribute for backward
+    compatibility with the inference pipeline's missing-value fill logic.
+    """
+    from sklearn.compose import ColumnTransformer
+
+    if not num_cols:
+        return StandardScaler()
+
+    nq = norm_cfg.get('n_quantiles', 1000)
+    qout = norm_cfg.get('quantile_output', 'normal')
+    transformers = []
+
+    for col in num_cols:
+        vals = tab_df[col].dropna().values.astype(float)
+        if len(vals) < 3:
+            method = 'standard'
+        else:
+            method = AstraScaler._select_method(vals)
+
+        if method == 'quantile':
+            t = QuantileTransformer(
+                n_quantiles=min(nq, len(vals)),
+                output_distribution=qout,
+            )
+        elif method == 'power':
+            t = PowerTransformer(method='yeo-johnson')
+        elif method == 'robust':
+            t = RobustScaler()
+        else:
+            t = StandardScaler()
+
+        transformers.append((f'{col}_{method}', t, [col]))
+        logger.info(f"  Tabular {col}: {method} (skew={_skew(vals):.2f})")
+
+    ct = ColumnTransformer(transformers, remainder='passthrough')
+    # Wrap with backward-compat .mean_ (populated after fit via monkey-patch)
+    _original_fit = ct.fit
+
+    def _fit_with_compat(X, y=None):
+        result = _original_fit(X, y)
+        # Compute column means for missing-value fill in inference
+        means = []
+        for col in num_cols:
+            vals = X[col].dropna().values
+            means.append(float(vals.mean()) if len(vals) > 0 else 0.0)
+        ct.mean_ = np.array(means)
+        return result
+
+    ct.fit = _fit_with_compat
+    return ct
+
+
+# ============================================================================
+# Masked Normalization Functions
 # ============================================================================
 
 def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
@@ -36,10 +257,13 @@ def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
       - Missing measurements within trajectory → 0.0
       - Padding beyond trajectory end         → 0.0
 
+    Supports both legacy ``StandardScaler`` and the new ``AstraScaler``
+    (per-channel adaptive normalization).
+
     Args:
         X: Array [n_samples, n_channels, seq_len]. May contain NaN for
            positions where no clinical measurement was recorded.
-        scaler: sklearn StandardScaler (stores mean_/scale_ per channel).
+        scaler: ``AstraScaler`` or sklearn ``StandardScaler``.
         trajectory_lengths: Array [n_samples] — number of real timesteps
            per sample.  Positions >= trajectory_lengths[i] are padding.
         fit: If True, compute and store per-channel statistics.
@@ -63,6 +287,33 @@ def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
     measured_mask = ~np.isnan(X) & ~padding_3d
 
     # ------------------------------------------------------------------
+    # AstraScaler path (per-channel adaptive)
+    # ------------------------------------------------------------------
+    if isinstance(scaler, AstraScaler):
+        if fit:
+            for ch in range(n_channels):
+                vals = X[:, ch, :][measured_mask[:, ch, :]]
+                scaler.fit_channel(ch, vals)
+            scaler._populate_compat_attrs(n_channels)
+
+            summary = scaler.summary()
+            logger.info(f"Fitted AstraScaler ({scaler.method}): {summary}")
+            for ch in range(n_channels):
+                logger.debug(f"  ch {ch}: {scaler.channel_methods_.get(ch, '?')}")
+            logger.info(f"  Mean range: [{scaler.mean_.min():.4f}, {scaler.mean_.max():.4f}]")
+            logger.info(f"  Scale range: [{scaler.scale_.min():.4f}, {scaler.scale_.max():.4f}]")
+
+        X_normalized = np.zeros((n_samples, n_channels, seq_len), dtype=np.float64)
+        for ch in range(n_channels):
+            m = measured_mask[:, ch, :]
+            if m.any():
+                vals = X[:, ch, :][m]
+                X_normalized[:, ch, :][m] = scaler.transform_channel(ch, vals)
+        return X_normalized
+
+    # ------------------------------------------------------------------
+    # Legacy StandardScaler path (backward compat with old caches)
+    # ------------------------------------------------------------------
     if fit:
         means = np.zeros(n_channels)
         stds  = np.zeros(n_channels)
@@ -83,11 +334,10 @@ def normalize_with_padding_mask(X, scaler, trajectory_lengths, fit=True):
         scaler.var_           = stds ** 2
         scaler.n_features_in_ = n_channels
 
-        logger.info("Fitted per-channel scaler on measured data:")
+        logger.info("Fitted per-channel StandardScaler on measured data:")
         logger.info(f"  Mean range: [{means.min():.4f}, {means.max():.4f}]")
         logger.info(f"  Std range:  [{stds.min():.4f}, {stds.max():.4f}]")
 
-    # ------------------------------------------------------------------
     # normalise: only measured positions get values; rest stays 0.0
     X_normalized = np.zeros((n_samples, n_channels, seq_len), dtype=np.float64)
 
@@ -319,7 +569,14 @@ def prepare_data_and_dls(cfg):
     logger.info("Fitting normalization scalers on trainval data (excluding padding)...")
 
     # 1. CONTINUOUS TIME SERIES SCALER
-    ts_scaler = StandardScaler()
+    norm_cfg = cfg.get('normalization', {})
+    ts_method = norm_cfg.get('ts_method', 'standard')
+    ts_scaler = AstraScaler(
+        method=ts_method,
+        n_quantiles=norm_cfg.get('n_quantiles', 1000),
+        quantile_output=norm_cfg.get('quantile_output', 'normal'),
+    )
+    logger.info(f"Using {ts_method} normalization for time series")
 
     # Get trajectory lengths (works with NaN for missing measurements).
     # Exclude EBM channel so forward-filled predictions cannot extend
@@ -395,7 +652,20 @@ def prepare_data_and_dls(cfg):
                f'{n_missing} missing ({100*n_missing/(n_measured+n_missing):.1f}%)')
 
     # 2. TABULAR DATA SCALER
-    tab_scaler = StandardScaler()
+    tab_method = norm_cfg.get('tab_method', 'standard')
+    if tab_method == 'quantile':
+        nq = norm_cfg.get('n_quantiles', 1000)
+        qout = norm_cfg.get('quantile_output', 'normal')
+        tab_scaler = QuantileTransformer(n_quantiles=nq, output_distribution=qout)
+    elif tab_method == 'power':
+        tab_scaler = PowerTransformer(method='yeo-johnson')
+    elif tab_method == 'robust':
+        tab_scaler = RobustScaler()
+    elif tab_method == 'adaptive':
+        tab_scaler = _create_adaptive_tab_scaler(trainval.tab_df, num_cols, norm_cfg)
+    else:
+        tab_scaler = StandardScaler()
+    logger.info(f"Using {tab_method} normalization for tabular features")
 
     if num_cols:
         logger.info(f'Fitting tabular scaler on {len(num_cols)} continuous features')

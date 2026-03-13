@@ -45,6 +45,7 @@ def _get_cache_key(cfg):
         "ebm_enabled": cfg.get("ebm_feature", {}).get("enabled", False),
         "temporal_features": cfg.get("temporal_features", {}).get("enabled", False),
         "agg_func": cfg.get("agg_func", {}),
+        "normalization": cfg.get("normalization", {}),
     }
     config_str = json.dumps(key_params, sort_keys=True, default=str)
     return hashlib.md5(config_str.encode()).hexdigest()[:12]

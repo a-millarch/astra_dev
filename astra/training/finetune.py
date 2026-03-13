@@ -42,6 +42,7 @@ from astra.training.utils import (
     EarlyStopping,
     MetricTracker,
     compute_auroc,
+    compute_val_metrics,
     _to_device,
 )
 from astra.data.dataloader import save_deployment_bundle
@@ -100,6 +101,11 @@ class FinetuneConfig:
     # Use pretrained weights
     use_pretrained: bool = True
     pretrain_checkpoint_dir: Optional[str] = None
+
+    # Class imbalance weighting for standard (non-temporal) head
+    # Multiplier applied to computed n_neg/n_pos ratio. 1.0 = full correction,
+    # 0.0 = no correction. Values around 0.5-0.8 often work best.
+    pos_weight_factor: float = 0.7
 
     # Time weighting for temporal head (training-specific, not model arch)
     time_weighting: str = "uniform"     # 'uniform' or 'early'
@@ -347,6 +353,7 @@ def _compute_weighted_loss(
     x_ts: torch.Tensor,
     label_smoothing: float = 0.0,
     early_weight: float = 2.0,
+    class_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute loss weighted by data availability.
@@ -356,6 +363,7 @@ def _compute_weighted_loss(
     """
     loss_per_sample = F.cross_entropy(
         logits, targets, reduction="none", label_smoothing=label_smoothing,
+        weight=class_weights,
     )
 
     # Data availability: fraction of non-zero timesteps
@@ -463,6 +471,8 @@ def train_one_epoch(
     pos_weight: Optional[torch.Tensor] = None,
     time_weighting: str = "uniform",
     early_weight_factor: float = 2.0,
+    # Class weighting for standard (non-temporal) head
+    class_weights: Optional[torch.Tensor] = None,
     desc: str = "Training",
 ) -> float:
     """
@@ -485,6 +495,7 @@ def train_one_epoch(
         pos_weight: Class imbalance weight for BCE (temporal mode).
         time_weighting: 'uniform' or 'early' (temporal mode).
         early_weight_factor: Max weight for early timesteps (temporal mode).
+        class_weights: Per-class weights for cross-entropy (standard mode).
 
     Returns:
         Average training loss for the epoch.
@@ -527,10 +538,12 @@ def train_one_epoch(
                 logits, targets, x_ts,
                 label_smoothing=label_smoothing,
                 early_weight=early_weight,
+                class_weights=class_weights,
             )
         else:
             loss = F.cross_entropy(
                 logits, targets, label_smoothing=label_smoothing,
+                weight=class_weights,
             )
 
         loss.backward()
@@ -571,6 +584,8 @@ def _run_phase(
     pos_weight: Optional[torch.Tensor] = None,
     time_weighting: str = "uniform",
     early_weight_factor: float = 2.0,
+    # Class weighting for standard (non-temporal) head
+    class_weights: Optional[torch.Tensor] = None,
 ) -> int:
     """
     Run a single training phase.
@@ -615,26 +630,34 @@ def _run_phase(
             pos_weight=pos_weight,
             time_weighting=time_weighting,
             early_weight_factor=early_weight_factor,
+            class_weights=class_weights,
             desc=desc,
         )
 
         if valid_dl is not None:
-            val_auroc = compute_auroc(model, valid_dl, device=device,
-                                      temporal_head=temporal_head)
-            tracker.update(phase_name, global_epoch, train_loss=train_loss, val_auroc=val_auroc)
+            metrics = compute_val_metrics(model, valid_dl, device=device,
+                                          temporal_head=temporal_head)
+            val_auroc = metrics["auroc"]
+            val_auprc = metrics["auprc"]
+            # Combined metric for early stopping and sweep objective
+            val_score = 0.5 * val_auroc + 0.5 * val_auprc
+            tracker.update(phase_name, global_epoch,
+                           train_loss=train_loss, val_auroc=val_auroc,
+                           val_auprc=val_auprc, val_score=val_score)
             logger.info(
-                f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, val_auroc={val_auroc:.4f}"
+                f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, "
+                f"val_auroc={val_auroc:.4f}, val_auprc={val_auprc:.4f}"
             )
 
-            # Optuna reporting + pruning
+            # Optuna reporting + pruning (report combined score)
             if trial is not None:
                 import optuna
-                trial.report(val_auroc, global_epoch)
+                trial.report(val_score, global_epoch)
                 if trial.should_prune():
                     raise optuna.TrialPruned()
 
-            # Early stopping (tracks best model internally)
-            if early_stopper is not None and early_stopper(val_auroc, model):
+            # Early stopping on combined metric
+            if early_stopper is not None and early_stopper(val_score, model):
                 logger.info(f"  Early stopping at epoch {global_epoch + 1}")
                 break
         else:
@@ -754,14 +777,18 @@ def run_finetune_v2(
         n_params = sum(p.numel() for _, p in params)
         logger.info(f"  {name}: {n_params:,} params")
 
-    # Temporal head: compute pos_weight for class imbalance in BCE
-    temporal_phase_kwargs = {}
+    # Class imbalance handling
+    y_arr = np.array(data["y"])
+    n_pos = y_arr.sum()
+    n_neg = len(y_arr) - n_pos
+    imbalance_ratio = n_neg / max(n_pos, 1)
+    logger.info(f"Class distribution: {int(n_neg)} neg / {int(n_pos)} pos "
+                f"(ratio={imbalance_ratio:.1f}:1)")
+
+    phase_kwargs = {}
     if temporal_head:
-        y_arr = np.array(data["y"])
-        n_pos = y_arr.sum()
-        n_neg = len(y_arr) - n_pos
-        pw = torch.tensor([n_neg / max(n_pos, 1)], device=device)
-        temporal_phase_kwargs = dict(
+        pw = torch.tensor([imbalance_ratio], device=device)
+        phase_kwargs = dict(
             temporal_head=True,
             pos_weight=pw,
             time_weighting=finetune_cfg.time_weighting,
@@ -769,6 +796,13 @@ def run_finetune_v2(
         )
         logger.info(f"Temporal head: pos_weight={pw.item():.2f}, "
                      f"time_weighting={finetune_cfg.time_weighting}")
+    else:
+        # Standard head: weighted cross-entropy for class imbalance
+        factor = finetune_cfg.pos_weight_factor
+        cw = torch.tensor([1.0, imbalance_ratio * factor], device=device)
+        phase_kwargs = dict(class_weights=cw)
+        logger.info(f"Standard head: class_weights={cw.tolist()} "
+                     f"(pos_weight_factor={factor})")
 
     # ========================================================================
     # 4. Phase 1: Head-only training
@@ -787,7 +821,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
-        **temporal_phase_kwargs,
+        **phase_kwargs,
     )
 
     # ========================================================================
@@ -808,7 +842,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
-        **temporal_phase_kwargs,
+        **phase_kwargs,
     )
 
     # ========================================================================
@@ -829,7 +863,7 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
-        **temporal_phase_kwargs,
+        **phase_kwargs,
     )
 
     # ========================================================================
@@ -852,7 +886,7 @@ def run_finetune_v2(
             global_epoch=global_epoch,
             enable_masking=True,
             enable_weighting=True,
-            **temporal_phase_kwargs,
+            **phase_kwargs,
         )
 
     # ========================================================================
@@ -860,11 +894,17 @@ def run_finetune_v2(
     # ========================================================================
     if early_stopper is not None:
         early_stopper.restore_best(backbone)
-        best_auroc = early_stopper.best_score or 0.0
-        logger.info(f"Best validation AUROC: {best_auroc:.4f}")
+        best_score = early_stopper.best_score or 0.0
+        # Extract individual metrics from tracker at best epoch
+        best_auroc = tracker.best("val_auroc")
+        best_auprc = tracker.best("val_auprc")
+        logger.info(f"Best validation: score={best_score:.4f}, "
+                     f"auroc={best_auroc:.4f}, auprc={best_auprc:.4f}")
     else:
         best_auroc = None
-        logger.info("Full trainval training complete (no validation AUROC available)")
+        best_auprc = None
+        best_score = None
+        logger.info("Full trainval training complete (no validation metrics available)")
 
     # Save model + deployment bundle
     if finetune_cfg.model_name:
@@ -877,4 +917,6 @@ def run_finetune_v2(
         "model": backbone,
         "tracker": tracker,
         "best_auroc": best_auroc,
+        "best_auprc": best_auprc,
+        "best_score": best_score,
     }

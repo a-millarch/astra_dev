@@ -188,12 +188,21 @@ class InferenceSession:
                     na_mask[col] = bool(pd.isna(tab_df[col].iloc[0]))
 
         # Fill NaN in tabular numeric columns before normalization.
-        # FillMissing uses median during training; we approximate with the scaler's
-        # mean so that missing values become 0 after standardization.
-        if num_cols and hasattr(tab_scaler, 'mean_'):
+        # Use the scaler's center estimate so missing values become ~0 after
+        # normalization.  Different scaler types expose different attributes:
+        #   StandardScaler / AstraScaler / ColumnTransformer → .mean_
+        #   RobustScaler → .center_
+        #   QuantileTransformer / PowerTransformer → neither (use 0.0)
+        fill_values = None
+        if num_cols:
+            if hasattr(tab_scaler, 'mean_'):
+                fill_values = tab_scaler.mean_
+            elif hasattr(tab_scaler, 'center_'):
+                fill_values = tab_scaler.center_
+        if fill_values is not None:
             for i, col in enumerate(num_cols):
                 if col in tab_df.columns and pd.isna(tab_df[col].iloc[0]):
-                    tab_df.loc[tab_df.index[0], col] = tab_scaler.mean_[i]
+                    tab_df.loc[tab_df.index[0], col] = fill_values[i]
 
         # Exclude EBM channel from trajectory length computation so forward-filled
         # predictions cannot extend the trajectory beyond clinical measurements.

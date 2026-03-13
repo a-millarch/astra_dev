@@ -6,18 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ASTRA (AI for Surgical Trauma Risk Assessment) is an ML-driven risk assessment tool for trauma patients, developed by CSTAR at Copenhagen University Hospital. It predicts 30-day mortality (`deceased_30d`) using a hybrid transformer model that fuses tabular, continuous time series, and categorical time series data from EHR records.
 
-The dataset contains ~13,000 unique patients (~17,400 trainval samples). Input vectors are highly sparse: ~80% of timesteps are missing or padding. Continuous TS shape is `[batch, 27 channels, 114 timesteps]` with variable-width bins (10min→1h→1D).
+The dataset contains ~13,000 unique patients (~17,400 trainval samples). Input vectors are highly sparse: ~80% of timesteps are missing or padding. Continuous TS shape is `[batch, channels, timesteps]` with variable-width bins (10min→1h→1D).
 
 Note: VSCode, where Claude Code functions, is separate from the development environment that contains the actual data. The user works in parallel in AzureML using git to push and pull code between secure and non-secure environment.
 
 ## Commands
-
-### Environment Setup
-```bash
-conda create --name astra python=3.10.12 --no-default-packages -y
-make requirements    # installs deps + editable package
-make local           # installs package in editable mode only
-```
 
 ### Data Processing
 ```bash
@@ -59,11 +52,6 @@ Note: `--skip-valid` (default) trains on full trainval without validation. `--no
 
 Legacy CLI (`astra/models/hybrid/train_model.py`) still works for basic pretrain/finetune/eval but lacks sweep and early-prediction support.
 
-### Documentation
-```bash
-make build_documentation   # build MkDocs
-make serve_documentation   # serve locally
-```
 
 ## Architecture
 
@@ -78,7 +66,7 @@ All config lives in `configs/defaults.yaml`, loaded globally via `astra.utils.ge
 - `temporal_features`: positional encoding mode (`sinusoidal` from elapsed_hours)
 - `evaluation`: threshold mode, F-beta settings
 
-### Data Pipeline (`astra/data/`)
+### Primary Data Pipeline (Cohort) (`astra/data/`)
 
 The pipeline processes clinical EHR data through these stages:
 
@@ -137,6 +125,7 @@ Single-patient real-time inference: `pipeline.py` orchestrates data preparation 
 
 - **Bin intervals**: Time discretized into variable-width bins (10min for 0-6h, 20min for 6-12h, 1h for 12-24h, up to 1D bins). Current config yields 114 timesteps per patient.
 - **Concepts**: Clinical data sources (VitaleVaerdier, Labsvar, Medicin, Procedurer, ITAOversigtsrapport, ADTHaendelser), each with their own aggregation functions.
+- **Prehospital data**: Optional data source, which occur prior to default data timeline. Some concepts are standalone, others are merged into existing concepts. The patient trajectory start is defined by prehospital start if available. Enabled via `prehospital: enabled: true` in config. 
 - **Temporal split**: Train/test split at `2023-06-01` (configurable). Patients before → trainval, after → holdout.
 - **4-phase finetuning**: Head-only → partial unfreeze → full finetune → optional early prediction hardening. Discriminative LRs decay exponentially from head to embeddings.
 - **Temporal head**: Optional per-timestep prediction mode (`temporal_head: true`). Uses causal masking so each position only attends to past timesteps. Statics are read-only context (blocked from attending to temporal positions to prevent information bridge).

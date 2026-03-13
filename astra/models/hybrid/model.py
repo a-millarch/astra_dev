@@ -1,3 +1,4 @@
+import logging
 import math
 
 import numpy as np
@@ -8,6 +9,8 @@ import torch
 import torch.nn as nn
 
 from typing import List, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def ifnone(a, b):
@@ -450,6 +453,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         temporal_head_dropout: float = 0.3,     # Dropout for temporal head MLP
         temporal_channel_idx: Optional[int] = None,          # Index of elapsed_hours in x_ts
         exclude_channel_indices: Optional[List[int]] = None, # Aux channels to skip in W_P
+        head_pool: str = 'flatten',             # 'flatten' (legacy) or 'mean_cat' (pooled)
     ):
         """
         Args:
@@ -532,13 +536,29 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         self.causal = causal
         self.seq_len = seq_len
 
+        self.head_pool = head_pool
+        self._n_static = n_cat + n_cont
+
         if temporal_head:
             # Per-timestep prediction head (~2K params)
             self.temporal_pred_head = TemporalPredictionHead(
                 d_model, seq_len, dropout=temporal_head_dropout
             )
-            self.head = None  # Skip 12M-param flatten+MLP
+            self.head = None  # Skip large flatten+MLP
             self.head_nf = d_model
+        elif head_pool == 'mean_cat':
+            # Pooled head: mean-pool temporal tokens, concat static tokens
+            # Input: d_model (temporal mean) + d_model * n_static (flattened statics)
+            mlp_input_size = d_model * (1 + n_cat + n_cont)
+            hidden_dimensions = list(map(lambda t: int(mlp_input_size * t), fc_mults))
+            all_dimensions = [mlp_input_size, *hidden_dimensions, c_out]
+            self.head_nf = mlp_input_size
+            self.head = _MLP(all_dimensions, act=fc_act, skip=fc_skip, bn=fc_bn,
+                             dropout=fc_dropout, bn_final=bn_final)
+            self.temporal_pred_head = None
+            logger.info(f"Pooled head (mean_cat): input={mlp_input_size}, "
+                        f"dims={all_dimensions}, "
+                        f"params={sum(p.numel() for p in self.head.parameters()):,}")
         else:
             # Original flatten + MLP head
             mlp_input_size = (d_model * (n_cat + n_cont + seq_len))
@@ -734,6 +754,19 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         # === HEAD ===
         if self.temporal_head_enabled and self.temporal_pred_head is not None:
             x = self.temporal_pred_head(x)  # [batch, seq_len]
+        elif self.head_pool == 'mean_cat':
+            # Pool temporal tokens, concat static tokens
+            x_temporal = x[:, :self.seq_len, :]    # [B, seq_len, d_model]
+            x_static = x[:, self.seq_len:, :]      # [B, n_static, d_model]
+            if key_padding_mask is not None:
+                # Masked mean: exclude padding positions
+                ts_mask = ~key_padding_mask[:, :self.seq_len]  # [B, seq_len], True=valid
+                ts_mask_f = ts_mask.unsqueeze(-1).float()      # [B, seq_len, 1]
+                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                x_pooled = x_temporal.mean(dim=1)  # [B, d_model]
+            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
+            x = self.head(x)  # [batch, c_out]
         else:
             x = self.head(x)  # [batch, c_out]
         return x

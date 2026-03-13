@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
@@ -132,6 +132,63 @@ def compute_auroc(
         return 0.0
 
 
+@torch.no_grad()
+def compute_val_metrics(
+    model: nn.Module,
+    dataloader,
+    device: str = "cuda",
+    temporal_head: bool = False,
+) -> Dict[str, float]:
+    """
+    Compute AUROC and AUPRC on a dataloader.
+
+    Returns dict with 'auroc' and 'auprc' keys.
+    """
+    model.eval()
+    all_probs = []
+    all_targets = []
+
+    for batch in tqdm(dataloader, desc="Validating", leave=False):
+        inputs, targets = batch
+        inputs = _to_device(inputs, device)
+        targets = _to_device(targets, device)
+
+        logits = model(inputs)
+
+        if temporal_head:
+            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+            has_data = (x_ts.abs() > 1e-6).any(dim=1)
+            seq_len = x_ts.shape[2]
+            positions = torch.arange(seq_len, device=x_ts.device).unsqueeze(0)
+            masked_pos = torch.where(has_data, positions,
+                                     torch.tensor(-1, device=x_ts.device))
+            last_step = masked_pos.max(dim=1).values.clamp(min=0).long()
+            logits_last = logits[torch.arange(logits.size(0), device=device), last_step]
+            probs = torch.sigmoid(logits_last)
+        else:
+            probs = F.softmax(logits, dim=-1)[:, 1]
+
+        all_probs.append(probs.cpu().numpy())
+        all_targets.append(targets.cpu().numpy())
+
+    all_probs = np.concatenate(all_probs)
+    all_targets = np.concatenate(all_targets)
+
+    try:
+        auroc = roc_auc_score(all_targets, all_probs)
+    except ValueError:
+        logger.warning("AUROC undefined (only one class in targets)")
+        auroc = 0.0
+
+    try:
+        auprc = average_precision_score(all_targets, all_probs)
+    except ValueError:
+        logger.warning("AUPRC undefined (only one class in targets)")
+        auprc = 0.0
+
+    return {"auroc": auroc, "auprc": auprc}
+
+
 def _to_device(obj, device: str):
     """Recursively move tensors to device, ensuring plain torch.Tensor type."""
     if isinstance(obj, torch.Tensor):
@@ -159,6 +216,16 @@ class MetricTracker:
 
     def get(self, key: str) -> List[float]:
         return self.history.get(key, [])
+
+    def best(self, metric_suffix: str, mode: str = "max") -> float:
+        """Return the best value for a metric across all phases."""
+        values = []
+        for key, vals in self.history.items():
+            if key.endswith(f"/{metric_suffix}") and vals:
+                values.extend(vals)
+        if not values:
+            return 0.0
+        return max(values) if mode == "max" else min(values)
 
     def summary(self) -> Dict[str, float]:
         """Return the last value for each tracked metric."""

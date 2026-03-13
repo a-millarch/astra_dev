@@ -57,7 +57,7 @@ def _save_best_callback(study_name: str, save_path: Path):
         with open(save_path, "w") as f:
             yaml.dump(result, f, default_flow_style=False)
         logger.info(f"Saved best params (trial {study.best_trial.number}, "
-                     f"AUROC {study.best_value:.4f}) → {save_path}")
+                     f"score {study.best_value:.4f}) → {save_path}")
 
     return callback
 
@@ -75,12 +75,13 @@ def _build_backbone_from_trial(data: dict, cfg_dict: dict, trial: optuna.Trial):
         Backbone model and a dict of the suggested architecture params.
     """
     d_model = trial.suggest_categorical("d_model", [32, 64, 128])
-    n_layers = trial.suggest_categorical("n_layers", [4, 6, 8, 10])
+    n_layers = trial.suggest_categorical("n_layers", [2, 4, 6, 8])
     n_heads = trial.suggest_categorical("n_heads", [4, 8])
     fc_mults_1 = trial.suggest_float("fc_mults_1", 0.1, 0.5)
     fc_mults_2 = trial.suggest_float("fc_mults_2", 0.05, 0.3)
     fc_dropout = trial.suggest_float("fc_dropout", 0.1, 0.9)
     res_dropout = trial.suggest_float("res_dropout", 0.0, 0.4)
+    head_pool = trial.suggest_categorical("head_pool", ["flatten", "mean_cat"])
 
     # Ensure d_model is divisible by n_heads
     if d_model % n_heads != 0:
@@ -89,12 +90,12 @@ def _build_backbone_from_trial(data: dict, cfg_dict: dict, trial: optuna.Trial):
             n_heads -= 1
 
     backbone = TSTabFusionTransformerMultiHot(
-        c_in=data["ts_dls"].vars,
+        c_in=data["c_in"],
         c_out=2,
-        seq_len=data["mixed_dls"].len,
+        seq_len=data["seq_len"],
         classes=data["classes"],
         cont_names=data["num_cols"],
-        ts_cat_dims=data["ts_cat_dls"].ts_cat_dims,
+        ts_cat_dims=data["ts_cat_dims"],
         d_model=d_model,
         n_layers=n_layers,
         n_heads=n_heads,
@@ -103,6 +104,7 @@ def _build_backbone_from_trial(data: dict, cfg_dict: dict, trial: optuna.Trial):
         fc_mults=(fc_mults_1, fc_mults_2),
         cat_ts_combine="add",
         use_count_normalization=False,
+        head_pool=head_pool,
     )
 
     arch_params = {
@@ -113,6 +115,7 @@ def _build_backbone_from_trial(data: dict, cfg_dict: dict, trial: optuna.Trial):
         "fc_mults_2": fc_mults_2,
         "fc_dropout": fc_dropout,
         "res_dropout": res_dropout,
+        "head_pool": head_pool,
     }
 
     return backbone, arch_params
@@ -153,7 +156,7 @@ def arch_objective(trial: optuna.Trial, data: dict, cfg_dict: dict, device: str 
     )
 
     clear_mem()
-    return result["best_auroc"]
+    return result["best_score"]
 
 
 def run_arch_sweep(
@@ -201,7 +204,7 @@ def run_arch_sweep(
 
     best = study.best_params
     logger.info("=" * 80)
-    logger.info(f"Stage 1 complete. Best AUROC: {study.best_value:.4f}")
+    logger.info(f"Stage 1 complete. Best score (AUROC+AUPRC): {study.best_value:.4f}")
     logger.info(f"Best architecture: {best}")
     logger.info("=" * 80)
 
@@ -235,6 +238,9 @@ def training_objective(
     phase3_epochs = trial.suggest_int("phase3_epochs", 3, 15)
     phase4_epochs = trial.suggest_int("phase4_epochs", 0, 10)
 
+    # Class imbalance handling
+    pos_weight_factor = trial.suggest_float("pos_weight_factor", 0.3, 1.0, log=True)
+
     # Early prediction params (only relevant if phase4_epochs > 0)
     masking_prob = trial.suggest_float("masking_prob", 0.3, 0.7)
     early_weight = trial.suggest_float("early_weight", 1.0, 3.0)
@@ -254,6 +260,7 @@ def training_objective(
         lr_decay_factor=lr_decay_factor,
         weight_decay=weight_decay,
         label_smoothing=label_smoothing,
+        pos_weight_factor=pos_weight_factor,
         use_pretrained=True,
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
         patience=7,
@@ -279,7 +286,7 @@ def training_objective(
         trial.set_user_attr(attr_name, actual)
 
     clear_mem()
-    return result["best_auroc"]
+    return result["best_score"]
 
 
 def run_training_sweep(
@@ -341,7 +348,7 @@ def run_training_sweep(
 
     best = study.best_params
     logger.info("=" * 80)
-    logger.info(f"Stage 2 complete. Best AUROC: {study.best_value:.4f}")
+    logger.info(f"Stage 2 complete. Best score (AUROC+AUPRC): {study.best_value:.4f}")
     logger.info(f"Best training HPs: {best}")
     logger.info("=" * 80)
 
@@ -361,6 +368,7 @@ def run_training_sweep(
         lr_decay_factor=best["lr_decay_factor"],
         weight_decay=best["weight_decay"],
         label_smoothing=best["label_smoothing"],
+        pos_weight_factor=best["pos_weight_factor"],
         use_pretrained=True,
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
     )
