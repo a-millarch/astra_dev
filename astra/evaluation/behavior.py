@@ -939,6 +939,20 @@ class ModelWrapperWithEmbeddings(nn.Module):
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
             return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+        return self._apply_head(x, key_padding_mask)
+
+    def _apply_head(self, x, key_padding_mask):
+        """Apply head with pooling logic matching model.py forward()."""
+        if self.model.head_pool == 'mean_cat':
+            x_temporal = x[:, :self.model.seq_len, :]
+            x_static = x[:, self.model.seq_len:, :]
+            if key_padding_mask is not None:
+                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
+                ts_mask_f = ts_mask.unsqueeze(-1).float()
+                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                x_pooled = x_temporal.mean(dim=1)
+            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
         return self.model.head(x)
 
 
@@ -1036,6 +1050,20 @@ class ModelWrapperWithRawCatTS(nn.Module):
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
             return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+        return self._apply_head(x, key_padding_mask)
+
+    def _apply_head(self, x, key_padding_mask):
+        """Apply head with pooling logic matching model.py forward()."""
+        if self.model.head_pool == 'mean_cat':
+            x_temporal = x[:, :self.model.seq_len, :]
+            x_static = x[:, self.model.seq_len:, :]
+            if key_padding_mask is not None:
+                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
+                ts_mask_f = ts_mask.unsqueeze(-1).float()
+                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                x_pooled = x_temporal.mean(dim=1)
+            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
         return self.model.head(x)
 
 
