@@ -6,12 +6,12 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '13032026_PPJ'
+model_name: '16032026_astra'
 
-target: deceased_90d
+target: deceased_30d
 
 # Pre-hospital (PPJ) data integration
-prehospital: true                     # Set true to enable pre-hospital data pipeline
+prehospital: false                     # Set true to enable pre-hospital data pipeline
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
@@ -88,7 +88,7 @@ concepts:
   
 
 dataset:
-  exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  exclusion: traumatext  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
   overwrite: True
   max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
@@ -108,7 +108,7 @@ dataset:
       Medicin: medication
       Procedurer: procedures
       ADTHaendelser: ADT
-      Events: events
+      Events: event
 
   cat_cols:
       - SEX
@@ -149,13 +149,17 @@ exclusion_criteria:
 
   lvl1tc:
     lvl1tc: true
+    traumatext: true
+    
+  traumatext:
+    traumatext: true
 
 pretrain:
     mask_prob_ts: 0.15
     mask_prob_cat_ts: 0.15
     mask_prob_cat: 0.15
     mask_prob_cont: 0.15
-    epochs: 10
+    epochs: 5
     lr: 5.0e-5
     warmup_epochs: 3
     ts_loss_weight: 1.5
@@ -221,7 +225,7 @@ finetune:
     label_smoothing: 0.1
 
     # Class imbalance
-    pos_weight_factor: 0.0       # scale factor for positive class weight (n_neg/n_pos * factor)
+    pos_weight_factor: 0.0       # 0 for disabled scale factor for positive class weight (n_neg/n_pos * factor)
 
     # Validation / early stopping
     patience: 7
@@ -315,7 +319,7 @@ bin_freq_include:
   - '4h'
   - '12h'
   - '1D'
-  - '7D'
+  #- '7D'
   #- '30D'
 
 agg_func: #also for datasets, split it up
