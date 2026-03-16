@@ -1053,6 +1053,7 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'temporal_head_dropout': cfg.get("model", {}).get("temporal_head_dropout", 0.3),
             'temporal_channel_idx': data.get('temporal_channel_idx', None),
             'exclude_channel_indices': data.get('exclude_channel_indices', []),
+            'head_pool': cfg.get("model", {}).get("head_pool", "flatten"),
         },
 
         # --- SHAP background data ---
