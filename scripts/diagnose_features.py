@@ -8,14 +8,14 @@ Usage (in notebook after existing diagnostic):
     %run scripts/diagnose_features.py
     # or import and call:
     from scripts.diagnose_features import compare_all_features
-    compare_all_features(data, session, ctx, cpr_hash)
+    compare_all_features(data, session, ctx, cpr_hash, service_date)
 """
 import numpy as np
 import pandas as pd
 import torch
 
 
-def compare_all_features(data, session, ctx, cpr_hash):
+def compare_all_features(data, session, ctx, cpr_hash, service_date):
     """Compare batch vs inference for tabular + categorical TS features.
 
     Args:
@@ -23,17 +23,25 @@ def compare_all_features(data, session, ctx, cpr_hash):
         session: InferenceSession with loaded model.
         ctx: PatientContext built from CSV.
         cpr_hash: Full CPR hash string.
+        service_date: ServiceDate to disambiguate multiple trajectories for the same CPR.
     """
     device = session.device
 
     # ---- 1. Find patient in holdout by batch PID ----
     batch_base = pd.read_pickle("data/interim/base_df.pkl")
-    matches = batch_base[batch_base["CPR_hash"] == cpr_hash]
+    sd = pd.Timestamp(service_date)
+    matches = batch_base[
+        (batch_base["CPR_hash"] == cpr_hash)
+        & (batch_base["ServiceDate"] == sd)
+    ]
     if matches.empty:
-        # Try prefix match
-        matches = batch_base[batch_base["CPR_hash"].str.startswith(cpr_hash[:16])]
+        # Try prefix match on CPR + exact ServiceDate
+        matches = batch_base[
+            batch_base["CPR_hash"].str.startswith(cpr_hash[:16])
+            & (batch_base["ServiceDate"] == sd)
+        ]
     if matches.empty:
-        print(f"ERROR: CPR_hash {cpr_hash[:8]}... not found in batch base_df")
+        print(f"ERROR: CPR_hash {cpr_hash[:8]}... + ServiceDate {sd} not found in batch base_df")
         return
 
     batch_pid = int(matches.iloc[0]["PID"])
