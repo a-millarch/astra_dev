@@ -78,8 +78,6 @@ def _load_astra_modules():
 # CONFIG & CACHED RESOURCES
 # ═════════════════════════════════════════════════════════════════════════
 
-st.cache_resource.clear()
-
 st.set_page_config(
     page_title="ASTRA SHAP Dashboard",
     page_icon="🔬",
@@ -463,20 +461,25 @@ def main():
         hours_offset = st.session_state.pop("play_target_hours")
 
     # ═════════════════════════════════════════════════════════════════
-    # AUTO-PREDICT: runs on every rerun (slider change, patient change)
+    # AUTO-PREDICT: only when patient or time actually changed
     # ═════════════════════════════════════════════════════════════════
 
-    try:
-        with st.spinner("Running simulation prediction..."):
-            pred_data = run_simulation_predict(
-                cfg, cpr, sd, actual_start, hours_offset
-            )
-        st.session_state["pred_data"] = pred_data
-        st.session_state["cfg_used"] = cfg
-    except Exception as e:
-        st.error(f"Error running simulation: {e}")
-        st.exception(e)
-        return
+    pred_key = f"{cpr}_{sd}_{cfg.get('model_name')}_{hours_offset}"
+    if st.session_state.get("pred_key") != pred_key or "pred_data" not in st.session_state:
+        try:
+            with st.spinner("Running simulation prediction..."):
+                pred_data = run_simulation_predict(
+                    cfg, cpr, sd, actual_start, hours_offset
+                )
+            st.session_state["pred_data"] = pred_data
+            st.session_state["pred_key"] = pred_key
+            st.session_state["cfg_used"] = cfg
+        except Exception as e:
+            st.error(f"Error running simulation: {e}")
+            st.exception(e)
+            return
+
+    pred_data = st.session_state["pred_data"]
 
     # ═════════════════════════════════════════════════════════════════
     # SHAP: only on button click

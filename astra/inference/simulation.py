@@ -457,6 +457,7 @@ class SimulationRunner:
         service_date,
         cfg: dict = None,
         data_dir: str = 'data/raw',
+        ebm_models_dir: str = 'models/ebm',
         start_hours: float = 0.0,
         end_hours: Optional[float] = None,
     ) -> SimulationResult:
@@ -477,15 +478,12 @@ class SimulationRunner:
         against the retrospective simulation path (``refresh(t)`` with
         ``_full_trajectory_data``).
 
-        Note: EBM predictions are not injected in real-time mode.  The EBM
-        setup requires ``from_csv()``-level context (filtered_concepts,
-        base_df) which is not available through the ``create()`` path.
-
         Args:
             cpr_hash: Patient identifier hash.
             service_date: Admission date (for base_df lookup).
             cfg: Configuration dict (loaded from defaults.yaml if None).
             data_dir: Path to raw CSV data.
+            ebm_models_dir: Path to saved EBM models.
             start_hours: Start simulation at this many hours after admission.
             end_hours: Stop simulation at this many hours (None = full trajectory).
 
