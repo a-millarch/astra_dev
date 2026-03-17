@@ -54,6 +54,7 @@ def load_patient_csv(
     filename: str,
     data_dir: str = 'data/raw',
     patient_dir: str = 'data/patients',
+    cache: bool = True,
     **read_csv_kwargs,
 ) -> pd.DataFrame:
     """Load a CSV filtered to a single patient.
@@ -63,11 +64,15 @@ def load_patient_csv(
     Otherwise falls back to the full population CSV at
     ``{data_dir}/{filename}.csv`` and filters by ``CPR_hash``.
 
+    When *cache* is True (default), a fallback load automatically saves the
+    filtered result to the per-patient directory so subsequent loads are fast.
+
     Args:
         cpr_hash: Patient identifier hash.
         filename: CSV stem without extension (e.g. ``'VitaleVaerdier'``).
         data_dir: Directory containing population-level CSVs.
         patient_dir: Root directory for per-patient subdirectories.
+        cache: If True, save filtered result to per-patient dir on fallback.
         **read_csv_kwargs: Passed to ``pd.read_csv()`` (e.g. ``index_col``,
             ``low_memory``, ``dtype``).
 
@@ -90,6 +95,15 @@ def load_patient_csv(
 
     if 'CPR_hash' in df.columns:
         df = df[df['CPR_hash'] == cpr_hash]
+
+    # Cache the filtered result for next time
+    if cache and not df.empty:
+        try:
+            os.makedirs(os.path.dirname(patient_path), exist_ok=True)
+            df.to_csv(patient_path, index=True)
+            logger.info("load_patient_csv: cached %s (%d rows)", patient_path, len(df))
+        except OSError as e:
+            logger.warning("load_patient_csv: failed to cache %s: %s", patient_path, e)
 
     return df
 

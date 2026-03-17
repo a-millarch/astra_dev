@@ -301,7 +301,7 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
             x=[shap_hours],
             y=[shap_prob],
             mode="markers",
-            marker=dict(size=12, color="red", symbol="diamond"),
+            marker=dict(size=12, color="#0068C9", symbol="diamond"),
             name=f"SHAP eval ({shap_hours:.1f}h)",
             showlegend=True,
         ))
@@ -467,20 +467,33 @@ def main():
 
     # ── Sidebar: Action buttons ──────────────────────────────────────
     st.sidebar.markdown("---")
-    sim_col1, sim_col2 = st.sidebar.columns(2)
-    with sim_col1:
+    # Green "Run Simulation" button via CSS on a keyed container
+    with st.sidebar.container(key="run_sim_container"):
         run_clicked = st.button(
             "Run Simulation",
             type="primary",
             use_container_width=True,
             help="Run simulation for the selected patient and time",
         )
-    with sim_col2:
+    with st.sidebar.container(key="shap_container"):
         shap_clicked = st.button(
             "Compute SHAP",
+            type="primary",
             use_container_width=True,
             help="Compute SHAP explanations at the current time point",
         )
+    st.sidebar.markdown("""
+    <style>
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"] {
+        background-color: #21a366;
+        border-color: #1a8a54;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"]:hover {
+        background-color: #1a8a54;
+        border-color: #15724a;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     # ── Apply playback override BEFORE prediction ─────────────────────
     # During playback, the previous rerun set play_target_hours.
