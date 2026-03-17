@@ -2579,7 +2579,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
 
 
 
-def shap_analysis(data=None, model=None, model_name='13012025', compute_per_category_shap=True,
+def shap_analysis(data=None, model=None, model_name='13012025', compute_per_category_shap=True, max_background_samples=600,
                   max_test_samples=90, visualize=True, specific_pids: List = None) -> Dict:
     """
     Run full SHAP analysis.
@@ -2625,7 +2625,7 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
         background_loader=data["mixed_dls"].train,
         test_loader=data["holdout_mixed_dls"].train,
         device=device,
-        max_background_samples=600,
+        max_background_samples=max_background_samples,
         max_test_samples=max_test_samples,
         encoding_info=data["encoding_info"],
         compute_per_category_shap=compute_per_category_shap,
