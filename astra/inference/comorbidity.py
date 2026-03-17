@@ -275,6 +275,7 @@ def compute_elixhauser_vw(diagnoses: List[str]) -> float:
 def compute_elixhauser_for_patient(
     base_df: pd.DataFrame,
     data_dir: str,
+    patient_dir: str = 'data/patients',
 ) -> pd.DataFrame:
     """
     Compute Elixhauser comorbidity score for a single patient from raw CSVs.
@@ -289,12 +290,16 @@ def compute_elixhauser_for_patient(
     Args:
         base_df: Single-patient base DataFrame with CPR_hash, PID, start, end.
         data_dir: Directory containing raw CSV files (Diagnoser.csv).
+        patient_dir: Directory with pre-split per-patient CSVs.
 
     Returns:
         base_df with ASMT_ELIX column added.
     """
+    from astra.inference.patient_store import load_patient_csv
+
     try:
-        diag = pd.read_csv(f"{data_dir}/Diagnoser.csv")
+        cpr_hash = base_df['CPR_hash'].iloc[0]
+        diag = load_patient_csv(cpr_hash, 'Diagnoser', data_dir, patient_dir)
     except FileNotFoundError:
         logger.info("Diagnoser.csv not found — setting ASMT_ELIX=NaN")
         base_df["ASMT_ELIX"] = np.nan

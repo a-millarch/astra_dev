@@ -253,6 +253,7 @@ class PatientContext:
         data_dir: str = 'data/raw',
         ebm_models_dir: str = 'models/ebm',
         start_hours: float = None,
+        patient_dir: str = 'data/patients',
     ) -> "PatientContext":
         """Create from raw CSV files (stateless — no shared file writes).
 
@@ -266,6 +267,7 @@ class PatientContext:
                 time from ``base_df['start']``.  This avoids misalignment
                 when ``service_date`` (date-only) differs from the true
                 admission timestamp (e.g. with prehospital data).
+            patient_dir: Directory with pre-split per-patient CSVs.
         """
         from astra.inference.data_prep import (
             _build_single_patient_base_df,
@@ -283,14 +285,16 @@ class PatientContext:
 
         # Phase 1: Build base_df (stateless)
         with timed_stage(timing, 'csv_load'):
-            base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
+            base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg,
+                                                    data_dir, patient_dir=patient_dir)
             logger.info(
                 f"Built base_df for patient {cpr_hash[:8]}...: "
                 f"trajectory {base_df['start'].iloc[0]} -> {base_df['end'].iloc[0]}"
             )
 
             # Phase 2: Filter concepts (stateless) — loads full trajectory
-            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir,
+                                                             patient_dir=patient_dir)
             logger.info(
                 f"Filtered {len(filtered_concepts)} concepts: "
                 f"{list(filtered_concepts.keys())}"

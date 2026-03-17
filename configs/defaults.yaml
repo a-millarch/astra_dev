@@ -154,6 +154,9 @@ exclusion_criteria:
   traumatext:
     traumatext: true
 
+  study3:
+    pid_file: data/external/studypop.csv
+
 pretrain:
     mask_prob_ts: 0.15
     mask_prob_cat_ts: 0.15
