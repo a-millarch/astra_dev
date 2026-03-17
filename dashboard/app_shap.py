@@ -264,6 +264,12 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
 
     df = sim_result.to_dataframe()
 
+    # Filter to observation window
+    if viewed_hours is not None:
+        df = df[df["elapsed_hours"] <= viewed_hours + 0.01].copy()
+    if df.empty:
+        return None
+
     fig = go.Figure()
 
     # Prediction curve
@@ -278,34 +284,17 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
 
     # Inhospital arrival boundary
     if sim_result.inhospital_start_hours is not None and sim_result.inhospital_start_hours > 0:
-        fig.add_vline(
-            x=sim_result.inhospital_start_hours,
-            line_dash="dot",
-            line_color="#2196F3",
-            annotation_text=f"Hospital arrival ({sim_result.inhospital_start_hours:.1f}h)",
-            annotation_position="top left",
-        )
-
-    # Mark current slider position
-    if viewed_hours is not None:
-        closest_idx = (df["elapsed_hours"] - viewed_hours).abs().idxmin()
-        viewed_prob = df.loc[closest_idx, "probability"]
-        fig.add_vline(
-            x=viewed_hours,
-            line_dash="dash",
-            line_color="#666",
-        )
-        fig.add_trace(go.Scatter(
-            x=[df.loc[closest_idx, "elapsed_hours"]],
-            y=[viewed_prob],
-            mode="markers",
-            marker=dict(size=10, color="#ff7f0e", symbol="circle"),
-            name=f"Viewing ({viewed_hours:.1f}h)",
-            showlegend=True,
-        ))
+        if viewed_hours is None or sim_result.inhospital_start_hours <= viewed_hours:
+            fig.add_vline(
+                x=sim_result.inhospital_start_hours,
+                line_dash="dot",
+                line_color="#2196F3",
+                annotation_text=f"Hospital arrival ({sim_result.inhospital_start_hours:.1f}h)",
+                annotation_position="top left",
+            )
 
     # Mark SHAP evaluation timepoint
-    if shap_hours is not None:
+    if shap_hours is not None and (viewed_hours is None or shap_hours <= viewed_hours + 0.01):
         closest_idx = (df["elapsed_hours"] - shap_hours).abs().idxmin()
         shap_prob = df.loc[closest_idx, "probability"]
         fig.add_trace(go.Scatter(
@@ -317,8 +306,9 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
             showlegend=True,
         ))
 
+    n_visible = len(df)
     fig.update_layout(
-        title=f"Prediction Trajectory ({sim_result.n_steps} simulation steps)",
+        title=f"Prediction Trajectory ({n_visible} steps up to {df['elapsed_hours'].iloc[-1]:.1f}h)",
         xaxis_title="Elapsed hours",
         yaxis_title="P(deceased 30d)",
         yaxis=dict(range=[-0.05, 1.05]),
@@ -330,12 +320,18 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
     return fig
 
 
-def _plot_simulation_diagnostics(sim_result):
+def _plot_simulation_diagnostics(sim_result, viewed_hours=None):
     """Build diagnostic Plotly charts from SimulationResult."""
     if sim_result is None or not sim_result.steps:
         return None, None
 
     df = sim_result.to_dataframe()
+
+    # Filter to observation window
+    if viewed_hours is not None:
+        df = df[df["elapsed_hours"] <= viewed_hours + 0.01].copy()
+    if df.empty:
+        return None, None
 
     # Timing breakdown (stacked bar)
     timing_cols = [c for c in df.columns if c.startswith("timing_")]
@@ -647,7 +643,7 @@ def main():
                 st.metric("Remaining Steps", runner.remaining_steps)
 
             # Diagnostic charts
-            fig_timing, fig_meas = _plot_simulation_diagnostics(sim_result)
+            fig_timing, fig_meas = _plot_simulation_diagnostics(sim_result, viewed_hours=hours_offset)
 
             if fig_timing:
                 fig_timing.update_layout(width=None)
