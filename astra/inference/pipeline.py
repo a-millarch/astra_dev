@@ -155,7 +155,8 @@ class InferenceSession:
     # Data preparation
     # ------------------------------------------------------------------
 
-    def _prepare_tensors(self, x_ts, x_ts_cat, tab_df, trajectory_length=None):
+    def _prepare_tensors(self, x_ts, x_ts_cat, tab_df, trajectory_length=None,
+                         profiling=None):
         """
         Normalize raw patient data and convert to model-ready tensors.
 
@@ -168,42 +169,45 @@ class InferenceSession:
             trajectory_length: Optional override for trajectory length. When
                 provided (e.g. from PatientContext), used instead of detecting
                 from the tensor via get_trajectory_lengths().
+            profiling: Optional dict to collect sub-stage timing (for perf analysis).
 
         Returns:
             (x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len) — all tensors on device
         """
+        from contextlib import nullcontext as _nullctx
+        from astra.inference.data_prep import timed_stage
+
+        def _ts(name):
+            return timed_stage(profiling, name) if profiling is not None else _nullctx()
+
         if x_ts.ndim == 2:
             x_ts = x_ts[np.newaxis, ...]
         if x_ts_cat.ndim == 2:
             x_ts_cat = x_ts_cat[np.newaxis, ...]
 
-        tab_df = tab_df.copy()
-        num_cols = self.bundle['tab_feature_names']
-        tab_scaler = self.bundle['tab_scaler']
+        with _ts('prep_tab_fill'):
+            tab_df = tab_df.copy()
+            num_cols = self.bundle['tab_feature_names']
+            tab_scaler = self.bundle['tab_scaler']
 
-        # Record which numeric columns are NaN BEFORE filling (for _na indicators)
-        na_mask = {}
-        if num_cols:
-            for col in num_cols:
-                if col in tab_df.columns:
-                    na_mask[col] = bool(pd.isna(tab_df[col].iloc[0]))
+            # Record which numeric columns are NaN BEFORE filling (for _na indicators)
+            na_mask = {}
+            if num_cols:
+                for col in num_cols:
+                    if col in tab_df.columns:
+                        na_mask[col] = bool(pd.isna(tab_df[col].iloc[0]))
 
-        # Fill NaN in tabular numeric columns before normalization.
-        # Use the scaler's center estimate so missing values become ~0 after
-        # normalization.  Different scaler types expose different attributes:
-        #   StandardScaler / AstraScaler / ColumnTransformer → .mean_
-        #   RobustScaler → .center_
-        #   QuantileTransformer / PowerTransformer → neither (use 0.0)
-        fill_values = None
-        if num_cols:
-            if hasattr(tab_scaler, 'mean_'):
-                fill_values = tab_scaler.mean_
-            elif hasattr(tab_scaler, 'center_'):
-                fill_values = tab_scaler.center_
-        if fill_values is not None:
-            for i, col in enumerate(num_cols):
-                if col in tab_df.columns and pd.isna(tab_df[col].iloc[0]):
-                    tab_df.loc[tab_df.index[0], col] = fill_values[i]
+            # Fill NaN in tabular numeric columns before normalization.
+            fill_values = None
+            if num_cols:
+                if hasattr(tab_scaler, 'mean_'):
+                    fill_values = tab_scaler.mean_
+                elif hasattr(tab_scaler, 'center_'):
+                    fill_values = tab_scaler.center_
+            if fill_values is not None:
+                for i, col in enumerate(num_cols):
+                    if col in tab_df.columns and pd.isna(tab_df[col].iloc[0]):
+                        tab_df.loc[tab_df.index[0], col] = fill_values[i]
 
         # Exclude EBM channel from trajectory length computation so forward-filled
         # predictions cannot extend the trajectory beyond clinical measurements.
@@ -211,9 +215,10 @@ class InferenceSession:
         traj_exclude_chs = [ebm_ch_idx] if ebm_ch_idx is not None else None
 
         # Normalize continuous TS + tabular using saved scalers
-        ts_norm, tab_norm = normalize_new_patient(
-            x_ts, tab_df, self.bundle, exclude_channels=traj_exclude_chs
-        )
+        with _ts('prep_normalize'):
+            ts_norm, tab_norm = normalize_new_patient(
+                x_ts, tab_df, self.bundle, exclude_channels=traj_exclude_chs
+            )
 
         # Restore raw elapsed_hours — sinusoidal PE requires actual hours (0–720),
         # not the ~N(0,1) values produced by the TS scaler.
@@ -228,40 +233,40 @@ class InferenceSession:
             traj_len = int(get_trajectory_lengths(x_ts, exclude_channels=traj_exclude_chs)[0])
 
         # Convert to tensors
-        x_ts_t = torch.from_numpy(ts_norm).float().to(self.device)
+        with _ts('prep_to_torch'):
+            x_ts_t = torch.from_numpy(ts_norm).float().to(self.device)
 
-        x_ts_cat_t = torch.from_numpy(x_ts_cat).float().to(self.device)
+            x_ts_cat_t = torch.from_numpy(x_ts_cat).float().to(self.device)
 
         # Static categorical: encode via the same procs used in training
-        # classes dict maps feature_name -> list of categories (index 0 = #na#)
-        # FillMissing adds {col}_na boolean indicators for numeric columns with NaN
-        classes = self.bundle['model_params']['classes']
-        if classes:
-            cat_indices = []
-            for col in classes:
-                class_list = list(classes[col])
-                if col.endswith('_na') and col not in tab_df.columns:
-                    # _na indicator: True if the original numeric column had NaN
-                    orig_col = col[:-3]  # strip '_na'
-                    is_na = na_mask.get(orig_col, False)
-                    idx = class_list.index(is_na) if is_na in class_list else 0
-                elif col in tab_df.columns:
-                    val = tab_df[col].iloc[0]
-                    idx = class_list.index(val) if val in class_list else 0
-                else:
-                    idx = 0  # unknown column → #na#
-                cat_indices.append(idx)
-            x_cat_t = torch.tensor([cat_indices], dtype=torch.long, device=self.device)
-        else:
-            x_cat_t = torch.zeros(1, 0, dtype=torch.long, device=self.device)
+        with _ts('prep_cat_encode'):
+            classes = self.bundle['model_params']['classes']
+            if classes:
+                cat_indices = []
+                for col in classes:
+                    class_list = list(classes[col])
+                    if col.endswith('_na') and col not in tab_df.columns:
+                        orig_col = col[:-3]
+                        is_na = na_mask.get(orig_col, False)
+                        idx = class_list.index(is_na) if is_na in class_list else 0
+                    elif col in tab_df.columns:
+                        val = tab_df[col].iloc[0]
+                        idx = class_list.index(val) if val in class_list else 0
+                    else:
+                        idx = 0
+                    cat_indices.append(idx)
+                x_cat_t = torch.tensor([cat_indices], dtype=torch.long, device=self.device)
+            else:
+                x_cat_t = torch.zeros(1, 0, dtype=torch.long, device=self.device)
 
         # Static continuous: already normalized in tab_norm
-        num_cols = self.bundle['tab_feature_names']
-        if num_cols and len(num_cols) > 0:
-            cont_vals = tab_norm[num_cols].values.astype(np.float32)
-            x_cont_t = torch.from_numpy(cont_vals).to(self.device)
-        else:
-            x_cont_t = torch.zeros(1, 0, dtype=torch.float32, device=self.device)
+        with _ts('prep_cont_encode'):
+            num_cols = self.bundle['tab_feature_names']
+            if num_cols and len(num_cols) > 0:
+                cont_vals = tab_norm[num_cols].values.astype(np.float32)
+                x_cont_t = torch.from_numpy(cont_vals).to(self.device)
+            else:
+                x_cont_t = torch.zeros(1, 0, dtype=torch.float32, device=self.device)
 
         logger.debug("Tensors prepared: ts=%s cat=%s cont=%s ts_cat=%s traj_len=%d",
                      x_ts_t.shape, x_cat_t.shape, x_cont_t.shape,
@@ -273,7 +278,7 @@ class InferenceSession:
     # ------------------------------------------------------------------
 
     def predict(self, x_ts, x_ts_cat, tab_df, censor_step=None, pid=None,
-                trajectory_length=None):
+                trajectory_length=None, profiling=None):
         """
         Run inference on a single patient.
 
@@ -284,20 +289,30 @@ class InferenceSession:
             censor_step: Optional timestep to evaluate at (temporal head only)
             pid: Optional patient identifier for the result
             trajectory_length: Optional override for trajectory length (from PatientContext).
+            profiling: Optional dict to collect sub-stage timing (for perf analysis).
 
         Returns:
             InferenceResult
         """
-        x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len = self._prepare_tensors(
-            x_ts, x_ts_cat, tab_df, trajectory_length=trajectory_length
-        )
+        from contextlib import nullcontext as _nullctx
+        from astra.inference.data_prep import timed_stage
+
+        def _ts(name):
+            return timed_stage(profiling, name) if profiling is not None else _nullctx()
+
+        with _ts('prep_tensors'):
+            x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len = self._prepare_tensors(
+                x_ts, x_ts_cat, tab_df, trajectory_length=trajectory_length,
+                profiling=profiling,
+            )
 
         # Pass trajectory lengths so the model builds a proper key_padding_mask
         # (matching training behavior from AstraMixedDataset)
         traj_lengths_t = torch.tensor([traj_len], dtype=torch.long, device=self.device)
 
-        with torch.no_grad():
-            logits = self.model((x_ts_t, (x_cat_t, x_cont_t), x_ts_cat_t, traj_lengths_t))
+        with _ts('model_forward'):
+            with torch.no_grad():
+                logits = self.model((x_ts_t, (x_cat_t, x_cont_t), x_ts_cat_t, traj_lengths_t))
 
         if self.is_temporal:
             # logits: [1, seq_len]
@@ -665,13 +680,14 @@ class InferenceSession:
         from astra.inference.patient_context import PatientContext
         return PatientContext.create(raw_data, self.bundle)
 
-    def predict_from_context(self, context, censor_step=None):
+    def predict_from_context(self, context, censor_step=None, profiling=None):
         """Run prediction using an existing PatientContext.
 
         Args:
             context: A :class:`PatientContext` instance.
             censor_step: Override timestep to evaluate at (temporal head).
                 Defaults to ``context.trajectory_length - 1``.
+            profiling: Optional dict to collect sub-stage timing (for perf analysis).
 
         Returns:
             :class:`InferenceResult`
@@ -684,6 +700,7 @@ class InferenceSession:
             censor_step=step,
             pid=context.pid,
             trajectory_length=context.trajectory_length,
+            profiling=profiling,
         )
 
     def refresh_and_predict(self, context, current_time, new_data=None):

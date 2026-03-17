@@ -70,10 +70,96 @@ class SimulationResult:
     wall_clock_seconds: float = 0.0
     prediction_curve: Optional[np.ndarray] = None  # [seq_len], NaN where unpredicted
     inhospital_start_hours: Optional[float] = None  # hours after admission
+    profiling: Optional[dict] = field(default=None, repr=False)  # fine-grained sub-stage timing
 
     @property
     def n_steps(self) -> int:
         return len(self.steps)
+
+    def print_profile(self):
+        """Log a comprehensive profiling summary.
+
+        Shows three sections:
+        1. **Step-level**: mean/total for coarse refresh vs predict per step.
+        2. **Context-level**: accumulated timing from PatientContext._timing
+           (continuous_build, categorical_build, time_filter, ebm_*).
+        3. **Sub-stage**: fine-grained breakdown within refresh and predict
+           (reveal_scan, temporal_features, normalization, model_forward, etc.).
+        """
+        lines = [
+            f"\n{'='*70}",
+            f"SIMULATION PROFILE: {self.n_steps} steps, "
+            f"{self.wall_clock_seconds:.1f}s wall clock",
+            f"{'='*70}",
+        ]
+
+        # --- Section 1: Step-level (refresh vs predict) ---
+        refresh_ms = []
+        predict_ms = []
+        for s in self.steps:
+            for stage, durations in s.step_timing.items():
+                val = sum(durations) * 1000
+                if stage == 'refresh':
+                    refresh_ms.append(val)
+                elif stage == 'predict':
+                    predict_ms.append(val)
+
+        lines.append("\n-- Step-level (per-step mean / total) --")
+        for label, vals in [('refresh', refresh_ms), ('predict', predict_ms)]:
+            if vals:
+                arr = np.array(vals)
+                lines.append(
+                    f"  {label:20s}: mean={arr.mean():7.1f}ms  "
+                    f"total={arr.sum():8.0f}ms  "
+                    f"min={arr.min():7.1f}ms  max={arr.max():7.1f}ms"
+                )
+
+        accounted = sum(refresh_ms) + sum(predict_ms)
+        overhead = self.wall_clock_seconds * 1000 - accounted
+        lines.append(f"  {'loop overhead':20s}: {overhead:8.0f}ms")
+
+        # --- Section 2: Context-level (PatientContext._timing) ---
+        if self.total_timing:
+            lines.append("\n-- Context-level (accumulated across all steps) --")
+            for stage, durations in sorted(self.total_timing.items()):
+                total = sum(durations) * 1000
+                count = len(durations)
+                mean = total / count if count else 0
+                lines.append(
+                    f"  {stage:20s}: mean={mean:7.1f}ms  "
+                    f"total={total:8.0f}ms  count={count}"
+                )
+
+        # --- Section 3: Sub-stage profiling ---
+        if self.profiling:
+            lines.append("\n-- Sub-stage profiling (fine-grained breakdown) --")
+            # Sort by total time descending
+            stage_totals = []
+            for stage, durations in self.profiling.items():
+                total = sum(durations) * 1000
+                count = len(durations)
+                mean = total / count if count else 0
+                stage_totals.append((stage, mean, total, count))
+            stage_totals.sort(key=lambda x: x[2], reverse=True)
+
+            for stage, mean, total, count in stage_totals:
+                pct = total / (self.wall_clock_seconds * 1000) * 100
+                lines.append(
+                    f"  {stage:25s}: mean={mean:7.2f}ms  "
+                    f"total={total:8.0f}ms  count={count:4d}  "
+                    f"({pct:5.1f}%)"
+                )
+
+            # Unaccounted time
+            profiled_total = sum(
+                sum(d) * 1000 for d in self.profiling.values()
+            )
+            # Note: sub-stages overlap with step-level, so just show totals
+            lines.append(f"\n  Sub-stage total: {profiled_total:.0f}ms "
+                         f"(may overlap with step-level timings)")
+
+        lines.append(f"{'='*70}")
+        logger.info('\n'.join(lines))
 
     def to_dataframe(self) -> pd.DataFrame:
         """One row per step: elapsed_hours, probability, timing breakdown."""
@@ -631,22 +717,26 @@ class SimulationRunner:
         steps = []
         prev_raw_counts = _count_raw_data(context._raw_data)
         prediction_curve = np.full(len(context.bin_df), np.nan)
+        profiling = {}  # fine-grained sub-stage timing
 
         for tp in time_points:
             step_timing = {}
 
             # Refresh context (incremental)
             with timed_stage(step_timing, 'refresh'):
-                context.refresh(tp)
+                context.refresh(tp, profiling=profiling)
 
             # Count new measurements
-            new_counts = _count_raw_data(context._raw_data)
+            with timed_stage(profiling, 'count_raw'):
+                new_counts = _count_raw_data(context._raw_data)
             n_new = new_counts - prev_raw_counts
             prev_raw_counts = new_counts
 
             # Predict
             with timed_stage(step_timing, 'predict'):
-                result = self.session.predict_from_context(context)
+                result = self.session.predict_from_context(
+                    context, profiling=profiling,
+                )
 
             # Store prediction at current bin position
             bin_idx = context.trajectory_length - 1
@@ -678,6 +768,7 @@ class SimulationRunner:
             wall_clock_seconds=time.perf_counter() - wall_start,
             prediction_curve=prediction_curve,
             inhospital_start_hours=ihs_hours,
+            profiling=profiling,
         )
 
         logger.info(
@@ -685,6 +776,7 @@ class SimulationRunner:
             f"{sim_result.wall_clock_seconds:.1f}s wall clock, "
             f"pid={context.pid}"
         )
+        sim_result.print_profile()
 
         return sim_result
 

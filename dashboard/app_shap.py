@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 @st.cache_resource
 def _load_astra_modules():
     """Import heavy astra modules once, lazily."""
-    from astra.utils import get_cfg, get_base_df, ProjectManager
+    from astra.utils import get_cfg, get_base_df
     from astra.inference import InferenceSession
     from astra.inference.patient_context import PatientContext
     from astra.inference.simulation import SimulationRunner
@@ -56,7 +56,6 @@ def _load_astra_modules():
     return {
         "get_cfg": get_cfg,
         "get_base_df": get_base_df,
-        "ProjectManager": ProjectManager,
         "InferenceSession": InferenceSession,
         "PatientContext": PatientContext,
         "SimulationRunner": SimulationRunner,
@@ -104,7 +103,6 @@ def list_config_files():
 @st.cache_resource
 def load_config(config_path):
     mods = _load_astra_modules()
-    mods["ProjectManager"](workdir="josefine.schoening/repos/astra/")
     cfg = mods["get_cfg"](config_path)
     return cfg
 

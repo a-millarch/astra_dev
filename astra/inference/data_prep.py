@@ -18,7 +18,7 @@ Usage:
 """
 
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext as _nullcontext
 
 import numpy as np
 import pandas as pd
@@ -815,6 +815,7 @@ def _build_continuous_ts_incremental(
     old_trajectory_length: int,
     trajectory_length: int,
     admission_time: pd.Timestamp = None,
+    profiling: Optional[dict] = None,
 ) -> Tuple[np.ndarray, int]:
     """Incrementally update the continuous time series tensor.
 
@@ -823,6 +824,9 @@ def _build_continuous_ts_incremental(
 
     Otherwise, only assigns *new_records* to bins, re-aggregates dirty
     positions, and extends the visible window.
+
+    Args:
+        profiling: Optional dict to collect sub-stage timing (for perf analysis).
 
     Returns ``(x_ts, trajectory_length)``.
     """
@@ -855,41 +859,45 @@ def _build_continuous_ts_incremental(
 
         # Assign new records and re-aggregate dirty bins
         if new_records:
-            _assign_and_cache_continuous(new_records, bin_df, cache)
+            with timed_stage(profiling, 'cts_assign') if profiling is not None else _nullcontext():
+                _assign_and_cache_continuous(new_records, bin_df, cache)
 
         if cache.dirty_continuous:
-            _reaggregate_dirty_bins(
-                cache, channel_map, channel_to_idx, x_ts,
-                cache.dirty_continuous,
-            )
+            with timed_stage(profiling, 'cts_reaggregate') if profiling is not None else _nullcontext():
+                _reaggregate_dirty_bins(
+                    cache, channel_map, channel_to_idx, x_ts,
+                    cache.dirty_continuous,
+                )
             cache.dirty_continuous.clear()
 
-    # Temporal features (always recomputed for full grid — cheap)
-    if admission_time is None:
-        admission_time = pd.Timestamp(bin_df['bin_start'].iloc[0])
-    temporal_features = _compute_temporal_features(
-        bin_df, admission_time, ts_channel_names,
-    )
-    for feat_name, values in temporal_features.items():
-        if feat_name not in channel_to_idx:
-            continue
-        ch_idx = channel_to_idx[feat_name]
-        n = min(len(values), seq_len)
-        x_ts[ch_idx, :n] = values[:n]
+    # Temporal features (always recomputed for full grid)
+    with timed_stage(profiling, 'cts_temporal_features') if profiling is not None else _nullcontext():
+        if admission_time is None:
+            admission_time = pd.Timestamp(bin_df['bin_start'].iloc[0])
+        temporal_features = _compute_temporal_features(
+            bin_df, admission_time, ts_channel_names,
+        )
+        for feat_name, values in temporal_features.items():
+            if feat_name not in channel_to_idx:
+                continue
+            ch_idx = channel_to_idx[feat_name]
+            n = min(len(values), seq_len)
+            x_ts[ch_idx, :n] = values[:n]
 
     # Update _data_present
-    if '_data_present' in channel_to_idx:
-        dp_ch = channel_to_idx['_data_present']
-        clinical_indices = [
-            channel_to_idx[name]
-            for name in ts_channel_names
-            if name not in _AUXILIARY and name in channel_to_idx
-        ]
-        if clinical_indices:
-            has_data = ~np.all(np.isnan(x_ts[clinical_indices, :]), axis=0)
-            x_ts[dp_ch, :] = has_data.astype(np.float64)
-        else:
-            x_ts[dp_ch, :] = 0.0
+    with timed_stage(profiling, 'cts_data_present') if profiling is not None else _nullcontext():
+        if '_data_present' in channel_to_idx:
+            dp_ch = channel_to_idx['_data_present']
+            clinical_indices = [
+                channel_to_idx[name]
+                for name in ts_channel_names
+                if name not in _AUXILIARY and name in channel_to_idx
+            ]
+            if clinical_indices:
+                has_data = ~np.all(np.isnan(x_ts[clinical_indices, :]), axis=0)
+                x_ts[dp_ch, :] = has_data.astype(np.float64)
+            else:
+                x_ts[dp_ch, :] = 0.0
 
     # Clamp trajectory length and apply padding
     trajectory_length = min(trajectory_length, seq_len)

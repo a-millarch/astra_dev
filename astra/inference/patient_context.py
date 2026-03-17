@@ -366,6 +366,7 @@ class PatientContext:
         self,
         current_time,
         new_data: Optional[dict] = None,
+        profiling: Optional[dict] = None,
     ) -> dict:
         """Update patient state and return model-ready tensors.
 
@@ -382,6 +383,7 @@ class PatientContext:
                 Same keys as ``raw_data`` (vitals, labs, icu, medications,
                 procedures, adt).  New entries are appended to accumulated
                 data; existing entries are preserved.
+            profiling: Optional dict to collect sub-stage timing (for perf analysis).
 
         Returns:
             Dict with x_ts, x_ts_cat, tab_df, trajectory_length, bin_df —
@@ -395,7 +397,11 @@ class PatientContext:
             _filter_raw_data_by_time,
             timed_stage,
         )
+        from contextlib import nullcontext as _nullctx
         from astra.evaluation.utils import time_to_step
+
+        def _ts(name):
+            return timed_stage(profiling, name) if profiling is not None else _nullctx()
 
         new_current_time = pd.Timestamp(current_time)
         if self.patient_end_time is not None and new_current_time > self.patient_end_time:
@@ -449,52 +455,53 @@ class PatientContext:
             # Simulation mode: reveal data from stored trajectory
             last_time = self._last_refresh_time or self.admission_time
             with timed_stage(self._timing, 'time_filter'):
-                for key, items in self._full_trajectory_data.items():
-                    if key in _RAW_DATA_META_KEYS or not isinstance(items, list):
-                        continue
-                    if not items:
-                        continue
+                with _ts('reveal_scan'):
+                    for key, items in self._full_trajectory_data.items():
+                        if key in _RAW_DATA_META_KEYS or not isinstance(items, list):
+                            continue
+                        if not items:
+                            continue
 
-                    sample = items[0]
-                    is_interval = 'start' in sample
-                    is_categorical = key in ts_cat_names
+                        sample = items[0]
+                        is_interval = 'start' in sample
+                        is_categorical = key in ts_cat_names
 
-                    if is_interval:
-                        # Interval events: include intervals that started in
-                        # (last_time, new_time] OR ongoing intervals extending
-                        # into newly visible bins.
-                        new_entries = []
-                        for evt in items:
-                            start = pd.Timestamp(evt['start'])
-                            end = pd.Timestamp(evt['end'])
-                            if start > new_current_time:
-                                continue
-                            if start > last_time:
-                                clamped = dict(evt)
-                                clamped['end'] = min(end, new_current_time)
-                                new_entries.append(clamped)
-                                self._raw_data.setdefault(key, []).append(clamped)
-                            elif end > last_time:
-                                clamped = {
-                                    'start': evt['start'],
-                                    'end': min(end, new_current_time),
-                                    'value': evt['value'],
-                                }
-                                new_entries.append(clamped)
-                        if new_entries:
-                            incremental_cat_events[key] = new_entries
-                    else:
-                        # Point events (continuous or categorical)
-                        new_entries = []
-                        for m in items:
-                            ts = pd.Timestamp(m['timestamp'])
-                            if ts > last_time and ts <= new_current_time:
-                                new_entries.append(m)
-                                self._raw_data.setdefault(key, []).append(m)
-                        if is_categorical and new_entries:
-                            incremental_cat_events[key] = new_entries
-                        elif new_entries:
-                            incremental_records.extend(new_entries)
+                        if is_interval:
+                            # Interval events: include intervals that started in
+                            # (last_time, new_time] OR ongoing intervals extending
+                            # into newly visible bins.
+                            new_entries = []
+                            for evt in items:
+                                start = pd.Timestamp(evt['start'])
+                                end = pd.Timestamp(evt['end'])
+                                if start > new_current_time:
+                                    continue
+                                if start > last_time:
+                                    clamped = dict(evt)
+                                    clamped['end'] = min(end, new_current_time)
+                                    new_entries.append(clamped)
+                                    self._raw_data.setdefault(key, []).append(clamped)
+                                elif end > last_time:
+                                    clamped = {
+                                        'start': evt['start'],
+                                        'end': min(end, new_current_time),
+                                        'value': evt['value'],
+                                    }
+                                    new_entries.append(clamped)
+                            if new_entries:
+                                incremental_cat_events[key] = new_entries
+                        else:
+                            # Point events (continuous or categorical)
+                            new_entries = []
+                            for m in items:
+                                ts = pd.Timestamp(m['timestamp'])
+                                if ts > last_time and ts <= new_current_time:
+                                    new_entries.append(m)
+                                    self._raw_data.setdefault(key, []).append(m)
+                            if is_categorical and new_entries:
+                                incremental_cat_events[key] = new_entries
+                            elif new_entries:
+                                incremental_records.extend(new_entries)
 
         self.current_time = new_current_time
         self._raw_data['current_time'] = self.current_time
@@ -514,6 +521,7 @@ class PatientContext:
                     old_trajectory_length=old_trajectory_length,
                     trajectory_length=visible_bins,
                     admission_time=self.admission_time,
+                    profiling=profiling,
                 )
             with timed_stage(self._timing, 'categorical_build'):
                 self.x_ts_cat = _build_categorical_ts_incremental(

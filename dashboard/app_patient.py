@@ -2,13 +2,10 @@
 
 import streamlit as st
 import pandas as pd
-from cstar import ProjectManager
-import cstar.azure as az
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import numpy as np
 
-pm = ProjectManager(workdir='josefine.schoening/repos/astra/')
 from astra.utils import get_base_df
 from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt
 
