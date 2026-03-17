@@ -428,12 +428,20 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Observation Time")
 
+    # Apply playback target to slider BEFORE widget renders (so slider updates visually)
+    _playback_target = st.session_state.pop("play_target_hours", None)
+    if _playback_target is not None:
+        snapped = round(_playback_target / 0.5) * 0.5
+        snapped = max(0.5, min(snapped, float(max_hours)))
+        st.session_state["slider_hours"] = snapped
+
     hours_offset = st.sidebar.slider(
         "Hours after admission",
         min_value=0.5,
         max_value=float(max_hours),
         value=float(max_hours),
         step=0.5,
+        key="slider_hours",
         help="How many hours of data to include from admission",
     )
 
@@ -495,18 +503,12 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    # ── Apply playback override BEFORE prediction ─────────────────────
-    # During playback, the previous rerun set play_target_hours.
-    # Override hours_offset so the prediction runs at the playback time.
-    is_playback = "play_target_hours" in st.session_state
-    if is_playback:
-        hours_offset = st.session_state.pop("play_target_hours")
-
     # ═════════════════════════════════════════════════════════════════
     # PREDICT: run simulation on button click / playback; reuse on slider
     # ═════════════════════════════════════════════════════════════════
 
-    should_run = run_clicked or shap_clicked or is_playback
+    is_playback_step = _playback_target is not None
+    should_run = run_clicked or shap_clicked or is_playback_step
     patient_key = f"{cpr}_{sd}_{cfg.get('model_name')}"
 
     if should_run:
@@ -564,7 +566,7 @@ def main():
 
     if st.session_state.get("play_active", False):
         runner = pred_data["runner"]
-        if runner.remaining_steps > 0:
+        if runner.remaining_steps > 0 and hasattr(runner, "_time_points") and hasattr(runner, "_step_idx"):
             # Determine step size from speed setting
             steps_map = {"1 step": 1, "5 steps": 5, "10 steps": 10}
             n_advance = steps_map.get(play_speed, 1)
@@ -578,11 +580,10 @@ def main():
                 next_tp = runner._time_points[next_idx - 1]
                 next_hours = (next_tp - runner.context.admission_time).total_seconds() / 3600
                 st.session_state["play_target_hours"] = next_hours
+                _time.sleep(0.3)
+                st.rerun()
             else:
                 st.session_state["play_active"] = False
-
-            _time.sleep(0.3)
-            st.rerun()
         else:
             st.session_state["play_active"] = False
 
