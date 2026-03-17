@@ -189,18 +189,42 @@ if __name__ == '__main__':
                         help='Output directory for per-patient files')
     parser.add_argument('--subset', type=int, default=None,
                         help='Only split for the first N patients (for testing)')
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--holdout', action='store_true',
+                       help='Only split holdout patients (ServiceDate > split date)')
+    group.add_argument('--trainval', action='store_true',
+                       help='Only split trainval patients (ServiceDate <= split date)')
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format='%(message)s')
 
     cpr_hashes = None
+
+    if args.holdout or args.trainval:
+        from astra.utils import get_cfg, get_base_df
+        cfg = get_cfg()
+        base_df = get_base_df()
+        split_date = cfg.get('holdout_split_date', '2023-06-01')
+        if args.holdout:
+            mask = base_df['ServiceDate'] > split_date
+            label = 'holdout'
+        else:
+            mask = base_df['ServiceDate'] <= split_date
+            label = 'trainval'
+        cpr_hashes = list(base_df.loc[mask, 'CPR_hash'].dropna().unique())
+        logger.info("Splitting %s patients (%d unique CPR hashes, split_date=%s)",
+                     label, len(cpr_hashes), split_date)
+
     if args.subset:
-        pi = pd.read_csv(
-            os.path.join(args.data_dir, 'PatientInfo.csv'),
-            usecols=['CPR_hash'], dtype={'CPR_hash': str},
-        )
-        all_hashes = pi['CPR_hash'].dropna().unique()
-        cpr_hashes = list(all_hashes[:args.subset])
+        if cpr_hashes is None:
+            pi = pd.read_csv(
+                os.path.join(args.data_dir, 'PatientInfo.csv'),
+                usecols=['CPR_hash'], dtype={'CPR_hash': str},
+            )
+            cpr_hashes = list(pi['CPR_hash'].dropna().unique())
+        cpr_hashes = cpr_hashes[:args.subset]
         logger.info("Subsetting to %d patients", len(cpr_hashes))
 
     split_population_csvs(
