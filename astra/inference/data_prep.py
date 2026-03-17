@@ -1964,7 +1964,22 @@ def _filtered_dfs_to_raw_data(
         'demographics': {col: row[col] for col in row.index},
     }
 
+    drop_features = cfg.get('drop_features', {})
+
     for concept, df in filtered_concepts.items():
+        if df.empty:
+            continue
+
+        # Apply drop_features filter (mirrors batch pipeline in datasets.py).
+        # For continuous concepts, drop_features matches on FEATURE column.
+        # For categorical concepts (e.g. ADTHaendelser), FEATURE is constant
+        # (e.g. "ADT") so we filter on VALUE instead.
+        concept_drops = drop_features.get(concept, [])
+        if concept_drops:
+            is_cat = concept in ts_cat_names
+            col = 'VALUE' if is_cat else 'FEATURE'
+            if col in df.columns:
+                df = df[~df[col].isin(concept_drops)]
         if df.empty:
             continue
 

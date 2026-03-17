@@ -553,29 +553,22 @@ def get_concept(concept, cfg) -> dict:
     """get concept from name"""
 
     drop_cols = cfg["drop_features"][concept]
+    ts_cat_names = cfg.get("dataset", {}).get("ts_cat_names", [])
     concept_dict = {}
 
     for agg_func in cfg["agg_func"][concept]:
         logger.debug(f"Loading {concept}.agg_func: {agg_func}")
         df = pd.read_csv(f"data/interim/mapped/{concept}_{agg_func}.csv")
         # if features to drop, drop now.
-        try:
-            df = df[
-                ~df.FEATURE.isin(
-                    drop_cols
-                    + [
-                        np.nan,
-                    ]
-                )
-            ]
-        except:
-            df = df[
-                ~df.FEATURE.isin(
-                    [
-                        np.nan,
-                    ]
-                )
-            ]
+        if concept in ts_cat_names:
+            # Categorical: FEATURE is constant (e.g. "ADT"), filter on VALUE
+            if drop_cols:
+                df = df[~df.VALUE.isin(drop_cols)]
+        else:
+            try:
+                df = df[~df.FEATURE.isin(drop_cols + [np.nan])]
+            except:
+                df = df[~df.FEATURE.isin([np.nan])]
         df["VALUE"] = pd.to_numeric(df["VALUE"], errors="coerce")
         concept_dict[agg_func] = df
     return concept_dict

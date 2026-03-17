@@ -515,10 +515,13 @@ class AggregatedDS:
         """
         Optimized aggregation using GPU or efficient pandas operations.
         """
-        # Apply drop_features filter if specified
+        # Apply drop_features filter if specified.
+        # For categorical concepts, FEATURE is constant (e.g. "ADT") so
+        # we filter on VALUE instead.
         if "drop_features" in self.cfg and concept_name in self.cfg["drop_features"]:
-            drop_features = self.cfg["drop_features"][concept_name]
-            concept_data = concept_data[~concept_data['FEATURE'].isin(drop_features)]
+            drop_list = self.cfg["drop_features"][concept_name]
+            col = 'VALUE' if is_categorical else 'FEATURE'
+            concept_data = concept_data[~concept_data[col].isin(drop_list)]
         
         if len(concept_data) == 0:
             logger.warning(f"No data to aggregate for {concept_name} ")
@@ -1239,7 +1242,11 @@ def get_concept(concept: str, cfg: Dict, base_pids: set = None) -> Dict:
         if base_pids is not None and 'PID' in df.columns:
             df = df[df['PID'].isin(base_pids)]
 
-        if concept not in cfg["dataset"]["ts_cat_names"]:
+        if concept in cfg["dataset"]["ts_cat_names"]:
+            # Categorical: FEATURE is constant (e.g. "ADT"), filter on VALUE
+            if drop_cols:
+                df = df[~df.VALUE.isin(drop_cols)]
+        else:
             try:
                 df = df[~df.FEATURE.isin(drop_cols + [np.nan])]
             except:
