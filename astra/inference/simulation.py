@@ -23,6 +23,12 @@ Interactive (pause & inspect)::
     runner.inspect()              # SHAP, trajectory, data completeness
     runner.advance_to(hours=24)
     runner.inspect()
+
+Real-time benchmark (mimics ETL-fed data delivery)::
+
+    result_rt = runner.run_realtime("abc123hash", "2025-06-15")
+    result_sim = runner.run("abc123hash", "2025-06-15")
+    # Compare predictions and timing between the two paths
 """
 
 import logging
@@ -335,15 +341,7 @@ class SimulationRunner:
         """Build a SimulationResult from steps accumulated so far."""
         if not self._steps or self.context is None:
             return None
-        # Compute inhospital start hours for prehospital boundary
-        ihs_hours = None
-        ihs_time = self.context.demographics.get('inhospital_start')
-        if ihs_time is not None:
-            ihs_ts = pd.Timestamp(ihs_time)
-            if pd.notna(ihs_ts):
-                h = (ihs_ts - self.context.admission_time).total_seconds() / 3600
-                if h > 0:
-                    ihs_hours = h
+        ihs_hours = _get_inhospital_start_hours(self.context)
         return SimulationResult(
             pid=self.context.pid,
             admission_time=self.context.admission_time,
@@ -364,6 +362,183 @@ class SimulationRunner:
     def remaining_steps(self) -> int:
         """Number of time points not yet advanced through."""
         return len(self._time_points) - self._step_idx
+
+    # ---- Real-time benchmark API ----
+
+    def run_realtime(
+        self,
+        cpr_hash: str,
+        service_date,
+        cfg: dict = None,
+        data_dir: str = 'data/raw',
+        start_hours: float = 0.0,
+        end_hours: Optional[float] = None,
+    ) -> SimulationResult:
+        """Run simulation mimicking real-time ETL-fed data delivery.
+
+        Unlike :meth:`run` which pre-loads the full trajectory and reveals
+        data internally via ``_full_trajectory_data``, this method:
+
+        1. Loads CSV data the same way (for apples-to-apples comparison)
+        2. Creates a :class:`PatientContext` with only initial demographics
+           (no clinical events)
+        3. At each bin boundary, extracts events in ``(last_time, current_time]``
+           from the pre-loaded data and passes them as ``new_data`` to
+           :meth:`~PatientContext.refresh` — mimicking how an external SQL ETL
+           pipeline would deliver genuinely new measurements at each poll
+
+        This benchmarks the real-time code path (``refresh(t, new_data=...)``)
+        against the retrospective simulation path (``refresh(t)`` with
+        ``_full_trajectory_data``).
+
+        Note: EBM predictions are not injected in real-time mode.  The EBM
+        setup requires ``from_csv()``-level context (filtered_concepts,
+        base_df) which is not available through the ``create()`` path.
+
+        Args:
+            cpr_hash: Patient identifier hash.
+            service_date: Admission date (for base_df lookup).
+            cfg: Configuration dict (loaded from defaults.yaml if None).
+            data_dir: Path to raw CSV data.
+            start_hours: Start simulation at this many hours after admission.
+            end_hours: Stop simulation at this many hours (None = full trajectory).
+
+        Returns:
+            :class:`SimulationResult` with per-step predictions and timing.
+        """
+        from astra.inference.patient_context import PatientContext
+        from astra.inference.data_prep import (
+            _build_single_patient_base_df,
+            _filter_concepts_for_patient,
+            _filtered_dfs_to_raw_data,
+            _RAW_DATA_META_KEYS,
+            timed_stage,
+        )
+
+        wall_start = time.perf_counter()
+
+        if cfg is None:
+            from astra.utils import get_cfg
+            cfg = get_cfg()
+
+        setup_timing = {}
+
+        # Phase 1-3: Load CSV data (identical to from_csv)
+        with timed_stage(setup_timing, 'csv_load'):
+            base_df = _build_single_patient_base_df(
+                cpr_hash, service_date, cfg, data_dir,
+            )
+            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+
+        admission_time = pd.Timestamp(base_df['start'].iloc[0])
+        current_time = admission_time + pd.Timedelta(hours=start_hours)
+
+        # Clamp to patient end
+        patient_end = base_df['end'].iloc[0]
+        if pd.notna(patient_end):
+            current_time = min(current_time, pd.Timestamp(patient_end))
+
+        # Build full raw_data (unfiltered by time) for slicing
+        raw_data_full = _filtered_dfs_to_raw_data(
+            base_df, filtered_concepts, current_time=current_time,
+            cfg=cfg, filter_by_time=False,
+        )
+
+        # Create initial context with only demographics (no clinical events)
+        initial_raw_data = {
+            'pid': raw_data_full.get('pid'),
+            'admission_time': raw_data_full['admission_time'],
+            'current_time': current_time,
+            'demographics': raw_data_full.get('demographics', {}),
+        }
+        for key, items in raw_data_full.items():
+            if key in _RAW_DATA_META_KEYS or not isinstance(items, list):
+                continue
+            initial_raw_data[key] = []
+
+        ctx = PatientContext.create(initial_raw_data, self.session.bundle)
+        ctx.patient_end_time = (
+            pd.Timestamp(patient_end) if pd.notna(patient_end) else None
+        )
+        for k, v in setup_timing.items():
+            ctx._timing.setdefault(k, []).extend(v)
+
+        # Generate bin-aligned time points (same grid as run())
+        time_points = _generate_bin_aligned_times(
+            ctx.bin_df, ctx.admission_time,
+            start_time=current_time, end_hours=end_hours,
+        )
+
+        # Step through, delivering data as an ETL would
+        steps = []
+        prev_raw_counts = _count_raw_data(ctx._raw_data)
+        prediction_curve = np.full(len(ctx.bin_df), np.nan)
+        last_delivery_time = current_time
+
+        for tp in time_points:
+            step_timing = {}
+
+            # Extract events in (last_delivery_time, tp] — mimics ETL poll
+            with timed_stage(step_timing, 'data_slice'):
+                new_data = _extract_events_in_window(
+                    raw_data_full, last_delivery_time, tp,
+                    _RAW_DATA_META_KEYS,
+                )
+
+            # Refresh with genuinely new data (real-time code path)
+            with timed_stage(step_timing, 'refresh'):
+                ctx.refresh(tp, new_data=new_data)
+
+            new_counts = _count_raw_data(ctx._raw_data)
+            n_new = new_counts - prev_raw_counts
+            prev_raw_counts = new_counts
+
+            with timed_stage(step_timing, 'predict'):
+                result = self.session.predict_from_context(ctx)
+
+            bin_idx = ctx.trajectory_length - 1
+            if 0 <= bin_idx < len(prediction_curve):
+                prediction_curve[bin_idx] = result.probability
+
+            elapsed = (tp - ctx.admission_time).total_seconds() / 3600
+
+            steps.append(SimulationStep(
+                current_time=tp,
+                elapsed_hours=elapsed,
+                trajectory_length=ctx.trajectory_length,
+                probability=result.probability,
+                predictions_over_time=result.predictions_over_time,
+                step_timing=step_timing,
+                n_new_measurements=n_new,
+            ))
+
+            last_delivery_time = tp
+
+        # Build result
+        ihs_hours = _get_inhospital_start_hours(ctx)
+
+        sim_result = SimulationResult(
+            pid=ctx.pid,
+            admission_time=ctx.admission_time,
+            steps=steps,
+            total_timing=dict(ctx._timing),
+            wall_clock_seconds=time.perf_counter() - wall_start,
+            prediction_curve=prediction_curve,
+            inhospital_start_hours=ihs_hours,
+        )
+
+        # Store state for inspect() / .result
+        self.context = ctx
+        self._steps = list(steps)
+        self._prediction_curve = prediction_curve.copy()
+        self.session.ctx = ctx
+
+        logger.info(
+            f"Real-time simulation complete: {len(steps)} steps, "
+            f"{sim_result.wall_clock_seconds:.1f}s wall clock, pid={ctx.pid}"
+        )
+
+        return sim_result
 
     # ---- Batch API (unchanged) ----
 
@@ -493,15 +668,7 @@ class SimulationRunner:
         # Aggregate timing from context
         total_timing = dict(context._timing)
 
-        # Compute inhospital start hours for prehospital boundary plotting
-        ihs_hours = None
-        ihs_time = context.demographics.get('inhospital_start')
-        if ihs_time is not None:
-            ihs_ts = pd.Timestamp(ihs_time)
-            if pd.notna(ihs_ts):
-                h = (ihs_ts - context.admission_time).total_seconds() / 3600
-                if h > 0:
-                    ihs_hours = h
+        ihs_hours = _get_inhospital_start_hours(context)
 
         sim_result = SimulationResult(
             pid=context.pid,
@@ -525,6 +692,80 @@ class SimulationRunner:
 # ============================================================================
 # Helpers
 # ============================================================================
+
+def _get_inhospital_start_hours(context) -> Optional[float]:
+    """Extract inhospital start hours from context demographics (if prehospital)."""
+    ihs_time = context.demographics.get('inhospital_start')
+    if ihs_time is not None:
+        ihs_ts = pd.Timestamp(ihs_time)
+        if pd.notna(ihs_ts):
+            h = (ihs_ts - context.admission_time).total_seconds() / 3600
+            if h > 0:
+                return h
+    return None
+
+
+def _extract_events_in_window(
+    raw_data_full: dict,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    meta_keys: frozenset,
+) -> dict:
+    """Extract events from *raw_data_full* in the time window ``(start, end]``.
+
+    Mimics how an ETL pipeline would deliver data arriving since the last poll:
+
+    - **Point events** (continuous or categorical): include if
+      ``window_start < timestamp <= window_end``.
+    - **Interval events**: include if the interval started in the window.
+      Ongoing intervals (started before *window_start* but extending past it)
+      are also included with clamped end, matching the simulation reveal logic
+      so that newly visible bins get the interval's multi-hot encoding.
+    """
+    new_data: Dict[str, list] = {}
+
+    for key, items in raw_data_full.items():
+        if key in meta_keys or not isinstance(items, list) or not items:
+            continue
+
+        sample = items[0]
+
+        if 'start' in sample:
+            # Interval events (e.g. ADTHaendelser)
+            entries = []
+            for evt in items:
+                start = pd.Timestamp(evt['start'])
+                end = pd.Timestamp(evt['end'])
+                if start > window_end:
+                    continue
+                if start > window_start:
+                    # New interval: clamp end to delivery time
+                    entries.append({
+                        'start': evt['start'],
+                        'end': min(end, window_end),
+                        'value': evt['value'],
+                    })
+                elif end > window_start:
+                    # Ongoing interval extending into new bins: deliver update
+                    entries.append({
+                        'start': evt['start'],
+                        'end': min(end, window_end),
+                        'value': evt['value'],
+                    })
+            if entries:
+                new_data[key] = entries
+
+        elif 'timestamp' in sample:
+            # Point events (continuous or categorical)
+            entries = [
+                m for m in items
+                if window_start < pd.Timestamp(m['timestamp']) <= window_end
+            ]
+            if entries:
+                new_data[key] = entries
+
+    return new_data
+
 
 def _generate_bin_aligned_times(
     bin_df: pd.DataFrame,
