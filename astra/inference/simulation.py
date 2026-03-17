@@ -547,6 +547,34 @@ class SimulationRunner:
         for k, v in setup_timing.items():
             ctx._timing.setdefault(k, []).extend(v)
 
+        # EBM setup: identical to from_csv() — bolt on EBM context so that
+        # refresh() can incrementally compute EBM predictions at each step.
+        bundle = self.session.bundle
+        if '_ebm_pred' in bundle.get('ts_channel_names', []):
+            from astra.inference.ebm import (
+                compute_ebm_predictions, inject_ebm_into_x_ts,
+            )
+
+            with timed_stage(ctx._timing, 'ebm_compute'):
+                ebm_preds = compute_ebm_predictions(
+                    initial_raw_data, filtered_concepts, base_df,
+                    cfg, ebm_models_dir,
+                )
+            with timed_stage(ctx._timing, 'ebm_inject'):
+                ctx.x_ts = inject_ebm_into_x_ts(
+                    ctx.x_ts, ebm_preds, ctx.bin_df,
+                    ctx.admission_time, bundle,
+                    trajectory_length=ctx.trajectory_length,
+                )
+
+            ctx._ebm_context = {
+                'filtered_concepts': filtered_concepts,
+                'base_df': base_df,
+                'cfg': cfg,
+                'ebm_models_dir': ebm_models_dir,
+            }
+            ctx._ebm_cache = dict(ebm_preds)
+
         # Generate bin-aligned time points (same grid as run())
         time_points = _generate_bin_aligned_times(
             ctx.bin_df, ctx.admission_time,

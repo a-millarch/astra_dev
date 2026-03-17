@@ -90,12 +90,12 @@ def list_config_files():
     """Find all YAML config files in configs/."""
     configs_dir = os.path.join(REPO_ROOT, "configs")
     if not os.path.isdir(configs_dir):
-        return ["configs/defaults_ebm.yaml"]
+        return ["configs/defaults.yaml"]
     files = []
     for f in sorted(os.listdir(configs_dir)):
         if f.endswith((".yaml", ".yml")):
             files.append(f"configs/{f}")
-    return files if files else ["configs/defaults_ebm.yaml"]
+    return files if files else ["configs/defaults.yaml"]
 
 
 @st.cache_resource
@@ -364,7 +364,7 @@ def main():
     st.sidebar.header("Configuration")
     config_files = list_config_files()
     default_idx = next(
-        (i for i, f in enumerate(config_files) if "defaults_ebm" in f), 0
+        (i for i, f in enumerate(config_files) if f.endswith("defaults.yaml")), 0
     )
     config_path = st.sidebar.selectbox(
         "Config file",
@@ -445,27 +445,38 @@ def main():
     if play_clicked:
         st.session_state["play_active"] = not st.session_state.get("play_active", False)
 
-    # ── Sidebar: SHAP button ─────────────────────────────────────────
+    # ── Sidebar: Action buttons ──────────────────────────────────────
     st.sidebar.markdown("---")
-    shap_clicked = st.sidebar.button(
-        "Compute SHAP",
-        type="primary",
-        use_container_width=True,
-        help="Compute SHAP explanations at the current time point",
-    )
+    sim_col1, sim_col2 = st.sidebar.columns(2)
+    with sim_col1:
+        run_clicked = st.button(
+            "Run Simulation",
+            type="primary",
+            use_container_width=True,
+            help="Run simulation for the selected patient and time",
+        )
+    with sim_col2:
+        shap_clicked = st.button(
+            "Compute SHAP",
+            use_container_width=True,
+            help="Compute SHAP explanations at the current time point",
+        )
 
     # ── Apply playback override BEFORE prediction ─────────────────────
     # During playback, the previous rerun set play_target_hours.
     # Override hours_offset so the prediction runs at the playback time.
-    if "play_target_hours" in st.session_state:
+    is_playback = "play_target_hours" in st.session_state
+    if is_playback:
         hours_offset = st.session_state.pop("play_target_hours")
 
     # ═════════════════════════════════════════════════════════════════
-    # AUTO-PREDICT: only when patient or time actually changed
+    # PREDICT: only on explicit button click or playback advance
     # ═════════════════════════════════════════════════════════════════
 
+    should_predict = run_clicked or shap_clicked or is_playback
     pred_key = f"{cpr}_{sd}_{cfg.get('model_name')}_{hours_offset}"
-    if st.session_state.get("pred_key") != pred_key or "pred_data" not in st.session_state:
+
+    if should_predict:
         try:
             with st.spinner("Running simulation prediction..."):
                 pred_data = run_simulation_predict(
@@ -478,6 +489,10 @@ def main():
             st.error(f"Error running simulation: {e}")
             st.exception(e)
             return
+
+    if "pred_data" not in st.session_state:
+        st.info("Select a patient and observation time, then click **Run Simulation**.")
+        return
 
     pred_data = st.session_state["pred_data"]
 
