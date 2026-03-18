@@ -703,6 +703,86 @@ def _plot_dca_comparison(
     logger.info(f"Saved dca_comparison_{model_name}.png")
 
 
+def _plot_dca_calibrated(
+    holdout_preds: Dict[int, TimepointPredictions],
+    calibrated_preds: Dict[int, Dict[str, np.ndarray]],
+    best_method: str,
+    model_name: str,
+    save_dir: str,
+    max_threshold: float = 0.5,
+    n_points: int = 200,
+):
+    """
+    Standalone DCA multi-curve using calibrated predictions at each timepoint.
+
+    Matches the style of plot_decision_curves_over_time() from
+    predictive_performance.py but uses the calibrated probability output.
+    """
+    colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
+              '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
+    thresholds = np.linspace(0.01, max_threshold, n_points)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    global_ymin = 0.0
+    global_ymax = 0.0
+    treat_all_curves = []
+
+    steps = sorted(holdout_preds.keys())
+    for i, step in enumerate(steps):
+        tp = holdout_preds[step]
+        y_true = tp.y_true.astype(float)
+
+        # Use calibrated predictions if available, else raw
+        if step in calibrated_preds and best_method in calibrated_preds[step]:
+            y_prob = calibrated_preds[step][best_method].astype(float)
+        else:
+            y_prob = tp.y_prob.astype(float)
+
+        prevalence = y_true.mean()
+        nb_model, _, _ = compute_net_benefit(y_true, y_prob, thresholds)
+
+        label = format_step_label(step)
+        color = colors[i % len(colors)]
+        ax.plot(thresholds, nb_model, color=color, linewidth=1.8, label=label)
+
+        nb_treat_all = prevalence - (1.0 - prevalence) * thresholds / (1.0 - thresholds)
+        treat_all_curves.append((nb_treat_all, color))
+
+        global_ymin = min(global_ymin, nb_model.min())
+        global_ymax = max(global_ymax, nb_model.max())
+
+    ymin = min(global_ymin, -0.01) - 0.005
+    ymax = global_ymax * 1.15 + 0.005
+
+    first = True
+    for nb_treat_all, color in treat_all_curves:
+        nb_clipped = np.clip(nb_treat_all, ymin, None)
+        ax.plot(thresholds, nb_clipped, color=color, linewidth=1.0,
+                linestyle='--', alpha=0.4,
+                label='Treat All' if first else None)
+        first = False
+
+    ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
+
+    ax.set_xlabel("Threshold Probability", fontsize=11)
+    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_title(
+        f"Decision Curves (Calibrated — {best_method.capitalize()})",
+        fontsize=13, fontweight='bold',
+    )
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+              title="Time Available", title_fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_threshold)
+    ax.set_ylim(ymin, ymax)
+
+    fig.subplots_adjust(right=0.78)
+    plt.tight_layout()
+    save_figure(fig, f"dca_calibrated_{model_name}", save_dir=save_dir)
+    plt.close(fig)
+    logger.info(f"Saved dca_calibrated_{model_name}.png")
+
+
 def _plot_per_timepoint_vs_global(
     results: List[CalibratorResult],
     best_method: str,
@@ -1004,6 +1084,9 @@ def run_posthoc_calibration(
     _plot_calibration_metrics_over_time(all_results, methods, model_name, save_dir)
     _plot_reliability_diagrams(
         holdout_preds, calibrated_holdout, best_method, model_name, save_dir, n_bins
+    )
+    _plot_dca_calibrated(
+        holdout_preds, calibrated_holdout, best_method, model_name, save_dir
     )
     _plot_dca_comparison(
         holdout_preds, calibrated_holdout, best_method, model_name, save_dir

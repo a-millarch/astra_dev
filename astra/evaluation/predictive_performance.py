@@ -19,7 +19,7 @@ from astra.data.mixed_dataloader import (
 from astra.evaluation.utils import (
     calculate_roc_auc_ci, calculate_average_precision_ci,
     _parse_timedelta_to_minutes, _get_intervals_from_cfg,
-    time_to_step, step_to_time, prepare_model
+    time_to_step, step_to_time, prepare_model, get_max_days
 )
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone
@@ -767,8 +767,16 @@ class TemporalEvaluator:
 # TIME THRESHOLD GENERATION
 # ============================================================================
 
-def generate_time_thresholds(max_days=30, cut_hours=72, step_hours=1, step_days=1):
-    """Generate list of time steps to evaluate at."""
+def generate_time_thresholds(max_days=None, cut_hours=72, step_hours=1, step_days=1):
+    """Generate list of time steps to evaluate at.
+
+    Args:
+        max_days: Maximum days to evaluate. Defaults to config-derived horizon
+                  via ``get_max_days()``.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+
     thresholds = []
 
     for h in range(step_hours, cut_hours+1, step_hours):
@@ -810,7 +818,9 @@ def format_step_label(step):
 # PLOTTING FUNCTIONS
 # ============================================================================
 
-def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=30):
+def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=None):
+    if max_days is None:
+        max_days = get_max_days()
     if not results:
         raise ValueError("No results to plot")
 
@@ -888,9 +898,11 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=30
 def plot_time_metrics_comparison(
     results_all: List[TimeMetricResult],
     results_active: List[TimeMetricResult],
-    cut_hours=72, max_days=30
+    cut_hours=72, max_days=None
 ):
     """Overlay all-patients vs active-only AUROC/AUPRC curves."""
+    if max_days is None:
+        max_days = get_max_days()
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
@@ -972,10 +984,12 @@ def plot_time_metrics_comparison(
 
 def plot_n_active_over_time(
     results_active: List[TimeMetricResult],
-    cut_hours=72, max_days=30,
+    cut_hours=72, max_days=None,
     target_name: str = "deceased_30d"
 ):
     """Show active patient count, outcome-positive count, and prevalence over time."""
+    if max_days is None:
+        max_days = get_max_days()
     if not results_active:
         raise ValueError("No active-only results to plot")
 
@@ -1184,7 +1198,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         if comprehensive_eval:
             censor_thresholds = generate_time_thresholds(
-                max_days=30, cut_hours=72, step_hours=1, step_days=1
+                cut_hours=72, step_hours=1, step_days=1
             )
             results, preds_df = temporal_eval.evaluate_over_time(
                 censor_thresholds, save_predictions=True, model_name=model_name,
@@ -1200,7 +1214,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     f'reports/predictions/preds_df_{model_name}.csv', index=False
                 )
 
-            fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
+            fig_time = plot_time_metrics(results, cut_hours=72)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
 
             # Active-only evaluation and comparison
@@ -1309,7 +1323,6 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         logger.info("="*80)
 
         censor_thresholds = generate_time_thresholds(
-            max_days=30,
             cut_hours=72,
             step_hours=1,
             step_days=1
@@ -1334,7 +1347,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         logger.info(f"Predictions saved to CSV")
 
         logger.info("Creating time-dependent metrics plot...")
-        fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
+        fig_time = plot_time_metrics(results, cut_hours=72)
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("Time metrics plot saved")
 

@@ -126,6 +126,26 @@ def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
     return all_ok
 
 
+def get_max_days(data_config=None):
+    """Return the maximum time horizon in days from bin interval config.
+
+    This is derived from the last interval's end time and should be used
+    instead of hardcoding ``max_days`` in evaluation/plotting functions.
+    """
+    if data_config is not None:
+        intervals = _get_intervals(
+            data_config['bin_intervals'],
+            data_config.get('bin_freq_include'),
+        )
+    else:
+        intervals = _get_intervals_from_cfg()
+
+    last_end_min = max(
+        end for _, end, _ in intervals if end is not None
+    )
+    return int(last_end_min / (24 * 60))
+
+
 def get_total_steps(data_config=None):
     """Compute total number of bin steps from config.
 

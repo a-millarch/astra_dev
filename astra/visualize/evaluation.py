@@ -386,7 +386,10 @@ def plot_multiple_evaluations(predictions_by_time, labels=None):
     plt.show()
     return fig
 
-def plot_time_metrics(results, cut_hours=72, max_days=30):
+def plot_time_metrics(results, cut_hours=72, max_days=None):
+    if max_days is None:
+        from astra.evaluation.utils import get_max_days
+        max_days = get_max_days()
     times_h = np.array([r["time_hours"] for r in results])
     times_d = np.array([r["time_days"] for r in results])
     auroc_vals = np.array([r["AUROC"] for r in results])

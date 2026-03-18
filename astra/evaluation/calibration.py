@@ -129,9 +129,8 @@ def run_eval_with_calibration(
         logger.info("="*80)
         
         censor_thresholds = generate_time_thresholds(
-            max_days=30, 
-            cut_hours=72, 
-            step_hours=1, 
+            cut_hours=72,
+            step_hours=1,
             step_days=1
         )
         
@@ -183,7 +182,7 @@ def run_eval_with_calibration(
     
         
         logger.info("Creating time-dependent metrics plot...")
-        fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
+        fig_time = plot_time_metrics(results, cut_hours=72)
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("✓ Time metrics plot saved")
         
