@@ -86,6 +86,10 @@ def parse_args():
     parser.add_argument("--active-only", action="store_true", default=False,
                         help="Also run active-only evaluation (patients still in hospital) and generate comparison plots")
 
+    # Calibration
+    parser.add_argument("--calibrate", action="store_true", default=False,
+                        help="Run posthoc calibration analysis (isotonic/Platt at each timepoint)")
+
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
                         help="Cross-validate temporal eval vs censored-dataloader eval")
@@ -248,6 +252,16 @@ def main():
             data, cfg, args.multicurve, args.comprehensive_eval,
             active_only=args.active_only,
         )
+
+    # ========================================================================
+    # Posthoc calibration
+    # ========================================================================
+    if args.calibrate:
+        from astra.evaluation.posthoc_calibration import run_posthoc_calibration
+        logger.info("=== Running Posthoc Calibration ===")
+        cal_summary = run_posthoc_calibration(data, cfg)
+        if len(cal_summary) > 0:
+            logger.info(f"Calibration summary: {len(cal_summary)} results saved")
 
     # ========================================================================
     # Temporal validation (cross-check eval methods)
