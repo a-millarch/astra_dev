@@ -246,7 +246,11 @@ def step_to_time(step, data_config=None):
             bins_cum.append(float('inf'))
 
     for i in range(len(intervals)):
-        if bins_cum[i] <= step < bins_cum[i + 1]:
+        # Use <= on the last interval so the boundary step (== total_steps)
+        # still resolves to the interval endpoint time.
+        is_last = (i == len(intervals) - 1)
+        upper_ok = step <= bins_cum[i + 1] if is_last else step < bins_cum[i + 1]
+        if bins_cum[i] <= step and upper_ok:
             start_min, end_min, bin_min = intervals[i]
             step_offset = step - bins_cum[i]
             t = start_min + (step_offset + 1) * bin_min
