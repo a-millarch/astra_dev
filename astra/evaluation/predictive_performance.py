@@ -251,8 +251,9 @@ def plot_decision_curves_over_time(
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
 
-    ymin = max(global_ymin, -0.05) - 0.01
-    ymax = max(global_ymax, 0.05) * 1.1
+    # Clip y-axis to model curve range (not Treat All tails)
+    ymin = min(global_ymin, -0.01) - 0.005
+    ymax = global_ymax * 1.15 + 0.005
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
@@ -321,7 +322,7 @@ def _plot_decision_curves_temporal(
         nb_treat_all = prevalence - (1.0 - prevalence) * thresholds / (1.0 - thresholds)
         treat_all_curves.append((nb_treat_all, color, label, prevalence))
 
-        global_ymin = min(global_ymin, nb_model.min(), nb_treat_all.min())
+        global_ymin = min(global_ymin, nb_model.min())
         global_ymax = max(global_ymax, nb_model.max())
 
     # Plot per-timepoint "Treat All" lines (thin, dashed, matching color)
@@ -349,8 +350,9 @@ def _plot_decision_curves_temporal(
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
 
-    ymin = max(global_ymin, -0.05) - 0.01
-    ymax = max(global_ymax, 0.05) * 1.1
+    # Clip y-axis to model curve range (not Treat All tails)
+    ymin = min(global_ymin, -0.01) - 0.005
+    ymax = global_ymax * 1.15 + 0.005
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
