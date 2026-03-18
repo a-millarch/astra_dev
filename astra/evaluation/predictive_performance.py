@@ -678,7 +678,6 @@ def plot_time_metrics_comparison(
     ax1.set_ylabel("Score", fontsize=11)
     ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=8, loc='lower right')
     ax1.set_ylim(0.0, 1.0)
 
     ax2.set_xlabel("Time (days)", fontsize=11)
@@ -688,10 +687,14 @@ def plot_time_metrics_comparison(
     ax2.set_ylabel("Score", fontsize=11)
     ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend(fontsize=8, loc='lower right')
     ax2.set_ylim(0.0, 1.0)
 
-    plt.tight_layout()
+    # Shared legend below both panels
+    handles, labels = ax1.get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=9,
+               bbox_to_anchor=(0.5, -0.02))
+    fig.subplots_adjust(bottom=0.18)
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
 
 
@@ -699,7 +702,7 @@ def plot_n_active_over_time(
     results_active: List[TimeMetricResult],
     cut_hours=72, max_days=30
 ):
-    """Show active patient count and positive count over time."""
+    """Show active patient count, positive count, and outcome prevalence over time."""
     if not results_active:
         raise ValueError("No active-only results to plot")
 
@@ -707,8 +710,9 @@ def plot_n_active_over_time(
     times_d = np.array([r.time_days for r in results_active])
     n_samples = np.array([r.n_samples for r in results_active])
     n_positive = np.array([r.n_positive for r in results_active])
+    prevalence = np.where(n_samples > 0, n_positive / n_samples, 0.0)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
 
     mask_cut = times_h <= cut_hours
 
@@ -720,7 +724,12 @@ def plot_n_active_over_time(
     ax1.set_ylabel("Count", fontsize=11)
     ax1.set_title("A) Active Patients over Hours", fontsize=12, fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=10)
+
+    ax1_prev = ax1.twinx()
+    ax1_prev.plot(times_h[mask_cut], prevalence[mask_cut] * 100, color="C4",
+                  linestyle="--", linewidth=1.5, label="Prevalence (%)")
+    ax1_prev.set_ylabel("Prevalence (%)", fontsize=10, color="C4")
+    ax1_prev.tick_params(axis='y', labelcolor="C4")
 
     # Days panel
     ax2.plot(times_d, n_samples, color="C0", label="Active patients")
@@ -730,9 +739,20 @@ def plot_n_active_over_time(
     ax2.set_ylabel("Count", fontsize=11)
     ax2.set_title("B) Active Patients over Days", fontsize=12, fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend(fontsize=10)
 
-    plt.tight_layout()
+    ax2_prev = ax2.twinx()
+    ax2_prev.plot(times_d, prevalence * 100, color="C4",
+                  linestyle="--", linewidth=1.5, label="Prevalence (%)")
+    ax2_prev.set_ylabel("Prevalence (%)", fontsize=10, color="C4")
+    ax2_prev.tick_params(axis='y', labelcolor="C4")
+
+    # Combined legend below
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax1_prev.get_legend_handles_labels()
+    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=9,
+               bbox_to_anchor=(0.5, -0.02))
+    fig.subplots_adjust(bottom=0.18)
+    plt.tight_layout(rect=[0, 0.08, 1, 1])
     return fig
 
 
