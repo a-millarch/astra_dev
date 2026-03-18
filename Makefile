@@ -58,7 +58,7 @@ finetune:
 	python $(PROJECT_NAME)/training/train.py --finetune 
 	
 eval:
-	python $(PROJECT_NAME)/training/train.py --eval  --multicurve --comprehensive-eval
+	python $(PROJECT_NAME)/training/train.py --eval  --multicurve --comprehensive-eval --active-only
 
 sweep_arch:
 	python $(PROJECT_NAME)/training/train.py --sweep-arch --n-arch-trials 30

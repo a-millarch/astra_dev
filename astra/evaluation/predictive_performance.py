@@ -92,6 +92,234 @@ def _to_device(obj, device):
     return obj
 
 
+# ============================================================================
+# DECISION CURVE ANALYSIS (NET BENEFIT)
+# ============================================================================
+
+def compute_net_benefit(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    thresholds: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Compute net benefit for decision curve analysis.
+
+    Args:
+        y_true: Binary labels (0/1), shape [N]
+        y_prob: Predicted probabilities, shape [N]
+        thresholds: Threshold probabilities in (0, 1)
+
+    Returns:
+        nb_model: Net benefit of the model at each threshold
+        nb_treat_all: Net benefit of "treat all" strategy
+        nb_treat_none: Net benefit of "treat none" (always 0)
+    """
+    N = len(y_true)
+    prevalence = y_true.mean()
+    nb_model = np.empty_like(thresholds, dtype=float)
+    nb_treat_all = np.empty_like(thresholds, dtype=float)
+
+    for i, t in enumerate(thresholds):
+        weight = t / (1.0 - t)
+        predicted_positive = y_prob >= t
+        tp = np.sum(predicted_positive & (y_true == 1))
+        fp = np.sum(predicted_positive & (y_true == 0))
+        nb_model[i] = tp / N - fp / N * weight
+        nb_treat_all[i] = prevalence - (1.0 - prevalence) * weight
+
+    nb_treat_none = np.zeros_like(thresholds)
+    return nb_model, nb_treat_all, nb_treat_none
+
+
+def plot_decision_curve(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    model_name: str = "Model",
+    max_threshold: float = 0.5,
+    n_points: int = 200,
+) -> plt.Figure:
+    """Plot decision curve analysis for a single set of predictions."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_prob = np.asarray(y_prob, dtype=float)
+    thresholds = np.linspace(0.01, max_threshold, n_points)
+
+    nb_model, nb_treat_all, nb_treat_none = compute_net_benefit(
+        y_true, y_prob, thresholds
+    )
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(thresholds, nb_model, color='#1F77B4', linewidth=2, label=model_name)
+    ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
+            label='Treat All')
+    ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
+
+    ax.set_xlabel("Threshold Probability", fontsize=11)
+    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_title("Decision Curve Analysis", fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_threshold)
+
+    # Clip y-axis: show a small margin below zero but avoid excessive whitespace
+    ymin = max(nb_treat_all.min(), -0.05)
+    ymax = max(nb_model.max(), y_true.mean()) * 1.1
+    ax.set_ylim(ymin - 0.01, ymax)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_decision_curves_over_time(
+    evaluator,
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None,
+    max_threshold: float = 0.5,
+    n_points: int = 200,
+) -> plt.Figure:
+    """
+    Plot decision curves at multiple timepoints.
+
+    Follows the same pattern as plot_multiple_roc_pr_curves(): iterates
+    censor_steps, extracts predictions, computes net benefit per timepoint.
+    """
+    colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
+              '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
+    thresholds = np.linspace(0.01, max_threshold, n_points)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    global_ymin = 0.0
+    global_ymax = 0.0
+    baseline_prevalence = None
+
+    for i, censor_step in enumerate(censor_steps):
+        dls = evaluator.create_censored_dataloaders_fast(censor_step)
+        if dls is None:
+            logger.warning(f"DCA: skipping step {censor_step}: dataloader creation failed")
+            continue
+
+        preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
+        y_preds = preds[:, 1].numpy()
+        ys = targets.numpy()
+
+        if len(set(ys)) < 2:
+            logger.warning(f"DCA: skipping step {censor_step}: only one class")
+            continue
+
+        if baseline_prevalence is None:
+            baseline_prevalence = ys.mean()
+
+        nb_model, _, _ = compute_net_benefit(ys, y_preds, thresholds)
+
+        label = labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        color = colors[i % len(colors)]
+        ax.plot(thresholds, nb_model, color=color, linewidth=1.8, label=label)
+
+        global_ymin = min(global_ymin, nb_model.min())
+        global_ymax = max(global_ymax, nb_model.max())
+
+    # Reference lines (shared)
+    if baseline_prevalence is not None:
+        nb_treat_all = baseline_prevalence - (1.0 - baseline_prevalence) * thresholds / (1.0 - thresholds)
+        ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
+                label='Treat All')
+    ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
+
+    ax.set_xlabel("Threshold Probability", fontsize=11)
+    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+              title="Time Available", title_fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_threshold)
+
+    ymin = max(global_ymin, -0.05) - 0.01
+    ymax = max(global_ymax, baseline_prevalence or 0.05) * 1.1
+    ax.set_ylim(ymin, ymax)
+
+    fig.subplots_adjust(right=0.78)
+    plt.tight_layout()
+    return fig
+
+
+def _plot_decision_curves_temporal(
+    preds_all: np.ndarray,
+    y_true: np.ndarray,
+    traj_lengths: np.ndarray,
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None,
+    max_threshold: float = 0.5,
+    n_points: int = 200,
+) -> plt.Figure:
+    """
+    Plot decision curves at multiple timepoints for temporal models.
+
+    Uses pre-computed predictions matrix instead of running inference per step.
+    """
+    colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
+              '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
+    thresholds = np.linspace(0.01, max_threshold, n_points)
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    global_ymin = 0.0
+    global_ymax = 0.0
+    baseline_prevalence = None
+
+    max_step = preds_all.shape[1] - 1
+
+    for i, censor_step in enumerate(censor_steps):
+        # Use effective step (min of censor_step, trajectory length - 1)
+        effective_steps = np.minimum(censor_step, traj_lengths - 1).astype(int)
+        effective_steps = np.clip(effective_steps, 0, max_step)
+
+        # Only include patients whose trajectory reaches this timepoint
+        active_mask = traj_lengths > censor_step
+        if active_mask.sum() < 10:
+            logger.warning(f"DCA temporal: skipping step {censor_step}: too few active patients")
+            continue
+
+        y_sub = y_true[active_mask]
+        preds_sub = preds_all[np.where(active_mask)[0], effective_steps[active_mask]]
+
+        if len(set(y_sub)) < 2:
+            logger.warning(f"DCA temporal: skipping step {censor_step}: only one class")
+            continue
+
+        if baseline_prevalence is None:
+            baseline_prevalence = y_true.mean()
+
+        nb_model, _, _ = compute_net_benefit(y_sub, preds_sub, thresholds)
+
+        label = labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        color = colors[i % len(colors)]
+        ax.plot(thresholds, nb_model, color=color, linewidth=1.8, label=label)
+
+        global_ymin = min(global_ymin, nb_model.min())
+        global_ymax = max(global_ymax, nb_model.max())
+
+    # Reference lines
+    if baseline_prevalence is not None:
+        nb_treat_all = baseline_prevalence - (1.0 - baseline_prevalence) * thresholds / (1.0 - thresholds)
+        ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
+                label='Treat All')
+    ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
+
+    ax.set_xlabel("Threshold Probability", fontsize=11)
+    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+              title="Time Available", title_fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_threshold)
+
+    ymin = max(global_ymin, -0.05) - 0.01
+    ymax = max(global_ymax, baseline_prevalence or 0.05) * 1.1
+    ax.set_ylim(ymin, ymax)
+
+    fig.subplots_adjust(right=0.78)
+    plt.tight_layout()
+    return fig
+
+
 class TimeDependentEvaluator:
     """
     Evaluates model performance at different time censoring points.
@@ -700,9 +928,10 @@ def plot_time_metrics_comparison(
 
 def plot_n_active_over_time(
     results_active: List[TimeMetricResult],
-    cut_hours=72, max_days=30
+    cut_hours=72, max_days=30,
+    target_name: str = "deceased_30d"
 ):
-    """Show active patient count, positive count, and outcome prevalence over time."""
+    """Show active patient count, outcome-positive count, and prevalence over time."""
     if not results_active:
         raise ValueError("No active-only results to plot")
 
@@ -712,13 +941,17 @@ def plot_n_active_over_time(
     n_positive = np.array([r.n_positive for r in results_active])
     prevalence = np.where(n_samples > 0, n_positive / n_samples, 0.0)
 
+    PREV_COLOR = "#1F77B4"  # blue
+    ACTIVE_COLOR = "#2CA02C"  # green
+    POSITIVE_COLOR = "#D62728"  # red
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
 
     mask_cut = times_h <= cut_hours
 
     # Hours panel
-    ax1.plot(times_h[mask_cut], n_samples[mask_cut], color="C0", label="Active patients")
-    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color="C3", label="Deceased (active)")
+    ax1.plot(times_h[mask_cut], n_samples[mask_cut], color=ACTIVE_COLOR, label="Active patients")
+    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
     ax1.set_xlabel("Time (hours)", fontsize=11)
     ax1.set_xlim(0, cut_hours)
     ax1.set_ylabel("Count", fontsize=11)
@@ -726,14 +959,15 @@ def plot_n_active_over_time(
     ax1.grid(True, alpha=0.3)
 
     ax1_prev = ax1.twinx()
-    ax1_prev.plot(times_h[mask_cut], prevalence[mask_cut] * 100, color="C4",
+    ax1_prev.plot(times_h[mask_cut], prevalence[mask_cut] * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax1_prev.set_ylabel("Prevalence (%)", fontsize=10, color="C4")
-    ax1_prev.tick_params(axis='y', labelcolor="C4")
+    ax1_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax1_prev.set_ylim(0, 12)
+    ax1_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
 
     # Days panel
-    ax2.plot(times_d, n_samples, color="C0", label="Active patients")
-    ax2.plot(times_d, n_positive, color="C3", label="Deceased (active)")
+    ax2.plot(times_d, n_samples, color=ACTIVE_COLOR, label="Active patients")
+    ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
     ax2.set_xlabel("Time (days)", fontsize=11)
     ax2.set_xlim(0, max_days)
     ax2.set_ylabel("Count", fontsize=11)
@@ -741,10 +975,11 @@ def plot_n_active_over_time(
     ax2.grid(True, alpha=0.3)
 
     ax2_prev = ax2.twinx()
-    ax2_prev.plot(times_d, prevalence * 100, color="C4",
+    ax2_prev.plot(times_d, prevalence * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax2_prev.set_ylabel("Prevalence (%)", fontsize=10, color="C4")
-    ax2_prev.tick_params(axis='y', labelcolor="C4")
+    ax2_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax2_prev.set_ylim(0, 12)
+    ax2_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
 
     # Combined legend below
     h1, l1 = ax1.get_legend_handles_labels()
@@ -868,6 +1103,12 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
         logger.info("Baseline temporal evaluation saved")
 
+        # Decision Curve Analysis (baseline — full trajectory)
+        fig_dca = plot_decision_curve(targs, baseline_preds, model_name=model_name)
+        save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
+        plt.close(fig_dca)
+        logger.info("Baseline decision curve saved")
+
         key_timepoints = None
         if multicurve:
             key_timepoints = [
@@ -887,6 +1128,15 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         f"AUROC={result.auroc:.3f} [{result.auroc_ci[0]:.3f}-{result.auroc_ci[1]:.3f}], "
                         f"AUPRC={result.auprc:.3f} [{result.auprc_ci[0]:.3f}-{result.auprc_ci[1]:.3f}]"
                     )
+
+            # Decision curves at key timepoints (temporal)
+            labels = [format_step_label(step) for step in key_timepoints]
+            fig_dca_time = _plot_decision_curves_temporal(
+                preds_all, targs, traj_lens, key_timepoints, labels=labels
+            )
+            save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
+            plt.close(fig_dca_time)
+            logger.info("Time-dependent decision curves saved (temporal)")
 
         if comprehensive_eval:
             censor_thresholds = generate_time_thresholds(
@@ -925,7 +1175,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         )
                     fig_cmp = plot_time_metrics_comparison(results, results_active)
                     save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
-                    fig_n = plot_n_active_over_time(results_active)
+                    fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                     save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                     logger.info("Active-only comparison plots saved")
 
@@ -961,6 +1211,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
     logger.info("Baseline ROC/PR plot saved")
 
+    # Decision Curve Analysis (baseline — full trajectory)
+    fig_dca = plot_decision_curve(
+        targs.numpy(), preds[:, 1].numpy(), model_name=model_name
+    )
+    save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
+    plt.close(fig_dca)
+    logger.info("Baseline decision curve saved")
+
     # Initialize evaluator with pre-normalized data
     evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
 
@@ -991,6 +1249,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         )
         save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
         logger.info("Multiple curves plot saved")
+
+        # Decision curves at key timepoints
+        fig_dca_time = plot_decision_curves_over_time(
+            evaluator, key_timepoints, labels=labels
+        )
+        save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
+        plt.close(fig_dca_time)
+        logger.info("Time-dependent decision curves saved")
 
     # COMPREHENSIVE TIME-DEPENDENT EVALUATION
     if comprehensive_eval:
@@ -1045,7 +1311,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     )
                 fig_cmp = plot_time_metrics_comparison(results, results_active)
                 save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
-                fig_n = plot_n_active_over_time(results_active)
+                fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                 save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                 logger.info("Active-only comparison plots saved")
 
