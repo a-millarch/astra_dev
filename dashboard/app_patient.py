@@ -456,18 +456,55 @@ def _ref_color(value: float, ref: tuple) -> str:
 
 
 def _add_ref_band(fig, feature: str, y_min: float, y_max: float):
-    """Add colored reference-range band to a plotly figure."""
+    """Add green/yellow/red background zones to a plotly figure."""
     ref = _get_ref_range(feature)
     if ref is None:
         return
     low, high = ref
-    # Grøn normalzone (klippet til synlig y-akse)
+    span = high - low if high != low else 1
+
+    # Gul zone: 0–50% af span udenfor normal
+    yellow_low = low - span * 0.5
+    yellow_high = high + span * 0.5
+
+    # Rød zone: alt udenfor gul (til y-akse grænser)
+    # Rød under gul (y_min → yellow_low)
+    if yellow_low > y_min:
+        fig.add_hrect(
+            y0=y_min, y1=yellow_low,
+            fillcolor="#d32f2f", opacity=0.07,
+            line_width=0, layer="below",
+        )
+    # Gul under grøn (yellow_low → low)
+    gl = max(yellow_low, y_min)
+    if gl < low:
+        fig.add_hrect(
+            y0=gl, y1=low,
+            fillcolor="#ff9800", opacity=0.08,
+            line_width=0, layer="below",
+        )
+    # Grøn normalzone (low → high)
     band_low = max(low, y_min)
     band_high = min(high, y_max)
     if band_low < band_high:
         fig.add_hrect(
             y0=band_low, y1=band_high,
             fillcolor="#2ca02c", opacity=0.08,
+            line_width=0, layer="below",
+        )
+    # Gul over grøn (high → yellow_high)
+    gh = min(yellow_high, y_max)
+    if high < gh:
+        fig.add_hrect(
+            y0=high, y1=gh,
+            fillcolor="#ff9800", opacity=0.08,
+            line_width=0, layer="below",
+        )
+    # Rød over gul (yellow_high → y_max)
+    if yellow_high < y_max:
+        fig.add_hrect(
+            y0=yellow_high, y1=y_max,
+            fillcolor="#d32f2f", opacity=0.07,
             line_width=0, layer="below",
         )
     # Stiplede linjer ved grænseværdier
@@ -539,27 +576,14 @@ def vis_feature_rækker(filtered_df, ts_col):
             if len(feat_df) >= 2:
                 fig = go.Figure()
 
-                # Farvede datapunkter baseret på referenceområde
-                if ref is not None:
-                    marker_colors = [_ref_color(v, ref) for v in feat_df["VALUE"]]
-                    fig.add_trace(go.Scatter(
-                        x=feat_df["timer_siden_start"],
-                        y=feat_df["VALUE"],
-                        mode="lines+markers",
-                        line=dict(color="#4e79a7"),
-                        marker=dict(color=marker_colors, size=7, line=dict(width=0.5, color="white")),
-                        hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
-                        customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
-                    ))
-                else:
-                    fig.add_trace(go.Scatter(
-                        x=feat_df["timer_siden_start"],
-                        y=feat_df["VALUE"],
-                        mode="lines",
-                        line=dict(color="#4e79a7"),
-                        hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
-                        customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
-                    ))
+                fig.add_trace(go.Scatter(
+                    x=feat_df["timer_siden_start"],
+                    y=feat_df["VALUE"],
+                    mode="lines",
+                    line=dict(color="#4e79a7"),
+                    hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
+                    customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
+                ))
 
                 max_timer = feat_df["timer_siden_start"].max()
                 min_timer = feat_df["timer_siden_start"].min()
