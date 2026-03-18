@@ -101,7 +101,7 @@ class TimeDependentEvaluator:
     """
 
     def __init__(self, data: dict, model: torch.nn.Module, cfg: dict,
-                 device: str = 'cuda'):
+                 device: str = 'cuda', active_only: bool = False):
         """
         Initialize evaluator with data and model.
 
@@ -110,6 +110,8 @@ class TimeDependentEvaluator:
             model: Trained model (nn.Module, already on device)
             cfg: Configuration dictionary
             device: Device string
+            active_only: If True, only include patients with active trajectories
+                         at each evaluation timestep
         """
         self.data = data
         self.model = model
@@ -137,10 +139,18 @@ class TimeDependentEvaluator:
         self.holdout_x_cat = holdout_ds.x_cat.numpy()
         self.holdout_x_cont = holdout_ds.x_cont.numpy()
         self.holdout_trajectory_lengths = data.get("holdout_trajectory_lengths")
+        self.active_only = active_only
 
         self.holdout = data["holdout"]
 
-        logger.info("TimeDependentEvaluator initialized with pre-normalized data")
+        mode_str = " (active-only mode)" if active_only else ""
+        logger.info(f"TimeDependentEvaluator initialized with pre-normalized data{mode_str}")
+
+    def _get_active_mask(self, censor_step: int) -> np.ndarray:
+        """Boolean mask: True for patients with trajectory_length > censor_step."""
+        if self.holdout_trajectory_lengths is None:
+            return np.ones(len(self.holdout_y), dtype=bool)
+        return self.holdout_trajectory_lengths > censor_step
 
     def _censor_normalized_data(self, X_normalized: np.ndarray, censor_step: int) -> np.ndarray:
         X_censored = X_normalized.copy()
@@ -157,27 +167,46 @@ class TimeDependentEvaluator:
     def create_censored_dataloaders_fast(self, censor_step: int) -> Optional[AstraMixedDataLoader]:
         """
         Create dataloaders by censoring pre-normalized data.
+        When active_only=True, filters to patients with active trajectories.
         """
-        if len(set(self.holdout_y)) < 2:
-            logger.warning("Only one class in dataset")
+        # Select patient subset
+        if self.active_only:
+            mask = self._get_active_mask(censor_step)
+            if mask.sum() < 2:
+                logger.warning(f"Too few active patients ({mask.sum()}) at step {censor_step}")
+                return None
+            X_norm = self.holdout_X_normalized[mask]
+            X_mh = self.holdout_X_multi_hot[mask]
+            x_cat = self.holdout_x_cat[mask]
+            x_cont = self.holdout_x_cont[mask]
+            y = np.array(self.holdout_y)[mask]
+            traj = self.holdout_trajectory_lengths[mask] if self.holdout_trajectory_lengths is not None else None
+        else:
+            X_norm = self.holdout_X_normalized
+            X_mh = self.holdout_X_multi_hot
+            x_cat = self.holdout_x_cat
+            x_cont = self.holdout_x_cont
+            y = self.holdout_y
+            traj = self.holdout_trajectory_lengths
+
+        if len(set(y)) < 2:
+            logger.warning(f"Only one class in dataset at step {censor_step}")
             return None
 
-        X_censored = self._censor_normalized_data(self.holdout_X_normalized, censor_step)
-        X_multi_hot_censored = self._censor_multihot(self.holdout_X_multi_hot, censor_step)
+        X_censored = self._censor_normalized_data(X_norm, censor_step)
+        X_multi_hot_censored = self._censor_multihot(X_mh, censor_step)
 
         # Effective trajectory: min(original, censor_step + 1) per sample
         effective_traj = None
-        if self.holdout_trajectory_lengths is not None:
-            effective_traj = np.minimum(
-                self.holdout_trajectory_lengths, censor_step + 1
-            )
+        if traj is not None:
+            effective_traj = np.minimum(traj, censor_step + 1)
 
         dataset = AstraMixedDataset(
             X_ts=X_censored,
-            x_cat=self.holdout_x_cat,
-            x_cont=self.holdout_x_cont,
+            x_cat=x_cat,
+            x_cont=x_cont,
             X_ts_cat=X_multi_hot_censored,
-            y=self.holdout_y,
+            y=y,
             trajectory_lengths=effective_traj,
         )
         return AstraMixedDataLoader(
@@ -257,7 +286,13 @@ class TimeDependentEvaluator:
                     preds, _ = _get_predictions(self.model, dls.train, self.device)
                     y_preds = preds[:, 1].numpy()
 
-                    for pid, pred in zip(patient_ids, y_preds):
+                    if self.active_only:
+                        mask = self._get_active_mask(censor_step)
+                        active_pids = patient_ids[mask]
+                    else:
+                        active_pids = patient_ids
+
+                    for pid, pred in zip(active_pids, y_preds):
                         preds_over_time.append({
                             "PID": pid,
                             "censor_step": censor_step,
@@ -296,11 +331,12 @@ class TemporalEvaluator:
     """
 
     def __init__(self, data: dict, model: torch.nn.Module, cfg: dict,
-                 device: str = 'cuda'):
+                 device: str = 'cuda', active_only: bool = False):
         self.data = data
         self.model = model
         self.cfg = cfg
         self.device = device
+        self.active_only = active_only
         self.model.eval()
 
         self._holdout_preds = None
@@ -309,6 +345,9 @@ class TemporalEvaluator:
                       data.get("traj_lengths_holdout", []))
         )
         self.holdout = data["holdout"]
+
+        mode_str = " (active-only mode)" if active_only else ""
+        logger.info(f"TemporalEvaluator initialized{mode_str}")
 
     def _get_all_predictions(self) -> np.ndarray:
         if self._holdout_preds is not None:
@@ -331,15 +370,29 @@ class TemporalEvaluator:
     def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
         preds_all = self._get_all_predictions()
         ys = np.array(self.data["ty"])
+        traj_lengths = self._holdout_traj_lengths
 
-        if len(self._holdout_traj_lengths) > 0:
-            effective_steps = np.minimum(censor_step, self._holdout_traj_lengths - 1)
+        # Active-only filtering
+        if self.active_only and len(traj_lengths) > 0:
+            mask = traj_lengths > censor_step
+            if mask.sum() < 2:
+                logger.warning(f"Too few active patients ({mask.sum()}) at step {censor_step}")
+                return None
+            preds_subset = preds_all[mask]
+            ys = ys[mask]
+            traj_subset = traj_lengths[mask]
+        else:
+            preds_subset = preds_all
+            traj_subset = traj_lengths
+
+        if len(traj_subset) > 0:
+            effective_steps = np.minimum(censor_step, traj_subset - 1)
             effective_steps = np.maximum(effective_steps, 0).astype(int)
         else:
-            effective_steps = np.full(len(preds_all), censor_step, dtype=int)
-            effective_steps = np.minimum(effective_steps, preds_all.shape[1] - 1)
+            effective_steps = np.full(len(preds_subset), censor_step, dtype=int)
+            effective_steps = np.minimum(effective_steps, preds_subset.shape[1] - 1)
 
-        y_preds = preds_all[np.arange(len(preds_all)), effective_steps]
+        y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
 
         if ys.sum() == 0 or ys.sum() == len(ys):
             return None
@@ -389,18 +442,30 @@ class TemporalEvaluator:
             results.append(result)
 
             if save_predictions:
-                if len(self._holdout_traj_lengths) > 0:
+                traj_lengths = self._holdout_traj_lengths
+
+                if self.active_only and len(traj_lengths) > 0:
+                    mask = traj_lengths > censor_step
+                    preds_subset = preds_all[mask]
+                    traj_subset = traj_lengths[mask]
+                    active_pids = patient_ids[mask]
+                else:
+                    preds_subset = preds_all
+                    traj_subset = traj_lengths
+                    active_pids = patient_ids
+
+                if len(traj_subset) > 0:
                     effective_steps = np.minimum(
-                        censor_step, self._holdout_traj_lengths - 1
+                        censor_step, traj_subset - 1
                     )
                     effective_steps = np.maximum(effective_steps, 0).astype(int)
                 else:
                     effective_steps = np.minimum(
-                        censor_step, preds_all.shape[1] - 1
+                        censor_step, preds_subset.shape[1] - 1
                     )
-                y_preds = preds_all[np.arange(len(preds_all)), effective_steps]
+                y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
 
-                for pid, pred in zip(patient_ids, y_preds):
+                for pid, pred in zip(active_pids, y_preds):
                     preds_over_time.append({
                         "PID": pid,
                         "censor_step": censor_step,
@@ -548,6 +613,129 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=30
     return fig
 
 
+def plot_time_metrics_comparison(
+    results_all: List[TimeMetricResult],
+    results_active: List[TimeMetricResult],
+    cut_hours=72, max_days=30
+):
+    """Overlay all-patients vs active-only AUROC/AUPRC curves."""
+    if not results_all or not results_active:
+        raise ValueError("Both result sets required for comparison plot")
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    datasets = [
+        ("All patients", results_all, "-"),
+        ("Active only", results_active, "--"),
+    ]
+
+    for label_prefix, results, linestyle in datasets:
+        times_h = np.array([r.time_hours for r in results])
+        times_d = np.array([r.time_days for r in results])
+        auroc_vals = np.array([r.auroc for r in results])
+        auroc_lower = np.array([r.auroc_ci[0] for r in results])
+        auroc_upper = np.array([r.auroc_ci[1] for r in results])
+        auprc_vals = np.array([r.auprc for r in results])
+        auprc_lower = np.array([r.auprc_ci[0] for r in results])
+        auprc_upper = np.array([r.auprc_ci[1] for r in results])
+
+        mask_cut = times_h <= cut_hours
+
+        for vals, lower, upper, color, metric_name in [
+            (auroc_vals, auroc_lower, auroc_upper, "C0", "AUROC"),
+            (auprc_vals, auprc_lower, auprc_upper, "C1", "AUPRC"),
+        ]:
+            # Hours panel
+            x = times_h[mask_cut]
+            v, lo, hi = vals[mask_cut], lower[mask_cut], upper[mask_cut]
+            if len(x) > 0:
+                if x[-1] < cut_hours:
+                    x = np.append(x, cut_hours)
+                    v = np.append(v, v[-1])
+                    lo = np.append(lo, lo[-1])
+                    hi = np.append(hi, hi[-1])
+                ax1.plot(x, v, color=color, linestyle=linestyle,
+                         label=f"{metric_name} ({label_prefix})", markersize=3)
+                ax1.fill_between(x, lo, hi, color=color, alpha=0.1)
+
+            # Days panel
+            x = times_d
+            v, lo, hi = vals, lower, upper
+            if len(x) > 0:
+                if x[-1] < max_days:
+                    x = np.append(x, max_days)
+                    v = np.append(v, v[-1])
+                    lo = np.append(lo, lo[-1])
+                    hi = np.append(hi, hi[-1])
+                ax2.plot(x, v, color=color, linestyle=linestyle,
+                         label=f"{metric_name} ({label_prefix})", markersize=3)
+                ax2.fill_between(x, lo, hi, color=color, alpha=0.1)
+
+    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_xlim(0, cut_hours)
+    ax1.set_xticks(np.arange(0, cut_hours+1, 6))
+    ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax1.set_ylabel("Score", fontsize=11)
+    ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=8, loc='lower right')
+    ax1.set_ylim(0.0, 1.0)
+
+    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_xlim(0, max_days)
+    ax2.set_xticks(np.arange(0, max_days+1, 5))
+    ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax2.set_ylabel("Score", fontsize=11)
+    ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=8, loc='lower right')
+    ax2.set_ylim(0.0, 1.0)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_n_active_over_time(
+    results_active: List[TimeMetricResult],
+    cut_hours=72, max_days=30
+):
+    """Show active patient count and positive count over time."""
+    if not results_active:
+        raise ValueError("No active-only results to plot")
+
+    times_h = np.array([r.time_hours for r in results_active])
+    times_d = np.array([r.time_days for r in results_active])
+    n_samples = np.array([r.n_samples for r in results_active])
+    n_positive = np.array([r.n_positive for r in results_active])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    mask_cut = times_h <= cut_hours
+
+    # Hours panel
+    ax1.plot(times_h[mask_cut], n_samples[mask_cut], color="C0", label="Active patients")
+    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color="C3", label="Deceased (active)")
+    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_xlim(0, cut_hours)
+    ax1.set_ylabel("Count", fontsize=11)
+    ax1.set_title("A) Active Patients over Hours", fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=10)
+
+    # Days panel
+    ax2.plot(times_d, n_samples, color="C0", label="Active patients")
+    ax2.plot(times_d, n_positive, color="C3", label="Deceased (active)")
+    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_xlim(0, max_days)
+    ax2.set_ylabel("Count", fontsize=11)
+    ax2.set_title("B) Active Patients over Days", fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10)
+
+    plt.tight_layout()
+    return fig
+
+
 def plot_multiple_roc_pr_curves(
     evaluator: TimeDependentEvaluator,
     censor_steps: List[int],
@@ -616,11 +804,16 @@ def plot_multiple_roc_pr_curves(
 # MAIN EVALUATION FUNCTION
 # ============================================================================
 
-def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True):
+def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True,
+             active_only: bool = False):
     """
     Enhanced evaluation with time-dependent metrics.
 
     Uses direct model inference (no FastAI Learner).
+
+    Args:
+        active_only: If True, also runs active-only evaluation and generates
+                     comparison plots (all patients vs active-only).
     """
     model_name = cfg["model_name"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
@@ -696,18 +889,45 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_time = plot_time_metrics(results, cut_hours=72, max_days=30)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
 
+            # Active-only evaluation and comparison
+            if active_only:
+                logger.info("Running active-only temporal evaluation...")
+                temporal_eval_active = TemporalEvaluator(
+                    data, model, cfg, device=device, active_only=True
+                )
+                results_active, preds_df_active = temporal_eval_active.evaluate_over_time(
+                    censor_thresholds, save_predictions=True, model_name=f"{model_name}_active",
+                )
+                if results_active:
+                    if preds_df_active is not None:
+                        preds_df_active.to_csv(
+                            f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                        )
+                    fig_cmp = plot_time_metrics_comparison(results, results_active)
+                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                    fig_n = plot_n_active_over_time(results_active)
+                    save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                    logger.info("Active-only comparison plots saved")
+
             logger.info("="*80)
             logger.info("TEMPORAL EVALUATION SUMMARY")
             logger.info("="*80)
             if key_timepoints:
                 for step in key_timepoints:
                     matching = [r for r in results if r.censor_step == step]
+                    if active_only and results_active:
+                        matching_active = [r for r in results_active if r.censor_step == step]
+                    else:
+                        matching_active = []
                     if matching:
                         r = matching[0]
-                        logger.info(
-                            f"  {format_step_label(step):>12s}: "
-                            f"AUROC={r.auroc:.3f}, AUPRC={r.auprc:.3f}"
-                        )
+                        line = (f"  {format_step_label(step):>12s}: "
+                                f"AUROC={r.auroc:.3f}, AUPRC={r.auprc:.3f}")
+                        if matching_active:
+                            ra = matching_active[0]
+                            line += (f"  |  Active: AUROC={ra.auroc:.3f}, "
+                                     f"AUPRC={ra.auprc:.3f} (n={ra.n_samples})")
+                        logger.info(line)
             return results, preds_df
         return None, None
 
@@ -788,6 +1008,27 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("Time metrics plot saved")
 
+        # Active-only evaluation and comparison
+        results_active = None
+        if active_only:
+            logger.info("Running active-only evaluation...")
+            evaluator_active = TimeDependentEvaluator(
+                data, model, cfg, device=device, active_only=True
+            )
+            results_active, preds_df_active = evaluator_active.evaluate_over_time_ultra_fast(
+                censor_thresholds, save_predictions=True, model_name=f"{model_name}_active"
+            )
+            if results_active:
+                if preds_df_active is not None:
+                    preds_df_active.to_csv(
+                        f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                    )
+                fig_cmp = plot_time_metrics_comparison(results, results_active)
+                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                fig_n = plot_n_active_over_time(results_active)
+                save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                logger.info("Active-only comparison plots saved")
+
         logger.info("="*80)
         logger.info("EVALUATION SUMMARY")
         logger.info("="*80)
@@ -798,13 +1039,22 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         if multicurve:
             for step in key_timepoints[::-1]:
                 matching = [r for r in results if r.censor_step == step]
+                if active_only and results_active:
+                    matching_active = [r for r in results_active if r.censor_step == step]
+                else:
+                    matching_active = []
                 if matching:
                     r = matching[0]
-                    logger.info(
+                    line = (
                         f"  {format_step_label(step):>12s}: "
                         f"AUROC={r.auroc:.3f} [{r.auroc_ci[0]:.3f}-{r.auroc_ci[1]:.3f}], "
                         f"AUPRC={r.auprc:.3f} [{r.auprc_ci[0]:.3f}-{r.auprc_ci[1]:.3f}]"
                     )
+                    if matching_active:
+                        ra = matching_active[0]
+                        line += (f"  |  Active: AUROC={ra.auroc:.3f}, "
+                                 f"AUPRC={ra.auprc:.3f} (n={ra.n_samples})")
+                    logger.info(line)
 
         logger.info("="*80)
         logger.info("Comprehensive evaluation complete!")

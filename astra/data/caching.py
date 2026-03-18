@@ -46,6 +46,7 @@ def _get_cache_key(cfg):
         "temporal_features": cfg.get("temporal_features", {}).get("enabled", False),
         "agg_func": cfg.get("agg_func", {}),
         "normalization": cfg.get("normalization", {}),
+        "drop_features": cfg.get("drop_features", {}),
     }
     config_str = json.dumps(key_params, sort_keys=True, default=str)
     return hashlib.md5(config_str.encode()).hexdigest()[:12]

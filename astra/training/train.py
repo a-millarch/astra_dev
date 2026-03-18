@@ -83,6 +83,8 @@ def parse_args():
     # Eval options
     parser.add_argument("--comprehensive-eval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--multicurve", action="store_true", default=False)
+    parser.add_argument("--active-only", action="store_true", default=False,
+                        help="Also run active-only evaluation (patients still in hospital) and generate comparison plots")
 
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
@@ -244,6 +246,7 @@ def main():
         logger.info("=== Running Evaluation ===")
         results, preds_df = run_eval(
             data, cfg, args.multicurve, args.comprehensive_eval,
+            active_only=args.active_only,
         )
 
     # ========================================================================
