@@ -148,8 +148,14 @@ def plot_decision_curve(
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
+
+    # Determine y-range from model curve, then clip Treat All to that range
+    ymin = min(nb_model.min(), -0.01) - 0.005
+    ymax = max(nb_model.max(), y_true.mean()) * 1.15 + 0.005
+    nb_treat_all_clipped = np.clip(nb_treat_all, ymin, None)
+
     ax.plot(thresholds, nb_model, color='#1F77B4', linewidth=2, label=model_name)
-    ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
+    ax.plot(thresholds, nb_treat_all_clipped, color='grey', linewidth=1.5, linestyle='--',
             label='Treat All')
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
@@ -159,11 +165,7 @@ def plot_decision_curve(
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
-
-    # Clip y-axis: show a small margin below zero but avoid excessive whitespace
-    ymin = max(nb_treat_all.min(), -0.05)
-    ymax = max(nb_model.max(), y_true.mean()) * 1.1
-    ax.set_ylim(ymin - 0.01, ymax)
+    ax.set_ylim(ymin, ymax)
 
     plt.tight_layout()
     return fig
@@ -223,18 +225,23 @@ def plot_decision_curves_over_time(
         nb_treat_all = prevalence - (1.0 - prevalence) * thresholds / (1.0 - thresholds)
         treat_all_curves.append((nb_treat_all, color, label, prevalence))
 
-        global_ymin = min(global_ymin, nb_model.min(), nb_treat_all.min())
+        global_ymin = min(global_ymin, nb_model.min())
         global_ymax = max(global_ymax, nb_model.max())
 
-    # Plot per-timepoint "Treat All" lines (thin, dashed, matching color)
+    # Determine y-axis range from model curves only
+    ymin = min(global_ymin, -0.01) - 0.005
+    ymax = global_ymax * 1.15 + 0.005
+
+    # Plot per-timepoint "Treat All" lines, clipped to visible range
     first_treat_all = True
     for curve_data in treat_all_curves:
         if curve_data is None:
             continue
         nb_treat_all, color, label, prevalence = curve_data
+        nb_treat_all_clipped = np.clip(nb_treat_all, ymin, None)
         legend_label = "Treat All" if first_treat_all else None
         ax.plot(
-            thresholds, nb_treat_all,
+            thresholds, nb_treat_all_clipped,
             color=color, linewidth=1.0, linestyle='--', alpha=0.4,
             label=legend_label,
         )
@@ -250,10 +257,6 @@ def plot_decision_curves_over_time(
               title="Time Available", title_fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
-
-    # Clip y-axis to model curve range (not Treat All tails)
-    ymin = min(global_ymin, -0.01) - 0.005
-    ymax = global_ymax * 1.15 + 0.005
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
@@ -325,15 +328,20 @@ def _plot_decision_curves_temporal(
         global_ymin = min(global_ymin, nb_model.min())
         global_ymax = max(global_ymax, nb_model.max())
 
-    # Plot per-timepoint "Treat All" lines (thin, dashed, matching color)
+    # Determine y-axis range from model curves only
+    ymin = min(global_ymin, -0.01) - 0.005
+    ymax = global_ymax * 1.15 + 0.005
+
+    # Plot per-timepoint "Treat All" lines, clipped to visible range
     first_treat_all = True
     for curve_data in treat_all_curves:
         if curve_data is None:
             continue
         nb_treat_all, color, label, prevalence = curve_data
+        nb_treat_all_clipped = np.clip(nb_treat_all, ymin, None)
         legend_label = "Treat All" if first_treat_all else None
         ax.plot(
-            thresholds, nb_treat_all,
+            thresholds, nb_treat_all_clipped,
             color=color, linewidth=1.0, linestyle='--', alpha=0.4,
             label=legend_label,
         )
@@ -349,10 +357,6 @@ def _plot_decision_curves_temporal(
               title="Time Available", title_fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
-
-    # Clip y-axis to model curve range (not Treat All tails)
-    ymin = min(global_ymin, -0.01) - 0.005
-    ymax = global_ymax * 1.15 + 0.005
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
