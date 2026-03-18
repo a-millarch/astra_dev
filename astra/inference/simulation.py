@@ -280,6 +280,7 @@ class SimulationRunner:
         data_dir: str = 'data/raw',
         ebm_models_dir: str = 'models/ebm',
         start_hours: float = 0.0,
+        patient_dir: str = 'data/patients',
     ):
         """Create PatientContext at admission and prepare for stepping.
 
@@ -293,6 +294,7 @@ class SimulationRunner:
             data_dir: Path to raw CSV data.
             ebm_models_dir: Path to saved EBM models.
             start_hours: Start at this many hours after admission.
+            patient_dir: Directory with pre-split per-patient CSVs.
         """
         from astra.inference.patient_context import PatientContext
 
@@ -305,6 +307,7 @@ class SimulationRunner:
             data_dir=data_dir,
             ebm_models_dir=ebm_models_dir,
             start_hours=start_hours,
+            patient_dir=patient_dir,
         )
 
         self._time_points = _generate_bin_aligned_times(
@@ -460,6 +463,7 @@ class SimulationRunner:
         ebm_models_dir: str = 'models/ebm',
         start_hours: float = 0.0,
         end_hours: Optional[float] = None,
+        patient_dir: str = 'data/patients',
     ) -> SimulationResult:
         """Run simulation mimicking real-time ETL-fed data delivery.
 
@@ -486,6 +490,7 @@ class SimulationRunner:
             ebm_models_dir: Path to saved EBM models.
             start_hours: Start simulation at this many hours after admission.
             end_hours: Stop simulation at this many hours (None = full trajectory).
+            patient_dir: Directory with pre-split per-patient CSVs.
 
         Returns:
             :class:`SimulationResult` with per-step predictions and timing.
@@ -511,8 +516,10 @@ class SimulationRunner:
         with timed_stage(setup_timing, 'csv_load'):
             base_df = _build_single_patient_base_df(
                 cpr_hash, service_date, cfg, data_dir,
+                patient_dir=patient_dir,
             )
-            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+            filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir,
+                                                             patient_dir=patient_dir)
 
         admission_time = pd.Timestamp(base_df['start'].iloc[0])
         current_time = admission_time + pd.Timedelta(hours=start_hours)
@@ -663,6 +670,7 @@ class SimulationRunner:
         ebm_models_dir: str = 'models/ebm',
         start_hours: float = 0.0,
         end_hours: Optional[float] = None,
+        patient_dir: str = 'data/patients',
     ) -> SimulationResult:
         """Run full simulation for a patient loaded from CSV.
 
@@ -678,6 +686,7 @@ class SimulationRunner:
             ebm_models_dir: Path to saved EBM models.
             start_hours: Start simulation at this many hours after admission.
             end_hours: Stop simulation at this many hours (None = full trajectory).
+            patient_dir: Directory with pre-split per-patient CSVs.
 
         Returns:
             :class:`SimulationResult` with per-step predictions and timing.
@@ -699,6 +708,7 @@ class SimulationRunner:
             data_dir=data_dir,
             ebm_models_dir=ebm_models_dir,
             start_hours=start_hours,
+            patient_dir=patient_dir,
         )
 
         result = self.run_from_context(ctx, end_hours=end_hours)

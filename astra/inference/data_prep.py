@@ -1353,6 +1353,7 @@ def prepare_patient_from_csv(
     cfg: dict = None,
     data_dir: str = 'data/raw',
     ebm_models_dir: str = 'models/ebm',
+    patient_dir: str = 'data/patients',
 ) -> dict:
     """
     Full pipeline from raw CSV files to model-ready tensors for a single patient.
@@ -1373,6 +1374,8 @@ def prepare_patient_from_csv(
         cfg: Config dict. Defaults to loading configs/defaults.yaml.
         data_dir: Directory containing raw CSV files.
         ebm_models_dir: Directory containing trained EBM deployment models.
+        patient_dir: Directory with pre-split per-patient CSVs. Falls back
+            to data_dir if per-patient files are not found.
 
     Returns:
         Same as prepare_single_patient(): dict with x_ts, x_ts_cat, tab_df,
@@ -1383,7 +1386,8 @@ def prepare_patient_from_csv(
         cfg = get_cfg()
 
     # Phase 1: Build base_df
-    base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir)
+    base_df = _build_single_patient_base_df(cpr_hash, service_date, cfg, data_dir,
+                                            patient_dir=patient_dir)
     logger.info(
         f"Built base_df for patient {cpr_hash[:8]}...: "
         f"trajectory {base_df['start'].iloc[0]} → {base_df['end'].iloc[0]}"
@@ -1399,7 +1403,8 @@ def prepare_patient_from_csv(
         current_time = clamped
 
     # Phase 2: Filter concepts
-    filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir)
+    filtered_concepts = _filter_concepts_for_patient(base_df, cfg, data_dir,
+                                                     patient_dir=patient_dir)
     logger.info(
         f"Filtered {len(filtered_concepts)} concepts: "
         f"{list(filtered_concepts.keys())}"
@@ -1434,6 +1439,7 @@ def _build_single_patient_base_df(
     service_date,
     cfg: dict,
     data_dir: str,
+    patient_dir: str = 'data/patients',
 ) -> pd.DataFrame:
     """
     Build a 1-row base_df for a single patient, reusing batch pipeline functions.
@@ -1443,6 +1449,7 @@ def _build_single_patient_base_df(
     """
     import astra.data.build_patient_info as bpi
     from astra.utils import ensure_datetime, inches_to_cm, ounces_to_kg
+    from astra.inference.patient_store import load_patient_csv
 
     service_date = pd.Timestamp(service_date)
 
@@ -1453,8 +1460,9 @@ def _build_single_patient_base_df(
     })
 
     # 2. Load ADT events, filter to this patient
-    df_ad = pd.read_csv(
-        f"{data_dir}/ADTHaendelser.csv", dtype={"CPR_hash": str}, index_col=0
+    df_ad = load_patient_csv(
+        cpr_hash, 'ADTHaendelser', data_dir, patient_dir,
+        dtype={"CPR_hash": str}, index_col=0,
     )
     df_ad = df_ad[df_ad['CPR_hash'] == cpr_hash].copy()
     df_ad[["Flyt_ind", "Flyt_ud"]] = df_ad[["Flyt_ind", "Flyt_ud"]].apply(
@@ -1477,7 +1485,7 @@ def _build_single_patient_base_df(
     merged_df = bpi.add_first_hospital(merged_df)
 
     # 6. Load patient info directly (skip Azure parquet filter)
-    pi = pd.read_csv(f"{data_dir}/PatientInfo.csv", index_col=0)
+    pi = load_patient_csv(cpr_hash, 'PatientInfo', data_dir, patient_dir, index_col=0)
     pi = pi.rename(columns={"Fødselsdato": "DOB", "Dødsdato": "DOD", "Køn": "SEX"})
     pi["SEX"] = pi["SEX"].replace({"Mand": "Male", "Kvinde": "Female"})
     result = merged_df.merge(
@@ -1505,7 +1513,7 @@ def _build_single_patient_base_df(
     ).astype(int)
 
     # HEIGHT / WEIGHT from VitaleVaerdier
-    result = _extract_height_weight(result, data_dir)
+    result = _extract_height_weight(result, data_dir, patient_dir=patient_dir)
 
     # Mortality labels (inference: patient is alive)
     result["deceased_30d"] = 0
@@ -1517,7 +1525,7 @@ def _build_single_patient_base_df(
         result.loc[result["first_RH"].notnull(), "LVL1TC"] = 1
 
     # 10. Elixhauser comorbidity score (pure Python, no file I/O)
-    result = _try_add_elixhauser(result, data_dir=data_dir)
+    result = _try_add_elixhauser(result, data_dir=data_dir, patient_dir=patient_dir)
 
     # 11. Prehospital start — aligns bin grid with batch pipeline
     if cfg.get("prehospital"):
@@ -1609,7 +1617,8 @@ def _apply_prehospital_start(
     return result
 
 
-def _extract_height_weight(base_df: pd.DataFrame, data_dir: str) -> pd.DataFrame:
+def _extract_height_weight(base_df: pd.DataFrame, data_dir: str,
+                           patient_dir: str = 'data/patients') -> pd.DataFrame:
     """
     Extract HEIGHT/WEIGHT from VitaleVaerdier.csv for this patient.
 
@@ -1617,9 +1626,12 @@ def _extract_height_weight(base_df: pd.DataFrame, data_dir: str) -> pd.DataFrame
     in-memory without writing to data/interim/Height_Weight.pkl.
     """
     from astra.utils import inches_to_cm, ounces_to_kg
+    from astra.inference.patient_store import load_patient_csv
 
     try:
-        vit_raw = pd.read_csv(f"{data_dir}/VitaleVaerdier.csv", index_col=0)
+        cpr_hash = base_df["CPR_hash"].iloc[0]
+        vit_raw = load_patient_csv(cpr_hash, 'VitaleVaerdier', data_dir,
+                                   patient_dir, index_col=0)
         vit_raw = vit_raw[vit_raw["CPR_hash"].isin(base_df["CPR_hash"].unique())]
         if len(vit_raw) == 0:
             base_df["HEIGHT"] = np.nan
@@ -1679,6 +1691,7 @@ def _extract_height_weight(base_df: pd.DataFrame, data_dir: str) -> pd.DataFrame
 def _try_add_elixhauser(
     base_df: pd.DataFrame,
     data_dir: str = 'data/raw',
+    patient_dir: str = 'data/patients',
 ) -> pd.DataFrame:
     """
     Compute Elixhauser score using pure-Python implementation.
@@ -1690,7 +1703,8 @@ def _try_add_elixhauser(
     from astra.inference.comorbidity import compute_elixhauser_for_patient
 
     try:
-        return compute_elixhauser_for_patient(base_df, data_dir)
+        return compute_elixhauser_for_patient(base_df, data_dir,
+                                              patient_dir=patient_dir)
     except Exception as e:
         logger.warning(
             f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=NaN."
@@ -1705,12 +1719,13 @@ def _filter_concepts_for_patient(
     base_df: pd.DataFrame,
     cfg: dict,
     data_dir: str,
+    patient_dir: str = 'data/patients',
 ) -> Dict[str, pd.DataFrame]:
     """
     Filter raw concept CSVs for a single patient.
 
     For each concept in cfg['concepts']:
-      1. Loads the raw CSV from data_dir
+      1. Loads the raw CSV from data_dir (or per-patient dir if available)
       2. Calls filter_inhospital() to keep data within the patient's trajectory
       3. Calls the concept-specific filter (filter_vitals, filter_labs, etc.)
 
@@ -1721,10 +1736,12 @@ def _filter_concepts_for_patient(
     from astra.data.filters import (
         filter_inhospital, collect_filter, filter_adt as _filter_adt,
     )
+    from astra.inference.patient_store import load_patient_csv
 
     metadata = pd.read_csv("data/external/metadata.csv")
     filtered = {}
     patient_cpr = base_df['CPR_hash'].iloc[0]
+    concept_timing = {}  # per-concept load+filter timing
 
     # Concepts that are derived from Notater (clinical notes), not raw CSVs
     _NOTES_DERIVED_CONCEPTS = {'ISS', 'Events'}
@@ -1738,10 +1755,12 @@ def _filter_concepts_for_patient(
         notater_meta = metadata[metadata['filename'] == 'Notater']
         if not notater_meta.empty:
             try:
-                notater_raw = pd.read_csv(
-                    f"{data_dir}/Notater.csv", low_memory=False, index_col=0
-                )
-                # Pre-filter by CPR_hash to minimise memory for large files
+                with timed_stage(concept_timing, 'load_Notater'):
+                    notater_raw = load_patient_csv(
+                        patient_cpr, 'Notater', data_dir, patient_dir,
+                        low_memory=False, index_col=0,
+                    )
+                # Pre-filter by CPR_hash (no-op for per-patient files)
                 if 'CPR_hash' in notater_raw.columns:
                     notater_raw = notater_raw[notater_raw['CPR_hash'] == patient_cpr]
                 if not notater_raw.empty:
@@ -1815,14 +1834,17 @@ def _filter_concepts_for_patient(
         dt_name = str(meta_row['dt_colname'].iat[0])
         offset = int(meta_row['ts_offset'].iat[0])
 
-        csv_path = f"{data_dir}/{concept}.csv"
         try:
-            raw_df = pd.read_csv(csv_path, low_memory=False, index_col=0)
+            with timed_stage(concept_timing, f'load_{concept}'):
+                raw_df = load_patient_csv(
+                    patient_cpr, concept, data_dir, patient_dir,
+                    low_memory=False, index_col=0,
+                )
         except FileNotFoundError:
-            logger.warning(f"Raw CSV not found: {csv_path}, skipping '{concept}'")
+            logger.warning(f"CSV not found for '{concept}', skipping")
             continue
 
-        # Pre-filter by CPR_hash to minimise memory for large population files
+        # Pre-filter by CPR_hash (no-op for per-patient files, safety net for fallback)
         if 'CPR_hash' in raw_df.columns:
             raw_df = raw_df[raw_df['CPR_hash'] == patient_cpr]
             if raw_df.empty:
@@ -1860,10 +1882,12 @@ def _filter_concepts_for_patient(
                 ews_dt = str(ews_meta['dt_colname'].iat[0])
                 ews_offset = int(ews_meta['ts_offset'].iat[0])
                 try:
-                    ews_raw = pd.read_csv(
-                        f"{data_dir}/EWS.csv", low_memory=False, index_col=0
-                    )
-                    # Pre-filter by CPR_hash
+                    with timed_stage(concept_timing, 'load_EWS_augment'):
+                        ews_raw = load_patient_csv(
+                            patient_cpr, 'EWS', data_dir, patient_dir,
+                            low_memory=False, index_col=0,
+                        )
+                    # Pre-filter by CPR_hash (no-op for per-patient files)
                     if 'CPR_hash' in ews_raw.columns:
                         ews_raw = ews_raw[ews_raw['CPR_hash'] == patient_cpr]
                     ews_inhospital = filter_inhospital(
@@ -1932,6 +1956,14 @@ def _filter_concepts_for_patient(
             continue
 
         filtered[concept] = concept_filtered
+
+    # Log per-concept timing breakdown
+    if concept_timing:
+        parts = []
+        for stage, durations in sorted(concept_timing.items()):
+            total_ms = sum(durations) * 1000
+            parts.append(f"{stage}={total_ms:.0f}ms")
+        logger.info("Concept load timing: %s", ', '.join(parts))
 
     return filtered
 

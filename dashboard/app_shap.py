@@ -149,21 +149,16 @@ def _get_or_create_runner(cfg, cpr, sd, actual_start, hours_offset):
 
     - Patient/model change → fresh setup + advance
     - Time increased → incremental advance_to (fast)
-    - Time decreased → re-setup (runner is forward-only) + advance
+    - Time already covered → no-op (lookup from stored steps)
     """
     mods = _load_astra_modules()
     session = load_session(cfg["model_name"])
 
     patient_key = f"{cpr}_{sd}_{cfg['model_name']}"
     prev_key = st.session_state.get("runner_key")
-    prev_hours = st.session_state.get("runner_hours", 0.0)
     runner = st.session_state.get("runner")
 
-    need_setup = (
-        runner is None
-        or prev_key != patient_key
-        or hours_offset < prev_hours  # backward requires re-setup
-    )
+    need_setup = runner is None or prev_key != patient_key
 
     if need_setup:
         runner = mods["SimulationRunner"](session)
@@ -173,17 +168,29 @@ def _get_or_create_runner(cfg, cpr, sd, actual_start, hours_offset):
             data_dir="data/raw",
         )
         st.session_state["runner_key"] = patient_key
-        # Invalidate stale SHAP when patient changes or time goes backward
+        # Invalidate stale SHAP when patient changes
         st.session_state.pop("shap_data", None)
         st.session_state.pop("shap_hours", None)
 
-    # Advance to target time (incremental if already partially there)
+    # Only advance if target is beyond what we've already simulated
     runner.advance_to(hours=hours_offset)
 
     st.session_state["runner"] = runner
-    st.session_state["runner_hours"] = hours_offset
 
     return session, runner
+
+
+def _lookup_step_at_hours(sim_result, hours_offset):
+    """Find the simulation step closest to (but not exceeding) hours_offset."""
+    if sim_result is None or not sim_result.steps:
+        return None
+    best = None
+    for step in sim_result.steps:
+        if step.elapsed_hours <= hours_offset + 0.01:
+            best = step
+        else:
+            break
+    return best
 
 
 def run_simulation_predict(cfg, cpr, sd, actual_start, hours_offset, progress_bar=None):
@@ -250,12 +257,18 @@ def run_shap_explanation(session, runner, progress_bar=None):
 # VISUALIZATION HELPERS
 # ═════════════════════════════════════════════════════════════════════════
 
-def _plot_simulation_trajectory(sim_result, shap_hours=None):
+def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
     """Build Plotly prediction trajectory from SimulationResult."""
     if sim_result is None or not sim_result.steps:
         return None
 
     df = sim_result.to_dataframe()
+
+    # Filter to observation window
+    if viewed_hours is not None:
+        df = df[df["elapsed_hours"] <= viewed_hours + 0.01].copy()
+    if df.empty:
+        return None
 
     fig = go.Figure()
 
@@ -271,30 +284,31 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None):
 
     # Inhospital arrival boundary
     if sim_result.inhospital_start_hours is not None and sim_result.inhospital_start_hours > 0:
-        fig.add_vline(
-            x=sim_result.inhospital_start_hours,
-            line_dash="dot",
-            line_color="#2196F3",
-            annotation_text=f"Hospital arrival ({sim_result.inhospital_start_hours:.1f}h)",
-            annotation_position="top left",
-        )
+        if viewed_hours is None or sim_result.inhospital_start_hours <= viewed_hours:
+            fig.add_vline(
+                x=sim_result.inhospital_start_hours,
+                line_dash="dot",
+                line_color="#2196F3",
+                annotation_text=f"Hospital arrival ({sim_result.inhospital_start_hours:.1f}h)",
+                annotation_position="top left",
+            )
 
     # Mark SHAP evaluation timepoint
-    if shap_hours is not None:
-        # Find the closest step to the SHAP evaluation time
+    if shap_hours is not None and (viewed_hours is None or shap_hours <= viewed_hours + 0.01):
         closest_idx = (df["elapsed_hours"] - shap_hours).abs().idxmin()
         shap_prob = df.loc[closest_idx, "probability"]
         fig.add_trace(go.Scatter(
             x=[shap_hours],
             y=[shap_prob],
             mode="markers",
-            marker=dict(size=12, color="red", symbol="diamond"),
+            marker=dict(size=12, color="#0068C9", symbol="diamond"),
             name=f"SHAP eval ({shap_hours:.1f}h)",
             showlegend=True,
         ))
 
+    n_visible = len(df)
     fig.update_layout(
-        title=f"Prediction Trajectory ({sim_result.n_steps} simulation steps)",
+        title=f"Prediction Trajectory ({n_visible} steps up to {df['elapsed_hours'].iloc[-1]:.1f}h)",
         xaxis_title="Elapsed hours",
         yaxis_title="P(deceased 30d)",
         yaxis=dict(range=[-0.05, 1.05]),
@@ -306,12 +320,18 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None):
     return fig
 
 
-def _plot_simulation_diagnostics(sim_result):
+def _plot_simulation_diagnostics(sim_result, viewed_hours=None):
     """Build diagnostic Plotly charts from SimulationResult."""
     if sim_result is None or not sim_result.steps:
         return None, None
 
     df = sim_result.to_dataframe()
+
+    # Filter to observation window
+    if viewed_hours is not None:
+        df = df[df["elapsed_hours"] <= viewed_hours + 0.01].copy()
+    if df.empty:
+        return None, None
 
     # Timing breakdown (stacked bar)
     timing_cols = [c for c in df.columns if c.startswith("timing_")]
@@ -408,12 +428,20 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Observation Time")
 
+    # Apply playback target to slider BEFORE widget renders (so slider updates visually)
+    _playback_target = st.session_state.pop("play_target_hours", None)
+    if _playback_target is not None:
+        snapped = round(_playback_target / 0.5) * 0.5
+        snapped = max(0.5, min(snapped, float(max_hours)))
+        st.session_state["slider_hours"] = snapped
+
     hours_offset = st.sidebar.slider(
         "Hours after admission",
         min_value=0.5,
         max_value=float(max_hours),
         value=float(max_hours),
         step=0.5,
+        key="slider_hours",
         help="How many hours of data to include from admission",
     )
 
@@ -447,43 +475,50 @@ def main():
 
     # ── Sidebar: Action buttons ──────────────────────────────────────
     st.sidebar.markdown("---")
-    sim_col1, sim_col2 = st.sidebar.columns(2)
-    with sim_col1:
+    # Green "Run Simulation" button via CSS on a keyed container
+    with st.sidebar.container(key="run_sim_container"):
         run_clicked = st.button(
             "Run Simulation",
             type="primary",
             use_container_width=True,
             help="Run simulation for the selected patient and time",
         )
-    with sim_col2:
+    with st.sidebar.container(key="shap_container"):
         shap_clicked = st.button(
             "Compute SHAP",
+            type="primary",
             use_container_width=True,
             help="Compute SHAP explanations at the current time point",
         )
-
-    # ── Apply playback override BEFORE prediction ─────────────────────
-    # During playback, the previous rerun set play_target_hours.
-    # Override hours_offset so the prediction runs at the playback time.
-    is_playback = "play_target_hours" in st.session_state
-    if is_playback:
-        hours_offset = st.session_state.pop("play_target_hours")
+    st.sidebar.markdown("""
+    <style>
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"] {
+        background-color: #21a366;
+        border-color: #1a8a54;
+    }
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"]:hover {
+        background-color: #1a8a54;
+        border-color: #15724a;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
     # ═════════════════════════════════════════════════════════════════
-    # PREDICT: only on explicit button click or playback advance
+    # PREDICT: run simulation on button click / playback; reuse on slider
     # ═════════════════════════════════════════════════════════════════
 
-    should_predict = run_clicked or shap_clicked or is_playback
-    pred_key = f"{cpr}_{sd}_{cfg.get('model_name')}_{hours_offset}"
+    is_playback_step = _playback_target is not None
+    should_run = run_clicked or shap_clicked or is_playback_step
+    patient_key = f"{cpr}_{sd}_{cfg.get('model_name')}"
 
-    if should_predict:
+    if should_run:
         try:
             with st.spinner("Running simulation prediction..."):
                 pred_data = run_simulation_predict(
                     cfg, cpr, sd, actual_start, hours_offset
                 )
             st.session_state["pred_data"] = pred_data
-            st.session_state["pred_key"] = pred_key
+            st.session_state["pred_patient_key"] = patient_key
             st.session_state["cfg_used"] = cfg
         except Exception as e:
             st.error(f"Error running simulation: {e}")
@@ -494,7 +529,19 @@ def main():
         st.info("Select a patient and observation time, then click **Run Simulation**.")
         return
 
+    # Invalidate cached results if the patient changed
+    if st.session_state.get("pred_patient_key") != patient_key:
+        st.session_state.pop("pred_data", None)
+        st.session_state.pop("shap_data", None)
+        st.session_state.pop("shap_hours", None)
+        st.info("Patient changed. Click **Run Simulation** to load the new patient.")
+        return
+
     pred_data = st.session_state["pred_data"]
+
+    # Look up the step at the current slider position from stored results
+    viewed_step = _lookup_step_at_hours(pred_data["sim_result"], hours_offset)
+    st.session_state["viewed_hours"] = hours_offset
 
     # ═════════════════════════════════════════════════════════════════
     # SHAP: only on button click
@@ -519,7 +566,7 @@ def main():
 
     if st.session_state.get("play_active", False):
         runner = pred_data["runner"]
-        if runner.remaining_steps > 0:
+        if runner.remaining_steps > 0 and hasattr(runner, "_time_points") and hasattr(runner, "_step_idx"):
             # Determine step size from speed setting
             steps_map = {"1 step": 1, "5 steps": 5, "10 steps": 10}
             n_advance = steps_map.get(play_speed, 1)
@@ -533,34 +580,39 @@ def main():
                 next_tp = runner._time_points[next_idx - 1]
                 next_hours = (next_tp - runner.context.admission_time).total_seconds() / 3600
                 st.session_state["play_target_hours"] = next_hours
+                _time.sleep(0.3)
+                st.rerun()
             else:
                 st.session_state["play_active"] = False
-
-            _time.sleep(0.3)
-            st.rerun()
         else:
             st.session_state["play_active"] = False
 
     mods = _load_astra_modules()
 
     # ── Header metrics ────────────────────────────────────────────────
-    result = pred_data["result"]
     sim_result = pred_data["sim_result"]
-    prob = result.probability
+    # Show metrics for the slider position (viewed_step), not the simulation endpoint
+    if viewed_step is not None:
+        prob = viewed_step.probability
+        traj_len = viewed_step.trajectory_length
+    else:
+        prob = pred_data["result"].probability
+        traj_len = pred_data["result"].trajectory_length
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("P(deceased 30d)", f"{prob:.3f}")
     with col2:
-        st.metric("Trajectory Length", f"{result.trajectory_length} steps")
+        st.metric("Trajectory Length", f"{traj_len} steps")
     with col3:
         st.metric("Simulation Steps", f"{sim_result.n_steps}" if sim_result else "0")
     with col4:
-        if sim_result and sim_result.steps:
-            effective_h = sim_result.steps[-1].elapsed_hours
-            st.metric("Effective Time", f"{effective_h:.1f}h")
+        if viewed_step is not None:
+            st.metric("Viewing Time", f"{viewed_step.elapsed_hours:.1f}h")
+        elif sim_result and sim_result.steps:
+            st.metric("Viewing Time", f"{sim_result.steps[-1].elapsed_hours:.1f}h")
         else:
-            st.metric("Effective Time", "N/A")
+            st.metric("Viewing Time", "N/A")
 
     # ── Patient Context (expandable) ──────────────────────────────────
     ctx = pred_data["ctx"]
@@ -571,7 +623,7 @@ def main():
             st.markdown(f"""
 **PID:** `{ctx.pid}`
 **Admission:** `{ctx.admission_time}`
-**Trajectory:** {result.trajectory_length} steps
+**Trajectory:** {traj_len} steps
 **Model:** `{cfg.get('model_name')}`
 **Temporal head:** `{session.is_temporal}`
 """)
@@ -583,7 +635,7 @@ def main():
 
     # ── Prediction Trajectory (from simulation) ──────────────────────
     shap_hours = st.session_state.get("shap_hours")
-    fig_traj = _plot_simulation_trajectory(sim_result, shap_hours=shap_hours)
+    fig_traj = _plot_simulation_trajectory(sim_result, shap_hours=shap_hours, viewed_hours=hours_offset)
     if fig_traj:
         fig_traj.update_layout(width=None)
         st.plotly_chart(fig_traj, use_container_width=True)
@@ -605,7 +657,7 @@ def main():
                 st.metric("Remaining Steps", runner.remaining_steps)
 
             # Diagnostic charts
-            fig_timing, fig_meas = _plot_simulation_diagnostics(sim_result)
+            fig_timing, fig_meas = _plot_simulation_diagnostics(sim_result, viewed_hours=hours_offset)
 
             if fig_timing:
                 fig_timing.update_layout(width=None)

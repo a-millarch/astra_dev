@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '16032026_astra'
+model_name: '17032026_astra'
 
 target: deceased_30d
 
@@ -78,7 +78,7 @@ concepts:
   - VitaleVaerdier
   - Labsvar
   - Medicin
-  - Procedurer
+  #- Procedurer
   - ADTHaendelser
   - EWS
   - ISS
@@ -153,9 +153,6 @@ exclusion_criteria:
     
   traumatext:
     traumatext: true
-
-  study3:
-    pid_file: data/external/studypop.csv
 
 pretrain:
     mask_prob_ts: 0.15
@@ -392,6 +389,7 @@ drop_features:
     - nan
   ADTHaendelser:
     - nan
+    - AMB
   EWS:
     - nan
   ISS:

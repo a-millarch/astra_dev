@@ -6,7 +6,7 @@ from typing import List, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 
-from astra.utils import get_bin_df, ensure_parent_dir
+from astra.utils import get_bin_df, ensure_parent_dir, PROJECT_ROOT
 from astra.data.filters import collect_filter
 
 logger = logging.getLogger(__name__)
@@ -178,6 +178,20 @@ def apply_exclusion_criteria(
         if excluded:
             logger.info(f"  exclusion  first_hospital in {first_hospital}: -{excluded}")
         mask &= m
+
+    # --- PID allowlist from external file --------------------------------
+    pid_file = criteria.get("pid_file")
+    if pid_file:
+        pid_path = PROJECT_ROOT / pid_file
+        if pid_path.exists():
+            allowed_pids = pd.read_csv(pid_path).iloc[:, 0]
+            m = base_df["PID"].isin(allowed_pids)
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  pid_file ({pid_file}): -{excluded}")
+            mask &= m
+        else:
+            logger.warning(f"  exclusion  pid_file requested but {pid_path} not found")
 
     # --- generic custom_filters ----------------------------------------
     for filt in criteria.get("custom_filters", []) or []:
