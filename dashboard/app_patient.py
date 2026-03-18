@@ -942,6 +942,20 @@ with tab_adt:
 with tab_trauma:
     pid_int = int(selected_pid)
 
+    def format_tid_i_forløb(ts):
+        """Format a timestamp as 'Xt Ym' or 'Xd Yt' relative to patient_start."""
+        sek = (pd.to_datetime(ts) - patient_start).total_seconds()
+        if sek < 0:
+            return "Før forløbsstart"
+        h = sek / 3600
+        if h < 24:
+            t = int(h)
+            m = int((h % 1) * 60)
+            return f"{t}t {m}m" if m > 0 else f"{t}t"
+        d = int(h // 24)
+        t = int(h % 24)
+        return f"{d}d {t}t" if t > 0 else f"{d}d"
+
     # ── ISS ──────────────────────────────────────────────────────────────
     st.markdown("### ISS (Injury Severity Score)")
     iss_df = _get_iss_from_notes()
@@ -950,9 +964,10 @@ with tab_trauma:
         st.info("Ingen ISS fundet i notater for denne patient.")
     else:
         iss_row = iss_pid.iloc[0]
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("ISS", int(iss_row["VALUE"]))
         col2.metric("Tidspunkt", pd.to_datetime(iss_row["TIMESTAMP"]).strftime("%Y-%m-%d %H:%M"))
+        col3.metric("Tid i forløb", format_tid_i_forløb(iss_row["TIMESTAMP"]))
 
     st.markdown("---")
 
@@ -964,9 +979,10 @@ with tab_trauma:
         st.info("Ingen intubation registreret i notater for denne patient.")
     else:
         intub_row = intub_pid.iloc[0]
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
         col1.metric("Intuberet", "Ja")
         col2.metric("Tidspunkt", pd.to_datetime(intub_row["TIMESTAMP"]).strftime("%Y-%m-%d %H:%M"))
+        col3.metric("Tid i forløb", format_tid_i_forløb(intub_row["TIMESTAMP"]))
 
     st.markdown("---")
 
@@ -986,9 +1002,9 @@ with tab_trauma:
             st.info(f"Ingen events indenfor de første {tidsvindue} timer.")
         else:
             tabel = ca_display[["TIMESTAMP"]].copy()
+            tabel["Tid i forløb"] = ca_display["TIMESTAMP"].apply(format_tid_i_forløb)
             tabel["TIMESTAMP"] = tabel["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
-            tabel["timer_ind"] = ca_display["timer_siden_start"].round(1)
-            tabel.columns = ["Tidspunkt", "Timer fra start"]
+            tabel.columns = ["Tidspunkt", "Tid i forløb"]
             st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=False,
                          height=min(HEADER_HEIGHT + len(tabel) * ROW_HEIGHT, 300))
 
