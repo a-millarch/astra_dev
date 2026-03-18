@@ -384,6 +384,102 @@ PLOT_HEIGHT = 250
 ROW_HEIGHT = 35
 HEADER_HEIGHT = 38
 
+# ── Referenceområder ──────────────────────────────────────────────────────────
+# Returns (low, high) for normal range given patient age and sex.
+# Age-dependent features use the patient's AGE from base_df.
+patient_age = float(row["AGE"]) if "AGE" in row.index and pd.notna(row["AGE"]) else None
+patient_sex = row["SEX"] if "SEX" in row.index and pd.notna(row["SEX"]) else None
+
+def _get_ref_range(feature: str) -> tuple | None:
+    """Return (low, high) reference range for a feature, or None if unknown."""
+    # ── Hæmoglobin: kønsafhængig ──
+    if feature == "HEMOGLOBIN":
+        if patient_sex == "M":
+            return (8.3, 10.5)
+        else:
+            return (7.3, 9.5)
+
+    # ── Leukocytter: aldersafhængig ──
+    if feature == "LEUKOCYTES":
+        if patient_age is not None and patient_age < 12:
+            return (4.5, 12.5)
+        elif patient_age is not None and patient_age < 18:
+            return (4.5, 12.5)
+        else:
+            return (3.5, 10.0)
+
+    # ── Respirationsfrekvens: aldersafhængig ──
+    if feature == "RESPIRATORYRATE":
+        if patient_age is None or patient_age >= 65:
+            return (12, 28)
+        elif patient_age >= 18:
+            return (12, 20)
+        elif patient_age >= 12:
+            return (12, 16)
+        elif patient_age >= 6:
+            return (18, 30)
+        else:
+            return (20, 40)
+
+    # ── Faste referenceområder ──
+    STATIC_RANGES = {
+        "HR":           (50, 100),
+        "SBP":          (120, 130),
+        "DBP":          (60, 80),
+        "MAP":          (65, 100),
+        "SPO2":         (95, 100),
+        "TEMP":         (36.5, 37.5),
+        "BASE_EXCESS":  (-3, 3),
+        "LACTATE":      (0.5, 1.5),
+        "TEG-MA":       (50, 70),
+        "TEG-R":        (4, 10),
+        "TEG-LY30":     (0, 7.5),
+        "SAPS3":        (0, 40),
+    }
+    return STATIC_RANGES.get(feature)
+
+
+def _ref_color(value: float, ref: tuple) -> str:
+    """Return hex color for a value given its (low, high) reference range."""
+    low, high = ref
+    span = high - low if high != low else 1
+    if low <= value <= high:
+        return "#2ca02c"  # grøn – normal
+    # Afvigelse som andel af span
+    if value < low:
+        deviation = (low - value) / span
+    else:
+        deviation = (value - high) / span
+    if deviation <= 0.5:
+        return "#ff9800"  # orange – let afvigende
+    return "#d32f2f"      # rød – kritisk
+
+
+def _add_ref_band(fig, feature: str, y_min: float, y_max: float):
+    """Add colored reference-range band to a plotly figure."""
+    ref = _get_ref_range(feature)
+    if ref is None:
+        return
+    low, high = ref
+    # Grøn normalzone (klippet til synlig y-akse)
+    band_low = max(low, y_min)
+    band_high = min(high, y_max)
+    if band_low < band_high:
+        fig.add_hrect(
+            y0=band_low, y1=band_high,
+            fillcolor="#2ca02c", opacity=0.08,
+            line_width=0, layer="below",
+        )
+    # Stiplede linjer ved grænseværdier
+    for boundary in (low, high):
+        if y_min <= boundary <= y_max:
+            fig.add_hline(
+                y=boundary,
+                line_dash="dot", line_color="#2ca02c", line_width=1,
+                opacity=0.5,
+            )
+
+
 def vis_feature_rækker(filtered_df, ts_col):
     def format_timer(h):
         if h < 1:
@@ -405,7 +501,14 @@ def vis_feature_rækker(filtered_df, ts_col):
             .dropna(subset=["VALUE"])
             .reset_index(drop=True)
         )
-        st.markdown(f"**{feature}**")
+
+        # Feature header med referenceområde-info
+        ref = _get_ref_range(feature)
+        if ref is not None:
+            st.markdown(f"**{feature}** &nbsp; <span style='color:#888; font-size:0.75rem'>ref: {ref[0]}–{ref[1]}</span>", unsafe_allow_html=True)
+        else:
+            st.markdown(f"**{feature}**")
+
         tabel_col, graf_col = st.columns([1, 2])
 
         with tabel_col:
@@ -415,22 +518,48 @@ def vis_feature_rækker(filtered_df, ts_col):
                 tabel_vis = feat_df.copy()
                 tabel_vis[ts_col] = tabel_vis[ts_col].dt.strftime("%Y-%m-%d %H:%M")
                 tabel_vis["VALUE"] = tabel_vis["VALUE"].round(2)
-                tabel_vis = tabel_vis[[ts_col, "VALUE"]]
-                tabel_vis.columns = ["Tidspunkt", "Værdi"]
+                # Tilføj status-kolonne hvis referenceområde findes
+                if ref is not None:
+                    low, high = ref
+                    def _status_label(v):
+                        if low <= v <= high:
+                            return "Normal"
+                        diff = v - high if v > high else v - low
+                        return f"{diff:+.1f}"
+                    tabel_vis["Status"] = tabel_vis["VALUE"].apply(_status_label)
+                    tabel_vis = tabel_vis[[ts_col, "VALUE", "Status"]]
+                    tabel_vis.columns = ["Tidspunkt", "Værdi", "Status"]
+                else:
+                    tabel_vis = tabel_vis[[ts_col, "VALUE"]]
+                    tabel_vis.columns = ["Tidspunkt", "Værdi"]
                 dynamisk_højde = min(HEADER_HEIGHT + len(tabel_vis) * ROW_HEIGHT, PLOT_HEIGHT)
                 st.dataframe(tabel_vis, hide_index=True, use_container_width=True, height=dynamisk_højde)
 
         with graf_col:
             if len(feat_df) >= 2:
                 fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=feat_df["timer_siden_start"],
-                    y=feat_df["VALUE"],
-                    mode="lines",
-                    line=dict(color="#4e79a7"),
-                    hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
-                    customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
-                ))
+
+                # Farvede datapunkter baseret på referenceområde
+                if ref is not None:
+                    marker_colors = [_ref_color(v, ref) for v in feat_df["VALUE"]]
+                    fig.add_trace(go.Scatter(
+                        x=feat_df["timer_siden_start"],
+                        y=feat_df["VALUE"],
+                        mode="lines+markers",
+                        line=dict(color="#4e79a7"),
+                        marker=dict(color=marker_colors, size=7, line=dict(width=0.5, color="white")),
+                        hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
+                        customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
+                    ))
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=feat_df["timer_siden_start"],
+                        y=feat_df["VALUE"],
+                        mode="lines",
+                        line=dict(color="#4e79a7"),
+                        hovertemplate="%{customdata}<br>Værdi: %{y}<extra></extra>",
+                        customdata=[format_timer(h) for h in feat_df["timer_siden_start"]],
+                    ))
 
                 max_timer = feat_df["timer_siden_start"].max()
                 min_timer = feat_df["timer_siden_start"].min()
@@ -469,10 +598,18 @@ def vis_feature_rækker(filtered_df, ts_col):
                 x_min = min(min_timer, tick_vals[0]) - interval * 0.1
                 x_max = max(max_timer, tick_vals[-1]) + interval * 0.1
 
-                # y-akse range baseret på hele patientens forløb for denne feature
+                # y-akse range: inkluder referenceområde hvis det findes
                 alle_værdier = filtered_df[filtered_df["FEATURE"] == feature]["VALUE"].dropna()
-                y_min = alle_værdier.min() * 0.95
-                y_max = alle_værdier.max() * 1.05
+                y_min = alle_værdier.min()
+                y_max = alle_værdier.max()
+                if ref is not None:
+                    y_min = min(y_min, ref[0])
+                    y_max = max(y_max, ref[1])
+                y_min = y_min * 0.95 if y_min > 0 else y_min * 1.05
+                y_max = y_max * 1.05
+
+                # Tilføj referenceområde-bånd
+                _add_ref_band(fig, feature, y_min, y_max)
 
                 fig.update_layout(
                     height=PLOT_HEIGHT,
@@ -496,7 +633,19 @@ def vis_feature_rækker(filtered_df, ts_col):
                 )
                 st.plotly_chart(fig, use_container_width=True)
             elif len(feat_df) == 1:
-                st.metric(label="", value=round(feat_df["VALUE"].iloc[0], 2))
+                val = round(feat_df["VALUE"].iloc[0], 2)
+                if ref is not None:
+                    color = _ref_color(val, ref)
+                    delta = None
+                    if val < ref[0]:
+                        delta = round(val - ref[0], 2)
+                    elif val > ref[1]:
+                        delta = round(val - ref[1], 2)
+                    st.metric(label="", value=val,
+                              delta=f"{delta:+.1f} fra ref" if delta else "Normal",
+                              delta_color="inverse" if delta else "off")
+                else:
+                    st.metric(label="", value=val)
 
         st.markdown("---")
 
@@ -559,7 +708,13 @@ with tab_icu:
                     .dropna(subset=["VALUE"])
                     .reset_index(drop=True)
                 )
-                st.markdown(f"**{feature}**")
+                # Feature header med referenceområde-info
+                icu_ref = _get_ref_range(feature)
+                if icu_ref is not None:
+                    st.markdown(f"**{feature}** &nbsp; <span style='color:#888; font-size:0.75rem'>ref: {icu_ref[0]}–{icu_ref[1]}</span>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"**{feature}**")
+
                 tabel_col, graf_col = st.columns([1, 2])
 
                 with tabel_col:
@@ -569,8 +724,19 @@ with tab_icu:
                         tabel_vis = feat_df.copy()
                         tabel_vis["TIMESTAMP"] = tabel_vis["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
                         tabel_vis["VALUE"] = tabel_vis["VALUE"].round(2)
-                        tabel_vis = tabel_vis[["TIMESTAMP", "VALUE", "Kilde"]]
-                        tabel_vis.columns = ["Tidspunkt", "Værdi", "Kilde"]
+                        if icu_ref is not None:
+                            low, high = icu_ref
+                            def _icu_status(v):
+                                if low <= v <= high:
+                                    return "Normal"
+                                diff = v - high if v > high else v - low
+                                return f"{diff:+.1f}"
+                            tabel_vis["Status"] = tabel_vis["VALUE"].apply(_icu_status)
+                            tabel_vis = tabel_vis[["TIMESTAMP", "VALUE", "Status", "Kilde"]]
+                            tabel_vis.columns = ["Tidspunkt", "Værdi", "Status", "Kilde"]
+                        else:
+                            tabel_vis = tabel_vis[["TIMESTAMP", "VALUE", "Kilde"]]
+                            tabel_vis.columns = ["Tidspunkt", "Værdi", "Kilde"]
                         dynamisk_højde = min(HEADER_HEIGHT + len(tabel_vis) * ROW_HEIGHT, PLOT_HEIGHT)
                         st.dataframe(tabel_vis, hide_index=True, use_container_width=True, height=dynamisk_højde)
 
@@ -598,8 +764,17 @@ with tab_icu:
                                     name=kilde,
                                 ))
                         alle_værdier = feat_df["VALUE"].dropna()
-                        y_min = alle_værdier.min() * 0.95
-                        y_max = alle_værdier.max() * 1.05
+                        y_min = alle_værdier.min()
+                        y_max = alle_værdier.max()
+                        if icu_ref is not None:
+                            y_min = min(y_min, icu_ref[0])
+                            y_max = max(y_max, icu_ref[1])
+                        y_min = y_min * 0.95 if y_min > 0 else y_min * 1.05
+                        y_max = y_max * 1.05
+
+                        # Tilføj referenceområde-bånd
+                        _add_ref_band(fig, feature, y_min, y_max)
+
                         fig.update_layout(
                             height=PLOT_HEIGHT,
                             margin=dict(l=0, r=0, t=10, b=10),
@@ -611,7 +786,18 @@ with tab_icu:
                         )
                         st.plotly_chart(fig, use_container_width=True)
                     elif len(feat_df) == 1:
-                        st.metric(label="", value=round(feat_df["VALUE"].iloc[0], 2))
+                        val = round(feat_df["VALUE"].iloc[0], 2)
+                        if icu_ref is not None:
+                            delta = None
+                            if val < icu_ref[0]:
+                                delta = round(val - icu_ref[0], 2)
+                            elif val > icu_ref[1]:
+                                delta = round(val - icu_ref[1], 2)
+                            st.metric(label="", value=val,
+                                      delta=f"{delta:+.1f} fra ref" if delta else "Normal",
+                                      delta_color="inverse" if delta else "off")
+                        else:
+                            st.metric(label="", value=val)
 
                 st.markdown("---")
 
