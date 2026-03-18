@@ -644,6 +644,11 @@ def main():
     ])
 
     # ── Tab 1: SHAP Heatmaps ─────────────────────────────────────────
+    # Compute the current eval_timestep from the slider so heatmap
+    # x-axis always matches the observation window, even when SHAP
+    # was computed at a different time point.
+    current_eval_step = mods["time_to_step"](hours_offset, "h") - 1
+
     with tab_shap:
         if shap_data is None:
             st.info("Click **Compute SHAP** in the sidebar to generate explanations for the current time point.")
@@ -652,6 +657,7 @@ def main():
                 shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=shap_data["channel2feature"],
+                eval_timestep=current_eval_step,
                 height=max(400, len(shap_data["channel2feature"]) * 14),
             )
             if fig_cont:
@@ -665,6 +671,7 @@ def main():
             fig_cat = mods["plot_categorical_ts_shap_plotly"](
                 shap_data["shap_dict"],
                 sample_idx=0,
+                eval_timestep=current_eval_step,
                 height=500,
             )
             if fig_cat:
@@ -692,6 +699,7 @@ def main():
 
             fig_channels = mods["plot_top_channels_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
+                eval_timestep=current_eval_step,
                 channel2feature=shap_data["channel2feature"])
             if fig_channels:
                 fig_channels.update_layout(width=None)
@@ -704,6 +712,7 @@ def main():
         else:
             fig_budget = mods["plot_shap_budget_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
+                eval_timestep=current_eval_step,
                 channel2feature=shap_data["channel2feature"])
             if fig_budget:
                 fig_budget.update_layout(width=None)
@@ -711,6 +720,7 @@ def main():
 
             fig_temporal = mods["plot_shap_temporal_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
+                eval_timestep=current_eval_step,
                 channel2feature=shap_data["channel2feature"])
             if fig_temporal:
                 fig_temporal.update_layout(width=None)

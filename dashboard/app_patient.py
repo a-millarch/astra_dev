@@ -2,12 +2,23 @@
 
 import streamlit as st
 import pandas as pd
+from cstar import ProjectManager
+import cstar.azure as az
 import plotly.graph_objects as go
 import streamlit.components.v1 as components
 import numpy as np
 
+import os, sys
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+os.chdir(REPO_ROOT)
+pm = ProjectManager()
+
 from astra.utils import get_base_df
 from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt
+from astra.data.notes_features import build_gcs_from_notes, build_iss_from_notes, build_intubation_from_notes
+from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
 
 @st.cache_data(show_spinner="Indlæser base-data …")
 def load_data() -> pd.DataFrame:
@@ -157,6 +168,10 @@ def load_procedurer():
 def load_adt():
     return pd.read_pickle("data/interim/concepts/ADTHaendelser.pkl")
 
+@st.cache_data(show_spinner="Indlæser EWS …")
+def load_ews():
+    return pd.read_pickle("data/interim/concepts/EWS.pkl")
+
 @st.cache_data(show_spinner="Indlæser diagnoser …")
 def load_diagnoser():
     return pd.read_pickle("data/interim/concepts/Diagnoser.pkl")
@@ -164,6 +179,163 @@ def load_diagnoser():
 @st.cache_data(show_spinner="Indlæser notater …")
 def load_notater():
     return pd.read_pickle("data/interim/concepts/Notater.pkl")
+
+
+# ── Per-patient cached data ──────────────────────────────────────────────────
+# These functions filter + process heavy concept data ONCE per patient.
+# Subsequent reruns (e.g. timeframe changes) skip the expensive work.
+
+@st.cache_data(show_spinner="Filtrerer vitale værdier for patient …")
+def get_patient_vitals(pid: int):
+    vitals_raw = load_vitals()
+    vitals_pid = vitals_raw[vitals_raw["PID"] == pid].copy()
+    if vitals_pid.empty:
+        return vitals_pid
+    ews_raw = load_ews()
+    ews_pid = ews_raw[ews_raw["PID"] == pid].copy()
+    vitals_pid = filter_vitals(vitals_pid, ews=ews_pid if not ews_pid.empty else None)
+    vitals_pid["VALUE"] = pd.to_numeric(vitals_pid["VALUE"], errors="coerce")
+    return vitals_pid
+
+@st.cache_data(show_spinner="Filtrerer laboratoriesvar for patient …")
+def get_patient_labs(pid: int):
+    labs_raw = load_labs()
+    labs_pid = labs_raw[labs_raw["PID"] == pid].copy()
+    if labs_pid.empty:
+        return labs_pid
+    labs_pid = filter_labs(labs_pid)
+    return labs_pid
+
+@st.cache_data(show_spinner="Filtrerer ICU-målinger for patient …")
+def get_patient_icu(pid: int):
+    icu_raw = load_icu()
+    icu_pid = icu_raw[icu_raw["PID"] == pid].copy()
+    gcs_notes = _get_gcs_from_notes()
+    gcs_notes_pid = gcs_notes[gcs_notes["PID"] == pid].copy()
+
+    if icu_pid.empty and gcs_notes_pid.empty:
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE", "Kilde"])
+
+    if not icu_pid.empty:
+        icu_pid = filter_ita(icu_pid)
+        icu_pid["Kilde"] = "Rådata"
+    else:
+        icu_pid = pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE", "Kilde"])
+
+    if not gcs_notes_pid.empty:
+        gcs_notes_pid["Kilde"] = "Notater"
+        icu_pid = pd.concat([icu_pid, gcs_notes_pid], ignore_index=True)
+
+    icu_pid["VALUE"] = pd.to_numeric(icu_pid["VALUE"], errors="coerce")
+    return icu_pid
+
+@st.cache_data(show_spinner="Filtrerer medicin for patient …")
+def get_patient_medicin(pid: int):
+    med_raw = load_medicin()
+    med_pid = med_raw[med_raw["PID"] == pid].copy()
+    if med_pid.empty:
+        return med_pid
+    med_pid = filter_medicin(med_pid)
+    med_pid["TIMESTAMP"] = pd.to_datetime(med_pid["TIMESTAMP"])
+    return med_pid
+
+@st.cache_data(show_spinner="Filtrerer procedurer for patient …")
+def get_patient_procedurer(pid: int):
+    proc_raw = load_procedurer()
+    proc_pid = proc_raw[proc_raw["PID"] == pid].copy()
+    if proc_pid.empty:
+        return proc_pid
+    proc_pid_filtered = filter_procedures(proc_pid)
+    proc_pid_filtered["TIMESTAMP"] = pd.to_datetime(proc_pid_filtered["TIMESTAMP"])
+    return proc_pid_filtered
+
+@st.cache_data(show_spinner="Filtrerer procedurer (alle) for patient …")
+def get_patient_procedurer_all(pid: int):
+    proc_raw = load_procedurer()
+    proc_pid = proc_raw[proc_raw["PID"] == pid].copy()
+    if proc_pid.empty:
+        return proc_pid
+    proc_pid["ServiceDatetime"] = pd.to_datetime(proc_pid["ServiceDatetime"], errors="coerce")
+    proc_pid = proc_pid.dropna(subset=["ServiceDatetime"]).sort_values("ServiceDatetime")
+    return proc_pid
+
+@st.cache_data(show_spinner="Filtrerer ADT for patient …")
+def get_patient_adt(pid: int, _base_df):
+    adt_raw = load_adt()
+    adt_pid = adt_raw[adt_raw["PID"] == pid].copy()
+    if adt_pid.empty:
+        return adt_pid
+    adt_filtered = filter_adt(adt_pid, base_df=_base_df)
+    adt_filtered["TIMESTAMP"] = pd.to_datetime(adt_filtered["TIMESTAMP"])
+    adt_filtered["END_TIMESTAMP"] = pd.to_datetime(adt_filtered["END_TIMESTAMP"])
+    return adt_filtered
+
+@st.cache_data(show_spinner="Filtrerer ADT (alle) for patient …")
+def get_patient_adt_all(pid: int):
+    adt_raw = load_adt()
+    adt_pid = adt_raw[adt_raw["PID"] == pid].copy()
+    if adt_pid.empty:
+        return adt_pid
+    adt_pid["Flyt_ind"] = pd.to_datetime(adt_pid["Flyt_ind"], errors="coerce")
+    adt_pid["Flyt_ud"] = pd.to_datetime(adt_pid["Flyt_ud"], errors="coerce")
+    adt_pid = adt_pid.dropna(subset=["Flyt_ind"]).sort_values("Flyt_ind")
+    adt_pid = adt_pid[adt_pid["Flyt_ind"] != adt_pid["Flyt_ud"]].copy()
+    # Merge consecutive stays at same ward
+    adt_pid = adt_pid.sort_values("Flyt_ind").reset_index(drop=True)
+    merged_rows = []
+    for _, r in adt_pid.iterrows():
+        if merged_rows and (
+            merged_rows[-1]["Afsnit"] == r["Afsnit"] and
+            merged_rows[-1]["Flyt_ud"] == r["Flyt_ind"]
+        ):
+            merged_rows[-1]["Flyt_ud"] = r["Flyt_ud"]
+        else:
+            merged_rows.append(r.to_dict())
+    return pd.DataFrame(merged_rows) if merged_rows else pd.DataFrame()
+
+@st.cache_data(show_spinner="Filtrerer diagnoser for patient …")
+def get_patient_diagnoser(pid: int):
+    diag_raw = load_diagnoser()
+    diag_pid = diag_raw[diag_raw["PID"] == pid].copy()
+    if diag_pid.empty:
+        return diag_pid
+    diag_pid["Noteret_dato"] = pd.to_datetime(diag_pid["Noteret_dato"], errors="coerce")
+    diag_pid = diag_pid.dropna(subset=["Noteret_dato"]).sort_values("Noteret_dato")
+    return diag_pid
+
+@st.cache_data(show_spinner="Filtrerer notater for patient …")
+def get_patient_notater(pid: int):
+    noter_raw = load_notater()
+    noter_pid = noter_raw[noter_raw["PID"] == pid].copy()
+    if noter_pid.empty:
+        return noter_pid
+    noter_pid = noter_pid.sort_values(["ID", "Linjenummer"])
+    noter_pid = (
+        noter_pid.groupby(["ID", "Oprettelsestidspunkt", "Redigeringstidspunkt",
+                           "Notetype", "Speciale"], as_index=False, dropna=False)
+        .agg({"Note": lambda x: " ".join(x.astype(str))})
+    )
+    noter_pid["Oprettelsestidspunkt"] = pd.to_datetime(noter_pid["Oprettelsestidspunkt"])
+    noter_pid["Note"] = noter_pid["Note"].str.replace("    ", "\n\n").str.replace("  ", "\n")
+    noter_pid = noter_pid.sort_values("Oprettelsestidspunkt", ascending=True).reset_index(drop=True)
+    return noter_pid
+
+# Cache the expensive notes-derived features globally (computed once for ALL patients)
+@st.cache_data(show_spinner="Bygger GCS fra notater …")
+def _get_gcs_from_notes():
+    return build_gcs_from_notes(load_notater())
+
+@st.cache_data(show_spinner="Bygger ISS fra notater …")
+def _get_iss_from_notes():
+    return build_iss_from_notes(load_notater())
+
+@st.cache_data(show_spinner="Bygger intubation fra notater …")
+def _get_intubation_from_notes():
+    return build_intubation_from_notes(load_notater())
+
+@st.cache_data(show_spinner="Bygger hjertestop fra notater …")
+def _get_cardiac_arrest_from_notes():
+    return build_cardiac_arrest_from_notes(load_notater())
 
 # ── Tidsvindue i sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
@@ -323,20 +495,17 @@ def vis_feature_rækker(filtered_df, ts_col):
 # ── Faner ─────────────────────────────────────────────────────────────────────
 st.markdown("---")
 
-tab_vitals, tab_labs, tab_icu, tab_med, tab_proc, tab_adt, tab_diag, tab_notater,tab_overview = st.tabs([
+tab_vitals, tab_labs, tab_icu, tab_med, tab_proc, tab_adt, tab_trauma, tab_diag, tab_notater, tab_overview = st.tabs([
     "Vitale værdier", "Laboratoriesvar", "ICU", "Medicin",
-    "Procedurer", "Afsnit", "Diagnoser","Notater", "Summary"
+    "Procedurer", "Afsnit", "Trauma / Events", "Diagnoser", "Notater", "Summary"
 ])
 
 
 with tab_vitals:
-    vitals_raw = load_vitals()
-    vitals_pid = vitals_raw[vitals_raw["PID"] == int(selected_pid)].copy()
+    vitals_pid = get_patient_vitals(int(selected_pid))
     if vitals_pid.empty:
         st.info("Ingen vitale værdier for denne patient.")
     else:
-        vitals_pid = filter_vitals(vitals_pid)
-        vitals_pid["VALUE"] = pd.to_numeric(vitals_pid["VALUE"], errors="coerce")
         vitals_filtered = tilfoej_timer(vitals_pid, "TIMESTAMP").dropna(subset=["VALUE"])
         if vitals_filtered.empty:
             st.info(f"Ingen målinger indenfor de første {tidsvindue} timer.")
@@ -344,12 +513,10 @@ with tab_vitals:
             vis_feature_rækker(vitals_filtered, "TIMESTAMP")
 
 with tab_labs:
-    labs_raw = load_labs()
-    labs_pid = labs_raw[labs_raw["PID"] == int(selected_pid)].copy()
+    labs_pid = get_patient_labs(int(selected_pid))
     if labs_pid.empty:
         st.info("Ingen laboratoriesvar for denne patient.")
     else:
-        labs_pid = filter_labs(labs_pid)
         labs_filtered = tilfoej_timer(labs_pid, "TIMESTAMP").dropna(subset=["VALUE"])
         if labs_filtered.empty:
             st.info(f"Ingen laboratoriesvar indenfor de første {tidsvindue} timer.")
@@ -357,27 +524,85 @@ with tab_labs:
             vis_feature_rækker(labs_filtered, "TIMESTAMP")
 
 with tab_icu:
-    icu_raw = load_icu()
-    icu_pid = icu_raw[icu_raw["PID"] == int(selected_pid)].copy()
+    icu_pid = get_patient_icu(int(selected_pid))
+
     if icu_pid.empty:
         st.info("Ingen ICU-målinger for denne patient.")
     else:
-        icu_pid = filter_ita(icu_pid)
-        icu_pid["VALUE"] = pd.to_numeric(icu_pid["VALUE"], errors="coerce")
         icu_filtered = tilfoej_timer(icu_pid, "TIMESTAMP").dropna(subset=["VALUE"])
         if icu_filtered.empty:
             st.info(f"Ingen ICU-målinger indenfor de første {tidsvindue} timer.")
         else:
-            vis_feature_rækker(icu_filtered, "TIMESTAMP")
+            # Show features with source column for GCS
+            features = sorted(icu_filtered["FEATURE"].unique())
+            for feature in features:
+                feat_df = (
+                    icu_filtered[icu_filtered["FEATURE"] == feature]
+                    .sort_values("TIMESTAMP")[["timer_siden_start", "TIMESTAMP", "VALUE", "Kilde"]]
+                    .dropna(subset=["VALUE"])
+                    .reset_index(drop=True)
+                )
+                st.markdown(f"**{feature}**")
+                tabel_col, graf_col = st.columns([1, 2])
+
+                with tabel_col:
+                    if feat_df.empty:
+                        st.caption("Ingen gyldige værdier")
+                    else:
+                        tabel_vis = feat_df.copy()
+                        tabel_vis["TIMESTAMP"] = tabel_vis["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
+                        tabel_vis["VALUE"] = tabel_vis["VALUE"].round(2)
+                        tabel_vis = tabel_vis[["TIMESTAMP", "VALUE", "Kilde"]]
+                        tabel_vis.columns = ["Tidspunkt", "Værdi", "Kilde"]
+                        dynamisk_højde = min(HEADER_HEIGHT + len(tabel_vis) * ROW_HEIGHT, PLOT_HEIGHT)
+                        st.dataframe(tabel_vis, hide_index=True, use_container_width=True, height=dynamisk_højde)
+
+                with graf_col:
+                    if len(feat_df) >= 2:
+                        fig = go.Figure()
+                        # Single combined line sorted by time, markers colored by source
+                        sorted_df = feat_df.sort_values("timer_siden_start").reset_index(drop=True)
+                        colors_map = {"Rådata": "#4e79a7", "Notater": "#e15759"}
+                        marker_colors = [colors_map.get(k, "#76b7b2") for k in sorted_df["Kilde"]]
+                        fig.add_trace(go.Scatter(
+                            x=sorted_df["timer_siden_start"],
+                            y=sorted_df["VALUE"],
+                            mode="markers+lines",
+                            line=dict(color="#4e79a7"),
+                            marker=dict(color=marker_colors, size=8),
+                            showlegend=False,
+                        ))
+                        # Invisible traces for legend
+                        for kilde, color in colors_map.items():
+                            if kilde in sorted_df["Kilde"].values:
+                                fig.add_trace(go.Scatter(
+                                    x=[None], y=[None], mode="markers",
+                                    marker=dict(color=color, size=8),
+                                    name=kilde,
+                                ))
+                        alle_værdier = feat_df["VALUE"].dropna()
+                        y_min = alle_værdier.min() * 0.95
+                        y_max = alle_værdier.max() * 1.05
+                        fig.update_layout(
+                            height=PLOT_HEIGHT,
+                            margin=dict(l=0, r=0, t=10, b=10),
+                            xaxis=dict(title="Timer i forløb", showgrid=True, gridcolor="#f0f0f0"),
+                            yaxis=dict(showgrid=True, gridcolor="#f0f0f0", range=[y_min, y_max]),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                            plot_bgcolor="white",
+                            paper_bgcolor="white",
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif len(feat_df) == 1:
+                        st.metric(label="", value=round(feat_df["VALUE"].iloc[0], 2))
+
+                st.markdown("---")
 
 with tab_med:
-    med_raw = load_medicin()
-    med_pid = med_raw[med_raw["PID"] == int(selected_pid)].copy()
-    if med_pid.empty:
+    med_pid_filtered = get_patient_medicin(int(selected_pid))
+    if med_pid_filtered.empty:
         st.info("Ingen medicin registreret for denne patient.")
     else:
-        med_pid_filtered = filter_medicin(med_pid)
-        med_pid_filtered["TIMESTAMP"] = pd.to_datetime(med_pid_filtered["TIMESTAMP"])
         med_filtered = tilfoej_timer(med_pid_filtered, "TIMESTAMP")
 
         if med_filtered.empty:
@@ -437,13 +662,10 @@ with tab_proc:
     tab_proc_klas, tab_proc_alle = st.tabs(["Klassificeret", "Alle"])
 
     with tab_proc_klas:
-        proc_raw = load_procedurer()
-        proc_pid = proc_raw[proc_raw["PID"] == int(selected_pid)].copy()
-        if proc_pid.empty:
+        proc_pid_filtered = get_patient_procedurer(int(selected_pid))
+        if proc_pid_filtered.empty:
             st.info("Ingen procedurer registreret for denne patient.")
         else:
-            proc_pid_filtered = filter_procedures(proc_pid)
-            proc_pid_filtered["TIMESTAMP"] = pd.to_datetime(proc_pid_filtered["TIMESTAMP"])
             proc_filtered = tilfoej_timer(proc_pid_filtered, "TIMESTAMP")
     
             if proc_filtered.empty:
@@ -498,13 +720,10 @@ with tab_proc:
                 st.plotly_chart(fig, use_container_width=True)
 
     with tab_proc_alle:
-        proc_raw2 = load_procedurer()
-        proc_pid2 = proc_raw2[proc_raw2["PID"] == int(selected_pid)].copy()
+        proc_pid2 = get_patient_procedurer_all(int(selected_pid))
         if proc_pid2.empty:
             st.info("Ingen procedurer registreret for denne patient.")
         else:
-            proc_pid2["ServiceDatetime"] = pd.to_datetime(proc_pid2["ServiceDatetime"], errors="coerce")
-            proc_pid2 = proc_pid2.dropna(subset=["ServiceDatetime"]).sort_values("ServiceDatetime")
             proc_pid2 = proc_pid2[
                 (proc_pid2["ServiceDatetime"] - patient_start).dt.total_seconds() / 3600 <= tidsvindue
             ].copy()
@@ -569,238 +788,272 @@ with tab_adt:
     tab_adt_klas, tab_adt_alle = st.tabs(["Klassificeret", "Alle"])
 
     with tab_adt_klas:
-        adt_raw = load_adt()
-        adt_pid = adt_raw[adt_raw["PID"] == int(selected_pid)].copy()
-        if adt_pid.empty:
+        adt_filtered = get_patient_adt(int(selected_pid), df)
+        if adt_filtered.empty:
             st.info("Ingen afsnitsregistreringer for denne patient.")
         else:
-            adt_filtered = filter_adt(adt_pid, base_df=df)
-            adt_filtered["TIMESTAMP"] = pd.to_datetime(adt_filtered["TIMESTAMP"])
-            adt_filtered["END_TIMESTAMP"] = pd.to_datetime(adt_filtered["END_TIMESTAMP"])
-    
-    
-            if adt_filtered.empty:
-                st.info("Ingen afsnitsregistreringer indenfor tidsvinduet.")
-            else:
-                # ── Overblik: tid brugt pr. afsnitstype ──────────────────────────
-                adt_filtered["varighed_timer"] = (
-                    (adt_filtered["END_TIMESTAMP"] - adt_filtered["TIMESTAMP"])
-                    .dt.total_seconds() / 3600
-                )
-                overblik = (
-                    adt_filtered.groupby("VALUE")["varighed_timer"]
-                    .sum()
-                    .reset_index()
-                    .rename(columns={"VALUE": "Afsnitstype", "varighed_timer": "Timer total"})
-                    .sort_values("Timer total", ascending=False)
-                )
-                cols = st.columns(len(overblik))
-                for i, r in overblik.iterrows():
-                    cols[i].metric(r["Afsnitstype"], f"{r['Timer total']:.1f} timer")
-    
-                st.markdown("---")
-    
-                # ── Gantt-plot ────────────────────────────────────────────────────
-                st.markdown("**Patientens forløb gennem afsnit**")
-    
-                FARVER = {
-                    "TC":  "#e15759",
-                    "OR":  "#4e79a7",
-                    "ICU": "#f28e2b",
-                    "BED": "#76b7b2",
-                    "AMB": "#59a14f",
-                }
-    
-                fig = go.Figure()
-                for _, r in adt_filtered.sort_values("TIMESTAMP").iterrows():
-                    farve = FARVER.get(r["VALUE"], "#bab0ac")
-                    fig.add_trace(go.Bar(
-                        x=[(r["END_TIMESTAMP"] - r["TIMESTAMP"]).total_seconds() / 3600],
-                        y=[r["VALUE"]],
-                        base=[(r["TIMESTAMP"] - patient_start).total_seconds() / 3600],
-                        orientation="h",
-                        marker=dict(color=farve, opacity=0.85),
-                        name=r["VALUE"],
-                        showlegend=False,
-                        hovertemplate=(
-                            f"<b>{r['VALUE']}</b><br>"
-                            f"Ind: {r['TIMESTAMP'].strftime('%Y-%m-%d %H:%M')}<br>"
-                            f"Ud: {r['END_TIMESTAMP'].strftime('%Y-%m-%d %H:%M')}<br>"
-                            f"Varighed: {(r['END_TIMESTAMP']-r['TIMESTAMP']).total_seconds()/3600:.1f} timer"
-                            "<extra></extra>"
-                        ),
-                    ))
-    
-                # Én legend-entry pr. afsnitstype
-                for atype, farve in FARVER.items():
-                    if atype in adt_filtered["VALUE"].values:
-                        fig.add_trace(go.Bar(
-                            x=[None], y=[None],
-                            orientation="h",
-                            marker=dict(color=farve),
-                            name=atype,
-                            showlegend=True,
-                        ))
-    
-                fig.update_layout(
-                    barmode="overlay",
-                    height=80 + len(adt_filtered["VALUE"].unique()) * 60,
-                    xaxis=dict(title="Timer fra forløbsstart", showgrid=True, gridcolor="#f0f0f0"),
-                    yaxis=dict(showgrid=False),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
-                # ── Rå tabel ──────────────────────────────────────────────────────
-                with st.expander("Se alle afsnitsregistreringer"):
-                    tabel = adt_filtered[["TIMESTAMP", "END_TIMESTAMP", "VALUE", "Afsnit"]].copy()
-                    tabel["TIMESTAMP"] = tabel["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
-                    tabel["END_TIMESTAMP"] = tabel["END_TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
-                    tabel.columns = ["Ind", "Ud", "Type", "Afsnit"]
-                    st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=True)
-    with tab_adt_alle:
-        adt_raw2 = load_adt()
-        adt_pid2 = adt_raw2[adt_raw2["PID"] == int(selected_pid)].copy()
-        if adt_pid2.empty:
-            st.info("Ingen afsnitsregistreringer for denne patient.")
-        else:
-            adt_pid2["Flyt_ind"] = pd.to_datetime(adt_pid2["Flyt_ind"], errors="coerce")
-            adt_pid2["Flyt_ud"] = pd.to_datetime(adt_pid2["Flyt_ud"], errors="coerce")
-            adt_pid2 = adt_pid2.dropna(subset=["Flyt_ind"]).sort_values("Flyt_ind")
-    
-            # Fjern ophold med varighed = 0
-            adt_pid2 = adt_pid2[adt_pid2["Flyt_ind"] != adt_pid2["Flyt_ud"]].copy()
-    
-            # Slå sammenhængende ophold på samme afsnit sammen
-            adt_pid2 = adt_pid2.sort_values("Flyt_ind").reset_index(drop=True)
-            merged_rows = []
-            for _, r in adt_pid2.iterrows():
-                if merged_rows and (
-                    merged_rows[-1]["Afsnit"] == r["Afsnit"] and
-                    merged_rows[-1]["Flyt_ud"] == r["Flyt_ind"]
-                ):
-                    merged_rows[-1]["Flyt_ud"] = r["Flyt_ud"]
-                else:
-                    merged_rows.append(r.to_dict())
-            adt_pid2 = pd.DataFrame(merged_rows)
-    
-    
-            if adt_pid2.empty:
-                st.info("Ingen afsnitsregistreringer indenfor tidsvinduet.")
-            else:
-                adt_pid2["varighed_timer"] = (
-                    (adt_pid2["Flyt_ud"] - adt_pid2["Flyt_ind"])
-                    .dt.total_seconds() / 3600
-                )
-    
-                # ── Gantt-plot ────────────────────────────────────────────────────
-                st.markdown("**Alle afsnit over forløbet**")    
-                afsnit_liste = adt_pid2["Afsnit"].unique().tolist()
-                FARVER = [
-                    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
-                    "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
-                    "#9c755f", "#bab0ac"
-                ]
-                farve_map = {a: FARVER[i % len(FARVER)] for i, a in enumerate(afsnit_liste)}
-    
-                fig = go.Figure()
-                vist = set()
-                for _, r in adt_pid2.iterrows():
-                    if pd.isna(r["Flyt_ud"]):
-                        continue
-                    varighed = (r["Flyt_ud"] - r["Flyt_ind"]).total_seconds() / 3600
-                    offset = (r["Flyt_ind"] - patient_start).total_seconds() / 3600
-                    farve = farve_map[r["Afsnit"]]
-                    fig.add_trace(go.Bar(
-                        x=[varighed],
-                        y=[r["Afsnit"]],
-                        base=[offset],
-                        orientation="h",
-                        marker=dict(color=farve, opacity=0.85),
-                        name=r["Afsnit"],
-                        showlegend=r["Afsnit"] not in vist,
-                        hovertemplate=(
-                            f"<b>{r['Afsnit']}</b><br>"
-                            f"Ind: {r['Flyt_ind'].strftime('%Y-%m-%d %H:%M')}<br>"
-                            f"Ud: {r['Flyt_ud'].strftime('%Y-%m-%d %H:%M')}<br>"
-                            f"Varighed: {varighed:.1f} timer"
-                            "<extra></extra>"
-                        ),
-                    ))
-                    vist.add(r["Afsnit"])
-    
-                fig.update_layout(
-                    barmode="overlay",
-                    height=max(300, 80 + len(afsnit_liste) * 40),
-                    xaxis=dict(title="Timer fra forløbsstart", showgrid=True, gridcolor="#f0f0f0"),
-                    yaxis=dict(showgrid=False),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-                    margin=dict(l=10, r=10, t=10, b=10),
-                    plot_bgcolor="white",
-                    paper_bgcolor="white",
-                )
-                st.plotly_chart(fig, use_container_width=True)
-    
-                # ── Tabel ─────────────────────────────────────────────────────────
-                with st.expander("Se alle afsnitsregistreringer"):
-                    tabel = adt_pid2[["Flyt_ind", "Flyt_ud", "Afsnit", "varighed_timer"]].copy()
-                    tabel["Flyt_ind"] = tabel["Flyt_ind"].dt.strftime("%Y-%m-%d %H:%M")
-                    tabel["Flyt_ud"] = tabel["Flyt_ud"].dt.strftime("%Y-%m-%d %H:%M")
-                    tabel["varighed_timer"] = tabel["varighed_timer"].round(1)
-                    tabel.columns = ["Ind", "Ud", "Afsnit", "Timer"]
-                    st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=True)
-
-with tab_diag:
-    diag_raw = load_diagnoser()
-    diag_pid = diag_raw[diag_raw["PID"] == int(selected_pid)].copy()
-    if diag_pid.empty:
-        st.info("Ingen diagnoser registreret for denne patient.")
-    else:
-        diag_pid["Noteret_dato"] = pd.to_datetime(diag_pid["Noteret_dato"], errors="coerce")
-        diag_pid = diag_pid.dropna(subset=["Noteret_dato"]).sort_values("Noteret_dato")
-        if diag_pid.empty:
-            st.info("Ingen diagnoser indenfor tidsvinduet.")
-        else:
-            diag_pid["dage_siden_start"] = (
-                (diag_pid["Noteret_dato"] - patient_start).dt.total_seconds() / 3600 / 24
+            # ── Overblik: tid brugt pr. afsnitstype ──────────────────────────
+            adt_filtered["varighed_timer"] = (
+                (adt_filtered["END_TIMESTAMP"] - adt_filtered["TIMESTAMP"])
+                .dt.total_seconds() / 3600
             )
-            # ── Tidslinje ─────────────────────────────────────────────────────
-            st.markdown("**Diagnoser over forløbet**")
+            overblik = (
+                adt_filtered.groupby("VALUE")["varighed_timer"]
+                .sum()
+                .reset_index()
+                .rename(columns={"VALUE": "Afsnitstype", "varighed_timer": "Timer total"})
+                .sort_values("Timer total", ascending=False)
+            )
+            cols = st.columns(len(overblik))
+            for i, r in overblik.iterrows():
+                cols[i].metric(r["Afsnitstype"], f"{r['Timer total']:.1f} timer")
+
+            st.markdown("---")
+
+            # ── Gantt-plot ────────────────────────────────────────────────────
+            st.markdown("**Patientens forløb gennem afsnit**")
+
+            FARVER = {
+                "TC":  "#e15759",
+                "OR":  "#4e79a7",
+                "ICU": "#f28e2b",
+                "BED": "#76b7b2",
+                "AMB": "#59a14f",
+            }
+
             fig = go.Figure()
-            for i, (_, r) in enumerate(diag_pid.iterrows()):
-                fig.add_trace(go.Scatter(
-                    x=[r["Noteret_dato"]],
-                    y=[i],
-                    mode="markers+text",
-                    marker=dict(size=10, color="#4e79a7"),
-                    text=[r["Diagnose"]],
-                    textposition="middle right",
-                    hovertemplate=f"<b>{r['Diagnose']}</b><br>{r['Noteret_dato'].strftime('%Y-%m-%d')}<extra></extra>",
+            for _, r in adt_filtered.sort_values("TIMESTAMP").iterrows():
+                farve = FARVER.get(r["VALUE"], "#bab0ac")
+                fig.add_trace(go.Bar(
+                    x=[(r["END_TIMESTAMP"] - r["TIMESTAMP"]).total_seconds() / 3600],
+                    y=[r["VALUE"]],
+                    base=[(r["TIMESTAMP"] - patient_start).total_seconds() / 3600],
+                    orientation="h",
+                    marker=dict(color=farve, opacity=0.85),
+                    name=r["VALUE"],
                     showlegend=False,
+                    hovertemplate=(
+                        f"<b>{r['VALUE']}</b><br>"
+                        f"Ind: {r['TIMESTAMP'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Ud: {r['END_TIMESTAMP'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Varighed: {(r['END_TIMESTAMP']-r['TIMESTAMP']).total_seconds()/3600:.1f} timer"
+                        "<extra></extra>"
+                    ),
                 ))
+
+            # Én legend-entry pr. afsnitstype
+            for atype, farve in FARVER.items():
+                if atype in adt_filtered["VALUE"].values:
+                    fig.add_trace(go.Bar(
+                        x=[None], y=[None],
+                        orientation="h",
+                        marker=dict(color=farve),
+                        name=atype,
+                        showlegend=True,
+                    ))
+
             fig.update_layout(
-                height=max(200, 60 + len(diag_pid) * 40),
-                xaxis=dict(showgrid=True, gridcolor="#f0f0f0", title="Dato", tickformat="%Y-%m-%d"),
-                yaxis=dict(visible=False),
-                margin=dict(l=10, r=300, t=20, b=40),
+                barmode="overlay",
+                height=80 + len(adt_filtered["VALUE"].unique()) * 60,
+                xaxis=dict(title="Timer fra forløbsstart", showgrid=True, gridcolor="#f0f0f0"),
+                yaxis=dict(showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                margin=dict(l=10, r=10, t=10, b=10),
                 plot_bgcolor="white",
                 paper_bgcolor="white",
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.markdown("---")
-            # ── Tabel ─────────────────────────────────────────────────────────
-            tabel = diag_pid[["Noteret_dato", "Diagnose"]].copy()
-            tabel["Noteret_dato"] = tabel["Noteret_dato"].dt.strftime("%Y-%m-%d")
-            tabel.columns = ["Dato", "Diagnose"]
-            st.dataframe(
-                tabel.reset_index(drop=True),
-                hide_index=True,
-                use_container_width=True,
-                height=min(HEADER_HEIGHT + len(tabel) * ROW_HEIGHT, 400),
+
+            # ── Rå tabel ──────────────────────────────────────────────────────
+            with st.expander("Se alle afsnitsregistreringer"):
+                tabel = adt_filtered[["TIMESTAMP", "END_TIMESTAMP", "VALUE", "Afsnit"]].copy()
+                tabel["TIMESTAMP"] = tabel["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
+                tabel["END_TIMESTAMP"] = tabel["END_TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
+                tabel.columns = ["Ind", "Ud", "Type", "Afsnit"]
+                st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=True)
+
+    with tab_adt_alle:
+        adt_pid2 = get_patient_adt_all(int(selected_pid))
+        if adt_pid2.empty:
+            st.info("Ingen afsnitsregistreringer for denne patient.")
+        else:
+            adt_pid2["varighed_timer"] = (
+                (adt_pid2["Flyt_ud"] - adt_pid2["Flyt_ind"])
+                .dt.total_seconds() / 3600
             )
+
+            # ── Gantt-plot ────────────────────────────────────────────────────
+            st.markdown("**Alle afsnit over forløbet**")
+            afsnit_liste = adt_pid2["Afsnit"].unique().tolist()
+            FARVER = [
+                "#4e79a7", "#f28e2b", "#e15759", "#76b7b2",
+                "#59a14f", "#edc948", "#b07aa1", "#ff9da7",
+                "#9c755f", "#bab0ac"
+            ]
+            farve_map = {a: FARVER[i % len(FARVER)] for i, a in enumerate(afsnit_liste)}
+
+            fig = go.Figure()
+            vist = set()
+            for _, r in adt_pid2.iterrows():
+                if pd.isna(r["Flyt_ud"]):
+                    continue
+                varighed = (r["Flyt_ud"] - r["Flyt_ind"]).total_seconds() / 3600
+                offset = (r["Flyt_ind"] - patient_start).total_seconds() / 3600
+                farve = farve_map[r["Afsnit"]]
+                fig.add_trace(go.Bar(
+                    x=[varighed],
+                    y=[r["Afsnit"]],
+                    base=[offset],
+                    orientation="h",
+                    marker=dict(color=farve, opacity=0.85),
+                    name=r["Afsnit"],
+                    showlegend=r["Afsnit"] not in vist,
+                    hovertemplate=(
+                        f"<b>{r['Afsnit']}</b><br>"
+                        f"Ind: {r['Flyt_ind'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Ud: {r['Flyt_ud'].strftime('%Y-%m-%d %H:%M')}<br>"
+                        f"Varighed: {varighed:.1f} timer"
+                        "<extra></extra>"
+                    ),
+                ))
+                vist.add(r["Afsnit"])
+
+            fig.update_layout(
+                barmode="overlay",
+                height=max(300, 80 + len(afsnit_liste) * 40),
+                xaxis=dict(title="Timer fra forløbsstart", showgrid=True, gridcolor="#f0f0f0"),
+                yaxis=dict(showgrid=False),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                margin=dict(l=10, r=10, t=10, b=10),
+                plot_bgcolor="white",
+                paper_bgcolor="white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Tabel ─────────────────────────────────────────────────────────
+            with st.expander("Se alle afsnitsregistreringer"):
+                tabel = adt_pid2[["Flyt_ind", "Flyt_ud", "Afsnit", "varighed_timer"]].copy()
+                tabel["Flyt_ind"] = tabel["Flyt_ind"].dt.strftime("%Y-%m-%d %H:%M")
+                tabel["Flyt_ud"] = tabel["Flyt_ud"].dt.strftime("%Y-%m-%d %H:%M")
+                tabel["varighed_timer"] = tabel["varighed_timer"].round(1)
+                tabel.columns = ["Ind", "Ud", "Afsnit", "Timer"]
+                st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=True)
+
+with tab_trauma:
+    pid_int = int(selected_pid)
+
+    # ── ISS ──────────────────────────────────────────────────────────────
+    st.markdown("### ISS (Injury Severity Score)")
+    iss_df = _get_iss_from_notes()
+    iss_pid = iss_df[iss_df["PID"] == pid_int]
+    if iss_pid.empty:
+        st.info("Ingen ISS fundet i notater for denne patient.")
+    else:
+        iss_row = iss_pid.iloc[0]
+        col1, col2 = st.columns(2)
+        col1.metric("ISS", int(iss_row["VALUE"]))
+        col2.metric("Tidspunkt", pd.to_datetime(iss_row["TIMESTAMP"]).strftime("%Y-%m-%d %H:%M"))
+
+    st.markdown("---")
+
+    # ── Intubation ───────────────────────────────────────────────────────
+    st.markdown("### Intubation")
+    intub_df = _get_intubation_from_notes()
+    intub_pid = intub_df[intub_df["PID"] == pid_int]
+    if intub_pid.empty:
+        st.info("Ingen intubation registreret i notater for denne patient.")
+    else:
+        intub_row = intub_pid.iloc[0]
+        col1, col2 = st.columns(2)
+        col1.metric("Intuberet", "Ja")
+        col2.metric("Tidspunkt", pd.to_datetime(intub_row["TIMESTAMP"]).strftime("%Y-%m-%d %H:%M"))
+
+    st.markdown("---")
+
+    # ── Cardiac Arrest ───────────────────────────────────────────────────
+    st.markdown("### Hjertestop")
+    ca_df = _get_cardiac_arrest_from_notes()
+    ca_pid = ca_df[ca_df["PID"] == pid_int]
+    if ca_pid.empty:
+        st.info("Ingen hjertestop registreret i notater for denne patient.")
+    else:
+        st.markdown(f"**{len(ca_pid)} hjertestop-event(s)**")
+        ca_pid = ca_pid.copy()
+        ca_pid["TIMESTAMP"] = pd.to_datetime(ca_pid["TIMESTAMP"])
+        ca_display = tilfoej_timer(ca_pid, "TIMESTAMP")
+
+        if ca_display.empty:
+            st.info(f"Ingen events indenfor de første {tidsvindue} timer.")
+        else:
+            tabel = ca_display[["TIMESTAMP"]].copy()
+            tabel["TIMESTAMP"] = tabel["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
+            tabel["timer_ind"] = ca_display["timer_siden_start"].round(1)
+            tabel.columns = ["Tidspunkt", "Timer fra start"]
+            st.dataframe(tabel.reset_index(drop=True), hide_index=True, use_container_width=False,
+                         height=min(HEADER_HEIGHT + len(tabel) * ROW_HEIGHT, 300))
+
+            # Timeline plot
+            if len(ca_display) >= 1:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=ca_display["timer_siden_start"],
+                    y=[1] * len(ca_display),
+                    mode="markers",
+                    marker=dict(color="#e15759", size=14, symbol="x"),
+                    hovertemplate="Timer: %{x:.1f}<extra>Hjertestop</extra>",
+                ))
+                fig.update_layout(
+                    height=120,
+                    margin=dict(l=0, r=0, t=10, b=10),
+                    xaxis=dict(title="Timer fra forløbsstart", showgrid=True, gridcolor="#f0f0f0"),
+                    yaxis=dict(visible=False),
+                    plot_bgcolor="white",
+                    paper_bgcolor="white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+with tab_diag:
+    diag_pid = get_patient_diagnoser(int(selected_pid))
+    if diag_pid.empty:
+        st.info("Ingen diagnoser registreret for denne patient.")
+    else:
+        diag_pid["dage_siden_start"] = (
+            (diag_pid["Noteret_dato"] - patient_start).dt.total_seconds() / 3600 / 24
+        )
+        # ── Tidslinje ─────────────────────────────────────────────────────
+        st.markdown("**Diagnoser over forløbet**")
+        fig = go.Figure()
+        for i, (_, r) in enumerate(diag_pid.iterrows()):
+            fig.add_trace(go.Scatter(
+                x=[r["Noteret_dato"]],
+                y=[i],
+                mode="markers+text",
+                marker=dict(size=10, color="#4e79a7"),
+                text=[r["Diagnose"]],
+                textposition="middle right",
+                hovertemplate=f"<b>{r['Diagnose']}</b><br>{r['Noteret_dato'].strftime('%Y-%m-%d')}<extra></extra>",
+                showlegend=False,
+            ))
+        fig.update_layout(
+            height=max(200, 60 + len(diag_pid) * 40),
+            xaxis=dict(showgrid=True, gridcolor="#f0f0f0", title="Dato", tickformat="%Y-%m-%d"),
+            yaxis=dict(visible=False),
+            margin=dict(l=10, r=300, t=20, b=40),
+            plot_bgcolor="white",
+            paper_bgcolor="white",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("---")
+        # ── Tabel ─────────────────────────────────────────────────────────
+        tabel = diag_pid[["Noteret_dato", "Diagnose"]].copy()
+        tabel["Noteret_dato"] = tabel["Noteret_dato"].dt.strftime("%Y-%m-%d")
+        tabel.columns = ["Dato", "Diagnose"]
+        st.dataframe(
+            tabel.reset_index(drop=True),
+            hide_index=True,
+            use_container_width=True,
+            height=min(HEADER_HEIGHT + len(tabel) * ROW_HEIGHT, 400),
+        )
 
 with tab_overview:
     st.markdown("**Tidsvindue**")
@@ -823,12 +1076,9 @@ with tab_overview:
     # ── Vitale værdier ────────────────────────────────────────────────────────
     with col_vit:
         st.markdown("**Vitale værdier**")
-        vit_ov = load_vitals()
-        vit_ov = vit_ov[vit_ov["PID"] == int(selected_pid)].copy()
+        vit_ov = get_patient_vitals(int(selected_pid))
         if not vit_ov.empty:
-            vit_ov = filter_vitals(vit_ov)
             vit_ov["TIMESTAMP"] = pd.to_datetime(vit_ov["TIMESTAMP"])
-            vit_ov["VALUE"] = pd.to_numeric(vit_ov["VALUE"], errors="coerce")
             vit_ov = vit_ov[(vit_ov["TIMESTAMP"] >= ov_start_dt) & (vit_ov["TIMESTAMP"] <= ov_slut_dt)]
         if vit_ov.empty:
             st.caption("Ingen målinger i dette vindue.")
@@ -843,10 +1093,8 @@ with tab_overview:
     # ── Laboratoriesvar ───────────────────────────────────────────────────────
     with col_lab:
         st.markdown("**Laboratoriesvar**")
-        lab_ov = load_labs()
-        lab_ov = lab_ov[lab_ov["PID"] == int(selected_pid)].copy()
+        lab_ov = get_patient_labs(int(selected_pid))
         if not lab_ov.empty:
-            lab_ov = filter_labs(lab_ov)
             lab_ov["TIMESTAMP"] = pd.to_datetime(lab_ov["TIMESTAMP"])
             lab_ov = lab_ov[(lab_ov["TIMESTAMP"] >= ov_start_dt) & (lab_ov["TIMESTAMP"] <= ov_slut_dt)]
         if lab_ov.empty:
@@ -863,12 +1111,9 @@ with tab_overview:
     # ── ICU ───────────────────────────────────────────────────────────────────
     with col_icu:
         st.markdown("**ICU**")
-        icu_ov = load_icu()
-        icu_ov = icu_ov[icu_ov["PID"] == int(selected_pid)].copy()
+        icu_ov = get_patient_icu(int(selected_pid))
         if not icu_ov.empty:
-            icu_ov = filter_ita(icu_ov)
             icu_ov["TIMESTAMP"] = pd.to_datetime(icu_ov["TIMESTAMP"])
-            icu_ov["VALUE"] = pd.to_numeric(icu_ov["VALUE"], errors="coerce")
             icu_ov = icu_ov[(icu_ov["TIMESTAMP"] >= ov_start_dt) & (icu_ov["TIMESTAMP"] <= ov_slut_dt)]
         if icu_ov.empty:
             st.caption("Ingen ICU-målinger i dette vindue.")
@@ -883,10 +1128,8 @@ with tab_overview:
     # ── Medicin ───────────────────────────────────────────────────────────────
     with col_med:
         st.markdown("**Medicin**")
-        med_ov = load_medicin()
-        med_ov = med_ov[med_ov["PID"] == int(selected_pid)].copy()
+        med_ov = get_patient_medicin(int(selected_pid))
         if not med_ov.empty:
-            med_ov = filter_medicin(med_ov)
             med_ov["TIMESTAMP"] = pd.to_datetime(med_ov["TIMESTAMP"])
             med_ov = med_ov[(med_ov["TIMESTAMP"] >= ov_start_dt) & (med_ov["TIMESTAMP"] <= ov_slut_dt)]
         if med_ov.empty:
@@ -904,10 +1147,8 @@ with tab_overview:
     # ── Procedurer ────────────────────────────────────────────────────────────
     with col_proc:
         st.markdown("**Procedurer**")
-        proc_ov = load_procedurer()
-        proc_ov = proc_ov[proc_ov["PID"] == int(selected_pid)].copy()
+        proc_ov = get_patient_procedurer(int(selected_pid))
         if not proc_ov.empty:
-            proc_ov = filter_procedures(proc_ov)
             proc_ov["TIMESTAMP"] = pd.to_datetime(proc_ov["TIMESTAMP"])
             proc_ov = proc_ov[(proc_ov["TIMESTAMP"] >= ov_start_dt) & (proc_ov["TIMESTAMP"] <= ov_slut_dt)]
         if proc_ov.empty:
@@ -925,12 +1166,8 @@ with tab_overview:
     # ── Afsnit (klassificeret) ────────────────────────────────────────────────
     with col_afsnit:
         st.markdown("**Afsnit**")
-        adt_ov = load_adt()
-        adt_ov = adt_ov[adt_ov["PID"] == int(selected_pid)].copy()
+        adt_ov = get_patient_adt(int(selected_pid), df)
         if not adt_ov.empty:
-            adt_ov = filter_adt(adt_ov, base_df=df)
-            adt_ov["TIMESTAMP"] = pd.to_datetime(adt_ov["TIMESTAMP"])
-            adt_ov["END_TIMESTAMP"] = pd.to_datetime(adt_ov["END_TIMESTAMP"])
             adt_ov = adt_ov[(adt_ov["TIMESTAMP"] >= ov_start_dt) & (adt_ov["TIMESTAMP"] <= ov_slut_dt)]
         if adt_ov.empty:
             st.caption("Ingen afsnitsregistreringer i dette vindue.")
@@ -946,22 +1183,11 @@ with tab_overview:
 
 
 with tab_notater:
-    noter_raw = load_notater()
-    noter_pid = noter_raw[noter_raw["PID"] == int(selected_pid)].copy()
+    noter_pid = get_patient_notater(int(selected_pid))
 
     if noter_pid.empty:
         st.info("Ingen notater for denne patient.")
     else:
-        # Sammensæt linjer per note-ID
-        noter_pid = noter_pid.sort_values(["ID", "Linjenummer"])
-        noter_pid = (
-            noter_pid.groupby(["ID", "Oprettelsestidspunkt", "Redigeringstidspunkt",
-                               "Notetype", "Speciale"], as_index=False, dropna=False)
-            .agg({"Note": lambda x: " ".join(x.astype(str))})
-        )
-        noter_pid["Oprettelsestidspunkt"] = pd.to_datetime(noter_pid["Oprettelsestidspunkt"])
-        noter_pid["Note"] = noter_pid["Note"].str.replace("    ", "\n\n").str.replace("  ", "\n")
-        noter_pid = noter_pid.sort_values("Oprettelsestidspunkt", ascending=True).reset_index(drop=True)
 
         # ── Filtre ────────────────────────────────────────────────────────────
         filter_col1, filter_col2, filter_col3 = st.columns(3)
