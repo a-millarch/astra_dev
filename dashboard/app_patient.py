@@ -517,19 +517,21 @@ def _add_ref_band(fig, feature: str, y_min: float, y_max: float):
             )
 
 
-def vis_feature_rækker(filtered_df, ts_col):
-    def format_timer(h):
-        if h < 1:
-            return f"{int(h * 60)}m"
-        elif h < 24:
-            t = int(h)
-            m = int((h % 1) * 60)
-            return f"{t}t {m}m" if m > 0 else f"{t}t"
-        else:
-            d = int(h // 24)
-            t = int(h % 24)
-            return f"{d}d {t}t" if t > 0 else f"{d}d"
+def format_timer(h):
+    """Format timer (float) som menneskevenlig streng: 45m, 3t 20m, 2d 5t."""
+    if h < 1:
+        return f"{int(h * 60)}m"
+    elif h < 24:
+        t = int(h)
+        m = int((h % 1) * 60)
+        return f"{t}t {m}m" if m > 0 else f"{t}t"
+    else:
+        d = int(h // 24)
+        t = int(h % 24)
+        return f"{d}d {t}t" if t > 0 else f"{d}d"
 
+
+def vis_feature_rækker(filtered_df, ts_col):
     features = sorted(filtered_df["FEATURE"].unique())
     for feature in features:
         feat_df = (
@@ -844,11 +846,13 @@ with tab_med:
                 with st.expander(f"**{kat}** – {antal} administreringer"):
                     kat_df = (
                         med_filtered[med_filtered["VALUE"] == kat]
-                        .sort_values("TIMESTAMP")[["TIMESTAMP", "Generisk_navn"]]
+                        .sort_values("TIMESTAMP")[["TIMESTAMP", "timer_siden_start", "Generisk_navn"]]
                         .reset_index(drop=True)
                     )
+                    kat_df["Tid i forløb"] = kat_df["timer_siden_start"].apply(format_timer)
                     kat_df["TIMESTAMP"] = kat_df["TIMESTAMP"].dt.strftime("%Y-%m-%d %H:%M")
-                    kat_df.columns = ["Tidspunkt", "Præparat"]
+                    kat_df = kat_df[["TIMESTAMP", "Tid i forløb", "Generisk_navn"]]
+                    kat_df.columns = ["Tidspunkt", "Tid i forløb", "Præparat"]
                     dynamisk_højde = min(HEADER_HEIGHT + len(kat_df) * ROW_HEIGHT, 250)
                     st.dataframe(kat_df, hide_index=True, use_container_width=False, height=dynamisk_højde)
 
@@ -864,14 +868,15 @@ with tab_med:
             fig = go.Figure()
             for i, kat in enumerate(kategorier):
                 kat_df = med_filtered[med_filtered["VALUE"] == kat].sort_values("TIMESTAMP")
+                hover_tid = [format_timer(h) for h in kat_df["timer_siden_start"]]
                 fig.add_trace(go.Scatter(
                     x=kat_df["TIMESTAMP"],
                     y=[kat] * len(kat_df),
                     mode="markers",
                     name=kat,
                     marker=dict(color=FARVER[i % len(FARVER)], size=10, symbol="line-ns-open", line=dict(width=2)),
-                    hovertemplate="%{x}<br>%{customdata}<extra>" + kat + "</extra>",
-                    customdata=kat_df["Generisk_navn"].values,
+                    hovertemplate="%{x}<br>%{customdata[0]}<br><b>%{customdata[1]}</b> inde i forløb<extra>" + kat + "</extra>",
+                    customdata=list(zip(kat_df["Generisk_navn"].values, hover_tid)),
                 ))
             fig.update_layout(
                 height=80 + len(kategorier) * 60,
