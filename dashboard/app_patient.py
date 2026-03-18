@@ -16,7 +16,7 @@ os.chdir(REPO_ROOT)
 pm = ProjectManager()
 
 from astra.utils import get_base_df
-from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt
+from astra.data.filters import filter_vitals, filter_labs, filter_ita, filter_medicin, filter_procedures, filter_adt, filter_ews
 from astra.data.notes_features import build_gcs_from_notes, build_iss_from_notes, build_intubation_from_notes
 from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
 
@@ -196,6 +196,15 @@ def get_patient_vitals(pid: int):
     vitals_pid = filter_vitals(vitals_pid, ews=ews_pid if not ews_pid.empty else None)
     vitals_pid["VALUE"] = pd.to_numeric(vitals_pid["VALUE"], errors="coerce")
     return vitals_pid
+
+@st.cache_data(show_spinner="Filtrerer EWS for patient …")
+def get_patient_ews(pid: int):
+    ews_raw = load_ews()
+    ews_pid = ews_raw[ews_raw["PID"] == pid].copy()
+    if ews_pid.empty:
+        return ews_pid
+    ews_pid = filter_ews(ews_pid)
+    return ews_pid
 
 @st.cache_data(show_spinner="Filtrerer laboratoriesvar for patient …")
 def get_patient_labs(pid: int):
@@ -503,10 +512,18 @@ tab_vitals, tab_labs, tab_icu, tab_med, tab_proc, tab_adt, tab_trauma, tab_diag,
 
 with tab_vitals:
     vitals_pid = get_patient_vitals(int(selected_pid))
-    if vitals_pid.empty:
+    ews_pid = get_patient_ews(int(selected_pid))
+    # Combine vitals and EWS score into one view
+    combined_parts = []
+    if not vitals_pid.empty:
+        combined_parts.append(vitals_pid)
+    if not ews_pid.empty:
+        combined_parts.append(ews_pid)
+    if not combined_parts:
         st.info("Ingen vitale værdier for denne patient.")
     else:
-        vitals_filtered = tilfoej_timer(vitals_pid, "TIMESTAMP").dropna(subset=["VALUE"])
+        combined = pd.concat(combined_parts, ignore_index=True)
+        vitals_filtered = tilfoej_timer(combined, "TIMESTAMP").dropna(subset=["VALUE"])
         if vitals_filtered.empty:
             st.info(f"Ingen målinger indenfor de første {tidsvindue} timer.")
         else:
