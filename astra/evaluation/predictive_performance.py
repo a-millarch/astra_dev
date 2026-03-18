@@ -168,7 +168,6 @@ def plot_decision_curve(
     plt.tight_layout()
     return fig
 
-
 def plot_decision_curves_over_time(
     evaluator,
     censor_steps: List[int],
@@ -181,6 +180,8 @@ def plot_decision_curves_over_time(
 
     Follows the same pattern as plot_multiple_roc_pr_curves(): iterates
     censor_steps, extracts predictions, computes net benefit per timepoint.
+    Each timepoint gets its own "Treat All" baseline computed from
+    the prevalence in the active cohort at that step.
     """
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
               '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
@@ -189,12 +190,15 @@ def plot_decision_curves_over_time(
     fig, ax = plt.subplots(figsize=(9, 6))
     global_ymin = 0.0
     global_ymax = 0.0
-    baseline_prevalence = None
+
+    # Store per-timepoint treat-all data
+    treat_all_curves = []
 
     for i, censor_step in enumerate(censor_steps):
         dls = evaluator.create_censored_dataloaders_fast(censor_step)
         if dls is None:
             logger.warning(f"DCA: skipping step {censor_step}: dataloader creation failed")
+            treat_all_curves.append(None)
             continue
 
         preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
@@ -203,10 +207,11 @@ def plot_decision_curves_over_time(
 
         if len(set(ys)) < 2:
             logger.warning(f"DCA: skipping step {censor_step}: only one class")
+            treat_all_curves.append(None)
             continue
 
-        if baseline_prevalence is None:
-            baseline_prevalence = ys.mean()
+        # Per-timepoint prevalence
+        prevalence = ys.mean()
 
         nb_model, _, _ = compute_net_benefit(ys, y_preds, thresholds)
 
@@ -214,14 +219,28 @@ def plot_decision_curves_over_time(
         color = colors[i % len(colors)]
         ax.plot(thresholds, nb_model, color=color, linewidth=1.8, label=label)
 
-        global_ymin = min(global_ymin, nb_model.min())
+        # Compute and store per-timepoint treat-all
+        nb_treat_all = prevalence - (1.0 - prevalence) * thresholds / (1.0 - thresholds)
+        treat_all_curves.append((nb_treat_all, color, label, prevalence))
+
+        global_ymin = min(global_ymin, nb_model.min(), nb_treat_all.min())
         global_ymax = max(global_ymax, nb_model.max())
 
-    # Reference lines (shared)
-    if baseline_prevalence is not None:
-        nb_treat_all = baseline_prevalence - (1.0 - baseline_prevalence) * thresholds / (1.0 - thresholds)
-        ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
-                label='Treat All')
+    # Plot per-timepoint "Treat All" lines (thin, dashed, matching color)
+    first_treat_all = True
+    for curve_data in treat_all_curves:
+        if curve_data is None:
+            continue
+        nb_treat_all, color, label, prevalence = curve_data
+        legend_label = "Treat All" if first_treat_all else None
+        ax.plot(
+            thresholds, nb_treat_all,
+            color=color, linewidth=1.0, linestyle='--', alpha=0.4,
+            label=legend_label,
+        )
+        first_treat_all = False
+
+    # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
     ax.set_xlabel("Threshold Probability", fontsize=11)
@@ -233,13 +252,12 @@ def plot_decision_curves_over_time(
     ax.set_xlim(0, max_threshold)
 
     ymin = max(global_ymin, -0.05) - 0.01
-    ymax = max(global_ymax, baseline_prevalence or 0.05) * 1.1
+    ymax = max(global_ymax, 0.05) * 1.1
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
     plt.tight_layout()
     return fig
-
 
 def _plot_decision_curves_temporal(
     preds_all: np.ndarray,
@@ -254,6 +272,8 @@ def _plot_decision_curves_temporal(
     Plot decision curves at multiple timepoints for temporal models.
 
     Uses pre-computed predictions matrix instead of running inference per step.
+    Each timepoint gets its own "Treat All" baseline computed from
+    the prevalence in the active cohort at that step.
     """
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
               '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
@@ -262,9 +282,11 @@ def _plot_decision_curves_temporal(
     fig, ax = plt.subplots(figsize=(9, 6))
     global_ymin = 0.0
     global_ymax = 0.0
-    baseline_prevalence = None
 
     max_step = preds_all.shape[1] - 1
+
+    # Store per-timepoint prevalences for treat-all lines
+    treat_all_curves = []
 
     for i, censor_step in enumerate(censor_steps):
         # Use effective step (min of censor_step, trajectory length - 1)
@@ -275,6 +297,7 @@ def _plot_decision_curves_temporal(
         active_mask = traj_lengths > censor_step
         if active_mask.sum() < 10:
             logger.warning(f"DCA temporal: skipping step {censor_step}: too few active patients")
+            treat_all_curves.append(None)
             continue
 
         y_sub = y_true[active_mask]
@@ -282,10 +305,11 @@ def _plot_decision_curves_temporal(
 
         if len(set(y_sub)) < 2:
             logger.warning(f"DCA temporal: skipping step {censor_step}: only one class")
+            treat_all_curves.append(None)
             continue
 
-        if baseline_prevalence is None:
-            baseline_prevalence = y_true.mean()
+        # Per-timepoint prevalence
+        prevalence = y_sub.mean()
 
         nb_model, _, _ = compute_net_benefit(y_sub, preds_sub, thresholds)
 
@@ -293,14 +317,28 @@ def _plot_decision_curves_temporal(
         color = colors[i % len(colors)]
         ax.plot(thresholds, nb_model, color=color, linewidth=1.8, label=label)
 
-        global_ymin = min(global_ymin, nb_model.min())
+        # Compute and store per-timepoint treat-all
+        nb_treat_all = prevalence - (1.0 - prevalence) * thresholds / (1.0 - thresholds)
+        treat_all_curves.append((nb_treat_all, color, label, prevalence))
+
+        global_ymin = min(global_ymin, nb_model.min(), nb_treat_all.min())
         global_ymax = max(global_ymax, nb_model.max())
 
-    # Reference lines
-    if baseline_prevalence is not None:
-        nb_treat_all = baseline_prevalence - (1.0 - baseline_prevalence) * thresholds / (1.0 - thresholds)
-        ax.plot(thresholds, nb_treat_all, color='grey', linewidth=1.5, linestyle='--',
-                label='Treat All')
+    # Plot per-timepoint "Treat All" lines (thin, dashed, matching color)
+    first_treat_all = True
+    for curve_data in treat_all_curves:
+        if curve_data is None:
+            continue
+        nb_treat_all, color, label, prevalence = curve_data
+        legend_label = "Treat All" if first_treat_all else None
+        ax.plot(
+            thresholds, nb_treat_all,
+            color=color, linewidth=1.0, linestyle='--', alpha=0.4,
+            label=legend_label,
+        )
+        first_treat_all = False
+
+    # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
     ax.set_xlabel("Threshold Probability", fontsize=11)
@@ -312,7 +350,7 @@ def _plot_decision_curves_temporal(
     ax.set_xlim(0, max_threshold)
 
     ymin = max(global_ymin, -0.05) - 0.01
-    ymax = max(global_ymax, baseline_prevalence or 0.05) * 1.1
+    ymax = max(global_ymax, 0.05) * 1.1
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
