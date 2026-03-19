@@ -497,17 +497,28 @@ class TimeDependentEvaluator:
         y_preds = preds[:, 1].numpy()
         ys = targets.numpy()
 
-        if ys.sum() == 0 or ys.sum() == len(ys):
-            logger.warning(f"Skipping censor_step={censor_step}: only one class in targets")
-            return None
-
-        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
-        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
-
         time_min = step_to_time(censor_step)
         if time_min is None:
             logger.warning(f"Could not convert step {censor_step} to time")
             return None
+
+        if ys.sum() == 0 or ys.sum() == len(ys):
+            logger.debug(f"Single class at censor_step={censor_step}, metrics undefined")
+            return TimeMetricResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                auroc=float('nan'),
+                auroc_ci=(float('nan'), float('nan')),
+                auprc=float('nan'),
+                auprc_ci=(float('nan'), float('nan')),
+                n_samples=len(ys),
+                n_positive=int(ys.sum()),
+            )
+
+        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
+        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
 
         return TimeMetricResult(
             time_min=time_min,
@@ -666,15 +677,27 @@ class TemporalEvaluator:
 
         y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
 
-        if ys.sum() == 0 or ys.sum() == len(ys):
-            return None
-
-        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
-        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
-
         time_min = step_to_time(censor_step)
         if time_min is None:
             return None
+
+        if ys.sum() == 0 or ys.sum() == len(ys):
+            logger.debug(f"Single class at censor_step={censor_step}, metrics undefined")
+            return TimeMetricResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                auroc=float('nan'),
+                auroc_ci=(float('nan'), float('nan')),
+                auprc=float('nan'),
+                auprc_ci=(float('nan'), float('nan')),
+                n_samples=len(ys),
+                n_positive=int(ys.sum()),
+            )
+
+        auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
+        auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
 
         return TimeMetricResult(
             time_min=time_min,
@@ -841,7 +864,8 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
         ("AUROC", auroc_vals[mask_cut], auroc_lower[mask_cut], auroc_upper[mask_cut], 'o', "C0", "AUROC"),
         ("AUPRC", auprc_vals[mask_cut], auprc_lower[mask_cut], auprc_upper[mask_cut], 's', "C1", "AUPRC")
     ]:
-        x = times_h[mask_cut]
+        valid = ~np.isnan(vals)
+        x, vals, lower, upper = times_h[mask_cut][valid], vals[valid], lower[valid], upper[valid]
         if len(x) > 0:
             if x[-1] < cut_hours:
                 x_ext = np.append(x, cut_hours)
@@ -868,7 +892,8 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
         ("AUROC", auroc_vals, auroc_lower, auroc_upper, 'o', "C0", "AUROC"),
         ("AUPRC", auprc_vals, auprc_lower, auprc_upper, 's', "C1", "AUPRC")
     ]:
-        x = times_d
+        valid = ~np.isnan(vals)
+        x, vals, lower, upper = times_d[valid], vals[valid], lower[valid], upper[valid]
         if len(x) > 0:
             if x[-1] < max_days:
                 x_ext = np.append(x, max_days)
@@ -929,9 +954,10 @@ def plot_time_metrics_comparison(
             (auroc_vals, auroc_lower, auroc_upper, "C0", "AUROC"),
             (auprc_vals, auprc_lower, auprc_upper, "C1", "AUPRC"),
         ]:
-            # Hours panel
-            x = times_h[mask_cut]
-            v, lo, hi = vals[mask_cut], lower[mask_cut], upper[mask_cut]
+            # Hours panel — filter NaN metrics
+            valid_h = mask_cut & ~np.isnan(vals)
+            x = times_h[valid_h]
+            v, lo, hi = vals[valid_h], lower[valid_h], upper[valid_h]
             if len(x) > 0:
                 if x[-1] < cut_hours:
                     x = np.append(x, cut_hours)
@@ -942,9 +968,10 @@ def plot_time_metrics_comparison(
                          label=f"{metric_name} ({label_prefix})", markersize=3)
                 ax1.fill_between(x, lo, hi, color=color, alpha=0.1)
 
-            # Days panel
-            x = times_d
-            v, lo, hi = vals, lower, upper
+            # Days panel — filter NaN metrics
+            valid_d = ~np.isnan(vals)
+            x = times_d[valid_d]
+            v, lo, hi = vals[valid_d], lower[valid_d], upper[valid_d]
             if len(x) > 0:
                 if x[-1] < max_days:
                     x = np.append(x, max_days)
