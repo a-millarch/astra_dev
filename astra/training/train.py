@@ -14,14 +14,11 @@ Usage:
     # Finetune with early prediction hardening
     python -m astra.training.train --finetune --early-prediction --eval
 
-    # Full pipeline with HP sweep: pretrain → HPO → retrain on full trainval → eval
-    python -m astra.training.train --pretrain --sweep-train --finetune --eval
+    # Joint HP sweep → pretrain best arch → retrain full trainval → eval
+    python -m astra.training.train --sweep --finetune --eval
 
-    # Architecture sweep (Stage 1)
-    python -m astra.training.train --sweep-arch --n-arch-trials 30
-
-    # Training HP sweep only (Stage 2, without final retrain)
-    python -m astra.training.train --sweep-train --no-finetune --n-train-trials 50
+    # Sweep only (no final retrain/eval)
+    python -m astra.training.train --sweep --no-finetune --no-eval --n-trials 80
 
     # Quick test (no pretraining, no eval)
     python -m astra.training.train --finetune --no-use-pretrained --no-eval
@@ -40,11 +37,7 @@ from astra.models.hybrid.mlm import MLMConfig
 from astra.evaluation.predictive_performance import run_eval
 
 from astra.training.finetune import FinetuneConfig, run_finetune_v2
-from astra.training.sweep import (
-    run_arch_sweep,
-    run_training_sweep,
-    report_sweep_results,
-)
+from astra.training.sweep import run_sweep, report_sweep_results
 
 
 def parse_args():
@@ -60,15 +53,11 @@ def parse_args():
     parser.add_argument("--eval", action=argparse.BooleanOptionalAction, default=True,
                         help="Run evaluation")
 
-    # Sweep stages
-    parser.add_argument("--sweep-arch", action="store_true", default=False,
-                        help="Stage 1: Architecture search (no pretraining)")
-    parser.add_argument("--sweep-train", action="store_true", default=False,
-                        help="Stage 2: Training HP search (with pretraining)")
-    parser.add_argument("--n-arch-trials", type=int, default=30,
-                        help="Number of architecture search trials")
-    parser.add_argument("--n-train-trials", type=int, default=50,
-                        help="Number of training HP search trials")
+    # Sweep
+    parser.add_argument("--sweep", action="store_true", default=False,
+                        help="Joint architecture + training HP sweep")
+    parser.add_argument("--n-trials", type=int, default=80,
+                        help="Number of sweep trials")
     parser.add_argument("--study-storage", type=str, default=None,
                         help="Optuna storage URL (e.g., sqlite:///optuna.db)")
 
@@ -142,69 +131,37 @@ def main():
     model_name = cfg["model_name"]
 
     # ========================================================================
-    # Stage 0: Pretraining (if no arch sweep — otherwise pretrain after sweep)
+    # Pretraining (standalone, when no sweep)
     # ========================================================================
-    if args.pretrain and not args.sweep_arch:
+    if args.pretrain and not args.sweep:
         pretrain_cfg = _get_pretrain_cfg()
         logger.info("=== Running Pretraining ===")
         pretrain_cfg, _, _ = run_pretrain(data, pretrain_cfg=pretrain_cfg, device="cuda")
 
     # ========================================================================
-    # Stage 1: Architecture sweep (optional)
-    # ========================================================================
-    if args.sweep_arch:
-        logger.info("=== Running Architecture Sweep (Stage 1) ===")
-        arch_result = run_arch_sweep(
-            data, cfg,
-            n_trials=args.n_arch_trials,
-            device="cuda",
-            storage=args.study_storage,
-        )
-        report_sweep_results(arch_result["study"])
-
-        # Update cfg with best architecture
-        best_arch = arch_result["best_params"]
-        cfg["model"]["d_model"] = best_arch["d_model"]
-        cfg["model"]["n_layers"] = best_arch["n_layers"]
-        cfg["model"]["n_heads"] = best_arch["n_heads"]
-        cfg["model"]["fc_mults_1"] = best_arch["fc_mults_1"]
-        cfg["model"]["fc_mults_2"] = best_arch["fc_mults_2"]
-        cfg["model"]["fc_dropout"] = best_arch["fc_dropout"]
-        cfg["model"]["res_dropout"] = best_arch["res_dropout"]
-
-        logger.info(f"Updated model config with best architecture: {best_arch}")
-
-        # Pretrain with the best architecture
-        if args.pretrain:
-            pretrain_cfg = _get_pretrain_cfg()
-            logger.info("=== Pretraining with best architecture ===")
-            pretrain_cfg, _, _ = run_pretrain(data, pretrain_cfg=pretrain_cfg, device="cuda")
-
-    # ========================================================================
-    # Stage 2: Training HP sweep (optional)
+    # Joint HP sweep (architecture + training HPs, no pretraining during sweep)
     # ========================================================================
     best_finetune_cfg = None
     sweep_retrained = False
-    if args.sweep_train:
+    if args.sweep:
         pretrain_cfg = _get_pretrain_cfg()
-        logger.info("=== Running Training HP Sweep (Stage 2) ===")
+        logger.info("=== Running Joint HP Sweep ===")
 
-        # When sweep + finetune + skip-valid: retrain on full trainval inside
-        # the sweep using the best trial's actual epoch counts
+        # When sweep + finetune + skip-valid: pretrain best arch + retrain
+        # on full trainval inside the sweep
         do_retrain = args.finetune and args.skip_valid
-        train_result = run_training_sweep(
+        sweep_result = run_sweep(
             data, cfg,
-            n_trials=args.n_train_trials,
+            n_trials=args.n_trials,
             device="cuda",
-            pretrain_cfg=pretrain_cfg,
-            pretrain_checkpoint_dir=pretrain_cfg.checkpoint_dir,
             storage=args.study_storage,
             retrain_full=do_retrain,
             model_name=model_name if do_retrain else None,
+            pretrain_cfg=pretrain_cfg if do_retrain else None,
         )
-        report_sweep_results(train_result["study"])
-        best_finetune_cfg = train_result["best_finetune_cfg"]
-        sweep_retrained = do_retrain and train_result.get("retrain_result") is not None
+        report_sweep_results(sweep_result["study"])
+        best_finetune_cfg = sweep_result["best_finetune_cfg"]
+        sweep_retrained = do_retrain and sweep_result.get("retrain_result") is not None
 
     # ========================================================================
     # Finetuning

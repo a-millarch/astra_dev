@@ -23,9 +23,7 @@ make train_v2        # full pipeline: pretrain → 4-phase finetune → comprehe
 make finetune_v2     # finetune only (uses existing pretrained checkpoint)
 make pretrain        # pretraining only (MLM self-supervised)
 make eval            # evaluation only on existing models
-make sweep           # two-stage HP sweep (architecture + training)
-make sweep_arch      # architecture sweep only (30 trials)
-make sweep_train     # training HP sweep only (50 trials)
+make sweep           # joint HP sweep (architecture + training)
 ```
 
 ### Direct CLI
@@ -42,11 +40,11 @@ python -m astra.training.train --finetune --no-skip-valid --eval
 # Finetune with early prediction hardening (Phase 4)
 python -m astra.training.train --finetune --early-prediction --eval
 
-# HP sweep: architecture then training
-python -m astra.training.train --sweep-arch --sweep-train --eval
+# Joint HP sweep → pretrain best arch → retrain full trainval → eval
+python -m astra.training.train --sweep --finetune --eval
 ```
 
-Key flags: `--pretrain`, `--finetune/--no-finetune`, `--eval/--no-eval`, `--use-pretrained/--no-use-pretrained`, `--skip-valid/--no-skip-valid` (default: skip), `--early-prediction`, `--comprehensive-eval`, `--multicurve`, `--sweep-arch`, `--sweep-train`, `--validate-temporal`
+Key flags: `--pretrain`, `--finetune/--no-finetune`, `--eval/--no-eval`, `--use-pretrained/--no-use-pretrained`, `--skip-valid/--no-skip-valid` (default: skip), `--early-prediction`, `--comprehensive-eval`, `--multicurve`, `--sweep`, `--n-trials`, `--validate-temporal`
 
 Note: `--skip-valid` (default) trains on full trainval without validation. `--no-skip-valid` creates an 80/20 split with early stopping.
 
@@ -103,7 +101,7 @@ Batch format: `((x_ts, (x_cat, x_cont), x_ts_cat), y)` where `x_ts` shape is `[b
   - Phase 4: Optional early prediction hardening (progressive time masking + weighted loss for sparse samples)
   - Early stopping resets patience between phases but preserves globally best model state
 - **`param_groups.py`** — Layer group extraction (embeddings → transformer pairs → head), discriminative LR computation, selective freezing (`freeze_to()`, `unfreeze_from()`, `unfreeze_all()`).
-- **`sweep.py`** — Two-stage Optuna HP search: Stage 1 architecture search (d_model, n_layers, n_heads, dropout) + Stage 2 training HP search (LR, weight_decay, label_smoothing, phase epochs).
+- **`sweep.py`** — Joint Optuna HP search: architecture (d_model, n_layers, n_heads, dropout, head_pool) + training HPs (LR, weight_decay, label_smoothing, phase epochs) in a single study. Sweep trials use random init (no pretraining); best config is pretrained + retrained on full trainval.
 - **`scheduler.py`** — Cosine warmup LR scheduler (linear warmup then cosine annealing).
 - **`utils.py`** — `EarlyStopping`, `MetricTracker`, `compute_auroc()`, checkpoint management.
 

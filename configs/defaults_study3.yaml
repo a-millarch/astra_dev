@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '17032026_study3'
+model_name: '19032026_study3'
 
 target: deceased_90d
 
@@ -322,7 +322,7 @@ bin_freq_include:
   - '4h'
   - '12h'
   - '1D'
-  #- '7D'
+  - '7D'
   #- '30D'
 
 agg_func: #also for datasets, split it up
@@ -391,6 +391,7 @@ drop_features:
   IndUd:
     - nan
   ADTHaendelser:
+    - AMB
     - nan
   EWS:
     - nan
@@ -402,7 +403,8 @@ drop_features:
 
 holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
-holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
+holdout_split_date: '2023-05-30'  # Temporal split cutoff: train <= date < test
+
 seed: 2024
 
 Medicin: 

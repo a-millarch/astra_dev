@@ -60,12 +60,8 @@ finetune:
 eval:
 	python $(PROJECT_NAME)/training/train.py --eval  --multicurve --comprehensive-eval --active-only
 
-sweep_arch:
-	python $(PROJECT_NAME)/training/train.py --sweep-arch --n-arch-trials 30
-sweep_train:
-	python $(PROJECT_NAME)/training/train.py --sweep-train --n-train-trials 50 --eval
 sweep:
-	python $(PROJECT_NAME)/training/train.py --sweep-arch --sweep-train --pretrain --finetune --eval --comprehensive-eval
+	python $(PROJECT_NAME)/training/train.py --sweep --finetune --eval --comprehensive-eval
 
 ## v2: Finetune with transfer learning (pretrain + 4-phase finetune + eval)
 train_v2:
@@ -75,17 +71,9 @@ train_v2:
 finetune_v2:
 	python -m $(PROJECT_NAME).training.train --finetune --eval --comprehensive-eval
 
-## v2: Two-stage HP sweep (architecture + training)
-sweep:
-	python -m $(PROJECT_NAME).training.train --sweep-arch --sweep-train --eval --comprehensive-eval
-
-## v2: Architecture sweep only
-sweep_arch:
-	python -m $(PROJECT_NAME).training.train --sweep-arch --n-arch-trials 30
-
-## v2: Training HP sweep only (requires pretrained checkpoint)
-sweep_train:
-	python -m $(PROJECT_NAME).training.train --sweep-train --n-train-trials 50 --eval
+## Joint HP sweep (architecture + training) → pretrain best → retrain full trainval
+sweep_v2:
+	python -m $(PROJECT_NAME).training.train --sweep --finetune --eval --comprehensive-eval
 
 ## Train EBM models at all time intervals
 ebm_models:

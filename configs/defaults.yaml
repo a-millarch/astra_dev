@@ -242,34 +242,30 @@ finetune:
     early_weight_factor: 2.0
 
 sweep:
-    # Stage 1: Architecture search
-    arch:
-        n_trials: 30
-        search_space:
-            d_model: [32, 64, 128]
-            n_layers: [2, 4, 6, 8]
-            n_heads: [4, 8]
-            fc_mults_1: [0.1, 0.5]
-            fc_mults_2: [0.05, 0.3]
-            fc_dropout: [0.1, 0.9]
-            res_dropout: [0.0, 0.4]
-            head_pool: [flatten, mean_cat]
-
-    # Stage 2: Training HP search
-    training:
-        n_trials: 50
-        search_space:
-            finetune_lr: [1.0e-5, 1.0e-3]   # log scale
-            weight_decay: [1.0e-4, 1.0e-1]   # log scale
-            label_smoothing: [0.0, 0.2]
-            lr_decay_factor: [0.01, 0.5]     # log scale
-            phase1_epochs: [2, 8]
-            phase2_epochs: [5, 20]
-            phase3_epochs: [3, 15]
-            phase4_epochs: [0, 10]           # 0 = skip early prediction
-            masking_prob: [0.3, 0.7]
-            early_weight: [1.0, 3.0]
-            pos_weight_factor: [0.3, 1.0]   # log scale
+    # Joint architecture + training HP search (no pretraining during sweep)
+    n_trials: 80
+    search_space:
+        # Architecture
+        d_model: [32, 64, 128]
+        n_layers: [2, 4, 6, 8]
+        n_heads: [4, 8]
+        fc_mults_1: [0.1, 0.5]
+        fc_mults_2: [0.05, 0.3]
+        fc_dropout: [0.1, 0.9]
+        res_dropout: [0.0, 0.4]
+        head_pool: [flatten, mean_cat]
+        # Training HPs
+        finetune_lr: [1.0e-5, 1.0e-3]       # log scale
+        weight_decay: [1.0e-4, 1.0e-1]       # log scale
+        label_smoothing: [0.0, 0.2]
+        lr_decay_factor: [0.01, 0.5]         # log scale
+        phase1_epochs: [2, 8]
+        phase2_epochs: [5, 20]
+        phase3_epochs: [3, 15]
+        phase4_epochs: [0, 10]               # 0 = skip early prediction
+        masking_prob: [0.3, 0.7]
+        early_weight: [1.0, 3.0]
+        pos_weight_factor: [0.3, 1.0]        # log scale
 
 evaluation:
     max_f_beta: 10
