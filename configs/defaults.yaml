@@ -6,12 +6,12 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '16032026_astra'
+model_name: '19032026_study3_temphead'
 
-target: deceased_30d
+target: deceased_90d
 
 # Pre-hospital (PPJ) data integration
-prehospital: false                     # Set true to enable pre-hospital data pipeline
+prehospital: true                     # Set true to enable pre-hospital data pipeline
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
@@ -78,7 +78,7 @@ concepts:
   - VitaleVaerdier
   - Labsvar
   - Medicin
-  - Procedurer
+  #- Procedurer
   - ADTHaendelser
   - EWS
   - ISS
@@ -88,7 +88,7 @@ concepts:
   
 
 dataset:
-  exclusion: traumatext  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  exclusion: study3  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
   overwrite: True
   max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
@@ -390,6 +390,7 @@ drop_features:
   IndUd:
     - nan
   ADTHaendelser:
+    - AMB
     - nan
   EWS:
     - nan
@@ -401,7 +402,7 @@ drop_features:
 
 holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
-holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
+holdout_split_date: '2023-05-30'  # Temporal split cutoff: train <= date < test
 seed: 2024
 
 Medicin: 

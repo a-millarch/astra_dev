@@ -184,9 +184,14 @@ def set_dropout_rates(
         res_dropout: New dropout rate for transformer residual connections.
     """
     if fc_dropout is not None:
-        # Head MLP dropout layers
-        if hasattr(model, "head"):
+        # Head MLP dropout layers (None when temporal head replaces standard head)
+        if hasattr(model, "head") and model.head is not None:
             for module in model.head.modules():
+                if isinstance(module, nn.Dropout):
+                    module.p = fc_dropout
+        # Temporal prediction head dropout (when temporal_head is enabled)
+        if hasattr(model, "temporal_pred_head") and model.temporal_pred_head is not None:
+            for module in model.temporal_pred_head.modules():
                 if isinstance(module, nn.Dropout):
                     module.p = fc_dropout
 
