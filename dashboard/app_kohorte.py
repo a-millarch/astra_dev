@@ -1499,7 +1499,7 @@ with tabs[8]:
                 top_n = st.slider("Antal diagnoser", 10, 50, 20, key="diag_topn")
             
             # Find tekst-kolonne og lav label med navn + kode
-            text_col = next((c for c in ["Diagnosetekst", "DiagnoseNavn", "Navn", "Tekst", "Beskrivelse"] if c in diag.columns), None)
+            text_col = next((c for c in ["Diagnose", "Diagnosetekst", "DiagnoseNavn", "Navn", "Tekst", "Beskrivelse"] if c in diag.columns and c != diag_col), None)
             if text_col:
                 # Map kode → første forekommende tekst
                 code_to_text = diag.dropna(subset=[text_col]).drop_duplicates(subset=[diag_col]).set_index(diag_col)[text_col].to_dict()
