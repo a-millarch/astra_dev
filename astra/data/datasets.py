@@ -184,7 +184,11 @@ def apply_exclusion_criteria(
     if pid_file:
         pid_path = PROJECT_ROOT / pid_file
         if pid_path.exists():
-            allowed_pids = pd.read_csv(pid_path).iloc[:, 0]
+            pid_df = pd.read_csv(pid_path)
+            if "PID" in pid_df.columns:
+                allowed_pids = pid_df["PID"]
+            else:
+                allowed_pids = pid_df.iloc[:, 0]
             m = base_df["PID"].isin(allowed_pids)
             excluded = (~m & mask).sum()
             if excluded:
