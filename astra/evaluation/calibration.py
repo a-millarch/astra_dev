@@ -94,7 +94,7 @@ def run_eval_with_calibration(
     # ============================================================================
     # TIME-DEPENDENT EVALUATION (same as before)
     # ============================================================================
-    evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
+    evaluator = TimeDependentEvaluator(data, model, cfg, device=device, active_only=True)
     
     if multicurve:
         logger.info("Creating multiple ROC/PR curves at key timepoints...")

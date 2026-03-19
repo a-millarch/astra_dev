@@ -34,6 +34,54 @@ logger = logging.getLogger(__name__)
 SWEEP_RESULTS_DIR = Path("configs/sweep_results")
 
 
+def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
+    """
+    Convert best trial params into model: and finetune: sections
+    that match defaults.yaml structure for easy copy-paste.
+    """
+    model_section = {
+        "d_model": best["d_model"],
+        "n_layers": best["n_layers"],
+        "n_heads": best["n_heads"],
+        "fc_mults_1": best["fc_mults_1"],
+        "fc_mults_2": best["fc_mults_2"],
+        "fc_dropout": best["fc_dropout"],
+        "res_dropout": best["res_dropout"],
+        "head_pool": best["head_pool"],
+    }
+
+    finetune_section = {
+        "phase1_epochs": best["phase1_epochs"],
+        "phase1_lr": best["phase1_lr"],
+        "phase2_epochs": best["phase2_epochs"],
+        "phase2_lr": best["phase2_lr"],
+        "phase3_epochs": best["phase3_epochs"],
+        "phase3_lr": best["phase3_lr"],
+        "phase4_epochs": best["phase4_epochs"],
+        "phase4_lr": best["phase4_lr"],
+        "enable_early_prediction": best["phase4_epochs"] > 0,
+        "masking_prob": best["masking_prob"],
+        "early_weight": best["early_weight"],
+        "lr_decay_factor": best["lr_decay_factor"],
+        "weight_decay": best["weight_decay"],
+        "label_smoothing": best["label_smoothing"],
+        "pos_weight_factor": best["pos_weight_factor"],
+    }
+
+    # Override epoch counts with actual (early-stopped) values if available
+    if best_attrs:
+        for key, attr in [
+            ("phase1_epochs", "phase1_actual_epochs"),
+            ("phase2_epochs", "phase2_actual_epochs"),
+            ("phase3_epochs", "phase3_actual_epochs"),
+            ("phase4_epochs", "phase4_actual_epochs"),
+        ]:
+            if attr in best_attrs:
+                finetune_section[key] = best_attrs[attr]
+
+    return {"model": model_section, "finetune": finetune_section}
+
+
 def _save_best_callback(study_name: str, save_path: Path):
     """Return an Optuna callback that saves best params to YAML after each trial."""
 
@@ -44,18 +92,20 @@ def _save_best_callback(study_name: str, save_path: Path):
             return  # Not a new best
 
         save_path.parent.mkdir(parents=True, exist_ok=True)
+        config_sections = _best_to_config_sections(
+            study.best_params, study.best_trial.user_attrs)
         result = {
             "study_name": study_name,
             "best_trial": study.best_trial.number,
             "best_value": study.best_value,
-            "best_params": study.best_params,
             "completed_trials": len([
                 t for t in study.trials
                 if t.state == optuna.trial.TrialState.COMPLETE
             ]),
+            **config_sections,
         }
         with open(save_path, "w") as f:
-            yaml.dump(result, f, default_flow_style=False)
+            yaml.dump(result, f, default_flow_style=False, sort_keys=False)
         logger.info(f"Saved best params (trial {study.best_trial.number}, "
                      f"score {study.best_value:.4f}) → {save_path}")
 
@@ -84,8 +134,8 @@ def joint_objective(
     d_model = trial.suggest_categorical("d_model", [32, 64, 128])
     n_layers = trial.suggest_categorical("n_layers", [2, 4, 6, 8])
     n_heads = trial.suggest_categorical("n_heads", [4, 8])
-    fc_mults_1 = trial.suggest_float("fc_mults_1", 0.1, 0.5)
-    fc_mults_2 = trial.suggest_float("fc_mults_2", 0.05, 0.3)
+    fc_mults_1 = trial.suggest_float("fc_mults_1", 0.1, 0.5, step=0.005)
+    fc_mults_2 = trial.suggest_float("fc_mults_2", 0.05, 0.3, step=0.005)
     fc_dropout = trial.suggest_float("fc_dropout", 0.1, 0.9)
     res_dropout = trial.suggest_float("res_dropout", 0.0, 0.4)
     head_pool = trial.suggest_categorical("head_pool", ["flatten", "mean_cat"])
@@ -96,8 +146,12 @@ def joint_objective(
         while d_model % n_heads != 0:
             n_heads -= 1
 
-    # --- Training parameters ---
-    finetune_lr = trial.suggest_float("finetune_lr", 1e-5, 1e-3, log=True)
+    # --- Training parameters (per-phase LRs swept independently) ---
+    phase1_lr = trial.suggest_float("phase1_lr", 1e-4, 1e-2, log=True)
+    phase2_lr = trial.suggest_float("phase2_lr", 5e-5, 3e-3, log=True)
+    phase3_lr = trial.suggest_float("phase3_lr", 1e-5, 1e-3, log=True)
+    phase4_lr = trial.suggest_float("phase4_lr", 5e-6, 5e-4, log=True)
+
     weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
     label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
     lr_decay_factor = trial.suggest_float("lr_decay_factor", 0.01, 0.5, log=True)
@@ -133,14 +187,14 @@ def joint_objective(
 
         finetune_cfg = FinetuneConfig(
             phase1_epochs=phase1_epochs,
-            phase1_lr=finetune_lr * 10,  # Head LR is typically higher
+            phase1_lr=phase1_lr,
             phase2_epochs=phase2_epochs,
-            phase2_lr=finetune_lr * 3,
+            phase2_lr=phase2_lr,
             phase3_epochs=phase3_epochs,
-            phase3_lr=finetune_lr,
+            phase3_lr=phase3_lr,
             enable_early_prediction=phase4_epochs > 0,
             phase4_epochs=phase4_epochs,
-            phase4_lr=finetune_lr * 0.5,
+            phase4_lr=phase4_lr,
             masking_prob=masking_prob,
             early_weight=early_weight,
             lr_decay_factor=lr_decay_factor,
@@ -180,6 +234,31 @@ def joint_objective(
 
     clear_mem()
     return result["best_score"]
+
+
+def _build_best_finetune_cfg(best: dict, pretrain_checkpoint_dir: str = None) -> FinetuneConfig:
+    """Reconstruct FinetuneConfig from best trial params."""
+    return FinetuneConfig(
+        phase1_epochs=best["phase1_epochs"],
+        phase1_lr=best["phase1_lr"],
+        phase2_epochs=best["phase2_epochs"],
+        phase2_lr=best["phase2_lr"],
+        phase3_epochs=best["phase3_epochs"],
+        phase3_lr=best["phase3_lr"],
+        enable_early_prediction=best["phase4_epochs"] > 0,
+        phase4_epochs=best["phase4_epochs"],
+        phase4_lr=best["phase4_lr"],
+        masking_prob=best["masking_prob"],
+        early_weight=best["early_weight"],
+        lr_decay_factor=best["lr_decay_factor"],
+        weight_decay=best["weight_decay"],
+        label_smoothing=best["label_smoothing"],
+        pos_weight_factor=best["pos_weight_factor"],
+        fc_dropout=best["fc_dropout"],
+        res_dropout=best["res_dropout"],
+        use_pretrained=True,  # Final retrain uses pretrained weights
+        pretrain_checkpoint_dir=pretrain_checkpoint_dir,
+    )
 
 
 def run_sweep(
@@ -255,27 +334,7 @@ def run_sweep(
     cfg_dict["model"]["head_pool"] = best["head_pool"]
     logger.info(f"Updated global model config with best architecture")
 
-    # Reconstruct best FinetuneConfig
-    best_cfg = FinetuneConfig(
-        phase1_epochs=best["phase1_epochs"],
-        phase1_lr=best["finetune_lr"] * 10,
-        phase2_epochs=best["phase2_epochs"],
-        phase2_lr=best["finetune_lr"] * 3,
-        phase3_epochs=best["phase3_epochs"],
-        phase3_lr=best["finetune_lr"],
-        enable_early_prediction=best["phase4_epochs"] > 0,
-        phase4_epochs=best["phase4_epochs"],
-        phase4_lr=best["finetune_lr"] * 0.5,
-        masking_prob=best["masking_prob"],
-        early_weight=best["early_weight"],
-        lr_decay_factor=best["lr_decay_factor"],
-        weight_decay=best["weight_decay"],
-        label_smoothing=best["label_smoothing"],
-        pos_weight_factor=best["pos_weight_factor"],
-        fc_dropout=best["fc_dropout"],
-        res_dropout=best["res_dropout"],
-        use_pretrained=True,  # Final retrain uses pretrained weights
-    )
+    best_cfg = _build_best_finetune_cfg(best)
 
     retrain_result = None
     if retrain_full:
@@ -319,6 +378,24 @@ def run_sweep(
             trial=None,
         )
         logger.info("Full trainval retrain complete")
+
+    # Save final config-ready YAML (with actual epoch counts if retrained)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    best_attrs = study.best_trial.user_attrs if retrain_full else {}
+    config_sections = _best_to_config_sections(best, best_attrs)
+    final_result = {
+        "study_name": study_name,
+        "best_trial": study.best_trial.number,
+        "best_value": study.best_value,
+        "completed_trials": len([
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]),
+        **config_sections,
+    }
+    with open(save_path, "w") as f:
+        yaml.dump(final_result, f, default_flow_style=False, sort_keys=False)
+    logger.info(f"Final sweep results saved → {save_path}")
 
     return {
         "best_params": best,

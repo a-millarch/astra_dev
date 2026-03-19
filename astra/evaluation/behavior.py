@@ -2896,8 +2896,14 @@ class TemporalSHAPAnalyzer:
         sample_cat_emb = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
 
         # Build traj_lengths tensor for wrapper (single sample -> [1])
+        # Clamp to censor_step+1 so the padding mask excludes censored positions
+        # from attention and mean pooling (matches training behavior with variable-length sequences)
         if traj_length is not None:
-            wrapper_traj = traj_length.unsqueeze(0) if traj_length.dim() == 0 else traj_length
+            tl = traj_length
+            if censor_step is not None:
+                effective = min(int(tl), censor_step + 1)
+                tl = torch.tensor(effective, dtype=traj_length.dtype, device=traj_length.device)
+            wrapper_traj = tl.unsqueeze(0) if tl.dim() == 0 else tl
         else:
             wrapper_traj = None
 
@@ -2937,9 +2943,11 @@ class TemporalSHAPAnalyzer:
 
         cont_shap = shap_values[idx][0] if bg['cont'].shape[1] > 0 else None
 
-        # Zero SHAP values at padding positions
+        # Zero SHAP values beyond effective trajectory (padding + censored positions)
         if traj_length is not None:
             tl = int(traj_length)
+            if censor_step is not None:
+                tl = min(tl, censor_step + 1)
             ts_shap[:, tl:] = 0.0
             if cat_ts_shap_per_cat is not None:
                 cat_ts_shap_per_cat[:, tl:] = 0.0

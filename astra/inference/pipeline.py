@@ -411,8 +411,10 @@ class InferenceSession:
             bg_ts_cat = self._bg['ts_cat']
 
         # Wrapper with causal mask + temporal step targeting
+        # Clamp traj_length to censor_step+1 so padding mask excludes censored positions
         has_cat_ts = self.model.n_ts_cat > 0
-        traj_lengths_t = torch.tensor([traj_len], dtype=torch.long, device=self.device)
+        effective_traj = min(traj_len, censor_step + 1) if censor_step is not None else traj_len
+        traj_lengths_t = torch.tensor([effective_traj], dtype=torch.long, device=self.device)
         wrapped = ModelWrapperWithRawCatTS(self.model, has_cat_ts=has_cat_ts,
                                            eval_timestep=target_step if target_step is not None else -1,
                                            traj_lengths=traj_lengths_t)
@@ -470,6 +472,12 @@ class InferenceSession:
         if self._bg['cont'].shape[1] > 0:
             cont_shap_raw = shap_values[idx][0]  # [n_cont_features]
             idx += 1
+
+        # Zero SHAP values beyond effective trajectory (padding + censored positions)
+        if effective_traj < ts_shap_raw.shape[-1]:
+            ts_shap_raw[:, effective_traj:] = 0.0
+            if cat_ts_shap_raw is not None:
+                cat_ts_shap_raw[:, effective_traj:] = 0.0
 
         # Map to named features
         channel_names = self.bundle['ts_channel_names']
