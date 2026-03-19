@@ -19,7 +19,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from astra.utils import get_base_df
+from astra.utils import get_base_df, get_cfg
 from astra.data.filters import (
     filter_vitals, filter_labs, filter_ita, 
     filter_medicin, filter_procedures, filter_adt
@@ -139,7 +139,21 @@ def load_holdout_pids():
                     return set(pids)
             except Exception:
                 continue
-    
+
+    # Auto-generate from data pipeline as last resort
+    try:
+        from astra.data.caching import prepare_data_and_dls_cached
+        cfg = get_cfg()
+        data = prepare_data_and_dls_cached(cfg)
+        holdout_pids = data["holdout"].base["PID"].unique()
+        # Save for future use
+        save_path = os.path.join(REPO_ROOT, "data/interim/holdout_pids.csv")
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        pd.DataFrame({"PID": holdout_pids}).to_csv(save_path, index=False)
+        return set(holdout_pids)
+    except Exception:
+        pass
+
     return None
 
 @st.cache_resource(show_spinner=False)
