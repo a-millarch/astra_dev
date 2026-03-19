@@ -414,7 +414,7 @@ with tabs[0]:
     st.markdown("---")
     
     # Demographics row
-    col_left, col_right = st.columns(2)
+    col_left, col_mid, col_right = st.columns(3)
     
     with col_left:
         st.markdown("### Kønsfordeling")
@@ -433,11 +433,11 @@ with tabs[0]:
         )
         st.plotly_chart(fig_sex, use_container_width=True)
     
-    with col_right:
+    with col_mid:
         st.markdown("### Aldersfordeling")
         mean_age = base["age_years"].mean()
         median_age = base["age_years"].median()
-        st.markdown(f'<span style="color: #e15759; font-weight: 600;">Gennemsnit: {mean_age:.1f} aar</span> | Median: {median_age:.1f} år', unsafe_allow_html=True)
+        st.markdown(f'<span style="color: #e15759; font-weight: 600;">Gennemsnit: {mean_age:.1f} år</span> | Median: {median_age:.1f} år', unsafe_allow_html=True)
         
         fig_age = px.histogram(
             base.dropna(subset=["age_years"]),
@@ -451,13 +451,48 @@ with tabs[0]:
         fig_age.update_layout(
             margin=dict(l=20, r=20, t=20, b=40),
             height=250,
-            xaxis_title="Alder (aar)",
+            xaxis_title="Alder (år)",
             yaxis_title="Antal",
             bargap=0.1
         )
         st.plotly_chart(fig_age, use_container_width=True)
     
+    with col_right:
+        st.markdown("### Elixhauser Comorbidity Index")
+        
+         # Check if ASMT_ELIX column exists
+        if "ASMT_ELIX" in base.columns:
+            elix_data = base["ASMT_ELIX"].dropna()
+            
+            if not elix_data.empty:
+                mean_elix = elix_data.mean()
+                median_elix = elix_data.median()
+                st.markdown(f'<span style="color: #59a14f; font-weight: 600;">Gennemsnit: {mean_elix:.1f}</span> | Median: {median_elix:.0f}', unsafe_allow_html=True)
+                
+                fig_elix = px.histogram(
+                    base.dropna(subset=["ASMT_ELIX"]),
+                    x="ASMT_ELIX",
+                    nbins=20,
+                    color_discrete_sequence=["#59a14f"]
+                )
+                fig_elix.add_vline(x=mean_elix, line_dash="dash", line_color="#e15759",
+                                  annotation_text=f"Gns: {mean_elix:.1f}",
+                                  annotation_font_color="#e15759")
+                fig_elix.update_layout(
+                    margin=dict(l=20, r=20, t=20, b=40),
+                    height=250,
+                    xaxis_title="Elixhauser Score",
+                    yaxis_title="Antal",
+                    bargap=0.1
+                )
+                st.plotly_chart(fig_elix, use_container_width=True)
+            else:
+                st.info("Ingen Elixhauser-data tilgængelig.")
+        else:
+            st.info("ASMT_ELIX kolonne ikke fundet i data.")
+    
     st.markdown("---")
+    
     
     # Visitation type
     st.markdown("### Visitationstype")
@@ -1471,7 +1506,7 @@ with tabs[8]:
     if diag.empty:
         st.info("Ingen diagnoser for denne kohorte.")
     else:
-        diag_col = next((c for c in ["Diagnosekode", "Diagnose", "diagnose", "DiagnoseKode"] if c in diag.columns), None)
+        diag_col = next((c for c in ["Diagnose", "diagnose", "DiagnoseKode"] if c in diag.columns), None)
         
         if diag_col:
             # Overview metrics
@@ -1498,17 +1533,7 @@ with tabs[8]:
             with col1:
                 top_n = st.slider("Antal diagnoser", 10, 50, 20, key="diag_topn")
             
-            # Find tekst-kolonne og lav label med navn + kode
-            text_col = next((c for c in ["Diagnose", "Diagnosetekst", "DiagnoseNavn", "Navn", "Tekst", "Beskrivelse"] if c in diag.columns and c != diag_col), None)
-            if text_col:
-                # Map kode → første forekommende tekst
-                code_to_text = diag.dropna(subset=[text_col]).drop_duplicates(subset=[diag_col]).set_index(diag_col)[text_col].to_dict()
-                diag["_diag_label"] = diag[diag_col].map(lambda c: f"{code_to_text.get(c, '')} ({c})" if code_to_text.get(c) else c)
-                group_col = "_diag_label"
-            else:
-                group_col = diag_col
-
-            top_diag = diag.groupby(group_col)["PID"].nunique().reset_index()
+            top_diag = diag.groupby(diag_col)["PID"].nunique().reset_index()
             top_diag.columns = ["Diagnose", "Patienter"]
             top_diag = top_diag.sort_values("Patienter", ascending=False)
             
