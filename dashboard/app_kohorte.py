@@ -156,6 +156,7 @@ def load_holdout_pids():
 
     return None
 
+
 @st.cache_resource(show_spinner=False)
 def load_vitals():
     return pd.read_pickle("data/interim/concepts/VitaleVaerdier.pkl")
@@ -241,7 +242,7 @@ def apply_filters(base, data_split, exclude_option, subgroup):
             df = df[(df["is_gravid"] != 1) & (df["is_psyk"] != 1)]
     
     # Subgroup filters
-    if subgroup == "LOS > 2d + dod":
+    if subgroup == "LOS > 2d + død":
         if "start" in df.columns and "end" in df.columns:
             df["_los"] = (df["end"] - df["start"]).dt.total_seconds() / 86400
             mort_col = next((c for c in ["deceased_30d", "deceased_90d"] if c in df.columns), None)
@@ -398,7 +399,7 @@ with tabs[0]:
                 (completed["DOD"] <= completed["end"])
             ]
             pct = (inhosp["PID"].nunique() / completed["PID"].nunique() * 100)
-            st.metric("In-hospital dod", f"{pct:.1f}%")
+            st.metric("In-hospital død", f"{pct:.1f}%")
         else:
             st.metric("In-hospital doød", "N/A")
     
