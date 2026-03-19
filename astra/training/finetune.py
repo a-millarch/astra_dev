@@ -108,8 +108,12 @@ class FinetuneConfig:
     pos_weight_factor: float = 0.7
 
     # Time weighting for temporal head (training-specific, not model arch)
-    time_weighting: str = "uniform"     # 'uniform' or 'early'
+    time_weighting: str = "uniform"     # 'uniform', 'early', or 'late'
     early_weight_factor: float = 2.0
+
+    # Validation objective weights (must sum to 1.0)
+    val_auroc_weight: float = 0.3
+    val_auprc_weight: float = 0.7
 
 
 def create_split_dataloaders(data: dict, splits, cfg_dict: dict):
@@ -414,8 +418,9 @@ def compute_temporal_loss(
         targets: [batch] -- binary labels (0/1)
         traj_lengths: [batch] -- number of valid timesteps per sample
         pos_weight: Scalar tensor for class imbalance (ratio of neg/pos)
-        time_weighting: 'uniform' or 'early' (weight earlier predictions more)
-        early_weight_factor: Maximum weight for earliest timesteps (early mode)
+        time_weighting: 'uniform', 'early', or 'late'
+        early_weight_factor: Maximum weight factor (early: applied to first steps,
+            late: applied to last steps)
 
     Returns:
         Scalar loss
@@ -444,6 +449,11 @@ def compute_temporal_loss(
     if time_weighting == "early":
         time_weights = torch.linspace(
             early_weight_factor, 1.0, seq_len, device=device
+        )
+        loss_per_element = loss_per_element * time_weights.unsqueeze(0)
+    elif time_weighting == "late":
+        time_weights = torch.linspace(
+            1.0, early_weight_factor, seq_len, device=device
         )
         loss_per_element = loss_per_element * time_weights.unsqueeze(0)
 
@@ -640,7 +650,8 @@ def _run_phase(
             val_auroc = metrics["auroc"]
             val_auprc = metrics["auprc"]
             # Combined metric for early stopping and sweep objective
-            val_score = 0.5 * val_auroc + 0.5 * val_auprc
+            val_score = (finetune_cfg.val_auroc_weight * val_auroc
+                         + finetune_cfg.val_auprc_weight * val_auprc)
             tracker.update(phase_name, global_epoch,
                            train_loss=train_loss, val_auroc=val_auroc,
                            val_auprc=val_auprc, val_score=val_score)

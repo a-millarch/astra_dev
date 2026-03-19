@@ -133,6 +133,26 @@ def compute_auroc(
 
 
 @torch.no_grad()
+def _safe_auroc(targets: np.ndarray, probs: np.ndarray) -> float:
+    """Compute AUROC, returning 0.0 if undefined (single class)."""
+    try:
+        return float(roc_auc_score(targets, probs))
+    except ValueError:
+        return 0.0
+
+
+def _safe_auprc(targets: np.ndarray, probs: np.ndarray) -> float:
+    """Compute AUPRC, returning 0.0 if undefined (single class)."""
+    try:
+        return float(average_precision_score(targets, probs))
+    except ValueError:
+        return 0.0
+
+
+# Default timepoints (hours) for multi-timepoint active-only validation
+VAL_TIMEPOINTS_HOURS = [6, 24, 72]
+
+
 def compute_val_metrics(
     model: nn.Module,
     dataloader,
@@ -142,49 +162,106 @@ def compute_val_metrics(
     """
     Compute AUROC and AUPRC on a dataloader.
 
-    Returns dict with 'auroc' and 'auprc' keys.
+    For temporal head: evaluates at multiple timepoints (6h, 24h, 72h) using
+    active-only patients at each timepoint, then averages. Also computes
+    last-step metrics for logging.
+
+    Returns dict with 'auroc' and 'auprc' keys (primary metrics used for
+    early stopping / sweep objective).
     """
     model.eval()
-    all_probs = []
+
+    if not temporal_head:
+        # Standard head: unchanged behavior
+        all_probs = []
+        all_targets = []
+        with torch.no_grad():
+            for batch in tqdm(dataloader, desc="Validating", leave=False):
+                inputs, targets = batch
+                inputs = _to_device(inputs, device)
+                targets = _to_device(targets, device)
+                logits = model(inputs)
+                probs = F.softmax(logits, dim=-1)[:, 1]
+                all_probs.append(probs.cpu().numpy())
+                all_targets.append(targets.cpu().numpy())
+
+        all_probs = np.concatenate(all_probs)
+        all_targets = np.concatenate(all_targets)
+        return {
+            "auroc": _safe_auroc(all_targets, all_probs),
+            "auprc": _safe_auprc(all_targets, all_probs),
+        }
+
+    # --- Temporal head: multi-timepoint active-only evaluation ---
+    all_logits = []  # [batch, seq_len]
     all_targets = []
+    all_traj_lengths = []
 
-    for batch in tqdm(dataloader, desc="Validating", leave=False):
-        inputs, targets = batch
-        inputs = _to_device(inputs, device)
-        targets = _to_device(targets, device)
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Validating", leave=False):
+            inputs, targets = batch
+            inputs = _to_device(inputs, device)
+            targets = _to_device(targets, device)
+            logits = model(inputs)  # [batch, seq_len]
 
-        logits = model(inputs)
+            # Get trajectory lengths from batch (element 3) or infer
+            if isinstance(inputs, (tuple, list)) and len(inputs) >= 4:
+                traj_lens = inputs[3]
+            else:
+                x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+                has_data = (x_ts.abs() > 1e-6).any(dim=1)
+                seq_len = x_ts.shape[2]
+                positions = torch.arange(seq_len, device=x_ts.device).unsqueeze(0)
+                masked_pos = torch.where(has_data, positions,
+                                         torch.tensor(-1, device=x_ts.device))
+                traj_lens = (masked_pos.max(dim=1).values + 1).clamp(min=1)
 
-        if temporal_head:
-            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-            has_data = (x_ts.abs() > 1e-6).any(dim=1)
-            seq_len = x_ts.shape[2]
-            positions = torch.arange(seq_len, device=x_ts.device).unsqueeze(0)
-            masked_pos = torch.where(has_data, positions,
-                                     torch.tensor(-1, device=x_ts.device))
-            last_step = masked_pos.max(dim=1).values.clamp(min=0).long()
-            logits_last = logits[torch.arange(logits.size(0), device=device), last_step]
-            probs = torch.sigmoid(logits_last)
-        else:
-            probs = F.softmax(logits, dim=-1)[:, 1]
+            all_logits.append(logits.cpu())
+            all_targets.append(targets.cpu().numpy())
+            all_traj_lengths.append(traj_lens.cpu().numpy())
 
-        all_probs.append(probs.cpu().numpy())
-        all_targets.append(targets.cpu().numpy())
+    all_logits = torch.cat(all_logits, dim=0)       # [N, seq_len]
+    all_targets = np.concatenate(all_targets)         # [N]
+    all_traj_lengths = np.concatenate(all_traj_lengths)  # [N]
 
-    all_probs = np.concatenate(all_probs)
-    all_targets = np.concatenate(all_targets)
+    # Convert evaluation timepoints (hours) to step indices
+    from astra.evaluation.utils import time_to_step
+    eval_steps = [time_to_step(h, 'h') for h in VAL_TIMEPOINTS_HOURS]
 
-    try:
-        auroc = roc_auc_score(all_targets, all_probs)
-    except ValueError:
-        logger.warning("AUROC undefined (only one class in targets)")
-        auroc = 0.0
+    # Multi-timepoint active-only metrics
+    tp_aurocs = []
+    tp_auprcs = []
+    for step in eval_steps:
+        active_mask = all_traj_lengths > step
+        n_active = active_mask.sum()
+        if n_active < 10 or len(np.unique(all_targets[active_mask])) < 2:
+            continue  # skip timepoints with too few samples or single class
+        probs_at_step = torch.sigmoid(all_logits[active_mask, step]).numpy()
+        targets_at_step = all_targets[active_mask]
+        tp_aurocs.append(_safe_auroc(targets_at_step, probs_at_step))
+        tp_auprcs.append(_safe_auprc(targets_at_step, probs_at_step))
 
-    try:
-        auprc = average_precision_score(all_targets, all_probs)
-    except ValueError:
-        logger.warning("AUPRC undefined (only one class in targets)")
-        auprc = 0.0
+    # Last-step metrics (for logging / backward compat)
+    last_steps = np.minimum(all_traj_lengths - 1, all_logits.shape[1] - 1).astype(int)
+    last_probs = torch.sigmoid(
+        all_logits[torch.arange(len(all_logits)), torch.from_numpy(last_steps)]
+    ).numpy()
+    last_auroc = _safe_auroc(all_targets, last_probs)
+    last_auprc = _safe_auprc(all_targets, last_probs)
+
+    # Use multi-timepoint average if available, else fall back to last-step
+    if tp_auprcs:
+        auroc = float(np.mean(tp_aurocs))
+        auprc = float(np.mean(tp_auprcs))
+        logger.info(
+            f"  Multi-timepoint val (active-only at {VAL_TIMEPOINTS_HOURS}h): "
+            f"AUROC={auroc:.4f}, AUPRC={auprc:.4f} | "
+            f"last-step: AUROC={last_auroc:.4f}, AUPRC={last_auprc:.4f}"
+        )
+    else:
+        auroc = last_auroc
+        auprc = last_auprc
+        logger.info(f"  Val (last-step only): AUROC={auroc:.4f}, AUPRC={auprc:.4f}")
 
     return {"auroc": auroc, "auprc": auprc}
 
