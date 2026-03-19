@@ -135,11 +135,24 @@ def unfreeze_from(model: nn.Module, group_name: str) -> None:
     """
     Freeze everything below `group_name`, unfreeze `group_name` and above.
 
+    If `group_name` doesn't exist (e.g. model has fewer layers than expected),
+    falls back to the last transformer group so at least something is unfrozen.
+
     Args:
         model: The backbone model.
         group_name: Name of the first group to unfreeze (inclusive).
     """
     layer_groups = get_layer_groups(model)
+
+    if group_name not in layer_groups:
+        # Fall back to last transformer group (the one just before "head")
+        transformer_groups = [n for n in layer_groups if n.startswith("transformer_")]
+        fallback = transformer_groups[-1] if transformer_groups else "head"
+        logger.warning(f"Layer group '{group_name}' not found in model "
+                       f"(available: {list(layer_groups.keys())}). "
+                       f"Falling back to '{fallback}'")
+        group_name = fallback
+
     reached = False
     for name, params_list in layer_groups.items():
         if name == group_name:

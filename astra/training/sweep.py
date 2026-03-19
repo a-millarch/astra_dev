@@ -235,6 +235,7 @@ def run_sweep(
         lambda trial: joint_objective(trial, data, cfg_dict, device),
         n_trials=n_trials,
         callbacks=[_save_best_callback(study_name, save_path)],
+        catch=(Exception,),  # Don't abort sweep on individual trial failures
     )
 
     best = study.best_params
