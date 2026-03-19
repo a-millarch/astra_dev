@@ -1471,7 +1471,7 @@ with tabs[8]:
     if diag.empty:
         st.info("Ingen diagnoser for denne kohorte.")
     else:
-        diag_col = next((c for c in ["Diagnose", "diagnose", "DiagnoseKode"] if c in diag.columns), None)
+        diag_col = next((c for c in ["Diagnosekode", "Diagnose", "diagnose", "DiagnoseKode"] if c in diag.columns), None)
         
         if diag_col:
             # Overview metrics
