@@ -1498,7 +1498,17 @@ with tabs[8]:
             with col1:
                 top_n = st.slider("Antal diagnoser", 10, 50, 20, key="diag_topn")
             
-            top_diag = diag.groupby(diag_col)["PID"].nunique().reset_index()
+            # Find tekst-kolonne og lav label med navn + kode
+            text_col = next((c for c in ["Diagnosetekst", "DiagnoseNavn", "Navn", "Tekst", "Beskrivelse"] if c in diag.columns), None)
+            if text_col:
+                # Map kode → første forekommende tekst
+                code_to_text = diag.dropna(subset=[text_col]).drop_duplicates(subset=[diag_col]).set_index(diag_col)[text_col].to_dict()
+                diag["_diag_label"] = diag[diag_col].map(lambda c: f"{code_to_text.get(c, '')} ({c})" if code_to_text.get(c) else c)
+                group_col = "_diag_label"
+            else:
+                group_col = diag_col
+
+            top_diag = diag.groupby(group_col)["PID"].nunique().reset_index()
             top_diag.columns = ["Diagnose", "Patienter"]
             top_diag = top_diag.sort_values("Patienter", ascending=False)
             
