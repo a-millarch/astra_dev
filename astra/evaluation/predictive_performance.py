@@ -462,7 +462,7 @@ class TimeDependentEvaluator:
             traj = self.holdout_trajectory_lengths
 
         if len(set(y)) < 2:
-            logger.warning(f"Only one class in dataset at step {censor_step}")
+            logger.debug(f"Only one class in dataset at step {censor_step}")
             return None
 
         X_censored = self._censor_normalized_data(X_norm, censor_step)
@@ -488,10 +488,40 @@ class TimeDependentEvaluator:
             shuffle_train=False,
         )
 
+    def _get_active_counts(self, censor_step: int) -> Optional[TimeMetricResult]:
+        """Return a counts-only result (NaN metrics) for single-class time points."""
+        time_min = step_to_time(censor_step)
+        if time_min is None:
+            return None
+
+        if self.active_only:
+            mask = self._get_active_mask(censor_step)
+            n_samples = int(mask.sum())
+            if n_samples == 0:
+                return None
+            y = np.array(self.holdout_y)[mask]
+        else:
+            y = np.array(self.holdout_y)
+            n_samples = len(y)
+
+        return TimeMetricResult(
+            time_min=time_min,
+            time_hours=time_min / 60,
+            time_days=time_min / (24 * 60),
+            censor_step=censor_step,
+            auroc=float('nan'),
+            auroc_ci=(float('nan'), float('nan')),
+            auprc=float('nan'),
+            auprc_ci=(float('nan'), float('nan')),
+            n_samples=n_samples,
+            n_positive=int(y.sum()),
+        )
+
     def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
         dls = self.create_censored_dataloaders_fast(censor_step)
         if dls is None:
-            return None
+            # Dataloader failed (single class or <2 patients) — return counts only
+            return self._get_active_counts(censor_step)
 
         preds, targets = _get_predictions(self.model, dls.train, self.device)
         y_preds = preds[:, 1].numpy()
@@ -564,7 +594,7 @@ class TimeDependentEvaluator:
             if result is not None:
                 results.append(result)
 
-                if save_predictions:
+                if save_predictions and not np.isnan(result.auroc):
                     dls = self.create_censored_dataloaders_fast(censor_step)
                     preds, _ = _get_predictions(self.model, dls.train, self.device)
                     y_preds = preds[:, 1].numpy()
