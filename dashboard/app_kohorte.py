@@ -1533,7 +1533,10 @@ with tabs[8]:
                 code = str(code).strip().upper()
                 if not code:
                     return "Ukendt"
-                c = code[0]
+                # SKS-systemet: diagnoser har prefix 'D' (fx DA00 = ICD A00)
+                if not code.startswith("D") or len(code) < 2:
+                    return "Ukendt"
+                c = code[1]
                 chapters = {
                     "A": "Infektioner", "B": "Infektioner",
                     "C": "Neoplasmer", "D": "Neoplasmer",
