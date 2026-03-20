@@ -491,6 +491,61 @@ def create_bin_df_with_mortality_masking(cfg, base):
     return bin_df
 
 
+def add_survival_labels(base):
+    """Add discrete-time survival labels to base_df.
+
+    Creates columns:
+        event_time_hours: continuous time-to-event (or censoring) in hours
+        event_time_steps: discrete timestep index of event/censoring
+        event_indicator: 1 if death observed within observation window, 0 if censored
+    """
+    from astra.evaluation.utils import time_to_step, step_to_time, get_total_steps
+
+    max_steps = get_total_steps(cfg.get("dataset"))
+    max_time_min = step_to_time(max_steps - 1)
+    max_hours = max_time_min / 60 if max_time_min is not None else float("inf")
+
+    start = pd.to_datetime(base["start"])
+    dod = pd.to_datetime(base["DOD"])
+    end = pd.to_datetime(base["end"])
+
+    # Time from admission to death (hours), NaN if no DOD
+    time_to_death_hours = (dod - start).dt.total_seconds() / 3600
+
+    # Time from admission to end of observation (hours) — already mortality-masked
+    time_to_end_hours = (end - start).dt.total_seconds() / 3600
+
+    # Event indicator: died AND death within observation window
+    has_death = base["DOD"].notnull()
+    within_window = time_to_death_hours <= max_hours
+    base["event_indicator"] = (has_death & within_window).astype(int)
+
+    # Event time: death time for events, end-of-observation for censored
+    base["event_time_hours"] = np.where(
+        base["event_indicator"] == 1,
+        time_to_death_hours,
+        time_to_end_hours.clip(upper=max_hours),
+    )
+    # Ensure non-negative
+    base["event_time_hours"] = base["event_time_hours"].clip(lower=0)
+
+    # Convert to discrete timestep index
+    base["event_time_steps"] = base["event_time_hours"].apply(
+        lambda h: time_to_step(h, time_unit="h") if pd.notnull(h) else 0
+    )
+    # Clamp to valid range
+    base["event_time_steps"] = base["event_time_steps"].clip(upper=max_steps - 1).astype(int)
+
+    n_events = base["event_indicator"].sum()
+    n_censored = len(base) - n_events
+    logger.info(
+        f"Survival labels: {n_events} events, {n_censored} censored "
+        f"(max observation: {max_hours:.0f}h / {max_steps} steps)"
+    )
+
+    return base
+
+
 ############
 def add_to_base(base):
 
@@ -517,6 +572,10 @@ def add_to_base(base):
         "deceased_90d",
     ] = 1
     base["deceased_90d"] = base["deceased_90d"].fillna(0)
+
+    # Survival labels (time-to-event)
+    base = add_survival_labels(base)
+
     # If trauma bay RH
     base["LVL1TC"] = 0
     base.loc[base.first_RH.notnull(), "LVL1TC"] = 1

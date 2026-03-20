@@ -195,6 +195,7 @@ model:
     temporal_head: true
     causal: true  # required for temporal_head
     temporal_head_dropout: 0.3
+    survival_mode: false  # true = discrete-time survival, false = binary classification
 
 finetune:
     # Phase 1: Head-only training (warm up randomly initialized head)

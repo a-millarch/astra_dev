@@ -41,6 +41,10 @@ class TimeMetricResult:
     auprc_ci: Tuple[float, float]
     n_samples: int
     n_positive: int
+    # Survival-specific metrics (optional, None for classification mode)
+    cindex: Optional[float] = None
+    cindex_ci: Optional[Tuple[float, float]] = None
+    brier_score: Optional[float] = None
 
 
 def _get_predictions(model, dataloader, device, temporal_head=False):
@@ -650,9 +654,11 @@ class TemporalEvaluator:
         self.cfg = cfg
         self.device = device
         self.active_only = active_only
+        self.survival_mode = cfg.get("model", {}).get("survival_mode", False)
         self.model.eval()
 
         self._holdout_preds = None
+        self._holdout_survival = None  # [N, seq_len] survival probs S(t)
         self._holdout_traj_lengths = np.array(
             data.get("holdout_trajectory_lengths",
                       data.get("traj_lengths_holdout", []))
@@ -660,24 +666,38 @@ class TemporalEvaluator:
         self.holdout = data["holdout"]
 
         mode_str = " (active-only mode)" if active_only else ""
-        logger.info(f"TemporalEvaluator initialized{mode_str}")
+        surv_str = " [survival]" if self.survival_mode else ""
+        logger.info(f"TemporalEvaluator initialized{mode_str}{surv_str}")
 
     def _get_all_predictions(self) -> np.ndarray:
+        """Get per-timestep predictions.
+
+        For classification: sigmoid probabilities [N, seq_len].
+        For survival: cumulative incidence 1-S(t) [N, seq_len].
+        """
         if self._holdout_preds is not None:
             return self._holdout_preds
 
         holdout_dls = self.data["holdout_mixed_dls"]
-        all_preds = []
+        all_logits = []
 
         with torch.no_grad():
             for batch in holdout_dls.train:
                 inputs, targets = batch
                 inputs = _to_device(inputs, self.device)
                 logits = self.model(inputs)
-                probs = torch.sigmoid(logits)
-                all_preds.append(probs.cpu().numpy())
+                all_logits.append(logits.cpu())
 
-        self._holdout_preds = np.concatenate(all_preds, axis=0)
+        all_logits_cat = torch.cat(all_logits, dim=0)  # [N, seq_len]
+
+        if self.survival_mode:
+            from astra.training.utils import hazards_to_survival
+            survival_probs = hazards_to_survival(all_logits_cat).numpy()
+            self._holdout_survival = survival_probs
+            self._holdout_preds = 1.0 - survival_probs  # cumulative incidence
+        else:
+            self._holdout_preds = torch.sigmoid(all_logits_cat).numpy()
+
         return self._holdout_preds
 
     def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
@@ -729,6 +749,28 @@ class TemporalEvaluator:
         auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
         auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
 
+        # Survival-specific metrics (C-index, Brier)
+        cindex_val = None
+        cindex_ci_val = None
+        brier_val = None
+        if self.survival_mode:
+            ho_event_times = self.data.get("holdout_event_times")
+            ho_event_indicators = self.data.get("holdout_event_indicators")
+            if ho_event_times is not None and ho_event_indicators is not None:
+                from astra.evaluation.survival_metrics import concordance_index as _ci
+                # Use the same subset if active_only filtering was applied
+                if self.active_only and len(traj_lengths) > 0:
+                    mask = traj_lengths > censor_step
+                    et = ho_event_times[mask]
+                    ei = ho_event_indicators[mask]
+                else:
+                    et = ho_event_times
+                    ei = ho_event_indicators
+                try:
+                    cindex_val, cindex_ci_val = _ci(et, ei, y_preds, n_bootstrap=500)
+                except Exception as e:
+                    logger.debug(f"C-index failed at step {censor_step}: {e}")
+
         return TimeMetricResult(
             time_min=time_min,
             time_hours=time_min / 60,
@@ -740,6 +782,9 @@ class TemporalEvaluator:
             auprc_ci=(auprc_lower, auprc_upper),
             n_samples=len(ys),
             n_positive=int(ys.sum()),
+            cindex=cindex_val,
+            cindex_ci=cindex_ci_val,
+            brier_score=brier_val,
         )
 
     def evaluate_over_time(
@@ -1238,11 +1283,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             for step in key_timepoints:
                 result = temporal_eval.evaluate_at_timestep(step)
                 if result:
-                    logger.info(
+                    line = (
                         f"  {format_step_label(step):>12s}: "
                         f"AUROC={result.auroc:.3f} [{result.auroc_ci[0]:.3f}-{result.auroc_ci[1]:.3f}], "
                         f"AUPRC={result.auprc:.3f} [{result.auprc_ci[0]:.3f}-{result.auprc_ci[1]:.3f}]"
                     )
+                    if result.cindex is not None:
+                        line += f", C-index={result.cindex:.3f}"
+                        if result.cindex_ci:
+                            line += f" [{result.cindex_ci[0]:.3f}-{result.cindex_ci[1]:.3f}]"
+                    logger.info(line)
 
             # Decision curves at key timepoints (temporal)
             labels = [format_step_label(step) for step in key_timepoints]
@@ -1308,6 +1358,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         r = matching[0]
                         line = (f"  {format_step_label(step):>12s}: "
                                 f"AUROC={r.auroc:.3f}, AUPRC={r.auprc:.3f}")
+                        if r.cindex is not None:
+                            line += f", C-index={r.cindex:.3f}"
                         if matching_active:
                             ra = matching_active[0]
                             line += (f"  |  Active: AUROC={ra.auroc:.3f}, "

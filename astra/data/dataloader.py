@@ -586,6 +586,21 @@ def prepare_data_and_dls(cfg):
     y = list(y[:, 0].flatten())
     logger.info(f'Train/val X shape (before normalization): {X.shape}')
 
+    # Extract survival labels (event_time_steps, event_indicator) aligned with PID order
+    # df2xy_pure sorts by [PID, FEATURE], so samples = sorted unique PIDs
+    survival_mode = cfg.get('model', {}).get('survival_mode', False)
+    trainval_event_times = None
+    trainval_event_indicators = None
+    if survival_mode:
+        _tv_sorted_pids = sorted(trainval.complete['PID'].unique())
+        _tv_surv = trainval.base.set_index('PID').loc[_tv_sorted_pids]
+        trainval_event_times = _tv_surv['event_time_steps'].values.astype(int)
+        trainval_event_indicators = _tv_surv['event_indicator'].values.astype(int)
+        logger.info(
+            f"Survival labels (trainval): {trainval_event_indicators.sum()} events, "
+            f"{len(trainval_event_indicators) - trainval_event_indicators.sum()} censored"
+        )
+
     # Channel names — df2xy_pure sorts by FEATURE ascending, so this IS the channel order.
     ts_channel_names = sorted(trainval.complete['FEATURE'].unique())
 
@@ -730,6 +745,8 @@ def prepare_data_and_dls(cfg):
         X_ts_cat=X_multi_hot,
         y=y,
         trajectory_lengths=traj_lengths,
+        event_times=trainval_event_times,
+        event_indicators=trainval_event_indicators,
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -751,6 +768,19 @@ def prepare_data_and_dls(cfg):
     )
     ty = list(ty[:, 0].flatten())
     logger.info(f'Holdout X shape (before normalization): {tX.shape}')
+
+    # Holdout survival labels
+    holdout_event_times = None
+    holdout_event_indicators = None
+    if survival_mode:
+        _ho_sorted_pids = sorted(holdout.complete['PID'].unique())
+        _ho_surv = holdout.base.set_index('PID').loc[_ho_sorted_pids]
+        holdout_event_times = _ho_surv['event_time_steps'].values.astype(int)
+        holdout_event_indicators = _ho_surv['event_indicator'].values.astype(int)
+        logger.info(
+            f"Survival labels (holdout): {holdout_event_indicators.sum()} events, "
+            f"{len(holdout_event_indicators) - holdout_event_indicators.sum()} censored"
+        )
 
     tX_raw = tX.copy()
 
@@ -804,6 +834,8 @@ def prepare_data_and_dls(cfg):
         X_ts_cat=tX_multi_hot,
         y=ty,
         trajectory_lengths=holdout_traj_lengths,
+        event_times=holdout_event_times,
+        event_indicators=holdout_event_indicators,
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,
@@ -863,6 +895,12 @@ def prepare_data_and_dls(cfg):
         "ebm_channel_idx": ebm_channel_idx,
         "temporal_channel_idx": temporal_channel_idx,
         "exclude_channel_indices": exclude_channel_indices,
+        # Survival labels (None when survival_mode is disabled)
+        "event_times": trainval_event_times,
+        "event_indicators": trainval_event_indicators,
+        "holdout_event_times": holdout_event_times,
+        "holdout_event_indicators": holdout_event_indicators,
+        "survival_mode": survival_mode,
         # Explicit scalars (replace TSAI DL attributes)
         "c_in": c_in,
         "seq_len": seq_len,
@@ -1054,6 +1092,7 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'temporal_channel_idx': data.get('temporal_channel_idx', None),
             'exclude_channel_indices': data.get('exclude_channel_indices', []),
             'head_pool': cfg.get("model", {}).get("head_pool", "flatten"),
+            'survival_mode': cfg.get("model", {}).get("survival_mode", False),
         },
 
         # --- SHAP background data ---

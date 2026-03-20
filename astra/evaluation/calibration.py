@@ -5,6 +5,8 @@ Extended evaluation workflow that includes calibration analysis.
 """
 
 import logging
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -861,6 +863,62 @@ def add_calibration_to_eval(
         'calibration_table': cal_table,
         'bin_data': bin_data
     }
+
+
+def plot_survival_calibration(
+    event_times: np.ndarray,
+    event_indicators: np.ndarray,
+    survival_probs: np.ndarray,
+    eval_time: int,
+    n_bins: int = 10,
+    title: str = "Survival Calibration",
+    save_path: Optional[str] = None,
+) -> plt.Figure:
+    """D-calibration plot: predicted S(t) vs observed survival in risk bins.
+
+    Args:
+        event_times: [N] time to event or censoring (steps).
+        event_indicators: [N] 1 = event, 0 = censored.
+        survival_probs: [N, seq_len] survival probabilities.
+        eval_time: Step index to evaluate calibration at.
+        n_bins: Number of calibration bins.
+        title: Plot title.
+        save_path: Path to save the figure.
+
+    Returns:
+        matplotlib Figure.
+    """
+    from astra.evaluation.survival_metrics import dcalibration
+
+    cal = dcalibration(event_times, event_indicators, survival_probs, eval_time, n_bins)
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    predicted = cal["predicted_survival"]
+    observed = cal["observed_survival"]
+    counts = cal["bin_counts"]
+
+    if predicted and observed:
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Perfect calibration')
+        sizes = [max(20, c * 2) for c in counts]
+        ax.scatter(predicted, observed, s=sizes, alpha=0.7, zorder=5)
+        ax.plot(predicted, observed, 'b-', alpha=0.5)
+
+        for p, o, c in zip(predicted, observed, counts):
+            ax.annotate(f'n={c}', (p, o), textcoords="offset points",
+                        xytext=(5, 5), fontsize=7, alpha=0.7)
+
+    ax.set_xlabel('Predicted S(t)')
+    ax.set_ylabel('Observed survival fraction')
+    ax.set_title(title)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.legend()
+    fig.tight_layout()
+
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    return fig
 
 
 # ============================================================================

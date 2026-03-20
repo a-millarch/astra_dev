@@ -961,12 +961,14 @@ class ModelWrapperWithRawCatTS(nn.Module):
     Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
     This allows SHAP to compute per-category attributions.
     """
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
+                 survival_mode: bool = False):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
         self.eval_timestep = eval_timestep
         self.traj_lengths = traj_lengths  # [n_samples] or None
+        self.survival_mode = survival_mode
 
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
         """
@@ -1049,6 +1051,13 @@ class ModelWrapperWithRawCatTS(nn.Module):
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
+            if self.survival_mode:
+                # Return cumulative incidence 1 - S(t) at eval_timestep (differentiable)
+                eval_t = self.eval_timestep if self.eval_timestep >= 0 else logits.shape[1] + self.eval_timestep
+                hazards = torch.sigmoid(logits[:, :eval_t + 1])
+                log_surv = torch.sum(torch.log1p(-hazards + 1e-7), dim=1)
+                surv = torch.exp(log_surv)
+                return (1.0 - surv).unsqueeze(-1)  # [batch, 1]
             return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
         return self._apply_head(x, key_padding_mask)
 

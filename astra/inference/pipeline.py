@@ -38,10 +38,11 @@ from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 class InferenceResult:
     """Result of a single-patient prediction."""
     pid: Any
-    probability: float                              # P(deceased_30d)
+    probability: float                              # P(deceased) or cumulative risk
     trajectory_length: int                          # Actual data timesteps
     censor_step: Optional[int] = None               # Timestep evaluated at
     predictions_over_time: Optional[np.ndarray] = None  # [seq_len] (temporal only)
+    survival_curve: Optional[np.ndarray] = None     # [seq_len] S(t) (survival mode only)
 
 
 @dataclass
@@ -317,24 +318,42 @@ class InferenceSession:
         if self.is_temporal:
             # logits: [1, seq_len]
             logger.debug("Temporal logits shape: %s", logits.shape)
-            probs_all = torch.sigmoid(logits).cpu().numpy()[0]  # [seq_len]
             seq_len = x_ts_t.shape[2]
             if censor_step is not None:
-                # Trust the caller's step (from time_to_step); only cap at seq_len
                 step = min(censor_step, seq_len - 1)
             else:
                 step = traj_len - 1
             step = max(step, 0)
-            probability = float(probs_all[step])
-            logger.info("Prediction: pid=%s P(deceased)=%.4f step=%d traj_len=%d",
-                        pid, probability, step, traj_len)
-            return InferenceResult(
-                pid=pid,
-                probability=probability,
-                trajectory_length=traj_len,
-                censor_step=step,
-                predictions_over_time=probs_all,
-            )
+
+            survival_mode = self.bundle.get('model_params', {}).get('survival_mode', False)
+            if survival_mode:
+                # Discrete-time survival: compute S(t) from hazard logits
+                from astra.training.utils import hazards_to_survival
+                surv_probs = hazards_to_survival(logits).cpu().numpy()[0]  # [seq_len]
+                cum_incidence = 1.0 - surv_probs  # risk at each timestep
+                probability = float(cum_incidence[step])
+                logger.info("Prediction (survival): pid=%s risk=%.4f S(t)=%.4f step=%d traj_len=%d",
+                            pid, probability, surv_probs[step], step, traj_len)
+                return InferenceResult(
+                    pid=pid,
+                    probability=probability,
+                    trajectory_length=traj_len,
+                    censor_step=step,
+                    predictions_over_time=cum_incidence,
+                    survival_curve=surv_probs,
+                )
+            else:
+                probs_all = torch.sigmoid(logits).cpu().numpy()[0]  # [seq_len]
+                probability = float(probs_all[step])
+                logger.info("Prediction: pid=%s P(deceased)=%.4f step=%d traj_len=%d",
+                            pid, probability, step, traj_len)
+                return InferenceResult(
+                    pid=pid,
+                    probability=probability,
+                    trajectory_length=traj_len,
+                    censor_step=step,
+                    predictions_over_time=probs_all,
+                )
         else:
             # logits: [1, 2]
             probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
@@ -415,9 +434,11 @@ class InferenceSession:
         has_cat_ts = self.model.n_ts_cat > 0
         effective_traj = min(traj_len, censor_step + 1) if censor_step is not None else traj_len
         traj_lengths_t = torch.tensor([effective_traj], dtype=torch.long, device=self.device)
+        survival_mode = self.bundle.get('model_params', {}).get('survival_mode', False)
         wrapped = ModelWrapperWithRawCatTS(self.model, has_cat_ts=has_cat_ts,
                                            eval_timestep=target_step if target_step is not None else -1,
-                                           traj_lengths=traj_lengths_t)
+                                           traj_lengths=traj_lengths_t,
+                                           survival_mode=survival_mode)
 
         # Pre-embed static categoricals (not differentiable — treated as context)
         bg_cat_emb = embed_categorical_features(self.model, self._bg['cat'])
