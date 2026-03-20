@@ -74,6 +74,8 @@ def parse_args():
     parser.add_argument("--multicurve", action="store_true", default=False)
     parser.add_argument("--active-only", action="store_true", default=False,
                         help="Also run active-only evaluation (patients still in hospital) and generate comparison plots")
+    parser.add_argument("--trauma-scores", action="store_true", default=False,
+                        help="Compute traditional trauma risk scores (RTS, ISS, TRISS) and add as baselines (Azure-only)")
 
     # Calibration
     parser.add_argument("--calibrate", action="store_true", default=False,
@@ -208,6 +210,7 @@ def main():
         results, preds_df = run_eval(
             data, cfg, args.multicurve, args.comprehensive_eval,
             active_only=args.active_only,
+            trauma_scores=args.trauma_scores,
         )
 
     # ========================================================================
