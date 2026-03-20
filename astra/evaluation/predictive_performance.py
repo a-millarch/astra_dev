@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
 from astra.utils import save_figure
@@ -257,7 +257,7 @@ def plot_decision_curves_over_time(
     ax.set_xlabel("Threshold Probability", fontsize=11)
     ax.set_ylabel("Net Benefit", fontsize=11)
     ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
               title="Time Available", title_fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
@@ -357,7 +357,7 @@ def _plot_decision_curves_temporal(
     ax.set_xlabel("Threshold Probability", fontsize=11)
     ax.set_ylabel("Net Benefit", fontsize=11)
     ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
               title="Time Available", title_fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
@@ -931,7 +931,7 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     auprc_lower = np.array([r.auprc_ci[0] for r in results])
     auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
 
     mask_cut = times_h <= cut_hours
 
@@ -998,16 +998,31 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
 def plot_time_metrics_comparison(
     results_all: List[TimeMetricResult],
     results_active: List[TimeMetricResult],
-    cut_hours=72, max_days=None
+    cut_hours=72, max_days=None,
+    target_name: str = "deceased_30d",
+    static_scores: Optional[Dict[str, dict]] = None,
 ):
-    """Overlay all-patients vs active-only AUROC/AUPRC curves."""
+    """Overlay all-patients vs active-only AUROC/AUPRC with population context.
+
+    2x2 layout:
+        Top row:    performance curves (AUROC/AUPRC, all vs active-only)
+        Bottom row: active patient counts, prevalence, and all-patients N reference
+
+    Args:
+        static_scores: Optional dict from evaluate_static_scores(). Each entry
+            maps score name to {auroc, auroc_ci, auprc, auprc_ci, n}. Drawn as
+            horizontal reference lines on performance panels.
+    """
     if max_days is None:
         max_days = get_max_days()
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(10, 11))
+    ax_perf_h, ax_perf_d = axes[0]
+    ax_count_h, ax_count_d = axes[1]
 
+    # ── Top row: performance curves ──────────────────────────────────────
     datasets = [
         ("All patients", results_all, "-"),
         ("Active only", results_active, "--"),
@@ -1029,7 +1044,7 @@ def plot_time_metrics_comparison(
             (auroc_vals, auroc_lower, auroc_upper, "C0", "AUROC"),
             (auprc_vals, auprc_lower, auprc_upper, "C1", "AUPRC"),
         ]:
-            # Hours panel — filter NaN metrics
+            # Hours panel
             valid_h = mask_cut & ~np.isnan(vals)
             x = times_h[valid_h]
             v, lo, hi = vals[valid_h], lower[valid_h], upper[valid_h]
@@ -1039,11 +1054,11 @@ def plot_time_metrics_comparison(
                     v = np.append(v, v[-1])
                     lo = np.append(lo, lo[-1])
                     hi = np.append(hi, hi[-1])
-                ax1.plot(x, v, color=color, linestyle=linestyle,
-                         label=f"{metric_name} ({label_prefix})", markersize=3)
-                ax1.fill_between(x, lo, hi, color=color, alpha=0.1)
+                ax_perf_h.plot(x, v, color=color, linestyle=linestyle,
+                               label=f"{metric_name} ({label_prefix})", markersize=3)
+                ax_perf_h.fill_between(x, lo, hi, color=color, alpha=0.1)
 
-            # Days panel — filter NaN metrics
+            # Days panel
             valid_d = ~np.isnan(vals)
             x = times_d[valid_d]
             v, lo, hi = vals[valid_d], lower[valid_d], upper[valid_d]
@@ -1053,34 +1068,248 @@ def plot_time_metrics_comparison(
                     v = np.append(v, v[-1])
                     lo = np.append(lo, lo[-1])
                     hi = np.append(hi, hi[-1])
-                ax2.plot(x, v, color=color, linestyle=linestyle,
-                         label=f"{metric_name} ({label_prefix})", markersize=3)
-                ax2.fill_between(x, lo, hi, color=color, alpha=0.1)
+                ax_perf_d.plot(x, v, color=color, linestyle=linestyle,
+                               label=f"{metric_name} ({label_prefix})", markersize=3)
+                ax_perf_d.fill_between(x, lo, hi, color=color, alpha=0.1)
 
-    ax1.set_xlabel("Time (hours)", fontsize=11)
-    ax1.set_xlim(0, cut_hours)
-    ax1.set_xticks(np.arange(0, cut_hours+1, 6))
-    ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax1.set_ylabel("Score", fontsize=11)
-    ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
-    ax1.set_ylim(0.0, 1.0)
+    # ── Static score reference lines (optional) ────────────────────────
+    if static_scores:
+        score_colors = {"ISS": "C2", "RTS": "C3", "TRISS": "C4"}
+        for score_name, metrics in static_scores.items():
+            color = score_colors.get(score_name, "C5")
+            auroc = metrics["auroc"]
+            auprc = metrics["auprc"]
+            n = metrics["n"]
+            for i, ax in enumerate([ax_perf_h, ax_perf_d]):
+                # Only add labels on first axis (hours) to avoid legend duplicates
+                auroc_label = f"AUROC {score_name} ({auroc:.3f}, n={n})" if i == 0 else None
+                auprc_label = f"AUPRC {score_name} ({auprc:.3f}, n={n})" if i == 0 else None
+                ax.axhline(y=auroc, color=color, linestyle=":", linewidth=1.5,
+                           label=auroc_label)
+                ax.axhline(y=auprc, color=color, linestyle="-.", linewidth=1.5,
+                           label=auprc_label)
 
-    ax2.set_xlabel("Time (days)", fontsize=11)
-    ax2.set_xlim(0, max_days)
-    ax2.set_xticks(np.arange(0, max_days+1, 5))
-    ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax2.set_ylabel("Score", fontsize=11)
-    ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
-    ax2.set_ylim(0.0, 1.0)
+    for ax, xlabel, xlim, xticks, title in [
+        (ax_perf_h, "Time (hours)", cut_hours,
+         np.arange(0, cut_hours + 1, 6), "A) Performance over Hours"),
+        (ax_perf_d, "Time (days)", max_days,
+         np.arange(0, max_days + 1, 5), "B) Performance over Days"),
+    ]:
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_xticks(xticks)
+        ax.set_yticks(np.arange(0.0, 1.1, 0.1))
+        ax.set_ylabel("Score", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0.0, 1.0)
 
-    # Shared legend below both panels
-    handles, labels = ax1.get_legend_handles_labels()
-    fig.legend(handles, labels, loc='lower center', ncol=4, fontsize=9,
-               bbox_to_anchor=(0.5, -0.02))
-    fig.subplots_adjust(bottom=0.18)
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    # ── Bottom row: patient counts & prevalence ──────────────────────────
+    PREV_COLOR = "#1F77B4"
+    ACTIVE_COLOR = "#2CA02C"
+    POSITIVE_COLOR = "#D62728"
+    ALL_COLOR = "#7F7F7F"
+
+    act_times_h = np.array([r.time_hours for r in results_active])
+    act_times_d = np.array([r.time_days for r in results_active])
+    act_n_samples = np.array([r.n_samples for r in results_active])
+    act_n_positive = np.array([r.n_positive for r in results_active])
+    act_prevalence = np.where(act_n_samples > 0, act_n_positive / act_n_samples, 0.0)
+
+    all_n = results_all[0].n_samples if results_all else 0
+    mask_cut_act = act_times_h <= cut_hours
+
+    prev_ax_ref = None
+    for ax, times, n_samp, n_pos, prev, mask, xlabel, xlim, title in [
+        (ax_count_h, act_times_h, act_n_samples, act_n_positive, act_prevalence,
+         mask_cut_act, "Time (hours)", cut_hours, "C) Active Patients over Hours"),
+        (ax_count_d, act_times_d, act_n_samples, act_n_positive, act_prevalence,
+         np.ones(len(act_times_d), dtype=bool), "Time (days)", max_days,
+         "D) Active Patients over Days"),
+    ]:
+        ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
+        ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
+                label=f"{target_name} = 1 (active)")
+        ax.axhline(y=all_n, color=ALL_COLOR, linestyle=":", linewidth=1.2,
+                    label=f"All patients (N={all_n})")
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel("Count", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+
+        ax_prev = ax.twinx()
+        ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
+                     linestyle="--", linewidth=1.5, label="Prevalence (%)")
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylim(0, 12)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        if prev_ax_ref is None:
+            prev_ax_ref = ax_prev
+
+    # ── Legends ──────────────────────────────────────────────────────────
+    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
+    fig.legend(perf_handles, perf_labels, loc='lower center', ncol=4, fontsize=10,
+               bbox_to_anchor=(0.5, 0.47))
+
+    count_handles, count_labels = ax_count_h.get_legend_handles_labels()
+    prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
+    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
+               loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.02))
+
+    fig.subplots_adjust(hspace=0.45, bottom=0.08)
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    return fig
+
+
+def plot_trauma_score_comparison(
+    results_active: List[TimeMetricResult],
+    static_scores: Dict[str, dict],
+    cut_hours=72, max_days=None,
+    target_name: str = "deceased_30d",
+    subset_n: Optional[int] = None,
+):
+    """Active-only AUROC/AUPRC for a filtered patient subset with static score baselines.
+
+    2x2 layout (same structure as plot_time_metrics_comparison):
+        Top row:    performance curves (AUROC/AUPRC, active-only) + static score reference lines
+        Bottom row: active patient counts, prevalence for the filtered subset
+    """
+    if max_days is None:
+        max_days = get_max_days()
+    if not results_active:
+        raise ValueError("Active-only results required for trauma score comparison")
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 11))
+    ax_perf_h, ax_perf_d = axes[0]
+    ax_count_h, ax_count_d = axes[1]
+
+    # ── Top row: performance curves ──────────────────────────────────────
+    times_h = np.array([r.time_hours for r in results_active])
+    times_d = np.array([r.time_days for r in results_active])
+    auroc_vals = np.array([r.auroc for r in results_active])
+    auroc_lower = np.array([r.auroc_ci[0] for r in results_active])
+    auroc_upper = np.array([r.auroc_ci[1] for r in results_active])
+    auprc_vals = np.array([r.auprc for r in results_active])
+    auprc_lower = np.array([r.auprc_ci[0] for r in results_active])
+    auprc_upper = np.array([r.auprc_ci[1] for r in results_active])
+
+    mask_cut = times_h <= cut_hours
+
+    for vals, lower, upper, color, metric_name in [
+        (auroc_vals, auroc_lower, auroc_upper, "C0", "AUROC"),
+        (auprc_vals, auprc_lower, auprc_upper, "C1", "AUPRC"),
+    ]:
+        # Hours panel
+        valid_h = mask_cut & ~np.isnan(vals)
+        x = times_h[valid_h]
+        v, lo, hi = vals[valid_h], lower[valid_h], upper[valid_h]
+        if len(x) > 0:
+            if x[-1] < cut_hours:
+                x = np.append(x, cut_hours)
+                v = np.append(v, v[-1])
+                lo = np.append(lo, lo[-1])
+                hi = np.append(hi, hi[-1])
+            ax_perf_h.plot(x, v, color=color, linestyle="-",
+                           label=f"{metric_name} (ASTRA)", markersize=3)
+            ax_perf_h.fill_between(x, lo, hi, color=color, alpha=0.15)
+
+        # Days panel
+        valid_d = ~np.isnan(vals)
+        x = times_d[valid_d]
+        v, lo, hi = vals[valid_d], lower[valid_d], upper[valid_d]
+        if len(x) > 0:
+            if x[-1] < max_days:
+                x = np.append(x, max_days)
+                v = np.append(v, v[-1])
+                lo = np.append(lo, lo[-1])
+                hi = np.append(hi, hi[-1])
+            ax_perf_d.plot(x, v, color=color, linestyle="-",
+                           label=f"{metric_name} (ASTRA)", markersize=3)
+            ax_perf_d.fill_between(x, lo, hi, color=color, alpha=0.15)
+
+    # Static score reference lines
+    if static_scores:
+        score_colors = {"ISS": "C2", "RTS": "C3", "TRISS": "C4"}
+        for score_name, metrics in static_scores.items():
+            color = score_colors.get(score_name, "C5")
+            auroc = metrics["auroc"]
+            auprc = metrics["auprc"]
+            n = metrics["n"]
+            for i, ax in enumerate([ax_perf_h, ax_perf_d]):
+                auroc_label = f"AUROC {score_name} ({auroc:.3f}, n={n})" if i == 0 else None
+                auprc_label = f"AUPRC {score_name} ({auprc:.3f}, n={n})" if i == 0 else None
+                ax.axhline(y=auroc, color=color, linestyle=":", linewidth=1.5,
+                           label=auroc_label)
+                ax.axhline(y=auprc, color=color, linestyle="-.", linewidth=1.5,
+                           label=auprc_label)
+
+    subset_label = f" (N={subset_n})" if subset_n else ""
+    for ax, xlabel, xlim, xticks, title in [
+        (ax_perf_h, "Time (hours)", cut_hours,
+         np.arange(0, cut_hours + 1, 6),
+         f"A) Performance over Hours — Trauma Score Subset{subset_label}"),
+        (ax_perf_d, "Time (days)", max_days,
+         np.arange(0, max_days + 1, 5),
+         f"B) Performance over Days — Trauma Score Subset{subset_label}"),
+    ]:
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_xticks(xticks)
+        ax.set_yticks(np.arange(0.0, 1.1, 0.1))
+        ax.set_ylabel("Score", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.set_ylim(0.0, 1.0)
+
+    # ── Bottom row: patient counts & prevalence ──────────────────────────
+    PREV_COLOR = "#1F77B4"
+    ACTIVE_COLOR = "#2CA02C"
+    POSITIVE_COLOR = "#D62728"
+
+    act_n_samples = np.array([r.n_samples for r in results_active])
+    act_n_positive = np.array([r.n_positive for r in results_active])
+    act_prevalence = np.where(act_n_samples > 0, act_n_positive / act_n_samples, 0.0)
+    mask_cut_act = times_h <= cut_hours
+
+    prev_ax_ref = None
+    for ax, times, n_samp, n_pos, prev, mask, xlabel, xlim, title in [
+        (ax_count_h, times_h, act_n_samples, act_n_positive, act_prevalence,
+         mask_cut_act, "Time (hours)", cut_hours, "C) Active Patients over Hours"),
+        (ax_count_d, times_d, act_n_samples, act_n_positive, act_prevalence,
+         np.ones(len(times_d), dtype=bool), "Time (days)", max_days,
+         "D) Active Patients over Days"),
+    ]:
+        ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
+        ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
+                label=f"{target_name} = 1 (active)")
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel("Count", fontsize=11)
+        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+
+        ax_prev = ax.twinx()
+        ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
+                     linestyle="--", linewidth=1.5, label="Prevalence (%)")
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylim(0, 12)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        if prev_ax_ref is None:
+            prev_ax_ref = ax_prev
+
+    # ── Legends ──────────────────────────────────────────────────────────
+    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
+    fig.legend(perf_handles, perf_labels, loc='lower center', ncol=3, fontsize=9,
+               bbox_to_anchor=(0.5, 0.47))
+
+    count_handles, count_labels = ax_count_h.get_legend_handles_labels()
+    prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
+    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
+               loc='lower center', ncol=3, fontsize=10, bbox_to_anchor=(0.5, -0.02))
+
+    fig.subplots_adjust(hspace=0.45, bottom=0.08)
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
     return fig
 
 
@@ -1105,7 +1334,7 @@ def plot_n_active_over_time(
     ACTIVE_COLOR = "#2CA02C"  # green
     POSITIVE_COLOR = "#D62728"  # red
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
 
     mask_cut = times_h <= cut_hours
 
@@ -1144,7 +1373,7 @@ def plot_n_active_over_time(
     # Combined legend below
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax1_prev.get_legend_handles_labels()
-    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=9,
+    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=10,
                bbox_to_anchor=(0.5, -0.02))
     fig.subplots_adjust(bottom=0.18)
     plt.tight_layout(rect=[0, 0.08, 1, 1])
@@ -1156,7 +1385,7 @@ def plot_multiple_roc_pr_curves(
     censor_steps: List[int],
     labels: Optional[List[str]] = None
 ):
-    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax_roc, ax_pr) = plt.subplots(2, 1, figsize=(8, 14))
 
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
               '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
@@ -1196,7 +1425,7 @@ def plot_multiple_roc_pr_curves(
     ax_roc.set_xlabel("False Positive Rate", fontsize=11)
     ax_roc.set_ylabel("True Positive Rate", fontsize=11)
     ax_roc.grid(alpha=0.3)
-    ax_roc.legend(fontsize=9, title="Time Available", title_fontsize=10)
+    ax_roc.legend(fontsize=10, title="Time Available", title_fontsize=10)
     ax_roc.set_aspect('equal', adjustable='box')
 
     if baseline is not None:
@@ -1205,11 +1434,8 @@ def plot_multiple_roc_pr_curves(
     ax_pr.set_xlabel("Recall", fontsize=11)
     ax_pr.set_ylabel("Precision", fontsize=11)
     ax_pr.grid(alpha=0.3)
-    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
-                title="Time Available", title_fontsize=10)
+    ax_pr.legend(fontsize=10, title="Time Available", title_fontsize=10)
     ax_pr.set_aspect('equal', adjustable='box')
-
-    fig.subplots_adjust(right=0.82, wspace=0.3)
     plt.tight_layout()
 
     return fig
@@ -1220,7 +1446,7 @@ def plot_multiple_roc_pr_curves(
 # ============================================================================
 
 def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True,
-             active_only: bool = False):
+             active_only: bool = False, trauma_scores: bool = False):
     """
     Enhanced evaluation with time-dependent metrics.
 
@@ -1229,6 +1455,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     Args:
         active_only: If True, also runs active-only evaluation and generates
                      comparison plots (all patients vs active-only).
+        trauma_scores: If True, compute traditional trauma risk scores (RTS, ISS,
+                      TRISS) and add them as baselines to comparison plots.
     """
     model_name = cfg["model_name"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
@@ -1325,7 +1553,9 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
 
             # Active-only evaluation and comparison
-            if active_only:
+            results_active = None
+            preds_df_active = None
+            if active_only or trauma_scores:
                 logger.info("Running active-only temporal evaluation...")
                 temporal_eval_active = TemporalEvaluator(
                     data, model, cfg, device=device, active_only=True
@@ -1338,11 +1568,69 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         preds_df_active.to_csv(
                             f'reports/predictions/preds_df_{model_name}_active.csv', index=False
                         )
-                    fig_cmp = plot_time_metrics_comparison(results, results_active)
+                    fig_cmp = plot_time_metrics_comparison(
+                        results, results_active, target_name=cfg["target"]
+                    )
                     save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                     save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                     logger.info("Active-only comparison plots saved")
+
+            # Trauma score comparison (temporal path)
+            if trauma_scores:
+                try:
+                    from astra.evaluation.trauma_scores import (
+                        build_trauma_score_df,
+                        evaluate_static_scores,
+                        recompute_metrics_for_subset,
+                    )
+
+                    trauma_df = build_trauma_score_df(data, cfg)
+                    holdout_pids = data["holdout"].base.PID.values
+                    holdout_y = np.array(data["ty"])
+
+                    static_scores_all = evaluate_static_scores(
+                        trauma_df, holdout_y, holdout_pids
+                    )
+
+                    if static_scores_all:
+                        if results_active and results:
+                            fig_cmp_ts = plot_time_metrics_comparison(
+                                results, results_active,
+                                target_name=cfg["target"],
+                                static_scores=static_scores_all,
+                            )
+                            save_figure(
+                                fig_cmp_ts,
+                                f"time_metrics_comparison_trauma_{model_name}",
+                                save_dir='reports/eval',
+                            )
+
+                        rts_valid = trauma_df.dropna(subset=["RTS"])
+                        valid_pids = rts_valid["PID"].values
+
+                        if len(valid_pids) >= 20 and preds_df_active is not None:
+                            static_scores_filtered = evaluate_static_scores(
+                                trauma_df[trauma_df["PID"].isin(valid_pids)],
+                                holdout_y, holdout_pids,
+                            )
+                            results_filtered = recompute_metrics_for_subset(
+                                preds_df_active, holdout_y, holdout_pids, valid_pids,
+                            )
+                            if results_filtered and static_scores_filtered:
+                                fig_trauma = plot_trauma_score_comparison(
+                                    results_filtered, static_scores_filtered,
+                                    target_name=cfg["target"],
+                                    subset_n=len(valid_pids),
+                                )
+                                save_figure(
+                                    fig_trauma,
+                                    f"trauma_score_comparison_{model_name}",
+                                    save_dir='reports/eval',
+                                )
+                                logger.info("Trauma score comparison plots saved")
+                except Exception as e:
+                    logger.error(f"Trauma score comparison failed: {e}", exc_info=True)
 
             logger.info("="*80)
             logger.info("TEMPORAL EVALUATION SUMMARY")
@@ -1462,7 +1750,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         # Active-only evaluation and comparison
         results_active = None
-        if active_only:
+        preds_df_active = None
+        if active_only or trauma_scores:
             logger.info("Running active-only evaluation...")
             evaluator_active = TimeDependentEvaluator(
                 data, model, cfg, device=device, active_only=True
@@ -1475,11 +1764,95 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     preds_df_active.to_csv(
                         f'reports/predictions/preds_df_{model_name}_active.csv', index=False
                     )
-                fig_cmp = plot_time_metrics_comparison(results, results_active)
+                fig_cmp = plot_time_metrics_comparison(
+                    results, results_active, target_name=cfg["target"]
+                )
                 save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                 save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                 logger.info("Active-only comparison plots saved")
+
+        # ================================================================
+        # TRAUMA SCORE COMPARISON (optional, Azure-only)
+        # ================================================================
+        if trauma_scores:
+            logger.info("="*80)
+            logger.info("TRAUMA SCORE COMPARISON")
+            logger.info("="*80)
+            try:
+                from astra.evaluation.trauma_scores import (
+                    build_trauma_score_df,
+                    evaluate_static_scores,
+                    recompute_metrics_for_subset,
+                )
+
+                trauma_df = build_trauma_score_df(data, cfg)
+                holdout_pids = data["holdout"].base.PID.values
+                holdout_y = np.array(data["ty"])
+
+                logger.info("Evaluating static trauma scores on all holdout patients...")
+                static_scores_all = evaluate_static_scores(
+                    trauma_df, holdout_y, holdout_pids
+                )
+
+                if static_scores_all:
+                    # B) Re-generate comparison plot with reference lines
+                    if results_active and results:
+                        fig_cmp_ts = plot_time_metrics_comparison(
+                            results, results_active,
+                            target_name=cfg["target"],
+                            static_scores=static_scores_all,
+                        )
+                        save_figure(
+                            fig_cmp_ts,
+                            f"time_metrics_comparison_trauma_{model_name}",
+                            save_dir='reports/eval',
+                        )
+                        logger.info("Comparison plot with trauma score baselines saved")
+
+                    # C) Filtered comparison: patients with RTS scores
+                    rts_valid = trauma_df.dropna(subset=["RTS"])
+                    valid_pids = rts_valid["PID"].values
+                    logger.info(
+                        f"Filtered subset: {len(valid_pids)} patients with RTS scores"
+                    )
+
+                    if len(valid_pids) >= 20 and preds_df_active is not None:
+                        # Evaluate static scores on filtered subset
+                        static_scores_filtered = evaluate_static_scores(
+                            trauma_df[trauma_df["PID"].isin(valid_pids)],
+                            holdout_y, holdout_pids,
+                        )
+
+                        # Recompute ASTRA metrics on filtered subset
+                        results_filtered = recompute_metrics_for_subset(
+                            preds_df_active, holdout_y, holdout_pids,
+                            valid_pids,
+                        )
+
+                        if results_filtered and static_scores_filtered:
+                            fig_trauma = plot_trauma_score_comparison(
+                                results_filtered,
+                                static_scores_filtered,
+                                target_name=cfg["target"],
+                                subset_n=len(valid_pids),
+                            )
+                            save_figure(
+                                fig_trauma,
+                                f"trauma_score_comparison_{model_name}",
+                                save_dir='reports/eval',
+                            )
+                            logger.info("Trauma score filtered comparison plot saved")
+                    else:
+                        logger.warning(
+                            f"Too few patients with RTS ({len(valid_pids)}) or "
+                            f"no active predictions — skipping filtered comparison"
+                        )
+                else:
+                    logger.warning("No valid trauma scores computed — skipping plots")
+
+            except Exception as e:
+                logger.error(f"Trauma score comparison failed: {e}", exc_info=True)
 
         logger.info("="*80)
         logger.info("EVALUATION SUMMARY")
