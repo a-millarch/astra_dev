@@ -1172,26 +1172,32 @@ def plot_trauma_score_comparison(
     """Active-only AUROC/AUPRC with time-varying trauma score baselines.
 
     2x2 layout:
-        Top row:    AUROC/AUPRC over time (ASTRA + each score as curves with CIs)
+        Top row:    AUROC/AUPRC over time (HNN + each score as curves with CIs)
         Bottom row: active patient counts, prevalence for the filtered subset
 
-    Args:
-        results_active: ASTRA model TimeMetricResults (active-only, filtered subset).
-        score_results: Dict mapping score name to List[TimeMetricResult],
-            from evaluate_static_scores_over_time().
+    Convention: AUROC = solid line, AUPRC = dotted line, same color per model.
+    ISS is excluded (not a useful standalone predictor).
     """
     if max_days is None:
         max_days = get_max_days()
     if not results_active:
         raise ValueError("Active-only results required for trauma score comparison")
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    ax_perf_h, ax_perf_d = axes[0]
-    ax_count_h, ax_count_d = axes[1]
+    # Filter out ISS from score_results
+    score_results = {k: v for k, v in score_results.items() if k != "ISS"}
 
-    # ── Helper to plot a result set as AUROC + AUPRC curves ──────────────
-    def _plot_results(results, label_suffix, color_auroc, color_auprc,
-                      linestyle="-", alpha_ci=0.1):
+    fig = plt.figure(figsize=(12, 13))
+    gs = fig.add_gridspec(2, 2, hspace=0.38, wspace=0.3)
+    ax_perf_h = fig.add_subplot(gs[0, 0])
+    ax_perf_d = fig.add_subplot(gs[0, 1])
+    ax_count_h = fig.add_subplot(gs[1, 0])
+    ax_count_d = fig.add_subplot(gs[1, 1])
+
+    # ── Color assignments: one color per model ───────────────────────────
+    model_colors = {"HNN": "C0", "RTS": "C3", "TRISS": "C4"}
+
+    # ── Helper to plot AUROC (solid) + AUPRC (dotted) for one model ──────
+    def _plot_model(results, model_name, color, alpha_ci=0.12):
         times_h = np.array([r.time_hours for r in results])
         times_d = np.array([r.time_days for r in results])
         auroc_vals = np.array([r.auroc for r in results])
@@ -1202,9 +1208,9 @@ def plot_trauma_score_comparison(
         auprc_hi = np.array([r.auprc_ci[1] for r in results])
         mask_cut = times_h <= cut_hours
 
-        for vals, lo, hi, color, metric in [
-            (auroc_vals, auroc_lo, auroc_hi, color_auroc, "AUROC"),
-            (auprc_vals, auprc_lo, auprc_hi, color_auprc, "AUPRC"),
+        for vals, lo, hi, ls, metric in [
+            (auroc_vals, auroc_lo, auroc_hi, "-", "AUROC"),
+            (auprc_vals, auprc_lo, auprc_hi, ":", "AUPRC"),
         ]:
             # Hours panel
             valid_h = mask_cut & ~np.isnan(vals)
@@ -1216,11 +1222,11 @@ def plot_trauma_score_comparison(
                     v = np.append(v, v[-1])
                     vlo = np.append(vlo, vlo[-1])
                     vhi = np.append(vhi, vhi[-1])
-                ax_perf_h.plot(x, v, color=color, linestyle=linestyle,
-                               label=f"{metric} {label_suffix}", linewidth=1.5)
+                ax_perf_h.plot(x, v, color=color, linestyle=ls,
+                               label=f"{metric} ({model_name})", linewidth=1.8)
                 ax_perf_h.fill_between(x, vlo, vhi, color=color, alpha=alpha_ci)
 
-            # Days panel
+            # Days panel (no duplicate labels)
             valid_d = ~np.isnan(vals)
             x = times_d[valid_d]
             v, vlo, vhi = vals[valid_d], lo[valid_d], hi[valid_d]
@@ -1230,20 +1236,16 @@ def plot_trauma_score_comparison(
                     v = np.append(v, v[-1])
                     vlo = np.append(vlo, vlo[-1])
                     vhi = np.append(vhi, vhi[-1])
-                ax_perf_d.plot(x, v, color=color, linestyle=linestyle,
-                               linewidth=1.5)
+                ax_perf_d.plot(x, v, color=color, linestyle=ls, linewidth=1.8)
                 ax_perf_d.fill_between(x, vlo, vhi, color=color, alpha=alpha_ci)
 
-    # Plot ASTRA model
-    _plot_results(results_active, "(ASTRA)", "C0", "C1",
-                  linestyle="-", alpha_ci=0.15)
+    # Plot HNN (the model)
+    _plot_model(results_active, "HNN", model_colors["HNN"], alpha_ci=0.15)
 
     # Plot each trauma score
-    score_color_map = {"ISS": "C2", "RTS": "C3", "TRISS": "C4"}
     for score_name, score_res in score_results.items():
-        color = score_color_map.get(score_name, "C5")
-        _plot_results(score_res, f"({score_name})", color, color,
-                      linestyle="--", alpha_ci=0.08)
+        color = model_colors.get(score_name, "C5")
+        _plot_model(score_res, score_name, color, alpha_ci=0.08)
 
     subset_label = f" (N={subset_n})" if subset_n else ""
     for ax, xlabel, xlim, xticks, title in [
@@ -1262,6 +1264,12 @@ def plot_trauma_score_comparison(
         ax.set_title(title, fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0.0, 1.0)
+
+    # Performance legend — snug below top row
+    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
+    fig.legend(perf_handles, perf_labels, loc='upper center',
+               ncol=3, fontsize=9, frameon=True, framealpha=0.9,
+               bbox_to_anchor=(0.5, 0.505))
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
     PREV_COLOR = "#1F77B4"
@@ -1301,18 +1309,14 @@ def plot_trauma_score_comparison(
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
-    # ── Legends ──────────────────────────────────────────────────────────
-    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    fig.legend(perf_handles, perf_labels, loc='upper center',
-               ncol=4, fontsize=8, bbox_to_anchor=(0.5, 0.50))
-
+    # Count legend — snug below bottom row
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
     fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='upper center', ncol=3, fontsize=9, bbox_to_anchor=(0.5, 0.02))
+               loc='lower center', ncol=3, fontsize=9, frameon=True,
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    fig.subplots_adjust(hspace=0.55)
-    plt.tight_layout(rect=[0, 0.06, 1, 1])
+    plt.subplots_adjust(bottom=0.07, top=0.96)
     return fig
 
 
