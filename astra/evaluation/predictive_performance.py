@@ -1018,9 +1018,15 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 11))
-    ax_perf_h, ax_perf_d = axes[0]
-    ax_count_h, ax_count_d = axes[1]
+    fig = plt.figure(figsize=(10, 12))
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
+                          height_ratios=[1, 1])
+    ax_perf_h = fig.add_subplot(gs[0, 0])
+    ax_perf_d = fig.add_subplot(gs[0, 1])
+    ax_count_h = fig.add_subplot(gs[1, 0])
+    ax_count_d = fig.add_subplot(gs[1, 1])
+    for ax in [ax_perf_h, ax_perf_d, ax_count_h, ax_count_d]:
+        ax.set_box_aspect(1)
 
     # ── Top row: performance curves ──────────────────────────────────────
     datasets = [
@@ -1149,16 +1155,18 @@ def plot_time_metrics_comparison(
 
     # ── Legends ──────────────────────────────────────────────────────────
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    fig.legend(perf_handles, perf_labels, loc='lower center', ncol=4, fontsize=10,
-               bbox_to_anchor=(0.5, 0.47))
+    # Position legend in the hspace gap between rows
+    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=4, fontsize=9,
+               frameon=True, framealpha=0.9,
+               bbox_to_anchor=(0.5, 0.52))
 
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
     fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.02))
+               loc='lower center', ncol=4, fontsize=9, frameon=True,
+               framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    fig.subplots_adjust(hspace=0.45, bottom=0.08)
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    plt.subplots_adjust(bottom=0.06, top=0.96)
     return fig
 
 
@@ -1188,12 +1196,15 @@ def plot_trauma_score_comparison(
         max_days = get_max_days()
 
     score_n = paired["score"][0].n_samples if paired["score"] else 0
-    fig = plt.figure(figsize=(12, 13))
-    gs = fig.add_gridspec(2, 2, hspace=0.38, wspace=0.3)
+    fig = plt.figure(figsize=(10, 12))
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
+                          height_ratios=[1, 1])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
     ax_count_h = fig.add_subplot(gs[1, 0])
     ax_count_d = fig.add_subplot(gs[1, 1])
+    for ax in [ax_perf_h, ax_perf_d, ax_count_h, ax_count_d]:
+        ax.set_box_aspect(1)
 
     # ── Color assignments ────────────────────────────────────────────────
     score_colors = {"RTS": "C3", "TRISS": "C4", "ISS": "C2"}
@@ -1265,11 +1276,11 @@ def plot_trauma_score_comparison(
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0.0, 1.0)
 
-    # Performance legend — snug below top row
+    # Performance legend — snug below top row (in the hspace gap)
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     fig.legend(perf_handles, perf_labels, loc='upper center',
                ncol=2, fontsize=9, frameon=True, framealpha=0.9,
-               bbox_to_anchor=(0.5, 0.505))
+               bbox_to_anchor=(0.5, 0.52))
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
     PREV_COLOR = "#1F77B4"
@@ -1283,6 +1294,15 @@ def plot_trauma_score_comparison(
     act_n_samples = np.array([r.n_samples for r in count_source])
     act_n_positive = np.array([r.n_positive for r in count_source])
     act_prevalence = np.where(act_n_samples > 0, act_n_positive / act_n_samples, 0.0)
+
+    # Extend to end of time range with zeros so lines go to 0 instead of clipping
+    if len(times_d) > 0 and times_d[-1] < max_days:
+        times_h = np.append(times_h, max_days * 24.0)
+        times_d = np.append(times_d, max_days)
+        act_n_samples = np.append(act_n_samples, 0)
+        act_n_positive = np.append(act_n_positive, 0)
+        act_prevalence = np.append(act_prevalence, 0.0)
+
     mask_cut_act = times_h <= cut_hours
 
     prev_ax_ref = None
@@ -1318,7 +1338,7 @@ def plot_trauma_score_comparison(
                loc='lower center', ncol=3, fontsize=9, frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    plt.subplots_adjust(bottom=0.07, top=0.96)
+    plt.subplots_adjust(bottom=0.06, top=0.96)
     return fig
 
 
