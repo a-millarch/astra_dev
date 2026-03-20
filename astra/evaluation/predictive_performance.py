@@ -1163,29 +1163,31 @@ def plot_time_metrics_comparison(
 
 
 def plot_trauma_score_comparison(
-    results_active: List[TimeMetricResult],
-    score_results: Dict[str, List[TimeMetricResult]],
+    score_name: str,
+    paired: Dict[str, List[TimeMetricResult]],
     cut_hours=72, max_days=None,
     target_name: str = "deceased_30d",
-    subset_n: Optional[int] = None,
+    results_counts: Optional[List[TimeMetricResult]] = None,
 ):
-    """Active-only AUROC/AUPRC with time-varying trauma score baselines.
+    """Single score vs HNN comparison on identical patients per timestep.
 
     2x2 layout:
-        Top row:    AUROC/AUPRC over time (HNN + each score as curves with CIs)
-        Bottom row: active patient counts, prevalence for the filtered subset
+        Top row:    AUROC/AUPRC over time (HNN + score as curves with CIs)
+        Bottom row: active patient counts, prevalence for this score's subset
+
+    Args:
+        score_name: Name of the score (e.g. "RTS", "TRISS").
+        paired: {"score": List[TimeMetricResult], "model": List[TimeMetricResult]}.
+            Model results are computed on the exact same patients as the score
+            at each timestep (fair comparison).
+        results_counts: Optional separate results for count panels (bottom row).
 
     Convention: AUROC = solid line, AUPRC = dotted line, same color per model.
-    ISS is excluded (not a useful standalone predictor).
     """
     if max_days is None:
         max_days = get_max_days()
-    if not results_active:
-        raise ValueError("Active-only results required for trauma score comparison")
 
-    # Filter out ISS from score_results
-    score_results = {k: v for k, v in score_results.items() if k != "ISS"}
-
+    score_n = paired["score"][0].n_samples if paired["score"] else 0
     fig = plt.figure(figsize=(12, 13))
     gs = fig.add_gridspec(2, 2, hspace=0.38, wspace=0.3)
     ax_perf_h = fig.add_subplot(gs[0, 0])
@@ -1193,8 +1195,10 @@ def plot_trauma_score_comparison(
     ax_count_h = fig.add_subplot(gs[1, 0])
     ax_count_d = fig.add_subplot(gs[1, 1])
 
-    # ── Color assignments: one color per model ───────────────────────────
-    model_colors = {"HNN": "C0", "RTS": "C3", "TRISS": "C4"}
+    # ── Color assignments ────────────────────────────────────────────────
+    score_colors = {"RTS": "C3", "TRISS": "C4", "ISS": "C2"}
+    score_color = score_colors.get(score_name, "C5")
+    hnn_color = "C0"
 
     # ── Helper to plot AUROC (solid) + AUPRC (dotted) for one model ──────
     def _plot_model(results, model_name, color, alpha_ci=0.12):
@@ -1239,22 +1243,18 @@ def plot_trauma_score_comparison(
                 ax_perf_d.plot(x, v, color=color, linestyle=ls, linewidth=1.8)
                 ax_perf_d.fill_between(x, vlo, vhi, color=color, alpha=alpha_ci)
 
-    # Plot HNN (the model)
-    _plot_model(results_active, "HNN", model_colors["HNN"], alpha_ci=0.15)
+    # Plot HNN (on this score's patient set) then the score itself
+    _plot_model(paired["model"], "HNN", hnn_color, alpha_ci=0.12)
+    _plot_model(paired["score"], score_name, score_color, alpha_ci=0.08)
 
-    # Plot each trauma score
-    for score_name, score_res in score_results.items():
-        color = model_colors.get(score_name, "C5")
-        _plot_model(score_res, score_name, color, alpha_ci=0.08)
-
-    subset_label = f" (N={subset_n})" if subset_n else ""
+    subset_label = f" (N={score_n})"
     for ax, xlabel, xlim, xticks, title in [
         (ax_perf_h, "Time (hours)", cut_hours,
          np.arange(0, cut_hours + 1, 6),
-         f"A) Performance — Trauma Score Subset{subset_label}"),
+         f"A) HNN vs {score_name}{subset_label} — Hours"),
         (ax_perf_d, "Time (days)", max_days,
          np.arange(0, max_days + 1, 5),
-         f"B) Performance — Trauma Score Subset{subset_label}"),
+         f"B) HNN vs {score_name}{subset_label} — Days"),
     ]:
         ax.set_xlabel(xlabel, fontsize=11)
         ax.set_xlim(0, xlim)
@@ -1268,7 +1268,7 @@ def plot_trauma_score_comparison(
     # Performance legend — snug below top row
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     fig.legend(perf_handles, perf_labels, loc='upper center',
-               ncol=3, fontsize=9, frameon=True, framealpha=0.9,
+               ncol=2, fontsize=9, frameon=True, framealpha=0.9,
                bbox_to_anchor=(0.5, 0.505))
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
@@ -1276,10 +1276,12 @@ def plot_trauma_score_comparison(
     ACTIVE_COLOR = "#2CA02C"
     POSITIVE_COLOR = "#D62728"
 
-    times_h = np.array([r.time_hours for r in results_active])
-    times_d = np.array([r.time_days for r in results_active])
-    act_n_samples = np.array([r.n_samples for r in results_active])
-    act_n_positive = np.array([r.n_positive for r in results_active])
+    # Use results_counts for bottom panels if provided (covers full time range)
+    count_source = results_counts if results_counts is not None else paired["model"]
+    times_h = np.array([r.time_hours for r in count_source])
+    times_d = np.array([r.time_days for r in count_source])
+    act_n_samples = np.array([r.n_samples for r in count_source])
+    act_n_positive = np.array([r.n_positive for r in count_source])
     act_prevalence = np.where(act_n_samples > 0, act_n_positive / act_n_samples, 0.0)
     mask_cut_act = times_h <= cut_hours
 
@@ -1456,7 +1458,6 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
             build_trauma_score_df,
             evaluate_static_scores,
             evaluate_static_scores_over_time,
-            recompute_metrics_for_subset,
         )
 
         logger.info("=" * 80)
@@ -1491,30 +1492,28 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
         logger.info(f"Filtered subset: {len(valid_pids)} patients with RTS scores")
 
         if len(valid_pids) >= 20 and preds_df_active is not None:
-            # ASTRA model metrics on filtered subset
-            results_filtered = recompute_metrics_for_subset(
-                preds_df_active, holdout_y, holdout_pids, valid_pids,
-            )
-
-            # Time-varying trauma score metrics on active patients
+            # Time-varying score + model metrics on identical patients per step
             score_results = evaluate_static_scores_over_time(
                 trauma_df, preds_df_active, holdout_y, holdout_pids,
                 valid_pids=valid_pids,
             )
 
-            if results_filtered and score_results:
-                fig_trauma = plot_trauma_score_comparison(
-                    results_filtered,
-                    score_results,
-                    target_name=cfg["target"],
-                    subset_n=len(valid_pids),
-                )
-                save_figure(
-                    fig_trauma,
-                    f"trauma_score_comparison_{model_name}",
-                    save_dir='reports/eval',
-                )
-                logger.info("Trauma score filtered comparison plot saved")
+            if score_results:
+                # One plot per score (each has different patient population)
+                for sname, paired in score_results.items():
+                    if sname == "ISS":
+                        continue
+                    fig_trauma = plot_trauma_score_comparison(
+                        sname, paired,
+                        target_name=cfg["target"],
+                        results_counts=paired["counts"],
+                    )
+                    save_figure(
+                        fig_trauma,
+                        f"trauma_{sname.lower()}_comparison_{model_name}",
+                        save_dir='reports/eval',
+                    )
+                    logger.info(f"HNN vs {sname} comparison plot saved")
         else:
             logger.warning(
                 f"Too few patients with RTS ({len(valid_pids)}) or "

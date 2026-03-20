@@ -571,11 +571,12 @@ def evaluate_static_scores_over_time(
     holdout_y: np.ndarray,
     holdout_pids: np.ndarray,
     valid_pids: Optional[np.ndarray] = None,
-) -> Dict[str, "List[TimeMetricResult]"]:
-    """Compute static score AUROC/AUPRC at each censor step using active patients only.
+) -> Dict[str, Dict[str, "List[TimeMetricResult]"]]:
+    """Compute score and model AUROC/AUPRC at each censor step on identical patients.
 
-    At each censor step, uses the same active patient set as the model evaluation
-    (determined by which PIDs appear in preds_df_active at that step).
+    At each censor step, for each score: identifies patients with that score available,
+    then computes BOTH the score's metric AND the HNN model's metric on that exact
+    same patient set. This ensures a fair apples-to-apples comparison.
 
     Args:
         scores_df: DataFrame with PID + score columns from build_trauma_score_df().
@@ -585,7 +586,8 @@ def evaluate_static_scores_over_time(
         valid_pids: Optional further filter (e.g., patients with RTS scores).
 
     Returns:
-        Dict mapping score label to List[TimeMetricResult].
+        Dict mapping score label to {"score": List[TimeMetricResult],
+                                      "model": List[TimeMetricResult]}.
     """
     from astra.evaluation.predictive_performance import TimeMetricResult
 
@@ -605,12 +607,17 @@ def evaluate_static_scores_over_time(
     else:
         preds_filtered = preds_df_active
 
+    # Index model predictions by (PID, censor_step) for fast lookup
+    preds_indexed = preds_filtered.set_index(['PID', 'censor_step'])['pred']
+
     all_results = {}
     for col, label, negate in score_configs:
         if col not in scores_by_pid.columns:
             continue
 
-        results = []
+        score_results = []
+        model_results = []
+        count_results = []
         for step, group in preds_filtered.groupby('censor_step'):
             # Active PIDs at this step (intersection with score availability)
             active_pids = group['PID'].values
@@ -618,46 +625,84 @@ def evaluate_static_scores_over_time(
             has_score = score_vals.notna()
 
             pids_with_score = active_pids[has_score.values]
-            if len(pids_with_score) < 10:
-                continue
-
-            y_true = np.array([pid_to_y[pid] for pid in pids_with_score])
-            y_score = score_vals[has_score].values.astype(float)
-
-            if negate:
-                y_score = -y_score
-
-            if len(np.unique(y_true)) < 2:
-                continue
 
             time_min = step_to_time(step)
             if time_min is None:
                 continue
+
+            y_true = np.array([pid_to_y[pid] for pid in pids_with_score])
+            n_samples = len(pids_with_score)
+            n_positive = int(y_true.sum())
+
+            time_kwargs = dict(
+                time_min=time_min,
+                time_hours=time_min / 60.0,
+                time_days=time_min / (60.0 * 24.0),
+                censor_step=int(step),
+                n_samples=n_samples,
+                n_positive=n_positive,
+            )
+
+            # Always record counts (no skipping — for bottom panels)
+            count_results.append(TimeMetricResult(
+                **time_kwargs,
+                auroc=float('nan'),
+                auroc_ci=(float('nan'), float('nan')),
+                auprc=float('nan'),
+                auprc_ci=(float('nan'), float('nan')),
+            ))
+
+            # Skip metric computation if insufficient data
+            if n_samples < 10 or len(np.unique(y_true)) < 2:
+                continue
+
+            y_score = score_vals[has_score].values.astype(float)
+            if negate:
+                y_score = -y_score
+
+            # Get model predictions for the SAME patients
+            model_preds = np.array([
+                preds_indexed.loc[(pid, step)]
+                for pid in pids_with_score
+            ])
 
             try:
                 auroc, auroc_lo, auroc_hi = calculate_roc_auc_ci(y_true, y_score)
                 auprc, auprc_lo, auprc_hi = calculate_average_precision_ci(
                     y_true, y_score, n_bootstraps=200
                 )
+                m_auroc, m_auroc_lo, m_auroc_hi = calculate_roc_auc_ci(
+                    y_true, model_preds
+                )
+                m_auprc, m_auprc_lo, m_auprc_hi = calculate_average_precision_ci(
+                    y_true, model_preds, n_bootstraps=200
+                )
             except Exception:
                 continue
 
-            results.append(TimeMetricResult(
-                time_min=time_min,
-                time_hours=time_min / 60.0,
-                time_days=time_min / (60.0 * 24.0),
-                censor_step=int(step),
+            score_results.append(TimeMetricResult(
+                **time_kwargs,
                 auroc=auroc,
                 auroc_ci=(auroc_lo, auroc_hi),
                 auprc=auprc,
                 auprc_ci=(auprc_lo, auprc_hi),
-                n_samples=len(pids_with_score),
-                n_positive=int(y_true.sum()),
             ))
 
-        if results:
-            all_results[label] = results
-            logger.info(f"  {label}: evaluated at {len(results)} time points")
+            model_results.append(TimeMetricResult(
+                **time_kwargs,
+                auroc=m_auroc,
+                auroc_ci=(m_auroc_lo, m_auroc_hi),
+                auprc=m_auprc,
+                auprc_ci=(m_auprc_lo, m_auprc_hi),
+            ))
+
+        if score_results:
+            all_results[label] = {
+                "score": score_results,
+                "model": model_results,
+                "counts": count_results,
+            }
+            logger.info(f"  {label}: evaluated at {len(score_results)} time points")
 
     return all_results
 
@@ -733,4 +778,49 @@ def recompute_metrics_for_subset(
 
     logger.info(f"Recomputed metrics for {len(results)} time points "
                 f"on {len(valid_pids)} patients")
+    return results
+
+
+def compute_counts_for_subset(
+    preds_df: pd.DataFrame,
+    holdout_y: np.ndarray,
+    holdout_pids: np.ndarray,
+    valid_pids: np.ndarray,
+) -> "List[TimeMetricResult]":
+    """Compute patient counts at each censor step for a filtered subset.
+
+    Unlike recompute_metrics_for_subset, this does NOT skip steps with
+    insufficient data — it returns entries for ALL censor steps with NaN
+    metrics but valid n_samples/n_positive. Used for the count panels.
+    """
+    from astra.evaluation.predictive_performance import TimeMetricResult
+
+    pid_to_y = dict(zip(holdout_pids, holdout_y))
+    valid_set = set(valid_pids)
+    preds_filtered = preds_df[preds_df['PID'].isin(valid_set)]
+
+    results = []
+    for step, group in preds_filtered.groupby('censor_step'):
+        pids = group['PID'].values
+        y_true = np.array([pid_to_y[pid] for pid in pids])
+        n_samples = len(y_true)
+        n_positive = int(y_true.sum())
+
+        time_min = step_to_time(step)
+        if time_min is None:
+            continue
+
+        results.append(TimeMetricResult(
+            time_min=time_min,
+            time_hours=time_min / 60.0,
+            time_days=time_min / (60.0 * 24.0),
+            censor_step=int(step),
+            auroc=float('nan'),
+            auroc_ci=(float('nan'), float('nan')),
+            auprc=float('nan'),
+            auprc_ci=(float('nan'), float('nan')),
+            n_samples=n_samples,
+            n_positive=n_positive,
+        ))
+
     return results
