@@ -67,6 +67,8 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "label_smoothing": best["label_smoothing"],
         "pos_weight_factor": best["pos_weight_factor"],
         "time_weighting": best.get("time_weighting", "uniform"),
+        "temporal_crop_prob": best.get("temporal_crop_prob", 0.0),
+        "temporal_crop_all_phases": best.get("temporal_crop_prob", 0.0) > 0,
     }
 
     # Override epoch counts with actual (early-stopped) values if available
@@ -181,6 +183,8 @@ def joint_objective(
         )
     else:
         time_weighting = "uniform"
+    # Temporal cropping augmentation
+    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", 0.2, 0.6)
 
     # --- Temporarily override global cfg with trial architecture ---
     orig_model_cfg = {k: cfg_dict["model"][k] for k in [
@@ -220,6 +224,8 @@ def joint_objective(
             use_pretrained=False,  # No pretraining during sweep
             patience=7,
             time_weighting=time_weighting,
+            temporal_crop_prob=temporal_crop_prob,
+            temporal_crop_all_phases=True,
         )
 
         result = run_finetune_v2(
@@ -274,6 +280,8 @@ def _build_best_finetune_cfg(best: dict, pretrain_checkpoint_dir: str = None) ->
         use_pretrained=True,  # Final retrain uses pretrained weights
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
         time_weighting=best.get("time_weighting", "uniform"),
+        temporal_crop_prob=best.get("temporal_crop_prob", 0.0),
+        temporal_crop_all_phases=best.get("temporal_crop_prob", 0.0) > 0,
     )
 
 
@@ -347,7 +355,8 @@ def run_sweep(
     cfg_dict["model"]["fc_mults_2"] = best["fc_mults_2"]
     cfg_dict["model"]["fc_dropout"] = best["fc_dropout"]
     cfg_dict["model"]["res_dropout"] = best["res_dropout"]
-    cfg_dict["model"]["head_pool"] = best["head_pool"]
+    if "head_pool" in best:
+        cfg_dict["model"]["head_pool"] = best["head_pool"]
     logger.info(f"Updated global model config with best architecture")
 
     best_cfg = _build_best_finetune_cfg(best)
