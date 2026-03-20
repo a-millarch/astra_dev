@@ -8,7 +8,7 @@ run_name: highres
 
 model_name: '20032026_exp1_baseline'
 
-target: deceased_90d
+target: deceased_30d
 
 # Pre-hospital (PPJ) data integration
 prehospital: true                     # Set true to enable pre-hospital data pipeline
@@ -82,7 +82,7 @@ concepts:
   - ADTHaendelser
   - EWS
   - ISS
-  - Events
+  #- Events
   #- IndUd
   #- ITARespirator
   
@@ -192,8 +192,8 @@ model:
     d_ff: None
     d_k: None
     d_v: None
-    temporal_head: true
-    causal: true  # required for temporal_head
+    temporal_head: false
+    causal: false  # required for temporal_head
     temporal_head_dropout: 0.3
     survival_mode: false  # true = discrete-time survival, false = binary classification
 
@@ -259,7 +259,7 @@ sweep:
         fc_mults_2: [0.05, 0.3]
         fc_dropout: [0.1, 0.9]
         res_dropout: [0.0, 0.4]
-        head_pool: [mean_cat]
+        head_pool: [flatten, mean_cat]
         # Training HPs (per-phase LRs swept independently)
         phase1_lr: [1.0e-4, 1.0e-2]          # log scale
         phase2_lr: [5.0e-5, 3.0e-3]          # log scale
@@ -274,8 +274,8 @@ sweep:
         lr_decay_factor: [0.01, 0.5]         # log scale
         masking_prob: [0.3, 0.7]
         early_weight: [1.0, 3.0]
-        pos_weight_factor: [0.3, 1.0]        # log scale
-        temporal_crop_prob: [0.2, 0.6]       # probability of cropping per batch
+        pos_weight_factor: [0.0, 1.0]        # linear (0 = no class weighting)
+        temporal_crop_prob: [0.0, 0.6]       # probability of cropping per batch
 
 evaluation:
     max_f_beta: 10

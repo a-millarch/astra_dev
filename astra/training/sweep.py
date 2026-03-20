@@ -132,21 +132,24 @@ def joint_objective(
     No pretraining — trains from random init with a validation split to
     evaluate each configuration. Pretraining is done once for the final
     winner after the sweep completes.
+
+    All search ranges are read from cfg_dict["sweep"]["search_space"].
     """
+    ss = cfg_dict["sweep"]["search_space"]
+
     # --- Architecture parameters ---
-    d_model = trial.suggest_categorical("d_model", [32, 64, 128])
-    n_layers = trial.suggest_categorical("n_layers", [2, 4, 6, 8])
-    n_heads = trial.suggest_categorical("n_heads", [4, 8])
-    fc_mults_1 = trial.suggest_float("fc_mults_1", 0.1, 0.5, step=0.005)
-    fc_mults_2 = trial.suggest_float("fc_mults_2", 0.05, 0.3, step=0.005)
-    fc_dropout = trial.suggest_float("fc_dropout", 0.1, 0.9)
-    res_dropout = trial.suggest_float("res_dropout", 0.0, 0.4)
+    d_model = trial.suggest_categorical("d_model", ss["d_model"])
+    n_layers = trial.suggest_categorical("n_layers", ss["n_layers"])
+    n_heads = trial.suggest_categorical("n_heads", ss["n_heads"])
+    fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"])
+    fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"])
+    fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"])
+    res_dropout = trial.suggest_float("res_dropout", *ss["res_dropout"])
     temporal_head = cfg_dict["model"].get("temporal_head", False)
     if temporal_head:
-        # Temporal head replaces the standard head; head_pool is irrelevant
-        head_pool = "mean_cat"  # unused but must be set for model constructor
+        head_pool = "mean_cat"  # temporal head replaces the standard head
     else:
-        head_pool = trial.suggest_categorical("head_pool", ["flatten", "mean_cat"])
+        head_pool = trial.suggest_categorical("head_pool", ss["head_pool"])
 
     # Ensure d_model is divisible by n_heads
     if d_model % n_heads != 0:
@@ -154,27 +157,24 @@ def joint_objective(
         while d_model % n_heads != 0:
             n_heads -= 1
 
-    # --- Training parameters (per-phase LRs swept independently) ---
-    phase1_lr = trial.suggest_float("phase1_lr", 1e-4, 1e-2, log=True)
-    phase2_lr = trial.suggest_float("phase2_lr", 5e-5, 3e-3, log=True)
-    phase3_lr = trial.suggest_float("phase3_lr", 1e-5, 1e-3, log=True)
-    phase4_lr = trial.suggest_float("phase4_lr", 5e-6, 5e-4, log=True)
+    # --- Training parameters ---
+    phase1_lr = trial.suggest_float("phase1_lr", *ss["phase1_lr"], log=True)
+    phase2_lr = trial.suggest_float("phase2_lr", *ss["phase2_lr"], log=True)
+    phase3_lr = trial.suggest_float("phase3_lr", *ss["phase3_lr"], log=True)
+    phase4_lr = trial.suggest_float("phase4_lr", *ss["phase4_lr"], log=True)
 
-    weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
-    label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
-    lr_decay_factor = trial.suggest_float("lr_decay_factor", 0.01, 0.5, log=True)
+    weight_decay = trial.suggest_float("weight_decay", *ss["weight_decay"], log=True)
+    label_smoothing = trial.suggest_float("label_smoothing", *ss["label_smoothing"])
+    lr_decay_factor = trial.suggest_float("lr_decay_factor", *ss["lr_decay_factor"], log=True)
 
-    phase1_epochs = trial.suggest_int("phase1_epochs", 2, 8)
-    phase2_epochs = trial.suggest_int("phase2_epochs", 5, 20)
-    phase3_epochs = trial.suggest_int("phase3_epochs", 3, 15)
-    phase4_epochs = trial.suggest_int("phase4_epochs", 0, 10)
+    phase1_epochs = trial.suggest_int("phase1_epochs", *ss["phase1_epochs"])
+    phase2_epochs = trial.suggest_int("phase2_epochs", *ss["phase2_epochs"])
+    phase3_epochs = trial.suggest_int("phase3_epochs", *ss["phase3_epochs"])
+    phase4_epochs = trial.suggest_int("phase4_epochs", *ss["phase4_epochs"])
 
-    # Class imbalance handling
-    pos_weight_factor = trial.suggest_float("pos_weight_factor", 0.3, 1.0, log=True)
-
-    # Early prediction params (only relevant if phase4_epochs > 0)
-    masking_prob = trial.suggest_float("masking_prob", 0.3, 0.7)
-    early_weight = trial.suggest_float("early_weight", 1.0, 3.0)
+    pos_weight_factor = trial.suggest_float("pos_weight_factor", *ss["pos_weight_factor"])
+    masking_prob = trial.suggest_float("masking_prob", *ss["masking_prob"])
+    early_weight = trial.suggest_float("early_weight", *ss["early_weight"])
 
     # Temporal head time weighting
     if temporal_head:
@@ -183,8 +183,9 @@ def joint_objective(
         )
     else:
         time_weighting = "uniform"
+
     # Temporal cropping augmentation
-    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", 0.2, 0.6)
+    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", *ss["temporal_crop_prob"])
 
     # --- Temporarily override global cfg with trial architecture ---
     orig_model_cfg = {k: cfg_dict["model"][k] for k in [
