@@ -47,7 +47,7 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "fc_mults_2": best["fc_mults_2"],
         "fc_dropout": best["fc_dropout"],
         "res_dropout": best["res_dropout"],
-        "head_pool": best["head_pool"],
+        "head_pool": best.get("head_pool", "mean_cat"),
     }
 
     finetune_section = {
@@ -66,6 +66,8 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "weight_decay": best["weight_decay"],
         "label_smoothing": best["label_smoothing"],
         "pos_weight_factor": best["pos_weight_factor"],
+        "temporal_crop_prob": best.get("temporal_crop_prob", 0.0),
+        "temporal_crop_all_phases": best.get("temporal_crop_prob", 0.0) > 0,
     }
 
     # Override epoch counts with actual (early-stopped) values if available
@@ -168,6 +170,9 @@ def joint_objective(
     masking_prob = trial.suggest_float("masking_prob", 0.3, 0.7)
     early_weight = trial.suggest_float("early_weight", 1.0, 3.0)
 
+    # Temporal cropping augmentation
+    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", 0.2, 0.6)
+
     # --- Temporarily override global cfg with trial architecture ---
     orig_model_cfg = {k: cfg_dict["model"][k] for k in [
         "d_model", "n_layers", "n_heads", "fc_mults_1", "fc_mults_2",
@@ -205,6 +210,8 @@ def joint_objective(
             res_dropout=res_dropout,
             use_pretrained=False,  # No pretraining during sweep
             patience=7,
+            temporal_crop_prob=temporal_crop_prob,
+            temporal_crop_all_phases=True,
         )
 
         result = run_finetune_v2(
@@ -258,6 +265,8 @@ def _build_best_finetune_cfg(best: dict, pretrain_checkpoint_dir: str = None) ->
         res_dropout=best["res_dropout"],
         use_pretrained=True,  # Final retrain uses pretrained weights
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
+        temporal_crop_prob=best.get("temporal_crop_prob", 0.0),
+        temporal_crop_all_phases=best.get("temporal_crop_prob", 0.0) > 0,
     )
 
 
@@ -331,7 +340,8 @@ def run_sweep(
     cfg_dict["model"]["fc_mults_2"] = best["fc_mults_2"]
     cfg_dict["model"]["fc_dropout"] = best["fc_dropout"]
     cfg_dict["model"]["res_dropout"] = best["res_dropout"]
-    cfg_dict["model"]["head_pool"] = best["head_pool"]
+    if "head_pool" in best:
+        cfg_dict["model"]["head_pool"] = best["head_pool"]
     logger.info(f"Updated global model config with best architecture")
 
     best_cfg = _build_best_finetune_cfg(best)

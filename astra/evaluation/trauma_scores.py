@@ -565,6 +565,103 @@ def evaluate_static_scores(
     return results
 
 
+def evaluate_static_scores_over_time(
+    scores_df: pd.DataFrame,
+    preds_df_active: pd.DataFrame,
+    holdout_y: np.ndarray,
+    holdout_pids: np.ndarray,
+    valid_pids: Optional[np.ndarray] = None,
+) -> Dict[str, "List[TimeMetricResult]"]:
+    """Compute static score AUROC/AUPRC at each censor step using active patients only.
+
+    At each censor step, uses the same active patient set as the model evaluation
+    (determined by which PIDs appear in preds_df_active at that step).
+
+    Args:
+        scores_df: DataFrame with PID + score columns from build_trauma_score_df().
+        preds_df_active: Active-only predictions DataFrame with [PID, censor_step, pred].
+        holdout_y: Full holdout binary targets.
+        holdout_pids: Full holdout PIDs (same order as holdout_y).
+        valid_pids: Optional further filter (e.g., patients with RTS scores).
+
+    Returns:
+        Dict mapping score label to List[TimeMetricResult].
+    """
+    from astra.evaluation.predictive_performance import TimeMetricResult
+
+    pid_to_y = dict(zip(holdout_pids, holdout_y))
+    scores_by_pid = scores_df.set_index('PID')
+
+    score_configs = [
+        ('RTS', 'RTS', True),
+        ('ISS_COMPOUND', 'ISS', False),
+        ('TRISS_mors_prob', 'TRISS', False),
+    ]
+
+    # Pre-filter valid_pids
+    if valid_pids is not None:
+        valid_set = set(valid_pids)
+        preds_filtered = preds_df_active[preds_df_active['PID'].isin(valid_set)]
+    else:
+        preds_filtered = preds_df_active
+
+    all_results = {}
+    for col, label, negate in score_configs:
+        if col not in scores_by_pid.columns:
+            continue
+
+        results = []
+        for step, group in preds_filtered.groupby('censor_step'):
+            # Active PIDs at this step (intersection with score availability)
+            active_pids = group['PID'].values
+            score_vals = scores_by_pid.reindex(active_pids)[col]
+            has_score = score_vals.notna()
+
+            pids_with_score = active_pids[has_score.values]
+            if len(pids_with_score) < 10:
+                continue
+
+            y_true = np.array([pid_to_y[pid] for pid in pids_with_score])
+            y_score = score_vals[has_score].values.astype(float)
+
+            if negate:
+                y_score = -y_score
+
+            if len(np.unique(y_true)) < 2:
+                continue
+
+            time_min = step_to_time(step)
+            if time_min is None:
+                continue
+
+            try:
+                auroc, auroc_lo, auroc_hi = calculate_roc_auc_ci(y_true, y_score)
+                auprc, auprc_lo, auprc_hi = calculate_average_precision_ci(
+                    y_true, y_score, n_bootstraps=200
+                )
+            except Exception:
+                continue
+
+            results.append(TimeMetricResult(
+                time_min=time_min,
+                time_hours=time_min / 60.0,
+                time_days=time_min / (60.0 * 24.0),
+                censor_step=int(step),
+                auroc=auroc,
+                auroc_ci=(auroc_lo, auroc_hi),
+                auprc=auprc,
+                auprc_ci=(auprc_lo, auprc_hi),
+                n_samples=len(pids_with_score),
+                n_positive=int(y_true.sum()),
+            ))
+
+        if results:
+            all_results[label] = results
+            logger.info(f"  {label}: evaluated at {len(results)} time points")
+
+    return all_results
+
+
 # ============================================================================
 # POST-HOC FILTERED EVALUATION
 # ============================================================================

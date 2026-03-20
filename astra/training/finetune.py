@@ -111,6 +111,10 @@ class FinetuneConfig:
     time_weighting: str = "uniform"     # 'uniform' or 'early'
     early_weight_factor: float = 2.0
 
+    # Temporal cropping augmentation
+    temporal_crop_prob: float = 0.0       # probability of cropping per batch (0 = disabled)
+    temporal_crop_all_phases: bool = False # apply cropping in Phases 1-3 (not just Phase 4)
+
 
 def create_split_dataloaders(data: dict, splits, cfg_dict: dict):
     """
@@ -578,6 +582,7 @@ def _run_phase(
     trial=None,
     global_epoch: int = 0,
     enable_masking: bool = False,
+    masking_prob: Optional[float] = None,
     enable_weighting: bool = False,
     # Per-timestep prediction options (passed through from run_finetune_v2)
     temporal_head: bool = False,
@@ -622,7 +627,7 @@ def _run_phase(
             grad_clip=finetune_cfg.grad_clip,
             label_smoothing=finetune_cfg.label_smoothing,
             enable_masking=enable_masking,
-            masking_prob=finetune_cfg.masking_prob,
+            masking_prob=masking_prob if masking_prob is not None else finetune_cfg.masking_prob,
             min_timesteps=finetune_cfg.min_timesteps,
             enable_weighting=enable_weighting,
             early_weight=finetune_cfg.early_weight,
@@ -811,6 +816,14 @@ def run_finetune_v2(
     # ========================================================================
     # 4. Phase 1: Head-only training
     # ========================================================================
+    # Temporal cropping: apply in Phases 1-3 when enabled
+    crop_phases = (finetune_cfg.temporal_crop_all_phases
+                   and finetune_cfg.temporal_crop_prob > 0)
+    crop_masking_prob = finetune_cfg.temporal_crop_prob if crop_phases else None
+    if crop_phases:
+        logger.info(f"Temporal cropping enabled in all phases "
+                     f"(prob={finetune_cfg.temporal_crop_prob:.2f})")
+
     # Freeze everything except head
     freeze_to(backbone, list(layer_groups.keys())[-2])  # freeze up to last transformer group
     logger.info("Phase 1: Training head only")
@@ -825,6 +838,8 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        enable_masking=crop_phases,
+        masking_prob=crop_masking_prob,
         **phase_kwargs,
     )
 
@@ -846,6 +861,8 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        enable_masking=crop_phases,
+        masking_prob=crop_masking_prob,
         **phase_kwargs,
     )
 
@@ -867,6 +884,8 @@ def run_finetune_v2(
         early_stopper=early_stopper,
         trial=trial,
         global_epoch=global_epoch,
+        enable_masking=crop_phases,
+        masking_prob=crop_masking_prob,
         **phase_kwargs,
     )
 

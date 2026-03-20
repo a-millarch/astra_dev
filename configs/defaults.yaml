@@ -6,12 +6,12 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '16032026_astra'
+model_name: '20032026_exp1_baseline'
 
-target: deceased_30d
+target: deceased_90d
 
 # Pre-hospital (PPJ) data integration
-prehospital: false                     # Set true to enable pre-hospital data pipeline
+prehospital: true                     # Set true to enable pre-hospital data pipeline
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
@@ -181,14 +181,14 @@ training:
     bs: 32
     
 model:
-    res_dropout: 0.031
-    fc_dropout: 0.736
-    fc_mults_1: 0.17972145033617737
-    fc_mults_2: 0.1062992529386409
-    n_layers: 2
-    n_heads: 4
-    d_model: 128
-    head_pool: flatten
+    res_dropout: 0.22
+    fc_dropout: 0.75
+    fc_mults_1: 0.3
+    fc_mults_2: 0.1
+    n_layers: 8
+    n_heads: 8
+    d_model: 64
+    head_pool: mean_cat
     d_ff: None
     d_k: None
     d_v: None
@@ -198,37 +198,37 @@ model:
 
 finetune:
     # Phase 1: Head-only training (warm up randomly initialized head)
-    phase1_epochs: 2
-    phase1_lr: 1.627e-3
+    phase1_epochs: 5
+    phase1_lr: 1.0e-3
 
     # Phase 2: Partial unfreeze (upper transformer layers + head)
-    phase2_epochs: 10
-    phase2_lr: 4.882e-4
-    phase2_unfreeze_from: transformer_0_1
+    phase2_epochs: 12
+    phase2_lr: 3.0e-4
+    phase2_unfreeze_from: transformer_4_5
 
     # Phase 3: Full finetune (all layers, discriminative LRs)
-    phase3_epochs: 13
-    phase3_lr: 1.627e-4
+    phase3_epochs: 16
+    phase3_lr: 1.0e-4
 
     # Phase 4: Early prediction hardening (optional)
     enable_early_prediction: true
-    phase4_epochs: 5
-    phase4_lr: 8.137e-5
-    masking_prob: 0.353
-    early_weight: 1.582
-    min_timesteps: 1
+    phase4_epochs: 8
+    phase4_lr: 5.0e-5
+    masking_prob: 0.8
+    early_weight: 2.0
+    min_timesteps: 2
 
     # Discriminative learning rates
-    lr_decay_factor: 0.070       # embedding_lr = head_lr * lr_decay_factor
+    lr_decay_factor: 0.1
 
     # Optimization
-    weight_decay: 0.045
+    weight_decay: 0.01
     warmup_fraction: 0.1         # fraction of phase steps for LR warmup
     grad_clip: 1.0
-    label_smoothing: 0.176
+    label_smoothing: 0.1
 
     # Class imbalance
-    pos_weight_factor: 0.607     # scale factor for positive class weight (n_neg/n_pos * factor)
+    pos_weight_factor: 0.0
 
     # Validation / early stopping
     patience: 7
@@ -238,8 +238,13 @@ finetune:
     use_pretrained: true
 
     # Time weighting for temporal head
-    time_weighting: uniform      # 'uniform' or 'early'
+    time_weighting: uniform
     early_weight_factor: 2.0
+
+    # Temporal cropping augmentation (all phases)
+    # Experiment 1: disabled. Experiment 2: set temporal_crop_prob: 0.4
+    temporal_crop_prob: 0.0
+    temporal_crop_all_phases: false
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
@@ -269,6 +274,7 @@ sweep:
         masking_prob: [0.3, 0.7]
         early_weight: [1.0, 3.0]
         pos_weight_factor: [0.3, 1.0]        # log scale
+        temporal_crop_prob: [0.2, 0.6]       # probability of cropping per batch
 
 evaluation:
     max_f_beta: 10
