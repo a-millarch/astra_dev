@@ -591,8 +591,9 @@ def _plot_reliability_diagrams(
             frac_raw, mean_raw = calibration_curve(
                 y_true, y_prob_raw, n_bins=n_bins, strategy='uniform'
             )
+            brier_raw = brier_score_loss(y_true, y_prob_raw)
             ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=1.5,
-                    markersize=5, alpha=0.7, label='Raw')
+                    markersize=5, alpha=0.7, label=f'Raw (Brier={brier_raw:.3f})')
         except Exception:
             pass
 
@@ -603,8 +604,9 @@ def _plot_reliability_diagrams(
                 frac_cal, mean_cal = calibration_curve(
                     y_true, y_prob_cal, n_bins=n_bins, strategy='uniform'
                 )
+                brier_cal = brier_score_loss(y_true, y_prob_cal)
                 ax.plot(mean_cal, frac_cal, 'o-', color='#2E86AB', linewidth=2,
-                        markersize=5, label=f'{best_method.capitalize()}')
+                        markersize=5, label=f'{best_method.capitalize()} (Brier={brier_cal:.3f})')
             except Exception:
                 pass
 
@@ -614,8 +616,7 @@ def _plot_reliability_diagrams(
         ax.set_ylim([0, 1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.2)
-        if idx == 0:
-            ax.legend(fontsize=8)
+        ax.legend(fontsize=7, loc='upper left')
         if row == nrows - 1:
             ax.set_xlabel('Predicted')
         if col == 0:
