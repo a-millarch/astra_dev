@@ -347,7 +347,7 @@ from sklearn.metrics import brier_score_loss
 import pandas as pd
 
 
-def calculate_ece(y_true, y_pred, n_bins=10):
+def calculate_ece(y_true, y_pred, n_bins=4):
     """
     Calculate Expected Calibration Error (ECE).
     
@@ -409,9 +409,9 @@ def calculate_ece(y_true, y_pred, n_bins=10):
 
 
 def plot_calibration_curve(
-    y_true, 
-    y_pred, 
-    n_bins=10,
+    y_true,
+    y_pred,
+    n_bins=4,
     strategy='uniform',
     title=None,
     save_path=None
@@ -565,10 +565,10 @@ def plot_calibration_curve(
 
 
 def plot_calibration_comparison(
-    y_true_list, 
-    y_pred_list, 
+    y_true_list,
+    y_pred_list,
     model_names,
-    n_bins=10,
+    n_bins=4,
     title="Model Calibration Comparison",
     save_path=None
 ):
@@ -637,7 +637,7 @@ def plot_calibration_comparison(
 
 def plot_calibration_over_time(
     preds_df: pd.DataFrame,
-    n_bins=10,
+    n_bins=4,
     time_points=None,
     save_path=None
 ):
@@ -747,7 +747,7 @@ def plot_calibration_over_time(
     return fig
 
 
-def calibration_summary_table(y_true, y_pred, n_bins=10):
+def calibration_summary_table(y_true, y_pred, n_bins=4):
     """
     Generate a summary table of calibration statistics.
     

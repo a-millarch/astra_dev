@@ -455,7 +455,7 @@ def _evaluate_calibrated(
     time_hours: float,
     method: str,
     calibrator_type: str,
-    n_bins: int = 10,
+    n_bins: int = 4,
 ) -> CalibratorResult:
     """Compare raw vs calibrated predictions at one timepoint."""
     ece_raw, _ = calculate_ece(y_true, y_prob_raw, n_bins=n_bins)
@@ -565,7 +565,7 @@ def _plot_reliability_diagrams(
     best_method: str,
     model_name: str,
     save_dir: str,
-    n_bins: int = 10,
+    n_bins: int = 4,
 ):
     """Grid of reliability diagrams at key timepoints (before/after)."""
     from sklearn.calibration import calibration_curve
@@ -879,7 +879,7 @@ def run_posthoc_calibration(
     methods: List[str] = ['isotonic', 'platt'],
     key_timepoints: Optional[List[int]] = None,
     min_positive_samples: int = 20,
-    n_bins: int = 10,
+    n_bins: int = 4,
     save_dir: str = 'reports/calibration',
     calibrator_dir: Optional[str] = None,
 ) -> pd.DataFrame:
