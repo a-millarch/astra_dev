@@ -1018,7 +1018,7 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig = plt.figure(figsize=(10, 12))
+    fig = plt.figure(figsize=(9, 9))
     gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
                           height_ratios=[1, 1])
     ax_perf_h = fig.add_subplot(gs[0, 0])
@@ -1141,6 +1141,7 @@ def plot_time_metrics_comparison(
         ax.set_xlabel(xlabel, fontsize=11)
         ax.set_xlim(0, xlim)
         ax.set_ylabel("Count", fontsize=11)
+        ax.set_ylim(bottom=0)
         ax.set_title(title, fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
 
@@ -1196,7 +1197,7 @@ def plot_trauma_score_comparison(
         max_days = get_max_days()
 
     score_n = paired["score"][0].n_samples if paired["score"] else 0
-    fig = plt.figure(figsize=(10, 12))
+    fig = plt.figure(figsize=(9, 9))
     gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
                           height_ratios=[1, 1])
     ax_perf_h = fig.add_subplot(gs[0, 0])
@@ -1319,6 +1320,7 @@ def plot_trauma_score_comparison(
         ax.set_xlabel(xlabel, fontsize=11)
         ax.set_xlim(0, xlim)
         ax.set_ylabel("Count", fontsize=11)
+        ax.set_ylim(bottom=0)
         ax.set_title(title, fontsize=11, fontweight='bold')
         ax.grid(True, alpha=0.3)
 
