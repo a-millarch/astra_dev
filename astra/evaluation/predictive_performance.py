@@ -18,12 +18,13 @@ from astra.data.mixed_dataloader import (
 
 from astra.evaluation.utils import (
     calculate_roc_auc_ci, calculate_average_precision_ci,
+    bootstrap_recall_ci, find_optimal_fbeta_threshold,
     _parse_timedelta_to_minutes, _get_intervals_from_cfg,
     time_to_step, step_to_time, prepare_model, get_max_days
 )
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone
-from astra.visualize.evaluation import plot_evaluation
+from astra.visualize.evaluation import plot_evaluation, evaluate_detection_rate
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,19 @@ class TimeMetricResult:
     cindex: Optional[float] = None
     cindex_ci: Optional[Tuple[float, float]] = None
     brier_score: Optional[float] = None
+
+
+@dataclass
+class PercentileRecallResult:
+    """Container for percentile-based recall at a single time point."""
+    time_min: float
+    time_hours: float
+    time_days: float
+    censor_step: int
+    recalls: Dict[int, float]                    # {percentile: recall}
+    recall_cis: Dict[int, Tuple[float, float]]   # {percentile: (lower, upper)}
+    n_samples: int
+    n_positive: int
 
 
 def _get_predictions(model, dataloader, device, temporal_head=False):
@@ -634,6 +648,60 @@ class TimeDependentEvaluator:
 
         return results, None
 
+    def evaluate_percentile_recall_over_time(
+        self,
+        censor_steps: List[int],
+        percentiles: List[int] = (5, 10, 15, 20, 25),
+        n_bootstraps: int = 1000,
+    ) -> List[PercentileRecallResult]:
+        """Compute recall at top-K% risk thresholds across time points."""
+        import time as time_module
+
+        results = []
+        logger.info(f"Percentile recall evaluation at {len(censor_steps)} time points "
+                     f"(percentiles={list(percentiles)})...")
+        start_time = time_module.time()
+
+        for i, censor_step in enumerate(censor_steps):
+            if i % 10 == 0:
+                logger.debug(f"Percentile recall progress: {i+1}/{len(censor_steps)}")
+
+            dls = self.create_censored_dataloaders_fast(censor_step)
+            if dls is None:
+                continue
+
+            preds, targets = _get_predictions(self.model, dls.train, self.device)
+            y_preds = preds[:, 1].numpy()
+            ys = targets.numpy()
+
+            time_min = step_to_time(censor_step)
+            if time_min is None or ys.sum() == 0:
+                continue
+
+            recalls = {}
+            recall_cis = {}
+            for perc in percentiles:
+                r, ci_lo, ci_hi = bootstrap_recall_ci(
+                    y_preds, ys, perc, n_bootstraps=n_bootstraps
+                )
+                recalls[perc] = r
+                recall_cis[perc] = (ci_lo, ci_hi)
+
+            results.append(PercentileRecallResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                recalls=recalls,
+                recall_cis=recall_cis,
+                n_samples=len(ys),
+                n_positive=int(ys.sum()),
+            ))
+
+        total_time = time_module.time() - start_time
+        logger.info(f"Percentile recall complete: {len(results)} time points in {total_time:.1f}s")
+        return results
+
 
 # ============================================================================
 # TEMPORAL EVALUATOR (PER-TIMESTEP MODELS)
@@ -860,6 +928,75 @@ class TemporalEvaluator:
 
         return results, pd.DataFrame(preds_over_time) if preds_over_time else (results, None)
 
+    def evaluate_percentile_recall_over_time(
+        self,
+        censor_steps: List[int],
+        percentiles: List[int] = (5, 10, 15, 20, 25),
+        n_bootstraps: int = 1000,
+    ) -> List[PercentileRecallResult]:
+        """Compute recall at top-K% risk thresholds across time points.
+
+        Reuses cached single-forward-pass predictions — no extra inference.
+        """
+        preds_all = self._get_all_predictions()
+        ys = np.array(self.data["ty"])
+        traj_lengths = self._holdout_traj_lengths
+
+        results = []
+        logger.info(f"Temporal percentile recall at {len(censor_steps)} time points "
+                     f"(percentiles={list(percentiles)})...")
+
+        for censor_step in censor_steps:
+            # Active-only filtering (same logic as evaluate_at_timestep)
+            if self.active_only and len(traj_lengths) > 0:
+                mask = traj_lengths > censor_step
+                if mask.sum() < 2:
+                    continue
+                preds_subset = preds_all[mask]
+                ys_subset = ys[mask]
+                traj_subset = traj_lengths[mask]
+            else:
+                preds_subset = preds_all
+                ys_subset = ys
+                traj_subset = traj_lengths
+
+            # Pick effective timestep per patient
+            if len(traj_subset) > 0:
+                effective_steps = np.minimum(censor_step, traj_subset - 1)
+                effective_steps = np.maximum(effective_steps, 0).astype(int)
+            else:
+                effective_steps = np.full(len(preds_subset), censor_step, dtype=int)
+                effective_steps = np.minimum(effective_steps, preds_subset.shape[1] - 1)
+
+            y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
+
+            time_min = step_to_time(censor_step)
+            if time_min is None or ys_subset.sum() == 0:
+                continue
+
+            recalls = {}
+            recall_cis = {}
+            for perc in percentiles:
+                r, ci_lo, ci_hi = bootstrap_recall_ci(
+                    y_preds, ys_subset, perc, n_bootstraps=n_bootstraps
+                )
+                recalls[perc] = r
+                recall_cis[perc] = (ci_lo, ci_hi)
+
+            results.append(PercentileRecallResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                recalls=recalls,
+                recall_cis=recall_cis,
+                n_samples=len(ys_subset),
+                n_positive=int(ys_subset.sum()),
+            ))
+
+        logger.info(f"Temporal percentile recall complete: {len(results)} time points")
+        return results
+
 
 # ============================================================================
 # TIME THRESHOLD GENERATION
@@ -992,6 +1129,102 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     ax2.set_ylim(0.0, 1.0)
 
     plt.tight_layout()
+    return fig
+
+
+def plot_multi_percentile_recall(
+    results: List[PercentileRecallResult],
+    percentiles: List[int] = (5, 10, 15, 20, 25),
+    cut_hours: int = 72,
+    max_days: float = None,
+):
+    """Plot recall over time for multiple top-percentile risk thresholds.
+
+    1x2 layout: hours (left) | days (right), with one line per percentile.
+
+    Args:
+        results: Output from evaluate_percentile_recall_over_time().
+        percentiles: Percentiles to plot (must match keys in results).
+        cut_hours: Hour cutoff for the left subplot.
+        max_days: Day limit for right subplot (default: from config).
+
+    Returns:
+        matplotlib Figure.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+    if not results:
+        raise ValueError("No percentile recall results to plot")
+
+    times_h = np.array([r.time_hours for r in results])
+    times_d = np.array([r.time_days for r in results])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    mask_cut = times_h <= cut_hours
+
+    for i, perc in enumerate(percentiles):
+        color = f"C{i}"
+        recall_vals = np.array([r.recalls[perc] for r in results])
+        recall_lower = np.array([r.recall_cis[perc][0] for r in results])
+        recall_upper = np.array([r.recall_cis[perc][1] for r in results])
+        label = f"Top {perc}%"
+
+        # --- Left panel: hours ---
+        x_h = times_h[mask_cut]
+        v_h = recall_vals[mask_cut]
+        lo_h = recall_lower[mask_cut]
+        hi_h = recall_upper[mask_cut]
+
+        if len(x_h) > 0:
+            if x_h[-1] < cut_hours:
+                x_h = np.append(x_h, cut_hours)
+                v_h = np.append(v_h, v_h[-1])
+                lo_h = np.append(lo_h, lo_h[-1])
+                hi_h = np.append(hi_h, hi_h[-1])
+            ax1.plot(x_h, v_h, color=color, marker='.', label=label,
+                     markersize=4, linewidth=2, alpha=0.8)
+            ax1.fill_between(x_h, lo_h, hi_h, color=color, alpha=0.15)
+
+        # --- Right panel: days ---
+        x_d = times_d
+        v_d = recall_vals
+        lo_d = recall_lower
+        hi_d = recall_upper
+
+        if len(x_d) > 0:
+            if x_d[-1] < max_days:
+                x_d = np.append(x_d, max_days)
+                v_d = np.append(v_d, v_d[-1])
+                lo_d = np.append(lo_d, lo_d[-1])
+                hi_d = np.append(hi_d, hi_d[-1])
+            ax2.plot(x_d, v_d, color=color, marker='.', label=label,
+                     markersize=4, linewidth=2, alpha=0.8)
+            ax2.fill_between(x_d, lo_d, hi_d, color=color, alpha=0.15)
+
+    # Left panel formatting
+    ax1.set_xlabel("Time (hours)", fontsize=12)
+    ax1.set_xlim(0, cut_hours)
+    ax1.set_xticks(np.arange(0, cut_hours + 1, 6 if cut_hours <= 72 else 4))
+    ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax1.set_ylim(0.0, 1.0)
+    ax1.set_ylabel("Recall", fontsize=12)
+    ax1.set_title(f"A) High-Risk Recall until {cut_hours}h", fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='lower right', fontsize=10)
+
+    # Right panel formatting
+    ax2.set_xlabel("Time (days)", fontsize=12)
+    ax2.set_xlim(0, max_days)
+    ax2.set_xticks(np.arange(0, max_days + 1, 5))
+    ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax2.set_ylim(0.0, 1.0)
+    ax2.set_ylabel("Recall", fontsize=12)
+    ax2.set_title(f"B) High-Risk Recall up to {int(max_days)} days", fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='lower right', fontsize=10)
+
+    plt.tight_layout(pad=3.0)
     return fig
 
 
@@ -1157,7 +1390,7 @@ def plot_time_metrics_comparison(
     # ── Legends ──────────────────────────────────────────────────────────
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     # Position legend in the hspace gap between rows
-    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=4, fontsize=9,
+    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=2, fontsize=9,
                frameon=True, framealpha=0.9,
                bbox_to_anchor=(0.5, 0.52))
 
@@ -1167,7 +1400,7 @@ def plot_time_metrics_comparison(
                loc='lower center', ncol=4, fontsize=9, frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    plt.subplots_adjust(bottom=0.06, top=0.96)
+    #plt.subplots_adjust(bottom=0.06, top=0.96)
     return fig
 
 
@@ -1605,6 +1838,37 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         plt.close(fig_dca)
         logger.info("Baseline decision curve saved")
 
+        # Confusion matrices at F-beta optimised thresholds (trainval → holdout)
+        logger.info("Computing F-beta thresholds on trainval (temporal)...")
+        trainval_dls = data["mixed_dls"]
+        tv_preds_all = []
+        tv_targets_all = []
+        with torch.no_grad():
+            for batch in trainval_dls.train:
+                inputs, targets_batch = batch
+                inputs = _to_device(inputs, device)
+                logits = model(inputs)
+                tv_preds_all.append(torch.sigmoid(logits).cpu())
+                tv_targets_all.append(targets_batch)
+        tv_preds_cat = torch.cat(tv_preds_all, dim=0).numpy()  # [N, seq_len]
+        tv_targs = torch.cat(tv_targets_all, dim=0).numpy()
+        tv_traj = np.array(data.get("trajectory_lengths", []))
+        if len(tv_traj) > 0:
+            tv_last = np.minimum(tv_preds_cat.shape[1] - 1, tv_traj - 1).astype(int)
+            tv_last = np.maximum(tv_last, 0)
+        else:
+            tv_last = np.full(len(tv_preds_cat), tv_preds_cat.shape[1] - 1, dtype=int)
+        tv_baseline_preds = tv_preds_cat[np.arange(len(tv_preds_cat)), tv_last]
+
+        for beta, label in [(1, "F1"), (5, "F5")]:
+            thr, score = find_optimal_fbeta_threshold(tv_targs, tv_baseline_preds, beta=beta)
+            logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on trainval")
+            fig_cm, _, _ = evaluate_detection_rate(
+                baseline_preds, targs, threshold=thr, label=label
+            )
+            save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
+            plt.close(fig_cm)
+
         key_timepoints = None
         if multicurve:
             key_timepoints = [
@@ -1659,6 +1923,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
             fig_time = plot_time_metrics(results, cut_hours=72)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+
+            # Percentile recall plot
+            percentiles = [5, 10, 15, 20, 25]
+            recall_results = temporal_eval.evaluate_percentile_recall_over_time(
+                censor_thresholds, percentiles=percentiles
+            )
+            if recall_results:
+                fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
+                save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir='reports/eval')
+                logger.info("Percentile recall plot saved")
 
             # Active-only evaluation and comparison
             results_active = None
@@ -1731,6 +2005,23 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
     plt.close(fig_dca)
     logger.info("Baseline decision curve saved")
+
+    # Confusion matrices at F-beta optimised thresholds (trainval → holdout)
+    logger.info("Computing F-beta thresholds on trainval...")
+    tv_preds, tv_targs = _get_predictions(model, data["mixed_dls"].train, device)
+    tv_y_pred = tv_preds[:, 1].numpy()
+    tv_y_true = tv_targs.numpy()
+    holdout_y_pred = preds[:, 1].numpy()
+    holdout_y_true = targs.numpy()
+
+    for beta, label in [(1, "F1"), (5, "F5")]:
+        thr, score = find_optimal_fbeta_threshold(tv_y_true, tv_y_pred, beta=beta)
+        logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on trainval")
+        fig_cm, _, _ = evaluate_detection_rate(
+            holdout_y_pred, holdout_y_true, threshold=thr, label=label
+        )
+        save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
+        plt.close(fig_cm)
 
     # Initialize evaluator with pre-normalized data
     evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
@@ -1805,6 +2096,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_time = plot_time_metrics(results, cut_hours=72)
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("Time metrics plot saved")
+
+        # Percentile recall plot
+        percentiles = [5, 10, 15, 20, 25]
+        recall_results = evaluator.evaluate_percentile_recall_over_time(
+            censor_thresholds, percentiles=percentiles
+        )
+        if recall_results:
+            fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
+            save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir='reports/eval')
+            logger.info("Percentile recall plot saved")
 
         # Active-only evaluation and comparison
         results_active = None

@@ -4,7 +4,7 @@ import math
 from astra.utils import cfg
 import numpy as np
 from scipy import stats
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 
 logger = logging.getLogger(__name__)
 
@@ -341,3 +341,85 @@ def calculate_average_precision_ci(y_true, y_pred, alpha=0.95, n_bootstraps=1000
     ci_lower = sorted_scores[int((1.0-alpha)/2 * len(sorted_scores))]
     ci_upper = sorted_scores[int((1.0+alpha)/2 * len(sorted_scores))]
     return ap, float(ci_lower), float(ci_upper)
+
+
+def _recall_at_percentile(y_preds, y_true, percentile):
+    """Calculate recall when selecting the top-percentile highest-risk patients.
+
+    Args:
+        y_preds: Prediction probabilities.
+        y_true: Binary ground-truth labels.
+        percentile: Top percentage to select (e.g. 10 for top 10%).
+
+    Returns:
+        Recall (float) within the selected group.
+    """
+    n_total_positive = np.sum(y_true == 1)
+    if n_total_positive == 0 or len(y_preds) == 0:
+        return 0.0
+
+    n_select = max(1, int(np.ceil(len(y_preds) * percentile / 100)))
+    top_indices = np.argsort(y_preds)[-n_select:]
+    return float(np.sum(y_true[top_indices] == 1)) / n_total_positive
+
+
+def bootstrap_recall_ci(y_preds, y_true, percentile, n_bootstraps=1000, alpha=0.95):
+    """Bootstrap confidence interval for recall at a given top-percentile threshold.
+
+    Mirrors ``calculate_average_precision_ci`` in structure.
+
+    Args:
+        y_preds: Prediction probabilities (1-D array).
+        y_true: Binary labels (1-D array).
+        percentile: Top percentage to select (e.g. 10 for top 10%).
+        n_bootstraps: Number of bootstrap resamples.
+        alpha: Confidence level.
+
+    Returns:
+        (recall, ci_lower, ci_upper)
+    """
+    recall = _recall_at_percentile(y_preds, y_true, percentile)
+
+    bootstrapped_scores = []
+    rng = np.random.RandomState(42)
+    for _ in range(n_bootstraps):
+        indices = rng.randint(0, len(y_true), len(y_true))
+        if np.sum(y_true[indices]) == 0:
+            continue
+        score = _recall_at_percentile(y_preds[indices], y_true[indices], percentile)
+        bootstrapped_scores.append(score)
+
+    if len(bootstrapped_scores) == 0:
+        return recall, 0.0, 1.0
+
+    sorted_scores = np.sort(np.array(bootstrapped_scores))
+    ci_lower = sorted_scores[int((1.0 - alpha) / 2 * len(sorted_scores))]
+    ci_upper = sorted_scores[int((1.0 + alpha) / 2 * len(sorted_scores))]
+    return recall, float(ci_lower), float(ci_upper)
+
+
+def find_optimal_fbeta_threshold(y_true, y_pred, beta=1.0):
+    """Find the probability threshold that maximises F-beta score.
+
+    Uses the precision-recall curve to evaluate all unique thresholds
+    in a single vectorised pass (no grid search needed).
+
+    Args:
+        y_true: Binary labels (1-D array).
+        y_pred: Predicted probabilities (1-D array).
+        beta: Beta parameter (1 = F1, 5 = F5, etc.).
+
+    Returns:
+        (best_threshold, best_fbeta)
+    """
+    precision, recall, thresholds = precision_recall_curve(y_true, y_pred)
+    # precision_recall_curve returns len(thresholds) = len(precision) - 1
+    precision = precision[:-1]
+    recall = recall[:-1]
+
+    beta_sq = beta ** 2
+    denom = beta_sq * precision + recall
+    fbeta = np.where(denom > 0, (1 + beta_sq) * precision * recall / denom, 0.0)
+
+    best_idx = np.argmax(fbeta)
+    return float(thresholds[best_idx]), float(fbeta[best_idx])
