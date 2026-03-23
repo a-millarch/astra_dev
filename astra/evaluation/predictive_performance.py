@@ -1838,8 +1838,10 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         plt.close(fig_dca)
         logger.info("Baseline decision curve saved")
 
-        # Confusion matrices at F-beta optimised thresholds (trainval → holdout)
-        logger.info("Computing F-beta thresholds on trainval (temporal)...")
+        # Confusion matrices at F-beta optimised thresholds (calibrated)
+        # 1. Get trainval baseline predictions
+        from astra.evaluation.posthoc_calibration import fit_calibrators, apply_calibrator
+        logger.info("Computing calibrated F-beta thresholds (temporal)...")
         trainval_dls = data["mixed_dls"]
         tv_preds_all = []
         tv_targets_all = []
@@ -1860,11 +1862,19 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             tv_last = np.full(len(tv_preds_cat), tv_preds_cat.shape[1] - 1, dtype=int)
         tv_baseline_preds = tv_preds_cat[np.arange(len(tv_preds_cat)), tv_last]
 
+        # 2. Fit isotonic calibrator on trainval, apply to both
+        calibrators = fit_calibrators(tv_targs, tv_baseline_preds, methods=['isotonic'])
+        iso_cal = calibrators['isotonic']
+        tv_cal = apply_calibrator(iso_cal, tv_baseline_preds, 'isotonic')
+        ho_cal = apply_calibrator(iso_cal, baseline_preds, 'isotonic')
+        logger.info("Isotonic calibrator fit on trainval, applied to holdout")
+
+        # 3. Find thresholds on calibrated trainval, evaluate on calibrated holdout
         for beta, label in [(1, "F1"), (5, "F5")]:
-            thr, score = find_optimal_fbeta_threshold(tv_targs, tv_baseline_preds, beta=beta)
-            logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on trainval")
+            thr, score = find_optimal_fbeta_threshold(tv_targs, tv_cal, beta=beta)
+            logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on calibrated trainval")
             fig_cm, _, _ = evaluate_detection_rate(
-                baseline_preds, targs, threshold=thr, label=label
+                ho_cal, targs, threshold=thr, label=label
             )
             save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
             plt.close(fig_cm)
@@ -2006,19 +2016,27 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     plt.close(fig_dca)
     logger.info("Baseline decision curve saved")
 
-    # Confusion matrices at F-beta optimised thresholds (trainval → holdout)
-    logger.info("Computing F-beta thresholds on trainval...")
-    tv_preds, tv_targs = _get_predictions(model, data["mixed_dls"].train, device)
-    tv_y_pred = tv_preds[:, 1].numpy()
-    tv_y_true = tv_targs.numpy()
+    # Confusion matrices at F-beta optimised thresholds (calibrated)
+    logger.info("Computing calibrated F-beta thresholds...")
+    tv_preds_raw, tv_targs_raw = _get_predictions(model, data["mixed_dls"].train, device)
+    tv_y_pred = tv_preds_raw[:, 1].numpy()
+    tv_y_true = tv_targs_raw.numpy()
     holdout_y_pred = preds[:, 1].numpy()
     holdout_y_true = targs.numpy()
 
+    # Fit isotonic calibrator on trainval, apply to both
+    from astra.evaluation.posthoc_calibration import fit_calibrators, apply_calibrator
+    calibrators = fit_calibrators(tv_y_true, tv_y_pred, methods=['isotonic'])
+    iso_cal = calibrators['isotonic']
+    tv_y_cal = apply_calibrator(iso_cal, tv_y_pred, 'isotonic')
+    ho_y_cal = apply_calibrator(iso_cal, holdout_y_pred, 'isotonic')
+    logger.info("Isotonic calibrator fit on trainval, applied to holdout")
+
     for beta, label in [(1, "F1"), (5, "F5")]:
-        thr, score = find_optimal_fbeta_threshold(tv_y_true, tv_y_pred, beta=beta)
-        logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on trainval")
+        thr, score = find_optimal_fbeta_threshold(tv_y_true, tv_y_cal, beta=beta)
+        logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on calibrated trainval")
         fig_cm, _, _ = evaluate_detection_rate(
-            holdout_y_pred, holdout_y_true, threshold=thr, label=label
+            ho_y_cal, holdout_y_true, threshold=thr, label=label
         )
         save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
         plt.close(fig_cm)
