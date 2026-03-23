@@ -1340,7 +1340,7 @@ def plot_trauma_score_comparison(
                loc='lower center', ncol=3, fontsize=9, frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    plt.subplots_adjust(bottom=0.06, top=0.96)
+    #plt.subplots_adjust(bottom=0.06, top=0.96)
     return fig
 
 
@@ -1365,7 +1365,9 @@ def plot_n_active_over_time(
     ACTIVE_COLOR = "#2CA02C"  # green
     POSITIVE_COLOR = "#D62728"  # red
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4.5))
+    for ax in [ax1, ax2]:
+        ax.set_box_aspect(1)
 
     mask_cut = times_h <= cut_hours
 
@@ -1375,6 +1377,7 @@ def plot_n_active_over_time(
     ax1.set_xlabel("Time (hours)", fontsize=11)
     ax1.set_xlim(0, cut_hours)
     ax1.set_ylabel("Count", fontsize=11)
+    ax1.set_ylim(bottom=0)
     ax1.set_title("A) Active Patients over Hours", fontsize=12, fontweight='bold')
     ax1.grid(True, alpha=0.3)
 
@@ -1391,6 +1394,7 @@ def plot_n_active_over_time(
     ax2.set_xlabel("Time (days)", fontsize=11)
     ax2.set_xlim(0, max_days)
     ax2.set_ylabel("Count", fontsize=11)
+    ax2.set_ylim(bottom=0)
     ax2.set_title("B) Active Patients over Days", fontsize=12, fontweight='bold')
     ax2.grid(True, alpha=0.3)
 
@@ -1404,10 +1408,9 @@ def plot_n_active_over_time(
     # Combined legend below
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax1_prev.get_legend_handles_labels()
-    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=10,
+    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=9,
                bbox_to_anchor=(0.5, -0.02))
-    fig.subplots_adjust(bottom=0.18)
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    plt.tight_layout(rect=[0, 0.06, 1, 1])
     return fig
 
 
