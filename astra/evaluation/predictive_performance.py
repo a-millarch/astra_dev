@@ -1132,6 +1132,165 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     return fig
 
 
+def plot_prediction_distribution(
+    preds_df: pd.DataFrame,
+    y_true: np.ndarray,
+    holdout_pids: np.ndarray,
+    cut_hours: int = 72,
+    max_days: float = None,
+    hour_timepoints: List[float] = None,
+    day_timepoints: List[float] = None,
+) -> plt.Figure:
+    """
+    Plot distribution of predicted probabilities per outcome category across timepoints.
+
+    Following Van Calster et al. (Lancet Digital Health 2025) recommendation for
+    risk distribution plots using split violin plots at selected timepoints.
+
+    Args:
+        preds_df: DataFrame with columns PID, censor_step, time_hours, time_days, pred
+        y_true: True binary labels for holdout patients
+        holdout_pids: Patient IDs corresponding to y_true
+        cut_hours: Hour cutoff for the hours panel
+        max_days: Max days for the days panel (from config if None)
+        hour_timepoints: Timepoints (hours) to show in panel A
+        day_timepoints: Timepoints (days) to show in panel B
+
+    Returns:
+        matplotlib Figure
+    """
+    if max_days is None:
+        max_days = get_max_days()
+
+    if hour_timepoints is None:
+        hour_timepoints = [1, 6, 12, 24, 48, 72]
+    if day_timepoints is None:
+        day_timepoints = [3, 7, 14, 30, 60, 90]
+    day_timepoints = [d for d in day_timepoints if d <= max_days]
+
+    # Map PID → true label
+    pid_to_label = dict(zip(holdout_pids, y_true))
+    df = preds_df.copy()
+    df['true_label'] = df['PID'].map(pid_to_label)
+    df = df.dropna(subset=['true_label'])
+
+    COLOR_NEG = '#2CA02C'  # survived (green)
+    COLOR_POS = '#D62728'  # deceased (red)
+    MIN_SAMPLES = 5
+
+    def _snap_timepoints(available, requested):
+        """Snap requested timepoints to nearest available, deduplicated."""
+        snapped = []
+        seen = set()
+        for t in requested:
+            closest = min(available, key=lambda x: abs(x - t))
+            if closest not in seen:
+                snapped.append((t, closest))
+                seen.add(closest)
+        return snapped
+
+    def _draw_split_violins(ax, df, time_col, timepoint_pairs, time_unit):
+        positions = list(range(len(timepoint_pairs)))
+
+        for i, (requested, actual) in enumerate(timepoint_pairs):
+            subset = df[df[time_col] == actual]
+            preds_neg = subset.loc[subset['true_label'] == 0, 'pred'].values
+            preds_pos = subset.loc[subset['true_label'] == 1, 'pred'].values
+
+            # Left half: survived (negative)
+            if len(preds_neg) >= MIN_SAMPLES:
+                parts = ax.violinplot(
+                    preds_neg, positions=[i], showmedians=False,
+                    showextrema=False, widths=0.8
+                )
+                for body in parts['bodies']:
+                    verts = body.get_paths()[0].vertices
+                    center = i
+                    verts[:, 0] = np.clip(verts[:, 0], -np.inf, center)
+                    body.set_facecolor(COLOR_NEG)
+                    body.set_edgecolor('black')
+                    body.set_linewidth(0.5)
+                    body.set_alpha(0.7)
+                med = np.median(preds_neg)
+                ax.hlines(med, i - 0.35, i, colors='black', linewidth=1.5)
+
+            # Right half: deceased (positive)
+            if len(preds_pos) >= MIN_SAMPLES:
+                parts = ax.violinplot(
+                    preds_pos, positions=[i], showmedians=False,
+                    showextrema=False, widths=0.8
+                )
+                for body in parts['bodies']:
+                    verts = body.get_paths()[0].vertices
+                    center = i
+                    verts[:, 0] = np.clip(verts[:, 0], center, np.inf)
+                    body.set_facecolor(COLOR_POS)
+                    body.set_edgecolor('black')
+                    body.set_linewidth(0.5)
+                    body.set_alpha(0.7)
+                med = np.median(preds_pos)
+                ax.hlines(med, i, i + 0.35, colors='black', linewidth=1.5)
+
+            # Sample count annotation below x-axis
+            n_neg = len(preds_neg)
+            n_pos = len(preds_pos)
+            ax.text(
+                i, -0.06, f"n={n_neg}/{n_pos}",
+                ha='center', va='top', fontsize=7, color='gray',
+                transform=ax.get_xaxis_transform(), clip_on=False,
+            )
+
+        # Format x-axis with requested timepoint labels
+        ax.set_xticks(positions)
+        if time_unit == 'hours':
+            labels = [f"{int(t)}h" for t, _ in timepoint_pairs]
+        else:
+            labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
+        ax.set_xticklabels(labels, fontsize=10)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+
+    # Panel A: Hours
+    avail_hours = sorted(df['time_hours'].unique())
+    hour_pairs = _snap_timepoints(avail_hours, hour_timepoints)
+    if hour_pairs:
+        _draw_split_violins(ax1, df, 'time_hours', hour_pairs, 'hours')
+
+    ax1.set_title("A) Prediction Distribution over Hours", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Predicted Mortality Risk", fontsize=11)
+    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_ylim(0, 1.05)
+    ax1.set_yticks(np.arange(0, 1.1, 0.1))
+    ax1.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # Panel B: Days
+    avail_days = sorted(df['time_days'].unique())
+    day_pairs = _snap_timepoints(avail_days, day_timepoints)
+    if day_pairs:
+        _draw_split_violins(ax2, df, 'time_days', day_pairs, 'days')
+
+    ax2.set_title("B) Prediction Distribution over Days", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Predicted Mortality Risk", fontsize=11)
+    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_ylim(0, 1.05)
+    ax2.set_yticks(np.arange(0, 1.1, 0.1))
+    ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=COLOR_NEG, edgecolor='black', alpha=0.7, label='Survived'),
+        Patch(facecolor=COLOR_POS, edgecolor='black', alpha=0.7, label='Deceased'),
+    ]
+    ax1.legend(handles=legend_elements, loc='upper right', fontsize=10)
+
+    plt.tight_layout()
+    plt.subplots_adjust(hspace=0.35)
+    return fig
+
+
 def plot_multi_percentile_recall(
     results: List[PercentileRecallResult],
     percentiles: List[int] = (5, 10, 15, 20, 25),
@@ -1934,6 +2093,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_time = plot_time_metrics(results, cut_hours=72)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
 
+            # Prediction distribution plot
+            if preds_df is not None:
+                fig_dist = plot_prediction_distribution(
+                    preds_df, np.array(data["ty"]),
+                    data["holdout"].base.PID.values
+                )
+                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
+                plt.close(fig_dist)
+                logger.info("Prediction distribution plot saved")
+
             # Percentile recall plot
             percentiles = [5, 10, 15, 20, 25]
             recall_results = temporal_eval.evaluate_percentile_recall_over_time(
@@ -2114,6 +2283,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_time = plot_time_metrics(results, cut_hours=72)
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("Time metrics plot saved")
+
+        # Prediction distribution plot
+        if preds_df is not None:
+            fig_dist = plot_prediction_distribution(
+                preds_df, np.array(data["ty"]),
+                data["holdout"].base.PID.values
+            )
+            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
+            plt.close(fig_dist)
+            logger.info("Prediction distribution plot saved")
 
         # Percentile recall plot
         percentiles = [5, 10, 15, 20, 25]
