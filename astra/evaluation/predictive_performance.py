@@ -1068,7 +1068,7 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     auprc_lower = np.array([r.auprc_ci[0] for r in results])
     auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     mask_cut = times_h <= cut_hours
 
@@ -1732,7 +1732,7 @@ def plot_trauma_score_comparison(
                loc='lower center', ncol=3, fontsize=9, frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
-    #plt.subplots_adjust(bottom=0.06, top=0.96)
+    plt.tight_layout()
     return fig
 
 
@@ -1811,7 +1811,7 @@ def plot_multiple_roc_pr_curves(
     censor_steps: List[int],
     labels: Optional[List[str]] = None
 ):
-    fig, (ax_roc, ax_pr) = plt.subplots(2, 1, figsize=(8, 14))
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(14, 6))
 
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
               '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
@@ -1851,7 +1851,7 @@ def plot_multiple_roc_pr_curves(
     ax_roc.set_xlabel("False Positive Rate", fontsize=11)
     ax_roc.set_ylabel("True Positive Rate", fontsize=11)
     ax_roc.grid(alpha=0.3)
-    ax_roc.legend(fontsize=10, title="Time Available", title_fontsize=10)
+    ax_roc.legend(fontsize=9, title="Time Available", title_fontsize=10)
     ax_roc.set_aspect('equal', adjustable='box')
 
     if baseline is not None:
@@ -1860,8 +1860,11 @@ def plot_multiple_roc_pr_curves(
     ax_pr.set_xlabel("Recall", fontsize=11)
     ax_pr.set_ylabel("Precision", fontsize=11)
     ax_pr.grid(alpha=0.3)
-    ax_pr.legend(fontsize=10, title="Time Available", title_fontsize=10)
+    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
+                title="Time Available", title_fontsize=10)
     ax_pr.set_aspect('equal', adjustable='box')
+
+    fig.subplots_adjust(right=0.82, wspace=0.3)
     plt.tight_layout()
 
     return fig
@@ -2093,16 +2096,6 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_time = plot_time_metrics(results, cut_hours=72)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
 
-            # Prediction distribution plot
-            if preds_df is not None:
-                fig_dist = plot_prediction_distribution(
-                    preds_df, np.array(data["ty"]),
-                    data["holdout"].base.PID.values
-                )
-                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
-                plt.close(fig_dist)
-                logger.info("Prediction distribution plot saved")
-
             # Percentile recall plot
             percentiles = [5, 10, 15, 20, 25]
             recall_results = temporal_eval.evaluate_percentile_recall_over_time(
@@ -2136,6 +2129,17 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                     save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                     logger.info("Active-only comparison plots saved")
+
+            # Prediction distribution plot (prefer active-only predictions)
+            dist_preds = preds_df_active if preds_df_active is not None else preds_df
+            if dist_preds is not None:
+                fig_dist = plot_prediction_distribution(
+                    dist_preds, np.array(data["ty"]),
+                    data["holdout"].base.PID.values
+                )
+                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
+                plt.close(fig_dist)
+                logger.info("Prediction distribution plot saved")
 
             # Trauma score comparison (temporal path)
             if trauma_scores:
@@ -2284,16 +2288,6 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
         logger.info("Time metrics plot saved")
 
-        # Prediction distribution plot
-        if preds_df is not None:
-            fig_dist = plot_prediction_distribution(
-                preds_df, np.array(data["ty"]),
-                data["holdout"].base.PID.values
-            )
-            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
-            plt.close(fig_dist)
-            logger.info("Prediction distribution plot saved")
-
         # Percentile recall plot
         percentiles = [5, 10, 15, 20, 25]
         recall_results = evaluator.evaluate_percentile_recall_over_time(
@@ -2327,6 +2321,17 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                 save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
                 logger.info("Active-only comparison plots saved")
+
+        # Prediction distribution plot (prefer active-only predictions)
+        dist_preds = preds_df_active if preds_df_active is not None else preds_df
+        if dist_preds is not None:
+            fig_dist = plot_prediction_distribution(
+                dist_preds, np.array(data["ty"]),
+                data["holdout"].base.PID.values
+            )
+            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
+            plt.close(fig_dist)
+            logger.info("Prediction distribution plot saved")
 
         # ================================================================
         # TRAUMA SCORE COMPARISON (optional, Azure-only)
