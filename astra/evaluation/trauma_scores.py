@@ -18,6 +18,8 @@ from scipy.special import expit
 from astra.evaluation.utils import (
     calculate_roc_auc_ci,
     calculate_average_precision_ci,
+    delong_test_paired,
+    benjamini_hochberg,
     step_to_time,
 )
 
@@ -571,6 +573,7 @@ def evaluate_static_scores_over_time(
     holdout_y: np.ndarray,
     holdout_pids: np.ndarray,
     valid_pids: Optional[np.ndarray] = None,
+    delong: bool = False,
 ) -> Dict[str, Dict[str, "List[TimeMetricResult]"]]:
     """Compute score and model AUROC/AUPRC at each censor step on identical patients.
 
@@ -584,10 +587,16 @@ def evaluate_static_scores_over_time(
         holdout_y: Full holdout binary targets.
         holdout_pids: Full holdout PIDs (same order as holdout_y).
         valid_pids: Optional further filter (e.g., patients with RTS scores).
+        delong: If True, run paired DeLong test at each timestep (HNN vs score)
+                and apply Benjamini-Hochberg FDR correction.
 
     Returns:
         Dict mapping score label to {"score": List[TimeMetricResult],
-                                      "model": List[TimeMetricResult]}.
+            "model": List[TimeMetricResult], "counts": List[TimeMetricResult]}.
+        When delong=True, also includes "delong_p": list of raw p-values,
+            "delong_p_adj": FDR-adjusted p-values, "delong_z": z-statistics,
+            "delong_hours": corresponding time in hours, and
+            "delong_significant": boolean mask of significance at alpha=0.05.
     """
     from astra.evaluation.predictive_performance import TimeMetricResult
 
@@ -618,6 +627,9 @@ def evaluate_static_scores_over_time(
         score_results = []
         model_results = []
         count_results = []
+        delong_raw_p = []
+        delong_z_vals = []
+        delong_hours = []
         for step, group in preds_filtered.groupby('censor_step'):
             # Active PIDs at this step (intersection with score availability)
             active_pids = group['PID'].values
@@ -696,12 +708,42 @@ def evaluate_static_scores_over_time(
                 auprc_ci=(m_auprc_lo, m_auprc_hi),
             ))
 
+            # DeLong paired test (model vs score AUROC)
+            if delong:
+                try:
+                    z, p = delong_test_paired(y_true, model_preds, y_score)
+                    delong_z_vals.append(z)
+                    delong_raw_p.append(p)
+                    delong_hours.append(time_min / 60.0)
+                except Exception:
+                    delong_z_vals.append(0.0)
+                    delong_raw_p.append(1.0)
+                    delong_hours.append(time_min / 60.0)
+
         if score_results:
-            all_results[label] = {
+            result_entry = {
                 "score": score_results,
                 "model": model_results,
                 "counts": count_results,
             }
+
+            # Apply FDR correction across all timesteps for this score
+            if delong and delong_raw_p:
+                p_arr = np.array(delong_raw_p)
+                rejected, p_adj = benjamini_hochberg(p_arr, alpha=0.05)
+                result_entry["delong_p"] = delong_raw_p
+                result_entry["delong_p_adj"] = p_adj.tolist()
+                result_entry["delong_z"] = delong_z_vals
+                result_entry["delong_hours"] = delong_hours
+                result_entry["delong_significant"] = rejected.tolist()
+
+                n_sig = int(rejected.sum())
+                logger.info(
+                    f"  {label}: DeLong test at {len(delong_raw_p)} time points, "
+                    f"{n_sig}/{len(delong_raw_p)} significant (FDR<0.05)"
+                )
+
+            all_results[label] = result_entry
             logger.info(f"  {label}: evaluated at {len(score_results)} time points")
 
     return all_results

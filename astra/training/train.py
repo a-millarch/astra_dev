@@ -76,6 +76,8 @@ def parse_args():
                         help="Also run active-only evaluation (patients still in hospital) and generate comparison plots")
     parser.add_argument("--trauma-scores", action="store_true", default=False,
                         help="Compute traditional trauma risk scores (RTS, ISS, TRISS) and add as baselines (Azure-only)")
+    parser.add_argument("--delong", action="store_true", default=False,
+                        help="Run paired DeLong tests between HNN and trauma scores with FDR correction (requires --trauma-scores)")
 
     # Calibration
     parser.add_argument("--calibrate", action="store_true", default=False,
@@ -211,6 +213,7 @@ def main():
             data, cfg, args.multicurve, args.comprehensive_eval,
             active_only=args.active_only,
             trauma_scores=args.trauma_scores,
+            delong=args.delong,
         )
 
     # ========================================================================

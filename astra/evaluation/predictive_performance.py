@@ -1670,6 +1670,35 @@ def plot_trauma_score_comparison(
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0.0, 1.0)
 
+    # ── DeLong significance annotation (optional) ─────────────────────────
+    if "delong_significant" in paired:
+        dl_hours = np.array(paired["delong_hours"])
+        dl_sig = np.array(paired["delong_significant"])
+        dl_p_adj = np.array(paired["delong_p_adj"])
+
+        # Shade significant regions on both performance panels
+        for ax, to_x, xlim_val in [
+            (ax_perf_h, lambda h: h, cut_hours),           # hours → hours
+            (ax_perf_d, lambda h: h / 24.0, max_days),     # hours → days
+        ]:
+            mask = dl_sig & (to_x(dl_hours) <= xlim_val)
+            sig_x = to_x(dl_hours[mask])
+            if len(sig_x) > 0:
+                # Light green vertical spans for significant time points
+                for sx in sig_x:
+                    ax.axvline(sx, color='#2CA02C', alpha=0.15, linewidth=4)
+
+        # Summary text: fraction significant, median p-value
+        n_sig = int(dl_sig.sum())
+        n_total = len(dl_sig)
+        median_p = float(np.median(dl_p_adj))
+        sig_text = (
+            f"DeLong: {n_sig}/{n_total} time points significant "
+            f"(FDR<0.05, median p_adj={median_p:.3f})"
+        )
+        fig.text(0.5, 0.505, sig_text, ha='center', va='bottom',
+                 fontsize=8, fontstyle='italic', color='#444444')
+
     # Performance legend — snug below top row (in the hspace gap)
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     fig.legend(perf_handles, perf_labels, loc='upper center',
@@ -1872,7 +1901,8 @@ def plot_multiple_roc_pr_curves(
 
 
 def _run_trauma_score_comparison(data, cfg, results_all, results_active,
-                                 preds_df_active, model_name):
+                                 preds_df_active, model_name,
+                                 delong: bool = False):
     """Shared trauma score comparison logic for both temporal and non-temporal paths."""
     try:
         from astra.evaluation.trauma_scores import (
@@ -1917,6 +1947,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
             score_results = evaluate_static_scores_over_time(
                 trauma_df, preds_df_active, holdout_y, holdout_pids,
                 valid_pids=valid_pids,
+                delong=delong,
             )
 
             if score_results:
@@ -1950,7 +1981,8 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
 # ============================================================================
 
 def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True,
-             active_only: bool = False, trauma_scores: bool = False):
+             active_only: bool = False, trauma_scores: bool = False,
+             delong: bool = False):
     """
     Enhanced evaluation with time-dependent metrics.
 
@@ -1961,6 +1993,9 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                      comparison plots (all patients vs active-only).
         trauma_scores: If True, compute traditional trauma risk scores (RTS, ISS,
                       TRISS) and add them as baselines to comparison plots.
+        delong: If True, run paired DeLong tests between HNN and trauma scores
+                at each timestep with Benjamini-Hochberg FDR correction.
+                Only effective when trauma_scores=True.
     """
     model_name = cfg["model_name"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
@@ -2145,7 +2180,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             # Trauma score comparison (temporal path)
             if trauma_scores:
                 _run_trauma_score_comparison(
-                    data, cfg, results, results_active, preds_df_active, model_name
+                    data, cfg, results, results_active, preds_df_active, model_name,
+                    delong=delong,
                 )
 
             logger.info("="*80)
@@ -2339,7 +2375,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         # ================================================================
         if trauma_scores:
             _run_trauma_score_comparison(
-                data, cfg, results, results_active, preds_df_active, model_name
+                data, cfg, results, results_active, preds_df_active, model_name,
+                delong=delong,
             )
 
         logger.info("="*80)
