@@ -365,8 +365,9 @@ def delong_test_paired(y_true, y_pred_a, y_pred_b):
         y_pred_b: Predicted scores from model B, shape (n,).
 
     Returns:
-        (z_stat, p_value): z-statistic and two-sided p-value.
-            p < 0.05 → significant difference in AUROCs.
+        (z_stat, p_value, se_diff): z-statistic, two-sided p-value, and
+            standard error of the AUC difference. se_diff can be used to
+            compute a 95% CI for delta AUC: delta +/- 1.96 * se_diff.
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred_a = np.asarray(y_pred_a, dtype=float)
@@ -378,7 +379,7 @@ def delong_test_paired(y_true, y_pred_a, y_pred_b):
     n = int(neg_mask.sum())
 
     if m < 2 or n < 2:
-        return 0.0, 1.0
+        return 0.0, 1.0, 0.0
 
     v10_a, v01_a = _compute_placement_values(y_true, y_pred_a)
     v10_b, v01_b = _compute_placement_values(y_true, y_pred_b)
@@ -399,11 +400,12 @@ def delong_test_paired(y_true, y_pred_a, y_pred_b):
     var_diff = S[0, 0] + S[1, 1] - 2.0 * S[0, 1]
 
     if var_diff <= 0:
-        return 0.0, 1.0
+        return 0.0, 1.0, 0.0
 
-    z = (auc_a - auc_b) / np.sqrt(var_diff)
+    se_diff = np.sqrt(var_diff)
+    z = (auc_a - auc_b) / se_diff
     p = 2.0 * stats.norm.sf(abs(z))
-    return float(z), float(p)
+    return float(z), float(p), float(se_diff)
 
 
 def benjamini_hochberg(p_values, alpha=0.05):

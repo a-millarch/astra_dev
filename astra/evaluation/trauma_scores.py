@@ -629,6 +629,8 @@ def evaluate_static_scores_over_time(
         count_results = []
         delong_raw_p = []
         delong_z_vals = []
+        delong_se_vals = []
+        delong_delta_vals = []
         delong_hours = []
         for step, group in preds_filtered.groupby('censor_step'):
             # Active PIDs at this step (intersection with score availability)
@@ -711,13 +713,17 @@ def evaluate_static_scores_over_time(
             # DeLong paired test (model vs score AUROC)
             if delong:
                 try:
-                    z, p = delong_test_paired(y_true, model_preds, y_score)
+                    z, p, se = delong_test_paired(y_true, model_preds, y_score)
                     delong_z_vals.append(z)
                     delong_raw_p.append(p)
+                    delong_se_vals.append(se)
+                    delong_delta_vals.append(m_auroc - auroc)
                     delong_hours.append(time_min / 60.0)
                 except Exception:
                     delong_z_vals.append(0.0)
                     delong_raw_p.append(1.0)
+                    delong_se_vals.append(0.0)
+                    delong_delta_vals.append(0.0)
                     delong_hours.append(time_min / 60.0)
 
         if score_results:
@@ -734,6 +740,8 @@ def evaluate_static_scores_over_time(
                 result_entry["delong_p"] = delong_raw_p
                 result_entry["delong_p_adj"] = p_adj.tolist()
                 result_entry["delong_z"] = delong_z_vals
+                result_entry["delong_se"] = delong_se_vals
+                result_entry["delong_delta"] = delong_delta_vals
                 result_entry["delong_hours"] = delong_hours
                 result_entry["delong_significant"] = rejected.tolist()
 

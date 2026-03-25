@@ -1670,35 +1670,6 @@ def plot_trauma_score_comparison(
         ax.grid(True, alpha=0.3)
         ax.set_ylim(0.0, 1.0)
 
-    # ── DeLong significance annotation (optional) ─────────────────────────
-    if "delong_significant" in paired:
-        dl_hours = np.array(paired["delong_hours"])
-        dl_sig = np.array(paired["delong_significant"])
-        dl_p_adj = np.array(paired["delong_p_adj"])
-
-        # Shade significant regions on both performance panels
-        for ax, to_x, xlim_val in [
-            (ax_perf_h, lambda h: h, cut_hours),           # hours → hours
-            (ax_perf_d, lambda h: h / 24.0, max_days),     # hours → days
-        ]:
-            mask = dl_sig & (to_x(dl_hours) <= xlim_val)
-            sig_x = to_x(dl_hours[mask])
-            if len(sig_x) > 0:
-                # Light green vertical spans for significant time points
-                for sx in sig_x:
-                    ax.axvline(sx, color='#2CA02C', alpha=0.15, linewidth=4)
-
-        # Summary text: fraction significant, median p-value
-        n_sig = int(dl_sig.sum())
-        n_total = len(dl_sig)
-        median_p = float(np.median(dl_p_adj))
-        sig_text = (
-            f"DeLong: {n_sig}/{n_total} time points significant "
-            f"(FDR<0.05, median p_adj={median_p:.3f})"
-        )
-        fig.text(0.5, 0.505, sig_text, ha='center', va='bottom',
-                 fontsize=8, fontstyle='italic', color='#444444')
-
     # Performance legend — snug below top row (in the hspace gap)
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     fig.legend(perf_handles, perf_labels, loc='upper center',
@@ -1763,6 +1734,153 @@ def plot_trauma_score_comparison(
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
     plt.tight_layout()
+    return fig
+
+
+def plot_delong_comparison(
+    score_name: str,
+    paired: Dict,
+    cut_hours=72, max_days=None,
+):
+    """Standalone DeLong statistical comparison: HNN vs a trauma score over time.
+
+    2x2 layout:
+        Top row:    Delta AUROC (HNN - score) with 95% CI from DeLong SE
+        Bottom row: -log10(FDR-adjusted p-value) trajectory
+
+    Left column = hours (0 to cut_hours), right column = days (0 to max_days).
+
+    Args:
+        score_name: Name of the baseline score (e.g. "RTS", "TRISS").
+        paired: Dict from evaluate_static_scores_over_time(delong=True).
+            Must contain keys: delong_hours, delong_delta, delong_se,
+            delong_p_adj, delong_significant.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+
+    hours = np.array(paired["delong_hours"])
+    days = hours / 24.0
+    delta = np.array(paired["delong_delta"])
+    se = np.array(paired["delong_se"])
+    p_adj = np.array(paired["delong_p_adj"])
+    sig = np.array(paired["delong_significant"])
+
+    ci_lo = delta - 1.96 * se
+    ci_hi = delta + 1.96 * se
+
+    # Clamp p_adj floor for log transform (avoid -log10(0) = inf)
+    p_adj_safe = np.clip(p_adj, 1e-20, 1.0)
+    neg_log_p = -np.log10(p_adj_safe)
+
+    SIG_COLOR = "#2CA02C"
+    NONSIG_COLOR = "#999999"
+    DELTA_COLOR = "C0"
+
+    fig = plt.figure(figsize=(12, 8))
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.40,
+                          height_ratios=[1, 1])
+    ax_d_h = fig.add_subplot(gs[0, 0])
+    ax_d_d = fig.add_subplot(gs[0, 1])
+    ax_p_h = fig.add_subplot(gs[1, 0])
+    ax_p_d = fig.add_subplot(gs[1, 1])
+
+    n_sig = int(sig.sum())
+    n_total = len(sig)
+
+    # ── Top row: Delta AUROC with CI ─────────────────────────────────────
+    for ax, times, xlim, xlabel, title_lbl in [
+        (ax_d_h, hours, cut_hours, "Time (hours)", "A"),
+        (ax_d_d, days, max_days, "Time (days)", "B"),
+    ]:
+        mask = times <= xlim
+        t = times[mask]
+        d, lo, hi = delta[mask], ci_lo[mask], ci_hi[mask]
+        s = sig[mask]
+
+        # CI band
+        ax.fill_between(t, lo, hi, color=DELTA_COLOR, alpha=0.12)
+        # Delta line
+        ax.plot(t, d, color=DELTA_COLOR, linewidth=1.5)
+        # Green fill where significant and HNN wins
+        sig_win = s & (d > 0)
+        if sig_win.any():
+            ax.fill_between(t, 0, d,
+                            where=sig_win, color=SIG_COLOR, alpha=0.18,
+                            label="Significant (FDR<0.05)")
+        # Reference line at 0
+        ax.axhline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
+
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel(r"$\Delta$ AUROC (HNN $-$ " + score_name + ")", fontsize=10)
+        ax.set_title(
+            f"{title_lbl}) Delta AUROC: HNN vs {score_name}",
+            fontsize=11, fontweight='bold',
+        )
+        ax.grid(True, alpha=0.3)
+
+    # Legend for top row
+    d_handles, d_labels = ax_d_h.get_legend_handles_labels()
+    if d_handles:
+        fig.legend(d_handles, d_labels, loc='upper center',
+                   ncol=1, fontsize=9, frameon=True, framealpha=0.9,
+                   bbox_to_anchor=(0.5, 0.53))
+
+    # ── Bottom row: -log10(p_adj) trajectory ─────────────────────────────
+    threshold = -np.log10(0.05)
+
+    for ax, times, xlim, xlabel, title_lbl in [
+        (ax_p_h, hours, cut_hours, "Time (hours)", "C"),
+        (ax_p_d, days, max_days, "Time (days)", "D"),
+    ]:
+        mask = times <= xlim
+        t = times[mask]
+        nlp = neg_log_p[mask]
+        s = sig[mask]
+
+        # Scatter: green = significant, gray = not
+        ax.scatter(t[s], nlp[s], c=SIG_COLOR, s=18, zorder=3,
+                   label="Significant (FDR<0.05)")
+        ax.scatter(t[~s], nlp[~s], c=NONSIG_COLOR, s=18, zorder=3,
+                   label="Not significant")
+        # Connect with a thin line
+        ax.plot(t, nlp, color='#666666', linewidth=0.6, alpha=0.5, zorder=2)
+        # Significance threshold
+        ax.axhline(threshold, color='red', linewidth=1.0, linestyle='--',
+                    alpha=0.6, label=r"$\alpha$ = 0.05")
+
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel(r"$-\log_{10}(p_{adj})$", fontsize=11)
+        ax.set_ylim(bottom=0)
+        ax.set_title(
+            f"{title_lbl}) DeLong p-value (FDR-corrected)",
+            fontsize=11, fontweight='bold',
+        )
+        ax.grid(True, alpha=0.3)
+
+    # Legend for bottom row
+    p_handles, p_labels = ax_p_h.get_legend_handles_labels()
+    if p_handles:
+        fig.legend(p_handles, p_labels, loc='lower center',
+                   ncol=3, fontsize=9, frameon=True, framealpha=0.9,
+                   bbox_to_anchor=(0.5, 0.01))
+
+    # Summary annotation
+    mean_delta = float(np.mean(delta))
+    summary = (
+        f"DeLong paired test: {n_sig}/{n_total} time points significant "
+        f"(BH-FDR<0.05), mean {chr(916)}AUROC = {mean_delta:+.3f}"
+    )
+    fig.suptitle(
+        f"HNN vs {score_name} — Statistical Comparison",
+        fontsize=13, fontweight='bold', y=1.01,
+    )
+    fig.text(0.5, 0.98, summary, ha='center', va='top',
+             fontsize=9, fontstyle='italic', color='#444444')
+
+    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
     return fig
 
 
@@ -1966,6 +2084,16 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                         save_dir='reports/eval',
                     )
                     logger.info(f"HNN vs {sname} comparison plot saved")
+
+                    # Standalone DeLong significance plot
+                    if "delong_significant" in paired:
+                        fig_dl = plot_delong_comparison(sname, paired)
+                        save_figure(
+                            fig_dl,
+                            f"delong_{sname.lower()}_comparison_{model_name}",
+                            save_dir='reports/eval',
+                        )
+                        logger.info(f"DeLong {sname} comparison plot saved")
         else:
             logger.warning(
                 f"Too few patients with RTS ({len(valid_pids)}) or "
