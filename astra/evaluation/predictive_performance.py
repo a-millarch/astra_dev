@@ -61,6 +61,12 @@ class PercentileRecallResult:
     n_positive: int
 
 
+_TARGET_DISPLAY = {"deceased_30d": "30-day Mortality"}
+
+def _display_target(name: str) -> str:
+    return _TARGET_DISPLAY.get(name, name)
+
+
 def _get_predictions(model, dataloader, device, temporal_head=False):
     """
     Run direct model inference on a dataloader.
@@ -1410,15 +1416,13 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig = plt.figure(figsize=(9, 9))
-    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
+    fig = plt.figure(figsize=(12, 9))
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.45,
                           height_ratios=[1, 1])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
     ax_count_h = fig.add_subplot(gs[1, 0])
     ax_count_d = fig.add_subplot(gs[1, 1])
-    for ax in [ax_perf_h, ax_perf_d, ax_count_h, ax_count_d]:
-        ax.set_box_aspect(1)
 
     # ── Top row: performance curves ──────────────────────────────────────
     datasets = [
@@ -1527,7 +1531,7 @@ def plot_time_metrics_comparison(
     ]:
         ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
         ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
-                label=f"{target_name} = 1 (active)")
+                label=f"{_display_target(target_name)} (active)")
         ax.axhline(y=all_n, color=ALL_COLOR, linestyle=":", linewidth=1.2,
                     label=f"All patients (N={all_n})")
         ax.set_xlabel(xlabel, fontsize=11)
@@ -1589,19 +1593,16 @@ def plot_trauma_score_comparison(
         max_days = get_max_days()
 
     score_n = paired["score"][0].n_samples if paired["score"] else 0
-    fig = plt.figure(figsize=(9, 9))
-    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.35,
+    fig = plt.figure(figsize=(12, 9))
+    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.45,
                           height_ratios=[1, 1])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
     ax_count_h = fig.add_subplot(gs[1, 0])
     ax_count_d = fig.add_subplot(gs[1, 1])
-    for ax in [ax_perf_h, ax_perf_d, ax_count_h, ax_count_d]:
-        ax.set_box_aspect(1)
 
     # ── Color assignments ────────────────────────────────────────────────
-    score_colors = {"RTS": "C3", "TRISS": "C4", "ISS": "C2"}
-    score_color = score_colors.get(score_name, "C5")
+    score_color = "C3"
     hnn_color = "C0"
 
     # ── Helper to plot AUROC (solid) + AUPRC (dotted) for one model ──────
@@ -1708,7 +1709,7 @@ def plot_trauma_score_comparison(
     ]:
         ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
         ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
-                label=f"{target_name} = 1 (active)")
+                label=f"{_display_target(target_name)} (active)")
         ax.set_xlabel(xlabel, fontsize=11)
         ax.set_xlim(0, xlim)
         ax.set_ylabel("Count", fontsize=11)
@@ -1765,7 +1766,7 @@ def plot_n_active_over_time(
 
     # Hours panel
     ax1.plot(times_h[mask_cut], n_samples[mask_cut], color=ACTIVE_COLOR, label="Active patients")
-    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
+    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
     ax1.set_xlabel("Time (hours)", fontsize=11)
     ax1.set_xlim(0, cut_hours)
     ax1.set_ylabel("Count", fontsize=11)
@@ -1782,7 +1783,7 @@ def plot_n_active_over_time(
 
     # Days panel
     ax2.plot(times_d, n_samples, color=ACTIVE_COLOR, label="Active patients")
-    ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
+    ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
     ax2.set_xlabel("Time (days)", fontsize=11)
     ax2.set_xlim(0, max_days)
     ax2.set_ylabel("Count", fontsize=11)
