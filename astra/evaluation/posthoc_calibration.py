@@ -574,7 +574,7 @@ def _plot_reliability_diagrams(
     n = len(steps)
     ncols = min(4, n)
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows))
     if nrows == 1 and ncols == 1:
         axes = np.array([axes])
     axes = np.atleast_2d(axes)
@@ -591,8 +591,8 @@ def _plot_reliability_diagrams(
             frac_raw, mean_raw = calibration_curve(
                 y_true, y_prob_raw, n_bins=n_bins, strategy='uniform'
             )
-            ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=1.5,
-                    markersize=5, alpha=0.7, label='Raw')
+            ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=2,
+                    markersize=7, alpha=0.7, label='Raw')
         except Exception:
             pass
 
@@ -603,23 +603,24 @@ def _plot_reliability_diagrams(
                 frac_cal, mean_cal = calibration_curve(
                     y_true, y_prob_cal, n_bins=n_bins, strategy='uniform'
                 )
-                ax.plot(mean_cal, frac_cal, 'o-', color='#2E86AB', linewidth=2,
-                        markersize=5, label=f'{best_method.capitalize()}')
+                ax.plot(mean_cal, frac_cal, 'o-', color='#2E86AB', linewidth=2.5,
+                        markersize=7, label=f'{best_method.capitalize()}')
             except Exception:
                 pass
 
         ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
-        ax.set_title(format_step_label(step), fontsize=11)
+        ax.set_title(format_step_label(step), fontsize=16, fontweight='bold')
         ax.set_xlim([0, 1])
         ax.set_ylim([0, 1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.2)
+        ax.tick_params(axis='both', labelsize=13)
         if idx == 0:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=13)
         if row == nrows - 1:
-            ax.set_xlabel('Predicted')
+            ax.set_xlabel('Predicted probability', fontsize=14)
         if col == 0:
-            ax.set_ylabel('Observed')
+            ax.set_ylabel('Observed frequency', fontsize=14)
 
     # Hide unused axes
     for idx in range(n, nrows * ncols):
@@ -627,7 +628,7 @@ def _plot_reliability_diagrams(
         axes[row, col].set_visible(False)
 
     fig.suptitle(f'Reliability Diagrams: Raw vs {best_method.capitalize()} Calibrated',
-                 fontsize=14, fontweight='bold')
+                 fontsize=18, fontweight='bold')
     plt.tight_layout()
     save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir)
     plt.close(fig)
