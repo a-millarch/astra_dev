@@ -2848,6 +2848,34 @@ class TemporalSHAPResults:
         return self.timeframe_results.get(timeframe)
 
 
+@dataclass
+class CohortTemporalSHAPResults:
+    """Aggregated temporal SHAP results across a cohort of patients."""
+    n_patients: int
+    pids: List
+    # Per-timeframe aggregated arrays
+    channel_importance: Dict[str, np.ndarray]       # tf -> [n_channels]
+    channel_importance_std: Dict[str, np.ndarray]   # tf -> [n_channels]
+    temporal_importance: Dict[str, np.ndarray]       # tf -> [seq_len]
+    temporal_importance_std: Dict[str, np.ndarray]   # tf -> [seq_len]
+    ts_shap_mean: Dict[str, np.ndarray]             # tf -> [n_channels, seq_len]
+    static_cat_importance: Dict[str, Optional[np.ndarray]]
+    static_cont_importance: Dict[str, Optional[np.ndarray]]
+    patient_counts: Dict[str, int]                  # tf -> n patients with this tf
+    # Metadata
+    channel2feature: Dict[int, str]
+    static_cat_names: List[str]
+    static_cont_names: List[str]
+    encoding_info: Dict
+    active_only: bool = False
+    density_normalize: bool = False
+    # Individual patient results (optional, for deep-dive)
+    patient_results: Optional[List[TemporalSHAPResults]] = None
+
+    def get_available_timeframes(self) -> List[str]:
+        return list(self.channel_importance.keys())
+
+
 # ============================================================================
 # MODEL WRAPPER
 # ============================================================================
@@ -3166,7 +3194,13 @@ class TemporalSHAPAnalyzer:
                 ts_channel_importance = np.abs(ts_shap[:, :eff]).mean(axis=1)
             else:
                 ts_channel_importance = np.zeros(ts_shap.shape[0])
-            ts_temporal_importance = ts_channel_importance  # same with effective_steps
+            # Temporal importance: mean |SHAP| across channels at each timestep
+            full_steps = ts_shap.shape[1]
+            if eff > 0:
+                ts_temporal_importance = np.zeros(full_steps)
+                ts_temporal_importance[:eff] = np.abs(ts_shap[:, :eff]).mean(axis=0)
+            else:
+                ts_temporal_importance = np.zeros(full_steps)
 
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
@@ -3494,9 +3528,7 @@ class TemporalSHAPAnalyzer:
         gs = fig.add_gridspec(4, n_tf, hspace=0.35, wspace=0.25, height_ratios=[1, 1.2, 1.5, 1])
         
         seq_len = results.timeframe_results[tfs[0]].ts_shap.shape[1]
-        tick_idx = np.linspace(0, seq_len-1, min(8, seq_len), dtype=int)
-        tick_labels = [time_to_hours_str(step_to_time(i)) for i in tick_idx]
-        
+
         all_temp = [results.timeframe_results[t].ts_temporal_importance for t in tfs]
         all_chan = [results.timeframe_results[t].ts_channel_importance for t in tfs]
         temp_max = max(np.max(x) for x in all_temp)
@@ -3537,15 +3569,22 @@ class TemporalSHAPAnalyzer:
             if results.active_only and r.n_active_background is not None:
                 active_annotation = f"\nn_bg={r.n_active_background}"
 
+            # Per-column display range: zoom to effective timeframe
+            eff = r.effective_steps
+            margin = max(3, int(eff * 0.08))
+            display_limit = min(eff + margin, seq_len)
+            col_ticks = np.linspace(0, display_limit - 1, min(8, display_limit), dtype=int)
+            col_tick_labels = [time_to_hours_str(step_to_time(i)) for i in col_ticks]
+
             # Row 1: Temporal importance
             ax1 = fig.add_subplot(gs[0, col])
             ax1.plot(r.ts_temporal_importance, lw=2, color='#ff0051')
             ax1.fill_between(range(len(r.ts_temporal_importance)), r.ts_temporal_importance, alpha=0.3, color='#ff0051')
             if r.censor_step: ax1.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax1.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5, alpha=0.7)
-            _draw_inhospital_boundary(ax1, results.inhospital_start_step, seq_len, label=(col == 0))
-            ax1.set_xlim(0, seq_len); ax1.set_ylim(0, temp_max*1.1)
-            ax1.set_xticks(tick_idx); ax1.set_xticklabels(tick_labels, rotation=45, fontsize=8)
+            _draw_inhospital_boundary(ax1, results.inhospital_start_step, display_limit, label=(col == 0))
+            ax1.set_xlim(0, display_limit); ax1.set_ylim(0, temp_max*1.1)
+            ax1.set_xticks(col_ticks); ax1.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
             ax1.set_title(f'{tf} {suffix}{ebm_annotation}{active_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
 
             # Row 2: Channel bars (clinical-only when EBM present)
@@ -3554,7 +3593,7 @@ class TemporalSHAPAnalyzer:
             ax2.barh(range(len(top_idx)), r.ts_channel_importance[top_idx], color=plt.cm.Blues(np.linspace(0.4,0.9,len(top_idx))))
             ax2.set_yticks(range(len(top_idx))); ax2.set_yticklabels(names, fontsize=9)
             ax2.set_xlim(0, chan_max*1.1); ax2.invert_yaxis(); ax2.grid(True, alpha=0.3, axis='x')
-            
+
             # Row 3: Heatmap
             ax3 = fig.add_subplot(gs[2, col])
             ts_top = r.ts_shap[top_idx]
@@ -3566,9 +3605,10 @@ class TemporalSHAPAnalyzer:
                            norm=TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax))
             if r.censor_step: ax3.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax3.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5)
-            _draw_inhospital_boundary(ax3, results.inhospital_start_step, seq_len, label=False)
+            _draw_inhospital_boundary(ax3, results.inhospital_start_step, display_limit, label=False)
+            ax3.set_xlim(-0.5, display_limit - 0.5)
             ax3.set_yticks(range(len(top_idx))); ax3.set_yticklabels(names, fontsize=8)
-            ax3.set_xticks(tick_idx); ax3.set_xticklabels(tick_labels, rotation=45, fontsize=8)
+            ax3.set_xticks(col_ticks); ax3.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
             plt.colorbar(im, ax=ax3, shrink=0.8)
             
             # Row 4: Static features
@@ -4130,7 +4170,383 @@ class TemporalSHAPAnalyzer:
                 record['static_cont_corr_with_ref'] = np.nan
             
             records.append(record)
-        
+
+        return pd.DataFrame(records)
+
+    # ====================================================================
+    # COHORT-LEVEL ANALYSIS
+    # ====================================================================
+
+    def analyze_cohort(self, test_loader, holdout_pids, max_patients=20,
+                       timeframes=None, verbose=True) -> CohortTemporalSHAPResults:
+        """Run temporal SHAP analysis for multiple patients and aggregate.
+
+        Args:
+            test_loader: DataLoader for holdout set
+            holdout_pids: List of all holdout PIDs (in dataloader order)
+            max_patients: Maximum number of patients to analyze
+            timeframes: List of timeframe names (default: all standard)
+            verbose: Print progress
+
+        Returns:
+            CohortTemporalSHAPResults with per-timeframe aggregated SHAP
+        """
+        pids_to_analyze = holdout_pids[:max_patients]
+        patient_results = []
+
+        for i, pid in enumerate(pids_to_analyze):
+            if verbose:
+                logger.info(f"\n[Patient {i+1}/{len(pids_to_analyze)}] PID: {pid}")
+            try:
+                result = self.analyze_patient(
+                    test_loader, pid=pid, holdout_pids=holdout_pids,
+                    timeframes=timeframes, verbose=verbose
+                )
+                patient_results.append(result)
+            except Exception as e:
+                logger.warning(f"  FAILED for PID {pid}: {e}")
+
+        if not patient_results:
+            raise RuntimeError("No patients were successfully analyzed")
+
+        if verbose:
+            logger.info(f"\nAggregating results from {len(patient_results)} patients...")
+
+        return self._aggregate_patient_results(patient_results)
+
+    def _aggregate_patient_results(self, patient_results: List[TemporalSHAPResults]
+                                    ) -> CohortTemporalSHAPResults:
+        """Aggregate per-patient temporal SHAP into cohort-level results."""
+
+        def _normalize_tf(tf):
+            """Map patient-specific 'max(...)' back to 'full' for aggregation."""
+            return 'full' if tf.startswith('max(') else tf
+
+        # Collect per-timeframe results across patients
+        tf_collections = OrderedDict()  # normalized_tf -> list of TimeframeSHAPResult
+        for pr in patient_results:
+            for tf, tfr in pr.timeframe_results.items():
+                norm_tf = _normalize_tf(tf)
+                tf_collections.setdefault(norm_tf, []).append(tfr)
+
+        # Order timeframes by DEFAULT_TIMEFRAMES order
+        ordered_tfs = [tf for tf in DEFAULT_TIMEFRAMES if tf in tf_collections]
+        # Add any extra timeframes not in defaults
+        for tf in tf_collections:
+            if tf not in ordered_tfs:
+                ordered_tfs.append(tf)
+
+        channel_importance = OrderedDict()
+        channel_importance_std = OrderedDict()
+        temporal_importance = OrderedDict()
+        temporal_importance_std = OrderedDict()
+        ts_shap_mean = OrderedDict()
+        static_cat_importance = OrderedDict()
+        static_cont_importance = OrderedDict()
+        patient_counts = OrderedDict()
+
+        for tf in ordered_tfs:
+            tf_results = tf_collections[tf]
+            patient_counts[tf] = len(tf_results)
+
+            # Channel importance: [n_patients, n_channels] -> mean/std
+            ch_imp = np.stack([r.ts_channel_importance for r in tf_results])
+            channel_importance[tf] = ch_imp.mean(axis=0)
+            channel_importance_std[tf] = ch_imp.std(axis=0)
+
+            # Temporal importance: [n_patients, seq_len] -> mean/std
+            temp_imp = np.stack([r.ts_temporal_importance for r in tf_results])
+            temporal_importance[tf] = temp_imp.mean(axis=0)
+            temporal_importance_std[tf] = temp_imp.std(axis=0)
+
+            # SHAP heatmap: [n_patients, n_channels, seq_len] -> mean |SHAP|
+            ts_shap_mean[tf] = np.mean(
+                [np.abs(r.ts_shap) for r in tf_results], axis=0)
+
+            # Static features
+            cat_shaps = [np.abs(r.cat_shap) for r in tf_results
+                         if r.cat_shap is not None]
+            cont_shaps = [np.abs(r.cont_shap) for r in tf_results
+                          if r.cont_shap is not None]
+            static_cat_importance[tf] = (
+                np.mean(cat_shaps, axis=0) if cat_shaps else None)
+            static_cont_importance[tf] = (
+                np.mean(cont_shaps, axis=0) if cont_shaps else None)
+
+        return CohortTemporalSHAPResults(
+            n_patients=len(patient_results),
+            pids=[pr.pid for pr in patient_results],
+            channel_importance=channel_importance,
+            channel_importance_std=channel_importance_std,
+            temporal_importance=temporal_importance,
+            temporal_importance_std=temporal_importance_std,
+            ts_shap_mean=ts_shap_mean,
+            static_cat_importance=static_cat_importance,
+            static_cont_importance=static_cont_importance,
+            patient_counts=patient_counts,
+            channel2feature=self.channel2feature,
+            static_cat_names=self.static_cat_names,
+            static_cont_names=self.static_cont_names,
+            encoding_info=self.encoding_info,
+            active_only=self.active_only,
+            density_normalize=self.density_normalize,
+            patient_results=patient_results,
+        )
+
+    def plot_cohort_temporal_comparison(self, results: CohortTemporalSHAPResults,
+                                        max_channels=15, figsize=(24, 18),
+                                        save_path=None):
+        """Cohort-averaged temporal SHAP comparison across timeframes.
+
+        Layout: 4 rows x N columns (one column per timeframe).
+        Row 1: Mean temporal importance with ±1 std shading
+        Row 2: Top channel bars (cohort mean)
+        Row 3: Mean |SHAP| heatmap
+        Row 4: Static feature importance
+        """
+        tfs = results.get_available_timeframes()
+        n_tf = len(tfs)
+        seq_len = results.ts_shap_mean[tfs[0]].shape[1]
+
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(4, n_tf, hspace=0.35, wspace=0.25,
+                              height_ratios=[1, 1.2, 1.5, 1])
+
+        # Consistent y-axis across columns
+        temp_max = max(np.max(results.temporal_importance[t]
+                              + results.temporal_importance_std[t]) for t in tfs)
+
+        # Top channels by mean importance across timeframes
+        has_ebm = _has_ebm_channels(results.channel2feature)
+        all_chan = [results.channel_importance[t] for t in tfs]
+        if has_ebm:
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(all_chan[0]))
+            clinical_chan = [ch[clinical_mask] for ch in all_chan]
+            chan_max = max(np.max(x) for x in clinical_chan)
+            top_clinical = np.argsort(
+                np.mean(clinical_chan, axis=0))[-max_channels:][::-1]
+            top_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            chan_max = max(np.max(x) for x in all_chan)
+            top_idx = np.argsort(
+                np.mean(all_chan, axis=0))[-max_channels:][::-1]
+
+        for col, tf in enumerate(tfs):
+            n_pat = results.patient_counts[tf]
+            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
+            suffix = f"({tf_hours}h)" if tf_hours else "(full)"
+
+            # Per-column display range
+            if tf_hours is not None:
+                eff = time_to_step(tf_hours, 'h') + 1
+            else:
+                eff = seq_len
+            margin = max(3, int(eff * 0.08))
+            display_limit = min(eff + margin, seq_len)
+            col_ticks = np.linspace(0, display_limit - 1,
+                                    min(8, display_limit), dtype=int)
+            col_tick_labels = [time_to_hours_str(step_to_time(i))
+                               for i in col_ticks]
+
+            # ── Row 1: Temporal importance (mean ± std) ──
+            ax1 = fig.add_subplot(gs[0, col])
+            mean_t = results.temporal_importance[tf]
+            std_t = results.temporal_importance_std[tf]
+            x_range = range(len(mean_t))
+            ax1.plot(mean_t, lw=2, color='#ff0051')
+            ax1.fill_between(x_range, (mean_t - std_t).clip(0), mean_t + std_t,
+                             alpha=0.2, color='#ff0051')
+            ax1.set_xlim(0, display_limit)
+            ax1.set_ylim(0, temp_max * 1.1)
+            ax1.set_xticks(col_ticks)
+            ax1.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
+            ax1.set_title(f'{tf} {suffix}\nn={n_pat}', fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+
+            # ── Row 2: Channel bars ──
+            ax2 = fig.add_subplot(gs[1, col])
+            ch_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                        for i in top_idx]
+            ch_vals = results.channel_importance[tf][top_idx]
+            ch_errs = results.channel_importance_std[tf][top_idx]
+            ax2.barh(range(len(top_idx)), ch_vals,
+                     xerr=ch_errs, capsize=2,
+                     color=plt.cm.Blues(np.linspace(0.4, 0.9, len(top_idx))))
+            ax2.set_yticks(range(len(top_idx)))
+            ax2.set_yticklabels(ch_names, fontsize=9)
+            ax2.set_xlim(0, chan_max * 1.1)
+            ax2.invert_yaxis()
+            ax2.grid(True, alpha=0.3, axis='x')
+
+            # ── Row 3: Mean |SHAP| heatmap ──
+            ax3 = fig.add_subplot(gs[2, col])
+            ts_top = results.ts_shap_mean[tf][top_idx]
+            vmax = max(np.abs(ts_top).max(), 1e-10)
+            im = ax3.imshow(ts_top, aspect='auto', cmap='YlOrRd',
+                            interpolation='nearest', vmin=0, vmax=vmax)
+            ax3.set_xlim(-0.5, display_limit - 0.5)
+            ax3.set_yticks(range(len(top_idx)))
+            ax3.set_yticklabels(ch_names, fontsize=8)
+            ax3.set_xticks(col_ticks)
+            ax3.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
+            plt.colorbar(im, ax=ax3, shrink=0.8)
+
+            # ── Row 4: Static features ──
+            ax4 = fig.add_subplot(gs[3, col])
+            static_names, static_vals = [], []
+            if results.static_cat_importance[tf] is not None:
+                for i, nm in enumerate(
+                        results.static_cat_names[:len(results.static_cat_importance[tf])]):
+                    val = results.static_cat_importance[tf][i]
+                    static_names.append(nm)
+                    static_vals.append(float(val) if np.isscalar(val)
+                                       or getattr(val, 'ndim', 1) == 0
+                                       else float(val.mean()))
+            if results.static_cont_importance[tf] is not None:
+                for i, nm in enumerate(
+                        results.static_cont_names[:len(results.static_cont_importance[tf])]):
+                    val = results.static_cont_importance[tf][i]
+                    static_names.append(nm)
+                    static_vals.append(float(val) if np.isscalar(val)
+                                       or getattr(val, 'ndim', 1) == 0
+                                       else float(val.mean()))
+            if static_vals:
+                static_vals = np.array(static_vals)
+                sorted_s = np.argsort(static_vals)[::-1][:15]
+                ax4.barh(range(len(sorted_s)), static_vals[sorted_s],
+                         color='#ff0051', alpha=0.7)
+                ax4.set_yticks(range(len(sorted_s)))
+                ax4.set_yticklabels([static_names[i] for i in sorted_s],
+                                    fontsize=8)
+                ax4.invert_yaxis()
+                ax4.grid(True, alpha=0.3, axis='x')
+            else:
+                ax4.text(0.5, 0.5, 'No static features', ha='center',
+                         va='center', transform=ax4.transAxes)
+
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(
+            f'Cohort Temporal SHAP (n={results.n_patients}){active_label}{dn_label}',
+            fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        if save_path:
+            ensure_parent_dir(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Saved: {save_path}")
+        return fig
+
+    def plot_cohort_feature_trajectory(self, results: CohortTemporalSHAPResults,
+                                        top_k=10, figsize=(14, 8),
+                                        save_path=None):
+        """Track top feature importance across timeframes (cohort average ± std)."""
+        tfs = results.get_available_timeframes()
+
+        # Select top channels from the last (broadest) timeframe
+        ref_imp = results.channel_importance[tfs[-1]]
+        has_ebm = _has_ebm_channels(results.channel2feature)
+        if has_ebm:
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(ref_imp))
+            clinical_imp = ref_imp[clinical_mask]
+            top_clinical = np.argsort(clinical_imp)[-top_k:][::-1]
+            feat_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            feat_idx = np.argsort(ref_imp)[-top_k:][::-1]
+
+        feature_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                         for i in feat_idx]
+
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(feature_names)))
+
+        for i, (name, idx) in enumerate(zip(feature_names, feat_idx)):
+            means = [results.channel_importance[tf][idx] for tf in tfs]
+            stds = [results.channel_importance_std[tf][idx] for tf in tfs]
+            x = range(len(tfs))
+            ax.plot(x, means, marker='o', lw=2, ms=8, label=name,
+                    color=colors[i])
+            ax.fill_between(x,
+                            np.array(means) - np.array(stds),
+                            np.array(means) + np.array(stds),
+                            alpha=0.1, color=colors[i])
+
+        # Annotate patient counts per timeframe
+        for j, tf in enumerate(tfs):
+            n = results.patient_counts[tf]
+            ax.annotate(f'n={n}', (j, 0), fontsize=7, ha='center',
+                        alpha=0.5, xytext=(0, -18),
+                        textcoords='offset points')
+
+        ax.set_xticks(range(len(tfs)))
+        ax.set_xticklabels(tfs, rotation=45)
+        ax.set_xlabel('Timeframe')
+        ax.set_ylabel('Mean |SHAP|')
+        active_label = " [active-only]" if results.active_only else ""
+        ax.set_title(
+            f'Feature Trajectory — Cohort (n={results.n_patients}){active_label}',
+            fontweight='bold')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            ensure_parent_dir(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            logger.info(f"Saved: {save_path}")
+        return fig
+
+    def generate_cohort_summary_report(self, results: CohortTemporalSHAPResults
+                                        ) -> pd.DataFrame:
+        """Summary DataFrame with per-timeframe cohort-averaged metrics."""
+        tfs = results.get_available_timeframes()
+        has_ebm = _has_ebm_channels(results.channel2feature)
+
+        records = []
+        for tf in tfs:
+            ch_imp = results.channel_importance[tf]
+            if has_ebm:
+                clinical_mask = _get_clinical_only_channel_mask(
+                    results.channel2feature, len(ch_imp))
+                display_imp = ch_imp[clinical_mask]
+                display_names = [results.channel2feature.get(
+                    int(clinical_mask[i]), f'Ch{i}')
+                    for i in range(len(clinical_mask))]
+            else:
+                display_imp = ch_imp
+                display_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                                 for i in range(len(ch_imp))]
+
+            top5_idx = np.argsort(display_imp)[-5:][::-1]
+            top5 = [display_names[i] for i in top5_idx]
+
+            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
+            record = {
+                'timeframe': tf,
+                'hours': tf_hours,
+                'n_patients': results.patient_counts[tf],
+                'top_5_channels': ', '.join(top5),
+                'mean_channel_shap': ch_imp.mean(),
+                'max_channel_shap': ch_imp.max(),
+            }
+
+            # EBM budget (from mean SHAP heatmap)
+            if has_ebm:
+                budget = compute_ebm_vs_clinical_budget(
+                    results.ts_shap_mean[tf], results.channel2feature)
+                if budget:
+                    record['ebm_pct'] = budget['ebm_pct']
+                    record['clinical_pct'] = budget['clinical_pct']
+
+            # Static features
+            if results.static_cat_importance[tf] is not None:
+                record['static_cat_mean'] = results.static_cat_importance[tf].mean()
+            if results.static_cont_importance[tf] is not None:
+                record['static_cont_mean'] = results.static_cont_importance[tf].mean()
+
+            records.append(record)
+
         return pd.DataFrame(records)
 
 
@@ -4197,6 +4613,73 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
         logger.info(f"Data: {results.actual_data_length_hours:.1f}h, Timeframes: {results.get_available_timeframes()}")
         logger.info(summary.to_string(index=False))
     
+    return results
+
+
+def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
+                                      max_background_samples=200,
+                                      timeframes=None,
+                                      save_dir='reports/shap',
+                                      verbose=True, active_only=False,
+                                      density_normalize: bool = False):
+    """Run temporal SHAP analysis across a cohort of holdout patients.
+
+    This is the cohort-level counterpart of ``run_temporal_shap_analysis``.
+    For each patient, SHAP values are re-computed per timeframe (with future
+    data censored), then results are aggregated across the cohort.
+
+    Args:
+        data: Data dict from prepare_data_and_dls()
+        model: Trained nn.Module
+        max_patients: Maximum number of holdout patients to analyze
+        max_background_samples: Background samples for SHAP explainer
+        timeframes: List of timeframe names (default: all from DEFAULT_TIMEFRAMES)
+        save_dir: Output directory for plots and CSV
+        verbose: Print progress
+        active_only: Only use background patients active at each timeframe
+        density_normalize: Normalize channel importance by measurement density
+
+    Returns:
+        CohortTemporalSHAPResults
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    analyzer = TemporalSHAPAnalyzer(
+        model, data, data["mixed_dls"].train,
+        'cuda' if torch.cuda.is_available() else 'cpu',
+        max_background_samples, active_only=active_only,
+        density_normalize=density_normalize,
+    )
+
+    holdout_pids = analyzer.get_holdout_pids()
+    logger.info(f"Cohort temporal SHAP: analyzing up to {max_patients} of "
+                f"{len(holdout_pids)} holdout patients")
+
+    results = analyzer.analyze_cohort(
+        data["holdout_mixed_dls"].train, holdout_pids,
+        max_patients=max_patients, timeframes=timeframes, verbose=verbose,
+    )
+
+    logger.info("\nGenerating cohort visualizations...")
+
+    for name, method in [
+        ('cohort_temporal_comparison',
+         analyzer.plot_cohort_temporal_comparison),
+        ('cohort_feature_trajectory',
+         analyzer.plot_cohort_feature_trajectory),
+    ]:
+        fig = method(results, save_path=f'{save_dir}/{name}.png')
+        if fig:
+            plt.close(fig)
+
+    summary = analyzer.generate_cohort_summary_report(results)
+    summary.to_csv(f'{save_dir}/cohort_temporal_shap_summary.csv', index=False)
+
+    if verbose:
+        logger.info(f"\n{'='*60}\nCOHORT TEMPORAL SHAP SUMMARY (n={results.n_patients})"
+                    f"\n{'='*60}")
+        logger.info(summary.to_string(index=False))
+
     return results
 
 
