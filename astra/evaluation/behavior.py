@@ -472,7 +472,7 @@ def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = None,
         n_steps = get_total_steps()
 
     # Respect eval_timestep cropping
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
 
     time_labels = [step_to_time(i) for i in range(n_steps)]
@@ -1673,7 +1673,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     # Crop time axis to eval_timestep — steps beyond have ~0 SHAP due to causal masking.
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[..., :n_steps]
 
@@ -2035,7 +2035,7 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 
     # Crop to eval_timestep — same as visualize_shap_individual.
     eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_data = ts_data[..., :n_steps]
 
@@ -2363,7 +2363,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # and showing them extends the x-axis with meaningless zeros.
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[..., :n_steps]
 
@@ -4824,7 +4824,7 @@ def plot_continuous_ts_shap_plotly(
 
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
 
@@ -4898,7 +4898,7 @@ def plot_categorical_ts_shap_plotly(
 
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         data = data[:, :n_steps]
 
@@ -5043,7 +5043,7 @@ def plot_shap_budget_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
@@ -5081,7 +5081,7 @@ def plot_shap_temporal_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
     time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
@@ -5136,7 +5136,7 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         ts_shap = ts_shap[:, :eval_timestep + 1]
     has_ebm = channel2feature and _has_ebm_channels(channel2feature)
     ch_imp = np.abs(ts_shap).mean(axis=1)
@@ -5309,7 +5309,7 @@ def plot_data_completeness_plotly(
     ts_data = shap_results["test_data"]["ts"][sample_idx]
     n_channels, n_steps_full = ts_data.shape
     eval_timestep = shap_results.get("eval_timestep")
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps_full:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps_full:
         n_steps = eval_timestep + 1
         ts_data = ts_data[:, :n_steps]
     else:
