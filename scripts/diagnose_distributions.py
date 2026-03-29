@@ -58,14 +58,18 @@ def _measured_mask(X, trajectory_lengths):
     return ~np.isnan(X) & ~padding_3d
 
 
-def _classify_distribution(skewness, kurtosis_excess):
+def _classify_distribution(skewness, kurtosis_excess, values=None):
     """Classify distribution shape and recommend scaler."""
+    from astra.data.dataloader import AstraScaler
+
     abs_skew = abs(skewness)
     if abs_skew < 0.5 and kurtosis_excess < 3:
         return "normal-ish", "StandardScaler"
     elif abs_skew < 2 and kurtosis_excess < 7:
         return "moderate skew", "PowerTransformer"
     else:
+        if values is not None and AstraScaler._is_boundary_concentrated(values):
+            return "boundary-concentrated", "RobustScaler"
         return "heavy skew/tails", "QuantileTransformer"
 
 
@@ -111,7 +115,7 @@ def analyze_channel(values, name):
     except Exception:
         shapiro_p = np.nan
 
-    dist_class, recommendation = _classify_distribution(skewness, kurtosis)
+    dist_class, recommendation = _classify_distribution(skewness, kurtosis, values)
 
     return {
         "channel": name,

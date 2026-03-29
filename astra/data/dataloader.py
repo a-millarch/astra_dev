@@ -53,12 +53,23 @@ class AstraScaler:
     _KURT_NORMAL = 3.0
     _KURT_MODERATE = 7.0
 
+    # Boundary concentration thresholds: override quantile → robust when
+    # >= _BOUNDARY_MASS_THRESH of values cluster within _BOUNDARY_RANGE_FRAC
+    # of the observed range at either boundary (e.g. SPO2 ceiling at 100).
+    _BOUNDARY_RANGE_FRAC = 0.05
+    _BOUNDARY_MASS_THRESH = 0.40
+
     def __init__(self, method='adaptive', n_quantiles=1000,
-                 quantile_output='normal', clip_range=None):
+                 quantile_output='normal', clip_range=None,
+                 boundary_range_frac=None, boundary_mass_thresh=None):
         self.method = method
         self.n_quantiles = n_quantiles
         self.quantile_output = quantile_output
         self.clip_range = clip_range  # e.g. (-3.0, 3.0) to clip normalized output
+        if boundary_range_frac is not None:
+            self._BOUNDARY_RANGE_FRAC = boundary_range_frac
+        if boundary_mass_thresh is not None:
+            self._BOUNDARY_MASS_THRESH = boundary_mass_thresh
 
         # Populated during fit
         self.channel_scalers_ = {}   # ch_idx → fitted object / dict
@@ -75,7 +86,30 @@ class AstraScaler:
     # Adaptive method selection
     # ------------------------------------------------------------------
     @staticmethod
-    def _select_method(values):
+    def _is_boundary_concentrated(values, range_frac=None, mass_thresh=None):
+        """Detect ceiling/floor-bounded distributions.
+
+        Returns True if >= *mass_thresh* of values cluster within
+        *range_frac* of the observed range at either boundary.  This
+        guards against quantile normalisation amplifying tiny raw
+        changes (e.g. SPO2 95-100 → full N(0,1) spread).
+        """
+        if range_frac is None:
+            range_frac = AstraScaler._BOUNDARY_RANGE_FRAC
+        if mass_thresh is None:
+            mass_thresh = AstraScaler._BOUNDARY_MASS_THRESH
+
+        vmin, vmax = float(np.nanmin(values)), float(np.nanmax(values))
+        span = vmax - vmin
+        if span == 0:
+            return False
+        zone = span * range_frac
+        at_ceiling = np.nansum(values >= vmax - zone) / len(values)
+        at_floor = np.nansum(values <= vmin + zone) / len(values)
+        return float(max(at_ceiling, at_floor)) >= mass_thresh
+
+    @staticmethod
+    def _select_method(values, range_frac=None, mass_thresh=None):
         """Pick normalisation method from distribution shape."""
         s = abs(float(_skew(values, nan_policy='omit')))
         k = float(_kurtosis(values, nan_policy='omit'))  # excess
@@ -83,6 +117,11 @@ class AstraScaler:
             return 'standard'
         elif s < AstraScaler._SKEW_MODERATE and k < AstraScaler._KURT_MODERATE:
             return 'power'
+        # Check for boundary-concentrated distributions before defaulting
+        # to quantile — quantile amplifies small changes in dense boundary
+        # regions (e.g. SPO2 ceiling, GCS ceiling).
+        if AstraScaler._is_boundary_concentrated(values, range_frac, mass_thresh):
+            return 'robust'
         return 'quantile'
 
     # ------------------------------------------------------------------
@@ -95,7 +134,8 @@ class AstraScaler:
             self.channel_scalers_[ch_idx] = {'mean': 0.0, 'std': 1.0}
             return
 
-        method = (self._select_method(values)
+        method = (self._select_method(
+                      values, self._BOUNDARY_RANGE_FRAC, self._BOUNDARY_MASS_THRESH)
                   if self.method == 'adaptive' else self.method)
         self.channel_methods_[ch_idx] = method
 
@@ -632,6 +672,8 @@ def prepare_data_and_dls(cfg):
         n_quantiles=norm_cfg.get('n_quantiles', 1000),
         quantile_output=norm_cfg.get('quantile_output', 'normal'),
         clip_range=clip_range,
+        boundary_range_frac=norm_cfg.get('boundary_range_frac'),
+        boundary_mass_thresh=norm_cfg.get('boundary_mass_thresh'),
     )
     logger.info(f"Using {ts_method} normalization for time series"
                 + (f" with clip_range={clip_range}" if clip_range else ""))

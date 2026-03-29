@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '20032026_exp1_baseline'
+model_name: '29032026_studycriteria_temphead'
 
 target: deceased_30d
 
@@ -88,7 +88,7 @@ concepts:
   
 
 dataset:
-  exclusion: study3  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc. study3
   overwrite: True
   max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
@@ -212,7 +212,7 @@ finetune:
     phase3_lr: 1.0e-4
 
     # Phase 4: Early prediction hardening (optional)
-    enable_early_prediction: true
+    enable_early_prediction: false
     phase4_epochs: 8
     phase4_lr: 5.0e-5
     masking_prob: 0.8
@@ -241,6 +241,20 @@ finetune:
     # Time weighting for temporal head
     time_weighting: uniform
     early_weight_factor: 2.0
+
+    # Temporal loss averaging: "per_sample" = each patient contributes equally,
+    # "global" = legacy (long trajectories dominate)
+    temporal_loss_averaging: per_sample
+
+    # Evaluation-timeframe weighting: upweight loss at eval-relevant timesteps
+    eval_timeframe_weighting: false
+    eval_timeframe_weight: 3.0
+
+    # Pairwise ranking loss (differentiable AUROC surrogate)
+    # 0.0 = disabled; e.g. 0.1 = 10% ranking loss + 90% BCE
+    ranking_loss_weight: 0.0
+    ranking_loss_n_timeframes: 5
+    ranking_loss_max_pairs: 10000
 
     # Temporal cropping augmentation (all phases)
     # Experiment 1: disabled. Experiment 2: set temporal_crop_prob: 0.4
@@ -288,6 +302,8 @@ normalization:
   n_quantiles: 1000         # max quantiles for quantile method
   quantile_output: normal   # normal | uniform
   clip_range: null           # null (disabled) or [min, max] e.g. [-3, 3] to clip normalized output
+  boundary_range_frac: 0.05  # fraction of value range defining boundary zone (adaptive only)
+  boundary_mass_thresh: 0.40 # mass fraction in boundary zone that overrides quantile → robust
 
 base_df_path: data/interim/base_df.pkl
 raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
