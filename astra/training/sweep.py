@@ -49,6 +49,8 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "res_dropout": best["res_dropout"],
         "head_pool": best.get("head_pool", "mean_cat"),
     }
+    if "temporal_head_dropout" in best:
+        model_section["temporal_head_dropout"] = best["temporal_head_dropout"]
 
     finetune_section = {
         "phase1_epochs": best["phase1_epochs"],
@@ -67,6 +69,10 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "label_smoothing": best["label_smoothing"],
         "pos_weight_factor": best["pos_weight_factor"],
         "time_weighting": best.get("time_weighting", "uniform"),
+        "temporal_loss_averaging": best.get("temporal_loss_averaging", "per_sample"),
+        "eval_timeframe_weighting": best.get("eval_timeframe_weighting", False),
+        "eval_timeframe_weight": best.get("eval_timeframe_weight", 3.0),
+        "ranking_loss_weight": best.get("ranking_loss_weight", 0.0),
         "temporal_crop_prob": best.get("temporal_crop_prob", 0.0),
         "temporal_crop_all_phases": best.get("temporal_crop_prob", 0.0) > 0,
     }
@@ -141,15 +147,16 @@ def joint_objective(
     d_model = trial.suggest_categorical("d_model", ss["d_model"])
     n_layers = trial.suggest_categorical("n_layers", ss["n_layers"])
     n_heads = trial.suggest_categorical("n_heads", ss["n_heads"])
-    fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"])
-    fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"])
-    fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"])
-    res_dropout = trial.suggest_float("res_dropout", *ss["res_dropout"])
+    fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"], step=0.05)
+    fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"], step=0.05)
+    fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"], step=0.05)
+    res_dropout = trial.suggest_float("res_dropout", *ss["res_dropout"], step=0.05)
     temporal_head = cfg_dict["model"].get("temporal_head", False)
     if temporal_head:
         head_pool = "mean_cat"  # temporal head replaces the standard head
         temporal_head_dropout = trial.suggest_float(
-            "temporal_head_dropout", *ss.get("temporal_head_dropout", [0.1, 0.6]),
+            "temporal_head_dropout", *ss.get("temporal_head_dropout", [0.0, 0.6]),
+            step=0.05,
         )
     else:
         head_pool = trial.suggest_categorical("head_pool", ss["head_pool"])
@@ -162,23 +169,26 @@ def joint_objective(
             n_heads -= 1
 
     # --- Training parameters ---
-    phase1_lr = trial.suggest_float("phase1_lr", *ss["phase1_lr"], log=True)
-    phase2_lr = trial.suggest_float("phase2_lr", *ss["phase2_lr"], log=True)
-    phase3_lr = trial.suggest_float("phase3_lr", *ss["phase3_lr"], log=True)
-    phase4_lr = trial.suggest_float("phase4_lr", *ss["phase4_lr"], log=True)
+    # Note: log-scale params can't use step (Optuna limitation), but we round
+    # them after suggestion for cleaner values. The rounding is fine because
+    # e.g. lr=3.4e-4 vs 3.5e-4 makes no practical difference.
+    phase1_lr = round(trial.suggest_float("phase1_lr", *ss["phase1_lr"], log=True), 6)
+    phase2_lr = round(trial.suggest_float("phase2_lr", *ss["phase2_lr"], log=True), 6)
+    phase3_lr = round(trial.suggest_float("phase3_lr", *ss["phase3_lr"], log=True), 6)
+    phase4_lr = round(trial.suggest_float("phase4_lr", *ss["phase4_lr"], log=True), 7)
 
-    weight_decay = trial.suggest_float("weight_decay", *ss["weight_decay"], log=True)
-    label_smoothing = trial.suggest_float("label_smoothing", *ss["label_smoothing"])
-    lr_decay_factor = trial.suggest_float("lr_decay_factor", *ss["lr_decay_factor"], log=True)
+    weight_decay = round(trial.suggest_float("weight_decay", *ss["weight_decay"], log=True), 5)
+    label_smoothing = trial.suggest_float("label_smoothing", *ss["label_smoothing"], step=0.01)
+    lr_decay_factor = round(trial.suggest_float("lr_decay_factor", *ss["lr_decay_factor"], log=True), 3)
 
     phase1_epochs = trial.suggest_int("phase1_epochs", *ss["phase1_epochs"])
     phase2_epochs = trial.suggest_int("phase2_epochs", *ss["phase2_epochs"])
     phase3_epochs = trial.suggest_int("phase3_epochs", *ss["phase3_epochs"])
     phase4_epochs = trial.suggest_int("phase4_epochs", *ss["phase4_epochs"])
 
-    pos_weight_factor = trial.suggest_float("pos_weight_factor", *ss["pos_weight_factor"])
-    masking_prob = trial.suggest_float("masking_prob", *ss["masking_prob"])
-    early_weight = trial.suggest_float("early_weight", *ss["early_weight"])
+    pos_weight_factor = trial.suggest_float("pos_weight_factor", *ss["pos_weight_factor"], step=0.05)
+    masking_prob = trial.suggest_float("masking_prob", *ss["masking_prob"], step=0.05)
+    early_weight = trial.suggest_float("early_weight", *ss["early_weight"], step=0.1)
 
     # Temporal head time weighting and loss improvements
     if temporal_head:
@@ -197,10 +207,12 @@ def joint_objective(
         eval_timeframe_weight = (
             trial.suggest_float(
                 "eval_timeframe_weight", *ss.get("eval_timeframe_weight", [1.5, 5.0]),
+                step=0.5,
             ) if eval_timeframe_weighting else 3.0
         )
         ranking_loss_weight = trial.suggest_float(
             "ranking_loss_weight", *ss.get("ranking_loss_weight", [0.0, 0.3]),
+            step=0.05,
         )
     else:
         time_weighting = "uniform"
@@ -210,7 +222,7 @@ def joint_objective(
         ranking_loss_weight = 0.0
 
     # Temporal cropping augmentation
-    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", *ss["temporal_crop_prob"])
+    temporal_crop_prob = trial.suggest_float("temporal_crop_prob", *ss["temporal_crop_prob"], step=0.05)
 
     # --- Temporarily override global cfg with trial architecture ---
     orig_model_cfg = {k: cfg_dict["model"][k] for k in [
