@@ -349,13 +349,16 @@ def compute_val_metrics(
     last_auroc = _safe_auroc(all_targets_binary, last_probs)
     last_auprc = _safe_auprc(all_targets_binary, last_probs)
 
-    # Use multi-timepoint average if available, else fall back to last-step
+    # Use multi-timepoint sum if available, else fall back to last-step.
+    # Sum (not mean) so that each well-performing timepoint adds to the score,
+    # incentivizing models that maintain performance across the full horizon.
     if tp_auprcs:
-        auroc = float(np.mean(tp_aurocs))
-        auprc = float(np.mean(tp_auprcs))
+        auroc = float(np.sum(tp_aurocs))
+        auprc = float(np.sum(tp_auprcs))
         logger.info(
-            f"  Multi-timepoint val (active-only at {VAL_TIMEPOINTS_HOURS}h): "
-            f"AUROC={auroc:.4f}, AUPRC={auprc:.4f} | "
+            f"  Multi-timepoint val (active-only at {VAL_TIMEPOINTS_HOURS}h, "
+            f"{len(tp_aurocs)} valid): "
+            f"sum_AUROC={auroc:.4f}, sum_AUPRC={auprc:.4f} | "
             f"last-step: AUROC={last_auroc:.4f}, AUPRC={last_auprc:.4f}"
         )
     else:

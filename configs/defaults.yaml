@@ -192,8 +192,8 @@ model:
     d_ff: None
     d_k: None
     d_v: None
-    temporal_head: false
-    causal: false  # required for temporal_head
+    temporal_head: true
+    causal: true  # required for temporal_head
     temporal_head_dropout: 0.3
     survival_mode: false  # true = discrete-time survival, false = binary classification
 finetune:
@@ -261,7 +261,8 @@ sweep:
         fc_mults_1: [0.1, 0.5]
         fc_mults_2: [0.05, 0.3]
         fc_dropout: [0.1, 0.9]
-        res_dropout: [0.0, 0.4]
+        res_dropout: [0.0, 0.6]
+        temporal_head_dropout: [0.0, 0.6]
         head_pool: [flatten, mean_cat]
         # Training HPs (per-phase LRs swept independently)
         phase1_lr: [1.0e-4, 1.0e-2]          # log scale
@@ -270,15 +271,20 @@ sweep:
         phase4_lr: [5.0e-6, 5.0e-4]          # log scale
         phase1_epochs: [2, 8]
         phase2_epochs: [5, 20]
-        phase3_epochs: [3, 15]
+        phase3_epochs: [3, 20]
         phase4_epochs: [0, 10]               # 0 = skip early prediction
         weight_decay: [1.0e-4, 1.0e-1]       # log scale
         label_smoothing: [0.0, 0.2]
         lr_decay_factor: [0.01, 0.5]         # log scale
-        masking_prob: [0.3, 0.7]
+        masking_prob: [0.3, 0.9]
         early_weight: [1.0, 3.0]
         pos_weight_factor: [0.0, 1.0]        # linear (0 = no class weighting)
         temporal_crop_prob: [0.0, 0.6]       # probability of cropping per batch
+        # Temporal loss improvements (only active when temporal_head=true)
+        temporal_loss_averaging: [per_sample, global]
+        eval_timeframe_weighting: [true, false]
+        eval_timeframe_weight: [1.5, 5.0]    # multiplier when eval_timeframe_weighting=true
+        ranking_loss_weight: [0.0, 0.3]      # 0=disabled; blended as (1-w)*bce + w*rank
 
 evaluation:
     max_f_beta: 10
