@@ -99,6 +99,24 @@ def stratified_sample_at_timepoint(
     n_nonsurvivor = len(nonsurvivor_pids)
     n_survivor_available = len(survivor_pids)
 
+    if n_nonsurvivor == 0:
+        logger.warning(
+            f"  [{timepoint_hours}h] No non-survivors active at this timepoint. "
+            f"Skipping."
+        )
+        return {
+            'pids': [],
+            'step': step,
+            'timepoint_hours': timepoint_hours,
+            'n_active_total': n_active,
+            'n_active_nonsurvivor': 0,
+            'n_active_survivor': n_survivor_available,
+            'n_nonsurvivor': 0,
+            'n_survivor_sampled': 0,
+            'n_total_sampled': 0,
+            'prevalence_active': 0.0,
+        }
+
     if n_nonsurvivor < 10:
         logger.warning(
             f"  [{timepoint_hours}h] Only {n_nonsurvivor} non-survivors active "
@@ -188,6 +206,10 @@ def compute_shap_per_timepoint(
         pids = sample_info['pids']
         n_deceased = sample_info['n_nonsurvivor']
 
+        if len(pids) == 0:
+            logger.info(f"Skipping {label} — no sampled patients.")
+            continue
+
         logger.info(
             f"\n{'='*60}\n"
             f"Computing SHAP at {label} (step={step}, n={len(pids)}, "
@@ -209,6 +231,10 @@ def compute_shap_per_timepoint(
             eval_timestep=step,
         )
 
+        # Squeeze trailing singleton dimension from GradientExplainer
+        # (returns shape [..., 1] for single-output models)
+        _squeeze_shap_results(shap_results)
+
         all_results[label] = shap_results
         logger.info(
             f"  ts_shap shape: {shap_results['ts_shap'].shape}, "
@@ -216,6 +242,16 @@ def compute_shap_per_timepoint(
         )
 
     return all_results
+
+
+def _squeeze_shap_results(shap_results: Dict) -> None:
+    """Squeeze trailing singleton dimensions from SHAP arrays in-place."""
+    for key in ('ts_shap', 'cat_ts_shap', 'cat_ts_shap_per_category',
+                'cat_ts_shap_embedded', 'cat_shap', 'cat_shap_embedded',
+                'cont_shap'):
+        val = shap_results.get(key)
+        if val is not None and isinstance(val, np.ndarray) and val.ndim > 1 and val.shape[-1] == 1:
+            shap_results[key] = val.squeeze(-1)
 
 
 def validate_shap_results(
@@ -379,10 +415,10 @@ def figure_b_heatmap(
     overall = imp_matrix.mean(axis=1)
     top_idx = np.argsort(overall)[-TOP_K_HEATMAP:][::-1]  # descending
 
-    heatmap_data = imp_matrix[top_idx]
-    row_labels = [clinical_names[i] for i in top_idx]
+    row_labels_clinical = [clinical_names[i] for i in top_idx]
 
-    # Add EBM row if present
+    # Compute EBM row if present
+    ebm_row = None
     if has_ebm:
         ebm_ch_idx = ebm_channels[0][0]  # (idx, name)
         ebm_row = np.zeros(len(EVAL_LABELS))
@@ -391,10 +427,21 @@ def figure_b_heatmap(
                 continue
             ts_shap = all_results[label]['ts_shap']
             ebm_row[col_idx] = np.abs(ts_shap[:, ebm_ch_idx, :]).mean(axis=1).mean(axis=0)
-        heatmap_data = np.vstack([heatmap_data, ebm_row])
-        row_labels.append('EBM (_ebm_pred)')
 
-    df_heat = pd.DataFrame(heatmap_data, index=row_labels, columns=EVAL_LABELS)
+    available_labels = [l for l in EVAL_LABELS if l in all_results]
+    df_heat = pd.DataFrame(
+        imp_matrix[top_idx][:, [EVAL_LABELS.index(l) for l in available_labels]],
+        index=row_labels_clinical,
+        columns=available_labels,
+    )
+    if has_ebm:
+        ebm_df = pd.DataFrame(
+            ebm_row[[EVAL_LABELS.index(l) for l in available_labels]].reshape(1, -1),
+            index=['EBM (_ebm_pred)'],
+            columns=available_labels,
+        )
+        df_heat = pd.concat([df_heat, ebm_df])
+    row_labels = list(df_heat.index)
 
     n_rows = len(row_labels)
     fig_height = max(4, n_rows * 0.28 + 1.0)
@@ -609,7 +656,11 @@ def figure_e_categorical_ts(
     # Truncate long labels
     row_labels = [name[:40] + '...' if len(name) > 40 else name for name in row_labels]
 
-    df_heat = pd.DataFrame(heatmap_data, index=row_labels, columns=EVAL_LABELS)
+    available_labels = [l for l in EVAL_LABELS if l in all_results]
+    avail_col_idx = [EVAL_LABELS.index(l) for l in available_labels]
+    df_heat = pd.DataFrame(
+        heatmap_data[:, avail_col_idx], index=row_labels, columns=available_labels
+    )
 
     n_rows = len(row_labels)
     fig_height = max(4, n_rows * 0.3 + 1.0)
@@ -710,6 +761,10 @@ def main():
         logger.info(f"Loading cached SHAP results from {CACHE_PATH}...")
         with open(CACHE_PATH, 'rb') as f:
             all_results = pickle.load(f)
+
+    # --- Squeeze cached results (handles trailing singleton from GradientExplainer) ---
+    for label in list(all_results.keys()):
+        _squeeze_shap_results(all_results[label])
 
     # --- Validation ---
     validate_shap_results(all_results, sampling_results)
