@@ -41,8 +41,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ============================================================================
 
-EVAL_TIMEPOINTS = [1, 6, 12, 72, 168, 720]  # hours
-EVAL_LABELS = ['1H', '6H', '12H', '3D', '7D', '30D']
+EVAL_TIMEPOINTS = [1, 6, 12, 72, 168, 336, 720]  # hours
+EVAL_LABELS = ['1H', '6H', '12H', '3D', '7D', '14D', '30D']
 OUTPUT_DIR = 'reports/shap_paper'
 CACHE_PATH = os.path.join(OUTPUT_DIR, 'shap_cache.pkl')
 SAMPLES_PATH = os.path.join(OUTPUT_DIR, 'stratified_samples.pkl')
