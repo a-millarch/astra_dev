@@ -2311,8 +2311,17 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
                            max_display: int = 20, class_idx: int = 1, save_path: str = None,
-                           eval_timestep: Optional[int] = None):
-    """Summary visualizations across cohort."""
+                           eval_timestep: Optional[int] = None,
+                           density_normalize: bool = False):
+    """Summary visualizations across cohort.
+
+    Args:
+        density_normalize: If True, normalize SHAP aggregation by measurement
+            density per channel.  Channels with more non-zero (measured) cells
+            naturally accumulate more |SHAP| under simple averaging; density
+            normalization divides by the fraction of measured cells so the bar
+            chart and heatmap reflect per-measurement importance.
+    """
 
     ts_shap = shap_results['ts_shap']
     if ts_shap.ndim == 4:
@@ -2365,6 +2374,19 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     else:
         valid_time = None  # fallback: treat all positions as valid
 
+    # Build measurement-density mask from input data (non-zero = measured)
+    # Used when density_normalize=True to avoid rewarding channels that are
+    # simply measured more often.
+    _measured_mask = None  # [n_samples, n_channels, n_steps] bool
+    if density_normalize:
+        test_ts = shap_results.get('test_data', {}).get('ts')
+        if test_ts is not None:
+            _measured_mask = test_ts[:n_samples, :, :n_steps] != 0.0
+            logger.info("Density normalization enabled for SHAP summary")
+        else:
+            logger.warning("density_normalize=True but test_data['ts'] not available; "
+                           "falling back to standard aggregation")
+
     def _masked_temporal_mean(arr_3d, ch_indices):
         """Mean |SHAP| over samples & channels -> [n_steps], padding-aware."""
         subset = np.abs(arr_3d[:, ch_indices, :])  # [n_samples, n_ch, n_steps]
@@ -2376,8 +2398,22 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         return subset.mean(axis=(0, 1))
 
     def _masked_channel_mean(arr_3d):
-        """Mean |SHAP| over samples & time -> [n_channels], padding-aware."""
+        """Mean |SHAP| over samples & time -> [n_channels], padding-aware.
+
+        When ``_measured_mask`` is set (density_normalize=True), the denominator
+        counts only positions where the channel had an actual measurement
+        (non-zero input), so channels are not rewarded for being measured more
+        frequently.
+        """
         subset = np.abs(arr_3d)  # [n_samples, n_channels, n_steps]
+        if _measured_mask is not None:
+            # Density-normalized: only count measured positions
+            mask = _measured_mask.copy()
+            if valid_time is not None:
+                # Also exclude padding
+                mask = mask & valid_time[:, None, :]
+            denom = mask.sum(axis=(0, 2)).clip(1)  # [n_channels]
+            return (subset * mask).sum(axis=(0, 2)) / denom
         if valid_time is not None:
             mask = valid_time[:, None, :]
             mask = np.broadcast_to(mask, subset.shape)
@@ -2442,8 +2478,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         bar_colors = ['#008bfb'] * len(sorted_idx)
     ax2.barh(range(len(sorted_idx)), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax2.set_yticks(range(len(sorted_idx))); ax2.set_yticklabels(names, fontsize=10)
-    bar_title = f'Top {len(sorted_idx)} Clinical Channels' if has_ebm else f'Top {len(sorted_idx)} Channels'
-    ax2.set_xlabel('Mean |SHAP|'); ax2.set_title(bar_title, fontweight='bold')
+    _dn_suffix = ' (per-measurement)' if _measured_mask is not None else ''
+    bar_title = f'Top {len(sorted_idx)} Clinical Channels{_dn_suffix}' if has_ebm else f'Top {len(sorted_idx)} Channels{_dn_suffix}'
+    _shap_label = 'Mean |SHAP| / measured cell' if _measured_mask is not None else 'Mean |SHAP|'
+    ax2.set_xlabel(_shap_label); ax2.set_title(bar_title, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='x'); ax2.invert_yaxis()
     if channel2feature and not has_ebm:
         used_groups = set()
@@ -2509,7 +2547,16 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     # Plot 4: Continuous TS heatmap — clinical-only when EBM present
     ax4 = fig.add_subplot(gs[2 + row_offset, :])
-    ts_mean = np.abs(ts_shap).mean(axis=0)
+    if _measured_mask is not None:
+        # Density-normalized heatmap: per-channel, per-timestep mean over
+        # measured positions only.
+        _hm_mask = _measured_mask.copy()
+        if valid_time is not None:
+            _hm_mask = _hm_mask & valid_time[:, None, :]
+        _hm_denom = _hm_mask.sum(axis=0).clip(1)  # [n_channels, n_steps]
+        ts_mean = (np.abs(ts_shap) * _hm_mask).sum(axis=0) / _hm_denom
+    else:
+        ts_mean = np.abs(ts_shap).mean(axis=0)
     if channel2feature and has_ebm:
         ordered_idx, ordered_labels_4 = _get_clinical_only_channel_order(channel2feature)
         ts_mean_display = ts_mean[ordered_idx]
@@ -2524,7 +2571,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         n_display_4 = n_channels
     im = ax4.imshow(ts_mean_display, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0)
     ax4.set_xlabel('Time'); ax4.set_ylabel('Channel')
-    heatmap_title_4 = 'Clinical Continuous TS |SHAP| Heatmap (Mean)' if has_ebm else 'Continuous TS |SHAP| Heatmap (Mean, grouped)'
+    if _measured_mask is not None:
+        heatmap_title_4 = 'Clinical |SHAP| Heatmap (per-measurement)' if has_ebm else '|SHAP| Heatmap (per-measurement, grouped)'
+    else:
+        heatmap_title_4 = 'Clinical Continuous TS |SHAP| Heatmap (Mean)' if has_ebm else 'Continuous TS |SHAP| Heatmap (Mean, grouped)'
     ax4.set_title(heatmap_title_4, fontweight='bold')
     if n_display_4 <= 40:
         ax4.set_yticks(range(n_display_4))
@@ -2589,7 +2639,8 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
 
 
 def shap_analysis(data=None, model=None, model_name='13012025', compute_per_category_shap=True, max_background_samples=600,
-                  max_test_samples=90, visualize=True, specific_pids: List = None) -> Dict:
+                  max_test_samples=90, visualize=True, specific_pids: List = None,
+                  density_normalize: bool = False) -> Dict:
     """
     Run full SHAP analysis.
 
@@ -2674,6 +2725,7 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
             save_path='reports/shap/shap_summary_cohort.png',
+            density_normalize=density_normalize,
         )
 
         # Use first PID for individual plot
@@ -2764,7 +2816,8 @@ class TimeframeSHAPResult:
     cont_data: Optional[np.ndarray]
     ts_channel_importance: np.ndarray
     ts_temporal_importance: np.ndarray
-    
+    n_active_background: Optional[int] = None
+
     @property
     def effective_steps(self) -> int:
         if self.censor_step is None:
@@ -2786,7 +2839,8 @@ class TemporalSHAPResults:
     encoding_info: Dict
     stability_metrics: Optional[Dict] = None
     inhospital_start_step: Optional[int] = None
-    
+    active_only: bool = False
+
     def get_available_timeframes(self) -> List[str]:
         return list(self.timeframe_results.keys())
     
@@ -2821,25 +2875,33 @@ class TemporalSHAPAnalyzer:
     """Analyzes SHAP values across timeframes using Option A (re-compute per timeframe)."""
     
     def __init__(self, model: nn.Module, data: Dict, background_loader,
-                 device: str = 'cuda', max_background_samples: int = 200, class_idx: int = 1):
+                 device: str = 'cuda', max_background_samples: int = 200,
+                 class_idx: int = 1, active_only: bool = False,
+                 density_normalize: bool = False):
         self.model = model
         self.data = data
         self.background_loader = background_loader
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.max_background_samples = max_background_samples
         self.class_idx = class_idx
-        
+        self.active_only = active_only
+        self.density_normalize = density_normalize
+
         self.encoding_info = data.get("encoding_info", {})
         self.channel2feature, self.feature2channel = self._create_channel_mapping()
         self.static_cat_names = list(data.get("classes", {}).keys())
         self.static_cont_names = data.get("num_cols", [])
-        
+
         self._bg_data = None
         self.model.eval()
         self.model = self.model.to(device)
         self.has_cat_ts = model.n_ts_cat > 0
-        
-        print(f"TemporalSHAPAnalyzer: {len(self.channel2feature)} channels, "
+
+        mode_parts = []
+        if active_only: mode_parts.append("active-only")
+        if density_normalize: mode_parts.append("density-norm")
+        mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
+        print(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
               f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
     
     def _create_channel_mapping(self):
@@ -2878,7 +2940,26 @@ class TemporalSHAPAnalyzer:
             'traj_lengths': torch.cat(all_traj)[:self.max_background_samples].to(self.device)
         }
         return self._bg_data
-    
+
+    def _get_active_background(self, censor_step):
+        """Filter background to patients with trajectory_length > censor_step.
+
+        Returns (filtered_bg_dict, n_active).  When active_only is False or
+        censor_step is None, returns the full background unchanged.
+        """
+        bg = self._extract_background_data()
+        if not self.active_only or censor_step is None:
+            return bg, bg['ts'].shape[0]
+
+        mask = bg['traj_lengths'] > censor_step
+        n_active = int(mask.sum())
+        if n_active < 2:
+            # Fall back to full background to avoid degenerate SHAP
+            print(f"  WARNING: only {n_active} active bg samples at step {censor_step}, using all")
+            return bg, bg['ts'].shape[0]
+
+        return {k: v[mask] for k, v in bg.items()}, n_active
+
     def _censor_data(self, ts, ts_cat, censor_step):
         if censor_step is None:
             return ts, ts_cat
@@ -2890,7 +2971,7 @@ class TemporalSHAPAnalyzer:
     
     def _compute_shap_for_sample(self, sample_ts, sample_ts_cat, sample_cat, sample_cont,
                                 censor_step=None, traj_length=None):
-        bg = self._extract_background_data()
+        bg, n_active = self._get_active_background(censor_step)
         bg_ts_c, bg_ts_cat_c = self._censor_data(bg['ts'], bg['ts_cat'], censor_step)
 
         if sample_ts.dim() == 2:
@@ -2965,7 +3046,8 @@ class TemporalSHAPAnalyzer:
 
         return {'ts_shap': ts_shap, 'cat_ts_shap': cat_ts_shap,
                 'cat_ts_shap_per_category': cat_ts_shap_per_cat,
-                'cat_shap': cat_shap, 'cont_shap': cont_shap}
+                'cat_shap': cat_shap, 'cont_shap': cont_shap,
+                'n_active_background': n_active}
     
     def get_holdout_pids(self, max_samples=None):
         pids = self.data["holdout"].tab_df['PID'].tolist()
@@ -3040,11 +3122,13 @@ class TemporalSHAPAnalyzer:
         
         # If we skipped some timeframes, add 'max' which uses actual data length
         # This replaces 'full' behavior with a named timeframe showing actual hours
+        # Use a local copy to avoid mutating the global DEFAULT_TIMEFRAMES
+        local_timeframes = OrderedDict(DEFAULT_TIMEFRAMES)
         if skipped_any and 'full' in valid_tfs:
             # Replace 'full' with 'max' to make it clearer this is the max available
-            valid_tfs = [tf if tf != 'full' else f'max({actual_hours:.1f}h)' for tf in valid_tfs]
-            # Add max to DEFAULT_TIMEFRAMES temporarily for this analysis
-            DEFAULT_TIMEFRAMES[f'max({actual_hours:.1f}h)'] = None  # None means full/no censoring
+            max_label = f'max({actual_hours:.1f}h)'
+            valid_tfs = [tf if tf != 'full' else max_label for tf in valid_tfs]
+            local_timeframes[max_label] = None  # None means full/no censoring
         
         if verbose: print(f"Analyzing: {valid_tfs}")
         
@@ -3052,7 +3136,7 @@ class TemporalSHAPAnalyzer:
         t0 = time.time()
         
         for i, tf in enumerate(valid_tfs):
-            tf_h = DEFAULT_TIMEFRAMES.get(tf)
+            tf_h = local_timeframes.get(tf)
             censor = None if tf_h is None else time_to_step(tf_h, 'h')
             if verbose: print(f"  [{i+1}/{len(valid_tfs)}] {tf}...", end=" ", flush=True)
             
@@ -3060,19 +3144,29 @@ class TemporalSHAPAnalyzer:
             shap_res = self._compute_shap_for_sample(
                 sample_ts, sample_ts_cat, sample_cat, sample_cont, censor,
                 traj_length=traj_length)
-            if verbose: print(f"done ({time.time()-t1:.1f}s)")
+            n_active_bg = shap_res['n_active_background']
+            if verbose:
+                active_str = f", bg={n_active_bg}" if self.active_only else ""
+                print(f"done ({time.time()-t1:.1f}s{active_str})")
 
             ts_shap = shap_res['ts_shap']
             if ts_shap.ndim == 3:
                 ts_shap = ts_shap[..., min(self.class_idx, ts_shap.shape[-1] - 1)]
 
-            # Compute importance with padding-aware averaging
-            tl = actual_steps  # already set from traj_length
-            ts_channel_importance = np.abs(ts_shap).mean(axis=1)  # [seq_len] — zeros beyond tl
-            ts_temporal_importance = (
-                np.abs(ts_shap[:, :tl]).mean(axis=1) if tl > 0
-                else np.zeros(ts_shap.shape[0])
-            )
+            # Compute importance using effective steps (respects both trajectory
+            # length AND censoring boundary — avoids dilution from zeroed positions)
+            eff = min(actual_steps, (censor + 1) if censor is not None else actual_steps)
+            if eff > 0 and self.density_normalize:
+                # Density-normalized: mean |SHAP| over measured cells only
+                shap_eff = np.abs(ts_shap[:, :eff])  # [n_channels, eff_steps]
+                measured = ts_np[:, :eff] != 0.0       # [n_channels, eff_steps]
+                denom = measured.sum(axis=1).clip(1)   # [n_channels]
+                ts_channel_importance = (shap_eff * measured).sum(axis=1) / denom
+            elif eff > 0:
+                ts_channel_importance = np.abs(ts_shap[:, :eff]).mean(axis=1)
+            else:
+                ts_channel_importance = np.zeros(ts_shap.shape[0])
+            ts_temporal_importance = ts_channel_importance  # same with effective_steps
 
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
@@ -3083,7 +3177,8 @@ class TemporalSHAPAnalyzer:
                 ts_data=ts_np, cat_ts_data=sample_ts_cat.cpu().numpy(),
                 cat_data=sample_cat.cpu().numpy(), cont_data=sample_cont.cpu().numpy(),
                 ts_channel_importance=ts_channel_importance,
-                ts_temporal_importance=ts_temporal_importance
+                ts_temporal_importance=ts_temporal_importance,
+                n_active_background=n_active_bg,
             )
         
         if verbose: print(f"Total: {time.time()-t0:.1f}s")
@@ -3093,7 +3188,8 @@ class TemporalSHAPAnalyzer:
             actual_data_length_steps=actual_steps, actual_data_length_hours=actual_hours,
             timeframe_results=results, channel2feature=self.channel2feature,
             static_cat_names=self.static_cat_names, static_cont_names=self.static_cont_names,
-            encoding_info=self.encoding_info, inhospital_start_step=ihs_step
+            encoding_info=self.encoding_info, inhospital_start_step=ihs_step,
+            active_only=self.active_only,
         )
         out.stability_metrics = self._compute_stability_metrics(out)
         return out
@@ -3436,6 +3532,11 @@ class TemporalSHAPAnalyzer:
                 if tf_budget is not None:
                     ebm_annotation = f"  [EBM: {tf_budget['ebm_pct']:.0f}%]"
 
+            # Active background count annotation
+            active_annotation = ''
+            if results.active_only and r.n_active_background is not None:
+                active_annotation = f"\nn_bg={r.n_active_background}"
+
             # Row 1: Temporal importance
             ax1 = fig.add_subplot(gs[0, col])
             ax1.plot(r.ts_temporal_importance, lw=2, color='#ff0051')
@@ -3445,7 +3546,7 @@ class TemporalSHAPAnalyzer:
             _draw_inhospital_boundary(ax1, results.inhospital_start_step, seq_len, label=(col == 0))
             ax1.set_xlim(0, seq_len); ax1.set_ylim(0, temp_max*1.1)
             ax1.set_xticks(tick_idx); ax1.set_xticklabels(tick_labels, rotation=45, fontsize=8)
-            ax1.set_title(f'{tf} {suffix}{ebm_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
+            ax1.set_title(f'{tf} {suffix}{ebm_annotation}{active_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
 
             # Row 2: Channel bars (clinical-only when EBM present)
             ax2 = fig.add_subplot(gs[1, col])
@@ -3493,12 +3594,13 @@ class TemporalSHAPAnalyzer:
             else:
                 ax4.text(0.5, 0.5, 'No static features', ha='center', va='center', transform=ax4.transAxes)
         
-        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data)',
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data){active_label}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
         return fig
-    
+
     def plot_stability_heatmap(self, results: TemporalSHAPResults, figsize=(24, 20), save_path=None):
         """
         Comprehensive heatmaps of stability metrics for ALL feature types.
@@ -3652,7 +3754,8 @@ class TemporalSHAPAnalyzer:
             axes[row_idx, 2].set_title('Stability Summary', fontweight='bold')
             axes[row_idx, 2].axis('off')
         
-        fig.suptitle(f'Comprehensive SHAP Stability Analysis - PID: {results.pid}\n'
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(f'Comprehensive SHAP Stability Analysis - PID: {results.pid}{active_label}\n'
                     f'Data: {results.actual_data_length_hours:.1f}h | Timeframes: {", ".join(tfs)}',
                     fontsize=14, fontweight='bold', y=1.02)
         
@@ -3874,7 +3977,8 @@ class TemporalSHAPAnalyzer:
                     ax.legend(fontsize=8)
                     ax.grid(True, alpha=0.3)
         
-        fig.suptitle(f'Feature Importance Correlation Analysis - PID: {results.pid}\n'
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(f'Feature Importance Correlation Analysis - PID: {results.pid}{active_label}\n'
                     f'Reference: {reference}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
@@ -3917,7 +4021,8 @@ class TemporalSHAPAnalyzer:
         
         ax.set_xticks(range(len(tfs))); ax.set_xticklabels(tfs, rotation=45)
         ax.set_xlabel('Timeframe'); ax.set_ylabel('Mean |SHAP|')
-        ax.set_title(f'Feature Trajectory - PID: {results.pid}', fontweight='bold')
+        active_label = " [active-only]" if results.active_only else ""
+        ax.set_title(f'Feature Trajectory - PID: {results.pid}{active_label}', fontweight='bold')
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -3952,6 +4057,7 @@ class TemporalSHAPAnalyzer:
                 'hours': r.timeframe_hours,
                 'censor_step': r.censor_step,
                 'effective_steps': r.effective_steps,
+                'n_active_bg': r.n_active_background,
 
                 # EBM vs Clinical budget
                 'ebm_pct': tf_budget['ebm_pct'] if tf_budget else np.nan,
@@ -4033,9 +4139,10 @@ class TemporalSHAPAnalyzer:
 # ============================================================================
 
 def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframes=None,
-                               max_background_samples=200, save_dir='reports/shap', verbose=False):
-    """
-    Run complete temporal SHAP analysis with all visualizations.
+                               max_background_samples=200, save_dir='reports/shap',
+                               verbose=False, active_only=False,
+                               density_normalize: bool = False):
+    """Run complete temporal SHAP analysis with all visualizations.
 
     Args:
         data: Data dict from prepare_data_and_dls()
@@ -4045,6 +4152,10 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
         timeframes: List of timeframe names (default: all)
         save_dir: Output directory
         verbose: Print progress
+        active_only: If True, only use background patients with active
+                     trajectories at each evaluation timeframe
+        density_normalize: If True, normalize channel importance by measurement
+                          density (per-measured-cell mean instead of per-timestep).
 
     Returns:
         TemporalSHAPResults
@@ -4052,7 +4163,9 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
     os.makedirs(save_dir, exist_ok=True)
 
     analyzer = TemporalSHAPAnalyzer(
-        model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu', max_background_samples
+        model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu',
+        max_background_samples, active_only=active_only,
+        density_normalize=density_normalize,
     )
     
     holdout_pids = analyzer.get_holdout_pids()

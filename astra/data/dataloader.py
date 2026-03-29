@@ -54,10 +54,11 @@ class AstraScaler:
     _KURT_MODERATE = 7.0
 
     def __init__(self, method='adaptive', n_quantiles=1000,
-                 quantile_output='normal'):
+                 quantile_output='normal', clip_range=None):
         self.method = method
         self.n_quantiles = n_quantiles
         self.quantile_output = quantile_output
+        self.clip_range = clip_range  # e.g. (-3.0, 3.0) to clip normalized output
 
         # Populated during fit
         self.channel_scalers_ = {}   # ch_idx → fitted object / dict
@@ -143,13 +144,17 @@ class AstraScaler:
         method = self.channel_methods_[ch_idx]
 
         if method == 'standard':
-            return (values - sc['mean']) / sc['std']
+            out = (values - sc['mean']) / sc['std']
         elif method in ('quantile', 'power'):
-            return sc.transform(values.reshape(-1, 1)).ravel()
+            out = sc.transform(values.reshape(-1, 1)).ravel()
         elif method == 'robust':
-            return (values - sc['median']) / sc['iqr']
+            out = (values - sc['median']) / sc['iqr']
         else:
             raise ValueError(f"Unknown method for channel {ch_idx}: {method}")
+
+        if self.clip_range is not None:
+            out = np.clip(out, self.clip_range[0], self.clip_range[1])
+        return out
 
     # ------------------------------------------------------------------
     # Populate backward-compat attributes after all channels are fitted
@@ -620,12 +625,16 @@ def prepare_data_and_dls(cfg):
     # 1. CONTINUOUS TIME SERIES SCALER
     norm_cfg = cfg.get('normalization', {})
     ts_method = norm_cfg.get('ts_method', 'standard')
+    clip_range_cfg = norm_cfg.get('clip_range', None)
+    clip_range = tuple(clip_range_cfg) if clip_range_cfg else None
     ts_scaler = AstraScaler(
         method=ts_method,
         n_quantiles=norm_cfg.get('n_quantiles', 1000),
         quantile_output=norm_cfg.get('quantile_output', 'normal'),
+        clip_range=clip_range,
     )
-    logger.info(f"Using {ts_method} normalization for time series")
+    logger.info(f"Using {ts_method} normalization for time series"
+                + (f" with clip_range={clip_range}" if clip_range else ""))
 
     # Get trajectory lengths (works with NaN for missing measurements).
     # Exclude EBM channel so forward-filled predictions cannot extend
