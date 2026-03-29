@@ -839,6 +839,27 @@ def get_static_cat_names_from_classes(classes: Dict) -> List[str]:
 # Model Wrapper for SHAP
 # ============================================================================
 
+def _select_temporal_output(logits, eval_timestep, key_padding_mask, seq_len):
+    """Select output from temporal head logits based on eval_timestep mode.
+
+    Args:
+        logits: [batch, seq_len] per-timestep logits from temporal_pred_head
+        eval_timestep: int index, or 'mean' for padding-aware mean across
+                       valid (non-padded) timesteps. Distributes SHAP gradients
+                       evenly so aggregate importance isn't dominated by the
+                       last position.
+        key_padding_mask: [batch, seq_len + n_static] bool (True=padding)
+        seq_len: number of temporal positions (to slice mask)
+    """
+    if eval_timestep == 'mean':
+        ts_mask = ~key_padding_mask[:, :seq_len]  # [batch, seq_len] True=valid
+        ts_mask_f = ts_mask.float()
+        masked_logits = logits[:, :seq_len] * ts_mask_f
+        mean_logit = masked_logits.sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+        return mean_logit.unsqueeze(-1)  # [batch, 1]
+    return logits[:, eval_timestep].unsqueeze(-1)  # [batch, 1]
+
+
 def _build_padding_mask_for_shap(x_ts, traj_lengths, n_static_tokens=0):
     """Build key_padding_mask matching model._build_traj_padding_mask().
 
@@ -938,7 +959,8 @@ class ModelWrapperWithEmbeddings(nn.Module):
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
         return self._apply_head(x, key_padding_mask)
 
     def _apply_head(self, x, key_padding_mask):
@@ -1053,12 +1075,13 @@ class ModelWrapperWithRawCatTS(nn.Module):
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
             if self.survival_mode:
                 # Return cumulative incidence 1 - S(t) at eval_timestep (differentiable)
-                eval_t = self.eval_timestep if self.eval_timestep >= 0 else logits.shape[1] + self.eval_timestep
+                eval_t = self.eval_timestep if isinstance(self.eval_timestep, int) and self.eval_timestep >= 0 else logits.shape[1] - 1
                 hazards = torch.sigmoid(logits[:, :eval_t + 1])
                 log_surv = torch.sum(torch.log1p(-hazards + 1e-7), dim=1)
                 surv = torch.exp(log_surv)
                 return (1.0 - surv).unsqueeze(-1)  # [batch, 1]
-            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
         return self._apply_head(x, key_padding_mask)
 
     def _apply_head(self, x, key_padding_mask):
@@ -1289,9 +1312,13 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         all_pids: List of all PIDs in the test loader (in order). Required if specific_pids
                   is provided, to map PIDs to sample indices.
         eval_timestep: For temporal head models, which sequence position to evaluate.
-                       Default -1 (last position) is wrong for causal models — SHAP gradients
-                       decay to near-zero for early steps through the long attention chain.
-                       Use a fixed clinical timepoint instead, e.g.:
+                       Default -1 auto-switches to 'mean' when temporal head is detected.
+                       Options:
+                         - 'mean': padding-aware mean across valid timesteps (recommended
+                           for aggregate SHAP — distributes gradients evenly)
+                         - int >= 0: specific timestep index
+                         - -1: last position (auto-converts to 'mean' for temporal head)
+                       For per-timeframe analysis, use a fixed clinical timepoint:
                            from astra.evaluation.utils import time_to_step
                            eval_timestep=time_to_step(24, 'h')  # prediction at 24 h
         inhospital_start_steps: Per-sample step index where inhospital data starts
@@ -1355,8 +1382,12 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     test_cat_emb = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
     
     if model.temporal_head_enabled:
-        print(f"  Temporal head: eval_timestep={eval_timestep} "
-              f"({'last position — consider a clinical timepoint' if eval_timestep == -1 else 'OK'})")
+        if eval_timestep == -1:
+            eval_timestep = 'mean'
+            print(f"  Temporal head detected: auto-switching eval_timestep to 'mean' "
+                  f"(padding-aware average across valid timesteps)")
+        else:
+            print(f"  Temporal head: eval_timestep={eval_timestep}")
 
     if bg_cat_emb is not None:
         print(f"  Static categorical embedded: {bg_cat_emb.shape}")
@@ -3026,7 +3057,15 @@ class TemporalSHAPAnalyzer:
         else:
             wrapper_traj = None
 
-        eval_ts = censor_step if censor_step is not None else -1
+        if censor_step is not None:
+            eval_ts = censor_step
+        elif self.model.temporal_head_enabled:
+            # No censoring (full timeframe): use mean across valid timesteps
+            # to distribute SHAP gradients evenly instead of only explaining
+            # the last position (where gradients decay through causal chain)
+            eval_ts = 'mean'
+        else:
+            eval_ts = -1
         wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
                                            traj_lengths=wrapper_traj)
 

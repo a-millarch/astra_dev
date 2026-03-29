@@ -116,22 +116,41 @@ class _TrainvalEvaluator:
         return X_censored
 
     def get_predictions_at_step(self, censor_step: int) -> Optional[TimepointPredictions]:
-        """Get trainval predictions at a censoring step."""
+        """Get trainval predictions at a censoring step (active patients only)."""
         y = np.array(self.y)
+
+        # Active-only: exclude patients whose trajectory ended before this step
+        if self.trajectory_lengths is not None:
+            active_mask = self.trajectory_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y = y[active_mask]
+            X_norm = self.X_normalized[active_mask]
+            X_mh = self.X_multi_hot[active_mask]
+            x_cat = self.x_cat[active_mask]
+            x_cont = self.x_cont[active_mask]
+            traj = self.trajectory_lengths[active_mask]
+        else:
+            X_norm = self.X_normalized
+            X_mh = self.X_multi_hot
+            x_cat = self.x_cat
+            x_cont = self.x_cont
+            traj = None
+
         if len(set(y)) < 2:
             return None
 
-        X_censored = self._censor_data(self.X_normalized, censor_step)
-        X_mh_censored = self._censor_data(self.X_multi_hot, censor_step)
+        X_censored = self._censor_data(X_norm, censor_step)
+        X_mh_censored = self._censor_data(X_mh, censor_step)
 
         effective_traj = None
-        if self.trajectory_lengths is not None:
-            effective_traj = np.minimum(self.trajectory_lengths, censor_step + 1)
+        if traj is not None:
+            effective_traj = np.minimum(traj, censor_step + 1)
 
         dataset = AstraMixedDataset(
             X_ts=X_censored,
-            x_cat=self.x_cat,
-            x_cont=self.x_cont,
+            x_cat=x_cat,
+            x_cont=x_cont,
             X_ts_cat=X_mh_censored,
             y=y,
             trajectory_lengths=effective_traj,
@@ -199,13 +218,20 @@ class _TrainvalTemporalEvaluator:
         y_true = self._y
         traj_lengths = self._traj_lengths
 
+        # Active-only: exclude patients whose trajectory ended before this step
         if len(traj_lengths) > 0:
-            effective_steps = np.minimum(censor_step, traj_lengths - 1)
+            active_mask = traj_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y_true = y_true[active_mask]
+            preds_sub = preds_all[active_mask]
+            traj_sub = traj_lengths[active_mask]
+            effective_steps = np.minimum(censor_step, traj_sub - 1)
             effective_steps = np.maximum(effective_steps, 0).astype(int)
+            y_prob = preds_sub[np.arange(len(preds_sub)), effective_steps]
         else:
-            effective_steps = np.full(len(preds_all), min(censor_step, preds_all.shape[1] - 1), dtype=int)
-
-        y_prob = preds_all[np.arange(len(preds_all)), effective_steps]
+            step = min(censor_step, preds_all.shape[1] - 1)
+            y_prob = preds_all[:, step]
 
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
             return None
@@ -259,20 +285,39 @@ class _HoldoutEvaluator:
 
     def get_predictions_at_step(self, censor_step: int) -> Optional[TimepointPredictions]:
         y = np.array(self.y)
+
+        # Active-only: exclude patients whose trajectory ended before this step
+        if self.trajectory_lengths is not None:
+            active_mask = self.trajectory_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y = y[active_mask]
+            X_norm = self.X_normalized[active_mask]
+            X_mh = self.X_multi_hot[active_mask]
+            x_cat = self.x_cat[active_mask]
+            x_cont = self.x_cont[active_mask]
+            traj = self.trajectory_lengths[active_mask]
+        else:
+            X_norm = self.X_normalized
+            X_mh = self.X_multi_hot
+            x_cat = self.x_cat
+            x_cont = self.x_cont
+            traj = None
+
         if len(set(y)) < 2:
             return None
 
-        X_censored = self._censor_data(self.X_normalized, censor_step)
-        X_mh_censored = self._censor_data(self.X_multi_hot, censor_step)
+        X_censored = self._censor_data(X_norm, censor_step)
+        X_mh_censored = self._censor_data(X_mh, censor_step)
 
         effective_traj = None
-        if self.trajectory_lengths is not None:
-            effective_traj = np.minimum(self.trajectory_lengths, censor_step + 1)
+        if traj is not None:
+            effective_traj = np.minimum(traj, censor_step + 1)
 
         dataset = AstraMixedDataset(
             X_ts=X_censored,
-            x_cat=self.x_cat,
-            x_cont=self.x_cont,
+            x_cat=x_cat,
+            x_cont=x_cont,
             X_ts_cat=X_mh_censored,
             y=y,
             trajectory_lengths=effective_traj,
@@ -339,13 +384,20 @@ class _HoldoutTemporalEvaluator:
         y_true = self._y
         traj_lengths = self._traj_lengths
 
+        # Active-only: exclude patients whose trajectory ended before this step
         if len(traj_lengths) > 0:
-            effective_steps = np.minimum(censor_step, traj_lengths - 1)
+            active_mask = traj_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y_true = y_true[active_mask]
+            preds_sub = preds_all[active_mask]
+            traj_sub = traj_lengths[active_mask]
+            effective_steps = np.minimum(censor_step, traj_sub - 1)
             effective_steps = np.maximum(effective_steps, 0).astype(int)
+            y_prob = preds_sub[np.arange(len(preds_sub)), effective_steps]
         else:
-            effective_steps = np.full(len(preds_all), min(censor_step, preds_all.shape[1] - 1), dtype=int)
-
-        y_prob = preds_all[np.arange(len(preds_all)), effective_steps]
+            step = min(censor_step, preds_all.shape[1] - 1)
+            y_prob = preds_all[:, step]
 
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
             return None

@@ -2410,9 +2410,12 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
         logger.info("Multiple curves plot saved")
 
-        # Decision curves at key timepoints
+        # Decision curves at key timepoints (active-only for correct prevalence)
+        evaluator_dca = TimeDependentEvaluator(
+            data, model, cfg, device=device, active_only=True
+        )
         fig_dca_time = plot_decision_curves_over_time(
-            evaluator, key_timepoints, labels=labels
+            evaluator_dca, key_timepoints, labels=labels
         )
         save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
         plt.close(fig_dca_time)
