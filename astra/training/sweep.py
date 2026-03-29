@@ -121,6 +121,35 @@ def _save_best_callback(study_name: str, save_path: Path):
     return callback
 
 
+def _study_early_stopping_callback(patience: int):
+    """Stop the study if the best score hasn't improved for `patience` completed trials."""
+
+    def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            return
+
+        completed = [
+            t for t in study.trials
+            if t.state == optuna.trial.TrialState.COMPLETE
+        ]
+        if len(completed) < patience:
+            return
+
+        best_trial_number = study.best_trial.number
+        trials_since_best = sum(
+            1 for t in completed if t.number > best_trial_number
+        )
+        if trials_since_best >= patience:
+            logger.info(
+                f"Study early stopping: no improvement for {trials_since_best} "
+                f"trials after best trial #{best_trial_number} "
+                f"(score {study.best_value:.4f}). Stopping."
+            )
+            study.stop()
+
+    return callback
+
+
 # ============================================================================
 # Joint objective: architecture + training HPs
 # ============================================================================
@@ -425,11 +454,16 @@ def run_sweep(
         study.enqueue_trial(seed_params)
         logger.info("Enqueued seed trial with defaults.yaml hyperparameters")
 
+    study_patience = cfg_dict.get("sweep", {}).get("study_patience", 0)
     save_path = SWEEP_RESULTS_DIR / f"{study_name}_best.yaml"
+    callbacks = [_save_best_callback(study_name, save_path)]
+    if study_patience > 0:
+        callbacks.append(_study_early_stopping_callback(study_patience))
+        logger.info(f"  Study early stopping: patience={study_patience} trials")
     study.optimize(
         lambda trial: joint_objective(trial, data, cfg_dict, device),
         n_trials=n_trials,
-        callbacks=[_save_best_callback(study_name, save_path)],
+        callbacks=callbacks,
         catch=(Exception,),  # Don't abort sweep on individual trial failures
     )
 
