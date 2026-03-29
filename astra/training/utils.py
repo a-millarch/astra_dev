@@ -37,6 +37,12 @@ class EarlyStopping:
     """
     Early stopping with support for both min and max mode.
 
+    Tracks two levels of "best":
+    - **Global best**: the best score and model state across ALL phases.
+      Never reset — this is what gets restored at the end of training.
+    - **Phase-local best**: used for patience counting within a single phase.
+      Reset between phases so each phase gets a fresh patience budget.
+
     Args:
         patience: Number of epochs without improvement before stopping.
         min_delta: Minimum change to count as improvement.
@@ -48,32 +54,37 @@ class EarlyStopping:
         self.min_delta = min_delta
         self.mode = mode
         self.counter = 0
+        # Phase-local tracking (reset between phases)
         self.best_score: Optional[float] = None
+        # Global tracking (never reset — preserved across all phases)
+        self.global_best_score: Optional[float] = None
         self.best_state: Optional[dict] = None
         self.early_stop = False
 
+    def _is_improvement(self, score: float, reference: float) -> bool:
+        if self.mode == "max":
+            return score > reference + self.min_delta
+        return score < reference - self.min_delta
+
     def __call__(self, score: float, model: Optional[nn.Module] = None) -> bool:
+        # Phase-local comparison for patience
         if self.best_score is None:
             self.best_score = score
-            if model is not None:
-                self.best_state = copy.deepcopy(model.state_dict())
-            return False
-
-        improved = False
-        if self.mode == "max":
-            improved = score > self.best_score + self.min_delta
-        else:
-            improved = score < self.best_score - self.min_delta
-
-        if improved:
+        elif self._is_improvement(score, self.best_score):
             self.best_score = score
             self.counter = 0
-            if model is not None:
-                self.best_state = copy.deepcopy(model.state_dict())
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
+
+        # Global best tracking — only save state when globally best
+        if self.global_best_score is None or self._is_improvement(score, self.global_best_score):
+            self.global_best_score = score
+            if model is not None:
+                self.best_state = copy.deepcopy(model.state_dict())
+            # Also reset patience counter on global improvement
+            self.counter = 0
 
         return self.early_stop
 
@@ -81,19 +92,18 @@ class EarlyStopping:
         """
         Reset patience counter and phase-local comparison score for a new phase.
 
-        Keeps best_state intact so the globally best model is preserved across
-        all phases. Only resets the patience mechanism so the new phase gets a
-        fresh budget of epochs before early stopping triggers.
+        Keeps global_best_score and best_state intact so the globally best
+        model is preserved across all phases.
         """
         self.counter = 0
         self.best_score = None  # forces re-baseline on first epoch of new phase
         self.early_stop = False
 
     def restore_best(self, model: nn.Module) -> None:
-        """Restore model to the best checkpoint seen so far."""
+        """Restore model to the best checkpoint seen across all phases."""
         if self.best_state is not None:
             model.load_state_dict(self.best_state)
-            logger.info(f"Restored best model (score={self.best_score:.4f})")
+            logger.info(f"Restored best model (global_best_score={self.global_best_score:.4f})")
 
 
 @torch.no_grad()
@@ -171,7 +181,8 @@ def _safe_auprc(targets: np.ndarray, probs: np.ndarray) -> float:
 
 
 # Default timepoints (hours) for multi-timepoint active-only validation
-VAL_TIMEPOINTS_HOURS = [6, 24, 72]
+# Covers early (6h, 24h), mid (72h, 7d), and late (14d, 30d) horizons
+VAL_TIMEPOINTS_HOURS = [6, 24, 72, 168, 336, 720]
 
 
 def _safe_cindex(event_times: np.ndarray, event_indicators: np.ndarray,

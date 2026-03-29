@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '29032026_studycriteria_temphead'
+model_name: '29032026_sweep'
 
 target: deceased_30d
 
@@ -196,70 +196,59 @@ model:
     causal: false  # required for temporal_head
     temporal_head_dropout: 0.3
     survival_mode: false  # true = discrete-time survival, false = binary classification
-
 finetune:
-    # Phase 1: Head-only training (warm up randomly initialized head)
-    phase1_epochs: 5
-    phase1_lr: 1.0e-3
+  # ── Hyperparameter sweep results (paste over this section) ──
+  phase1_epochs: 5
+  phase1_lr: 1.0e-3
+  phase2_epochs: 12
+  phase2_lr: 3.0e-4
+  phase3_epochs: 16
+  phase3_lr: 1.0e-4
+  phase4_epochs: 8
+  phase4_lr: 5.0e-5
+  enable_early_prediction: false
+  masking_prob: 0.8
+  early_weight: 2.0
+  lr_decay_factor: 0.1
+  weight_decay: 0.01
+  label_smoothing: 0.1
+  pos_weight_factor: 0.0
+  time_weighting: uniform
+  temporal_crop_prob: 0.0
+  temporal_crop_all_phases: false
+  # ── End sweep results ──
 
-    # Phase 2: Partial unfreeze (upper transformer layers + head)
-    phase2_epochs: 12
-    phase2_lr: 3.0e-4
-    phase2_unfreeze_from: transformer_4_5
+  # Phase 2 architecture
+  phase2_unfreeze_from: transformer_4_5
 
-    # Phase 3: Full finetune (all layers, discriminative LRs)
-    phase3_epochs: 16
-    phase3_lr: 1.0e-4
+  # Phase 4 settings
+  min_timesteps: 2
 
-    # Phase 4: Early prediction hardening (optional)
-    enable_early_prediction: false
-    phase4_epochs: 8
-    phase4_lr: 5.0e-5
-    masking_prob: 0.8
-    early_weight: 2.0
-    min_timesteps: 2
+  # Optimization
+  warmup_fraction: 0.1
+  grad_clip: 1.0
 
-    # Discriminative learning rates
-    lr_decay_factor: 0.1
+  # Validation / early stopping
+  patience: 7
+  valid_size: 0.2
 
-    # Optimization
-    weight_decay: 0.01
-    warmup_fraction: 0.1         # fraction of phase steps for LR warmup
-    grad_clip: 1.0
-    label_smoothing: 0.1
+  # Pretrained weights
+  use_pretrained: true
 
-    # Class imbalance
-    pos_weight_factor: 0.0
+  # Temporal head
+  early_weight_factor: 2.0
 
-    # Validation / early stopping
-    patience: 7
-    valid_size: 0.2              # fraction of trainval used for validation
+  # Temporal loss averaging
+  temporal_loss_averaging: per_sample
 
-    # Pretrained weights
-    use_pretrained: true
+  # Evaluation-timeframe weighting
+  eval_timeframe_weighting: false
+  eval_timeframe_weight: 3.0
 
-    # Time weighting for temporal head
-    time_weighting: uniform
-    early_weight_factor: 2.0
-
-    # Temporal loss averaging: "per_sample" = each patient contributes equally,
-    # "global" = legacy (long trajectories dominate)
-    temporal_loss_averaging: per_sample
-
-    # Evaluation-timeframe weighting: upweight loss at eval-relevant timesteps
-    eval_timeframe_weighting: false
-    eval_timeframe_weight: 3.0
-
-    # Pairwise ranking loss (differentiable AUROC surrogate)
-    # 0.0 = disabled; e.g. 0.1 = 10% ranking loss + 90% BCE
-    ranking_loss_weight: 0.0
-    ranking_loss_n_timeframes: 5
-    ranking_loss_max_pairs: 10000
-
-    # Temporal cropping augmentation (all phases)
-    # Experiment 1: disabled. Experiment 2: set temporal_crop_prob: 0.4
-    temporal_crop_prob: 0.0
-    temporal_crop_all_phases: false
+  # Pairwise ranking loss
+  ranking_loss_weight: 0.0
+  ranking_loss_n_timeframes: 5
+  ranking_loss_max_pairs: 10000
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)

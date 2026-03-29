@@ -334,6 +334,45 @@ def run_sweep(
         load_if_exists=True,
     )
 
+    # Seed first trial with current defaults.yaml values as a known-good baseline.
+    # This ensures the sweep result is at least as good as the manual config.
+    if len(study.trials) == 0:
+        model_cfg = cfg_dict.get("model", {})
+        ft_cfg = cfg_dict.get("finetune", {})
+        seed_params = {
+            # Architecture
+            "d_model": model_cfg.get("d_model", 64),
+            "n_layers": model_cfg.get("n_layers", 8),
+            "n_heads": model_cfg.get("n_heads", 8),
+            "fc_mults_1": model_cfg.get("fc_mults_1", 0.3),
+            "fc_mults_2": model_cfg.get("fc_mults_2", 0.1),
+            "fc_dropout": model_cfg.get("fc_dropout", 0.75),
+            "res_dropout": model_cfg.get("res_dropout", 0.22),
+            # Training
+            "phase1_lr": ft_cfg.get("phase1_lr", 1e-3),
+            "phase2_lr": ft_cfg.get("phase2_lr", 3e-4),
+            "phase3_lr": ft_cfg.get("phase3_lr", 1e-4),
+            "phase4_lr": ft_cfg.get("phase4_lr", 5e-5),
+            "phase1_epochs": ft_cfg.get("phase1_epochs", 5),
+            "phase2_epochs": ft_cfg.get("phase2_epochs", 12),
+            "phase3_epochs": ft_cfg.get("phase3_epochs", 16),
+            "phase4_epochs": ft_cfg.get("phase4_epochs", 8),
+            "weight_decay": ft_cfg.get("weight_decay", 0.01),
+            "label_smoothing": ft_cfg.get("label_smoothing", 0.1),
+            "lr_decay_factor": ft_cfg.get("lr_decay_factor", 0.1),
+            "masking_prob": ft_cfg.get("masking_prob", 0.8),
+            "early_weight": ft_cfg.get("early_weight", 2.0),
+            "pos_weight_factor": ft_cfg.get("pos_weight_factor", 0.0),
+            "temporal_crop_prob": ft_cfg.get("temporal_crop_prob", 0.0),
+        }
+        # head_pool and time_weighting only searched for certain configs
+        if not model_cfg.get("temporal_head", False):
+            seed_params["head_pool"] = model_cfg.get("head_pool", "mean_cat")
+        else:
+            seed_params["time_weighting"] = ft_cfg.get("time_weighting", "uniform")
+        study.enqueue_trial(seed_params)
+        logger.info("Enqueued seed trial with defaults.yaml hyperparameters")
+
     save_path = SWEEP_RESULTS_DIR / f"{study_name}_best.yaml"
     study.optimize(
         lambda trial: joint_objective(trial, data, cfg_dict, device),
@@ -380,17 +419,10 @@ def run_sweep(
         logger.info("FINAL RETRAIN: Full trainval with best HPs")
         logger.info("=" * 80)
 
-        # Use actual epoch counts from the best trial (accounts for early stopping)
-        best_attrs = study.best_trial.user_attrs
-        best_cfg.phase1_epochs = best_attrs.get(
-            "phase1_actual_epochs", best_cfg.phase1_epochs)
-        best_cfg.phase2_epochs = best_attrs.get(
-            "phase2_actual_epochs", best_cfg.phase2_epochs)
-        best_cfg.phase3_epochs = best_attrs.get(
-            "phase3_actual_epochs", best_cfg.phase3_epochs)
-        best_cfg.phase4_epochs = best_attrs.get(
-            "phase4_actual_epochs", best_cfg.phase4_epochs)
-        logger.info(f"  Using epoch counts from best trial: "
+        # Use the sweep's suggested epoch counts as budgets (not early-stopped
+        # counts, which were calibrated for random init on 80% data and would
+        # likely undertrain when retraining with pretrained weights on 100% data)
+        logger.info(f"  Using suggested epoch budgets from best trial: "
                      f"P1={best_cfg.phase1_epochs}, P2={best_cfg.phase2_epochs}, "
                      f"P3={best_cfg.phase3_epochs}, P4={best_cfg.phase4_epochs}")
 
