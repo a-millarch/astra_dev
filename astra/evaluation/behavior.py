@@ -2840,10 +2840,11 @@ class TemporalSHAPResults:
     stability_metrics: Optional[Dict] = None
     inhospital_start_step: Optional[int] = None
     active_only: bool = False
+    density_normalize: bool = False
 
     def get_available_timeframes(self) -> List[str]:
         return list(self.timeframe_results.keys())
-    
+
     def get_result(self, timeframe: str) -> Optional[TimeframeSHAPResult]:
         return self.timeframe_results.get(timeframe)
 
@@ -3196,7 +3197,14 @@ class TemporalSHAPAnalyzer:
                 ts_channel_importance = np.zeros(ts_shap.shape[0])
             # Temporal importance: mean |SHAP| across channels at each timestep
             full_steps = ts_shap.shape[1]
-            if eff > 0:
+            if eff > 0 and self.density_normalize:
+                # Density-normalized: per-timestep mean over measured channels only
+                shap_eff = np.abs(ts_shap[:, :eff])      # [n_channels, eff]
+                measured = ts_np[:, :eff] != 0.0           # [n_channels, eff]
+                denom_t = measured.sum(axis=0).clip(1)     # [eff]
+                ts_temporal_importance = np.zeros(full_steps)
+                ts_temporal_importance[:eff] = (shap_eff * measured).sum(axis=0) / denom_t
+            elif eff > 0:
                 ts_temporal_importance = np.zeros(full_steps)
                 ts_temporal_importance[:eff] = np.abs(ts_shap[:, :eff]).mean(axis=0)
             else:
@@ -3224,6 +3232,7 @@ class TemporalSHAPAnalyzer:
             static_cat_names=self.static_cat_names, static_cont_names=self.static_cont_names,
             encoding_info=self.encoding_info, inhospital_start_step=ihs_step,
             active_only=self.active_only,
+            density_normalize=self.density_normalize,
         )
         out.stability_metrics = self._compute_stability_metrics(out)
         return out
@@ -3635,7 +3644,8 @@ class TemporalSHAPAnalyzer:
                 ax4.text(0.5, 0.5, 'No static features', ha='center', va='center', transform=ax4.transAxes)
         
         active_label = " [active-only]" if results.active_only else ""
-        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data){active_label}',
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data){active_label}{dn_label}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
@@ -4062,7 +4072,8 @@ class TemporalSHAPAnalyzer:
         ax.set_xticks(range(len(tfs))); ax.set_xticklabels(tfs, rotation=45)
         ax.set_xlabel('Timeframe'); ax.set_ylabel('Mean |SHAP|')
         active_label = " [active-only]" if results.active_only else ""
-        ax.set_title(f'Feature Trajectory - PID: {results.pid}{active_label}', fontweight='bold')
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        ax.set_title(f'Feature Trajectory - PID: {results.pid}{active_label}{dn_label}', fontweight='bold')
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -4319,18 +4330,24 @@ class TemporalSHAPAnalyzer:
         # Top channels by mean importance across timeframes
         has_ebm = _has_ebm_channels(results.channel2feature)
         all_chan = [results.channel_importance[t] for t in tfs]
+        # Account for error bars (mean + std) when computing axis limits
+        all_chan_upper = [results.channel_importance[t] + results.channel_importance_std[t]
+                         for t in tfs]
         if has_ebm:
             clinical_mask = _get_clinical_only_channel_mask(
                 results.channel2feature, len(all_chan[0]))
             clinical_chan = [ch[clinical_mask] for ch in all_chan]
-            chan_max = max(np.max(x) for x in clinical_chan)
+            chan_max = max(np.max(ch[clinical_mask]) for ch in all_chan_upper)
             top_clinical = np.argsort(
                 np.mean(clinical_chan, axis=0))[-max_channels:][::-1]
             top_idx = np.array([clinical_mask[i] for i in top_clinical])
         else:
-            chan_max = max(np.max(x) for x in all_chan)
+            chan_max = max(np.max(x) for x in all_chan_upper)
             top_idx = np.argsort(
                 np.mean(all_chan, axis=0))[-max_channels:][::-1]
+
+        _dn = results.density_normalize
+        _shap_label = 'Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|'
 
         for col, tf in enumerate(tfs):
             n_pat = results.patient_counts[tf]
@@ -4378,6 +4395,8 @@ class TemporalSHAPAnalyzer:
             ax2.set_xlim(0, chan_max * 1.1)
             ax2.invert_yaxis()
             ax2.grid(True, alpha=0.3, axis='x')
+            if col == 0:
+                ax2.set_xlabel(_shap_label)
 
             # ── Row 3: Mean |SHAP| heatmap ──
             ax3 = fig.add_subplot(gs[2, col])
@@ -4482,10 +4501,12 @@ class TemporalSHAPAnalyzer:
         ax.set_xticks(range(len(tfs)))
         ax.set_xticklabels(tfs, rotation=45)
         ax.set_xlabel('Timeframe')
-        ax.set_ylabel('Mean |SHAP|')
+        _dn = results.density_normalize
+        ax.set_ylabel('Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|')
         active_label = " [active-only]" if results.active_only else ""
+        dn_label = " [density-norm]" if _dn else ""
         ax.set_title(
-            f'Feature Trajectory — Cohort (n={results.n_patients}){active_label}',
+            f'Feature Trajectory — Cohort (n={results.n_patients}){active_label}{dn_label}',
             fontweight='bold')
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
         ax.grid(True, alpha=0.3)
@@ -4530,6 +4551,18 @@ class TemporalSHAPAnalyzer:
                 'mean_channel_shap': ch_imp.mean(),
                 'max_channel_shap': ch_imp.max(),
             }
+
+            # Mean active background count when active_only is enabled
+            if results.active_only and results.patient_results:
+                bg_counts = []
+                for pr in results.patient_results:
+                    # Map patient-specific max(...) back to 'full'
+                    for ptf, tfr in pr.timeframe_results.items():
+                        norm = 'full' if ptf.startswith('max(') else ptf
+                        if norm == tf and tfr.n_active_background is not None:
+                            bg_counts.append(tfr.n_active_background)
+                if bg_counts:
+                    record['mean_n_active_bg'] = np.mean(bg_counts)
 
             # EBM budget (from mean SHAP heatmap)
             if has_ebm:
@@ -4662,18 +4695,27 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
 
     logger.info("\nGenerating cohort visualizations...")
 
+    # Build suffix for file names to distinguish different mode runs
+    suffix_parts = []
+    if active_only:
+        suffix_parts.append('active')
+    if density_normalize:
+        suffix_parts.append('dn')
+    suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
+
     for name, method in [
         ('cohort_temporal_comparison',
          analyzer.plot_cohort_temporal_comparison),
         ('cohort_feature_trajectory',
          analyzer.plot_cohort_feature_trajectory),
     ]:
-        fig = method(results, save_path=f'{save_dir}/{name}.png')
+        fig = method(results, save_path=f'{save_dir}/{name}{suffix}.png')
         if fig:
             plt.close(fig)
 
     summary = analyzer.generate_cohort_summary_report(results)
-    summary.to_csv(f'{save_dir}/cohort_temporal_shap_summary.csv', index=False)
+    summary.to_csv(f'{save_dir}/cohort_temporal_shap_summary{suffix}.csv',
+                   index=False)
 
     if verbose:
         logger.info(f"\n{'='*60}\nCOHORT TEMPORAL SHAP SUMMARY (n={results.n_patients})"
