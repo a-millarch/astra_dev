@@ -83,6 +83,12 @@ def parse_args():
     parser.add_argument("--calibrate", action="store_true", default=False,
                         help="Run posthoc calibration analysis (isotonic/Platt at each timepoint)")
 
+    # SHAP
+    parser.add_argument("--shap", action="store_true", default=False,
+                        help="Run cohort temporal SHAP analysis with visualizations")
+    parser.add_argument("--shap-max-patients", type=int, default=20,
+                        help="Max holdout patients for temporal SHAP (default: 20)")
+
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
                         help="Cross-validate temporal eval vs censored-dataloader eval")
@@ -225,6 +231,45 @@ def main():
         cal_summary = run_posthoc_calibration(data, cfg)
         if len(cal_summary) > 0:
             logger.info(f"Calibration summary: {len(cal_summary)} results saved")
+
+    # ========================================================================
+    # SHAP analysis
+    # ========================================================================
+    if args.shap:
+        from astra.evaluation.behavior import (
+            shap_analysis, visualize_shap_summary,
+            run_cohort_temporal_shap_analysis,
+        )
+        from astra.evaluation.utils import prepare_model
+        logger.info("=== Running SHAP Analysis ===")
+        model, device = prepare_model(data, cfg)
+        model_name = cfg["model_name"]
+
+        # Aggregate SHAP (auto-uses 'mean' for temporal head)
+        shap_results = shap_analysis(
+            data, model, model_name=model_name,
+            visualize=False, max_test_samples=500,
+            max_background_samples=1000, density_normalize=True,
+        )
+        visualize_shap_summary(
+            shap_results["shap_results"],
+            channel2feature=shap_results["channel2feature"],
+            feature_names_cat=shap_results["static_cat_names"],
+            feature_names_cont=cfg["dataset"]["num_cols"],
+            class_idx=1, max_display=20,
+            save_path=f'reports/eval/shap_class1_{model_name}.png',
+            density_normalize=True,
+        )
+
+        # Per-timeframe cohort temporal SHAP
+        run_cohort_temporal_shap_analysis(
+            data, model,
+            max_patients=args.shap_max_patients,
+            max_background_samples=1000,
+            save_dir=f'reports/eval/temporal_shap_{model_name}',
+            density_normalize=True,
+        )
+        logger.info("SHAP analysis complete")
 
     # ========================================================================
     # Temporal validation (cross-check eval methods)
