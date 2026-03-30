@@ -321,55 +321,47 @@ def _prepare_long_df(base: pd.DataFrame) -> None:
 
 
 def add_iss_to_df(base: pd.DataFrame) -> pd.DataFrame:
-    """Add ISS columns to base_df from R-computed ICD codes + notes-extracted ISS.
+    """Add ISS columns to base_df from combined ISS concept (notes + R-computed)
+    and R-computed auxiliary columns (maxais, niss, mechmaj).
 
-    Sources (in priority order): R-computed riss/niss, notes-extracted ISS.
+    ISS.pkl contains the merged max ISS per patient from both notes extraction
+    and R-computed ICD-10 codes (built by make_data._save_notater_derived_concepts).
     """
     from astra.utils import is_file_present
 
-    # Try loading R-computed ISS
-    iss_path = "data/interim/computed_iss_df.csv"
-    if not is_file_present(iss_path):
+    # Primary ISS source: combined pickle (notes + R-computed, merged in make_data)
+    iss_pkl_path = "data/interim/concepts/ISS.pkl"
+    if os.path.exists(iss_pkl_path):
+        iss_combined = pd.read_pickle(iss_pkl_path)
+        iss_seq = (
+            iss_combined.groupby("PID")["VALUE"]
+            .max()
+            .reset_index()
+            .rename(columns={"VALUE": "riss"})
+        )
+        base = base.merge(iss_seq, how="left", on="PID")
+        logger.info(f"Merged combined ISS (notes + R-computed): {len(iss_seq)} patients")
+    else:
+        base["riss"] = np.nan
+        logger.warning("ISS.pkl not found — no ISS data available")
+
+    # Auxiliary R-computed columns (maxais, niss, mechmaj) for TRISS mechanism
+    iss_r_path = "data/interim/computed_iss_df.csv"
+    if not is_file_present(iss_r_path):
         try:
             compute_iss_from_r(base)
         except Exception as e:
             logger.warning(f"ISS R computation failed: {e}")
 
-    keep_cols = ["riss", "maxais", "niss", "mechmaj1", "mechmaj2", "mechmaj3", "mechmaj4"]
-    if is_file_present(iss_path):
-        iss = pd.read_csv(iss_path, low_memory=False)
-        available_cols = [c for c in keep_cols if c in iss.columns]
+    aux_cols = ["maxais", "niss", "mechmaj1", "mechmaj2", "mechmaj3", "mechmaj4"]
+    if is_file_present(iss_r_path):
+        iss_r = pd.read_csv(iss_r_path, low_memory=False)
+        available_cols = [c for c in aux_cols if c in iss_r.columns]
         if available_cols:
-            base = base.merge(iss[["PID"] + available_cols], how="left", on="PID")
+            base = base.merge(iss_r[["PID"] + available_cols], how="left", on="PID")
             for col in available_cols:
                 base[col] = base[col].replace("None", np.nan)
-            logger.info(f"Merged R-computed ISS ({len(available_cols)} cols)")
-    else:
-        logger.warning("No R-computed ISS file found")
-
-    # Notes-extracted ISS
-    iss_notes_path = "data/interim/concepts/ISS.pkl"
-    if os.path.exists(iss_notes_path):
-        iss_notes = pd.read_pickle(iss_notes_path)
-        iss_seq = (
-            iss_notes.groupby("PID")["VALUE"]
-            .max()
-            .reset_index()
-            .rename(columns={"VALUE": "iss_notes"})
-        )
-        base = base.merge(iss_seq, how="left", on="PID")
-        logger.info(f"Merged notes ISS ({len(iss_seq)} patients)")
-    else:
-        base["iss_notes"] = np.nan
-
-    # Combine: max of riss and iss_notes
-    if "riss" in base.columns:
-        base["riss"] = base[["riss", "iss_notes"]].astype(float).max(axis=1)
-    elif "iss_notes" in base.columns:
-        base["riss"] = base["iss_notes"].astype(float)
-
-    if "iss_notes" in base.columns:
-        base.drop(columns=["iss_notes"], inplace=True)
+            logger.info(f"Merged R auxiliary columns: {available_cols}")
 
     return base
 
