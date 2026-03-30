@@ -1954,11 +1954,20 @@ def plot_n_active_over_time(
     return fig
 
 
-def plot_multiple_roc_pr_curves(
-    evaluator: TimeDependentEvaluator,
+def _plot_roc_pr_curves_from_arrays(
     censor_steps: List[int],
-    labels: Optional[List[str]] = None
+    preds_per_step: List[np.ndarray],
+    targets_per_step: List[np.ndarray],
+    labels: Optional[List[str]] = None,
 ):
+    """Shared plotting logic for ROC/PR multi-curve plots.
+
+    Args:
+        censor_steps: List of censor step indices.
+        preds_per_step: List of 1-D prediction arrays, one per step.
+        targets_per_step: List of 1-D target arrays, one per step.
+        labels: Optional display labels per step.
+    """
     fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(14, 6))
 
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
@@ -1967,14 +1976,8 @@ def plot_multiple_roc_pr_curves(
     baseline = None
 
     for i, censor_step in enumerate(censor_steps):
-        dls = evaluator.create_censored_dataloaders_fast(censor_step)
-        if dls is None:
-            logger.warning(f"Skipping step {censor_step}: dataloader creation failed")
-            continue
-
-        preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
-        y_preds = preds[:, 1].numpy()
-        ys = targets.numpy()
+        y_preds = preds_per_step[i]
+        ys = targets_per_step[i]
 
         if len(set(ys)) < 2:
             logger.warning(f"Skipping step {censor_step}: only one class")
@@ -2016,6 +2019,82 @@ def plot_multiple_roc_pr_curves(
     plt.tight_layout()
 
     return fig
+
+
+def plot_multiple_roc_pr_curves(
+    evaluator: TimeDependentEvaluator,
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None
+):
+    preds_list = []
+    targs_list = []
+    valid_steps = []
+    valid_labels = []
+
+    for i, censor_step in enumerate(censor_steps):
+        dls = evaluator.create_censored_dataloaders_fast(censor_step)
+        if dls is None:
+            logger.warning(f"Skipping step {censor_step}: dataloader creation failed")
+            continue
+
+        preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
+        preds_list.append(preds[:, 1].numpy())
+        targs_list.append(targets.numpy())
+        valid_steps.append(censor_step)
+        valid_labels.append(
+            labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        )
+
+    return _plot_roc_pr_curves_from_arrays(valid_steps, preds_list, targs_list, valid_labels)
+
+
+def plot_multiple_roc_pr_curves_temporal(
+    temporal_eval: 'TemporalEvaluator',
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None,
+):
+    """Create multi-curve ROC/PR plot using temporal (single forward pass) predictions."""
+    preds_all = temporal_eval._get_all_predictions()  # [N, seq_len]
+    ys = np.array(temporal_eval.data["ty"])
+    traj_lengths = temporal_eval._holdout_traj_lengths
+
+    preds_list = []
+    targs_list = []
+    valid_steps = []
+    valid_labels = []
+
+    for i, censor_step in enumerate(censor_steps):
+        # Apply active-only filtering if configured
+        if temporal_eval.active_only and len(traj_lengths) > 0:
+            mask = traj_lengths > censor_step
+            if mask.sum() < 2:
+                logger.warning(f"Skipping step {censor_step}: too few active patients ({mask.sum()})")
+                continue
+            preds_subset = preds_all[mask]
+            ys_subset = ys[mask]
+            traj_subset = traj_lengths[mask]
+        else:
+            preds_subset = preds_all
+            ys_subset = ys
+            traj_subset = traj_lengths
+
+        # Pick effective timestep per patient (min of censor_step, traj_end)
+        if len(traj_subset) > 0:
+            effective_steps = np.minimum(censor_step, traj_subset - 1).astype(int)
+            effective_steps = np.maximum(effective_steps, 0)
+        else:
+            effective_steps = np.full(len(preds_subset), min(censor_step, preds_subset.shape[1] - 1), dtype=int)
+
+        y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
+
+        preds_list.append(y_preds)
+        targs_list.append(ys_subset)
+        valid_steps.append(censor_step)
+        valid_labels.append(
+            labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        )
+
+    return _plot_roc_pr_curves_from_arrays(valid_steps, preds_list, targs_list, valid_labels)
 
 
 def _run_trauma_score_comparison(data, cfg, results_all, results_active,
@@ -2230,8 +2309,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                             line += f" [{result.cindex_ci[0]:.3f}-{result.cindex_ci[1]:.3f}]"
                     logger.info(line)
 
-            # Decision curves at key timepoints (temporal)
+            # ROC/PR curves at key timepoints (temporal)
             labels = [format_step_label(step) for step in key_timepoints]
+            fig_curves = plot_multiple_roc_pr_curves_temporal(
+                temporal_eval, key_timepoints, labels=labels
+            )
+            save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
+            plt.close(fig_curves)
+            logger.info("Multiple ROC/PR curves plot saved (temporal)")
+
+            # Decision curves at key timepoints (temporal)
             fig_dca_time = _plot_decision_curves_temporal(
                 preds_all, targs, traj_lens, key_timepoints, labels=labels
             )
