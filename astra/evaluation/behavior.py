@@ -4231,28 +4231,70 @@ class TemporalSHAPAnalyzer:
                        timeframes=None, verbose=True) -> CohortTemporalSHAPResults:
         """Run temporal SHAP analysis for multiple patients and aggregate.
 
+        ``max_patients`` is the target count **per timeframe**, not a global
+        cap.  Patients with short trajectories only contribute to early
+        timeframes, so we keep analyzing until every timeframe has reached
+        the target (or we run out of holdout patients).
+
+        Trajectory lengths are read upfront from the dataset to decide
+        which timeframes each patient can contribute to, skipping patients
+        and timeframes that are already saturated — avoiding unnecessary
+        SHAP computation.
+
         Args:
             test_loader: DataLoader for holdout set
             holdout_pids: List of all holdout PIDs (in dataloader order)
-            max_patients: Maximum number of patients to analyze
+            max_patients: Target number of patients per timeframe
             timeframes: List of timeframe names (default: all standard)
             verbose: Print progress
 
         Returns:
             CohortTemporalSHAPResults with per-timeframe aggregated SHAP
         """
-        pids_to_analyze = holdout_pids[:max_patients]
+        timeframes = timeframes or list(DEFAULT_TIMEFRAMES.keys())
+
+        # Pre-read trajectory lengths from dataset (cheap — no SHAP yet)
+        holdout_ds = self.data["holdout_mixed_dls"]._train_ds
+        if hasattr(holdout_ds, 'dataset'):
+            holdout_ds = holdout_ds.dataset  # unwrap Subset
+        all_traj = holdout_ds.traj_lengths.numpy()  # [n_holdout]
+
+        # Track per-timeframe saturation
+        tf_counts = {tf: 0 for tf in timeframes}
         patient_results = []
 
-        for i, pid in enumerate(pids_to_analyze):
+        for i, pid in enumerate(holdout_pids):
+            if all(c >= max_patients for c in tf_counts.values()):
+                break
+
+            # Determine which timeframes this patient can contribute to
+            # and that still need more patients
+            traj_steps = int(all_traj[i])
+            traj_hours = (step_to_time(traj_steps - 1) or 0) / 60 if traj_steps > 0 else 0
+            needed_tfs = []
+            for tf in timeframes:
+                if tf_counts[tf] >= max_patients:
+                    continue
+                tf_h = DEFAULT_TIMEFRAMES.get(tf)
+                if tf_h is None or tf_h <= traj_hours:
+                    needed_tfs.append(tf)
+
+            if not needed_tfs:
+                continue  # this patient can't help any unsaturated timeframe
+
             if verbose:
-                logger.info(f"\n[Patient {i+1}/{len(pids_to_analyze)}] PID: {pid}")
+                logger.info(f"\n[Patient {len(patient_results)+1}, PID {pid}] "
+                            f"traj={traj_hours:.1f}h, computing {len(needed_tfs)} timeframes")
             try:
                 result = self.analyze_patient(
                     test_loader, pid=pid, holdout_pids=holdout_pids,
-                    timeframes=timeframes, verbose=verbose
+                    timeframes=needed_tfs, verbose=verbose
                 )
                 patient_results.append(result)
+                for tf in result.timeframe_results:
+                    norm_tf = 'full' if tf.startswith('max(') else tf
+                    if norm_tf in tf_counts:
+                        tf_counts[norm_tf] += 1
             except Exception as e:
                 logger.warning(f"  FAILED for PID {pid}: {e}")
 
@@ -4260,7 +4302,8 @@ class TemporalSHAPAnalyzer:
             raise RuntimeError("No patients were successfully analyzed")
 
         if verbose:
-            logger.info(f"\nAggregating results from {len(patient_results)} patients...")
+            logger.info(f"\nAnalyzed {len(patient_results)} patients. "
+                        f"Per-timeframe counts: {tf_counts}")
 
         return self._aggregate_patient_results(patient_results)
 
@@ -4344,145 +4387,172 @@ class TemporalSHAPAnalyzer:
         )
 
     def plot_cohort_temporal_comparison(self, results: CohortTemporalSHAPResults,
-                                        max_channels=15, figsize=(24, 18),
+                                        max_channels=15, figsize=(18, 20),
                                         save_path=None):
         """Cohort-averaged temporal SHAP comparison across timeframes.
 
-        Layout: 4 rows x N columns (one column per timeframe).
-        Row 1: Mean temporal importance with ±1 std shading
-        Row 2: Top channel bars (cohort mean)
-        Row 3: Mean |SHAP| heatmap
-        Row 4: Static feature importance
+        Consolidated 4-panel layout (replaces old N-column grid):
+          A (top-left):  Channel × Timeframe importance heatmap
+          B (top-right): Static Feature × Timeframe importance heatmap
+          C (middle):    Overlaid temporal importance curves (all TFs)
+          D (bottom):    Full-timeframe SHAP heatmap (channels × timesteps)
         """
         tfs = results.get_available_timeframes()
         n_tf = len(tfs)
         seq_len = results.ts_shap_mean[tfs[0]].shape[1]
 
-        fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(4, n_tf, hspace=0.35, wspace=0.25,
-                              height_ratios=[1, 1.2, 1.5, 1])
-
-        # Consistent y-axis across columns
-        temp_max = max(np.max(results.temporal_importance[t]
-                              + results.temporal_importance_std[t]) for t in tfs)
-
-        # Top channels by mean importance across timeframes
+        # ── Top channels by mean importance across all timeframes ──
         has_ebm = _has_ebm_channels(results.channel2feature)
         all_chan = [results.channel_importance[t] for t in tfs]
-        # Account for error bars (mean + std) when computing axis limits
-        all_chan_upper = [results.channel_importance[t] + results.channel_importance_std[t]
-                         for t in tfs]
         if has_ebm:
             clinical_mask = _get_clinical_only_channel_mask(
                 results.channel2feature, len(all_chan[0]))
             clinical_chan = [ch[clinical_mask] for ch in all_chan]
-            chan_max = max(np.max(ch[clinical_mask]) for ch in all_chan_upper)
             top_clinical = np.argsort(
                 np.mean(clinical_chan, axis=0))[-max_channels:][::-1]
             top_idx = np.array([clinical_mask[i] for i in top_clinical])
         else:
-            chan_max = max(np.max(x) for x in all_chan_upper)
             top_idx = np.argsort(
                 np.mean(all_chan, axis=0))[-max_channels:][::-1]
+
+        ch_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                    for i in top_idx]
 
         _dn = results.density_normalize
         _shap_label = 'Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|'
 
-        for col, tf in enumerate(tfs):
-            n_pat = results.patient_counts[tf]
-            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
-            suffix = f"({tf_hours}h)" if tf_hours else "(full)"
+        # ── Figure layout ──
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 0.8, 1.2],
+                              width_ratios=[3, 1], hspace=0.35, wspace=0.25)
 
-            # Per-column display range
-            if tf_hours is not None:
-                eff = time_to_step(tf_hours, 'h') + 1
-            else:
-                eff = seq_len
-            margin = max(3, int(eff * 0.08))
-            display_limit = min(eff + margin, seq_len)
-            col_ticks = np.linspace(0, display_limit - 1,
-                                    min(8, display_limit), dtype=int)
-            col_tick_labels = [time_to_hours_str(step_to_time(i))
-                               for i in col_ticks]
+        # ── Panel A: Channel × Timeframe importance heatmap ──
+        ax_a = fig.add_subplot(gs[0, 0])
+        chan_matrix = np.column_stack(
+            [results.channel_importance[tf][top_idx] for tf in tfs])  # [n_ch, n_tf]
+        vmax_a = max(np.abs(chan_matrix).max(), 1e-10)
+        im_a = ax_a.imshow(chan_matrix, aspect='auto', cmap='YlOrRd',
+                           interpolation='nearest', vmin=0, vmax=vmax_a)
+        ax_a.set_yticks(range(len(top_idx)))
+        ax_a.set_yticklabels(ch_names, fontsize=10)
+        tf_labels = [f'{tf}\nn={results.patient_counts[tf]}' for tf in tfs]
+        ax_a.set_xticks(range(n_tf))
+        ax_a.set_xticklabels(tf_labels, fontsize=9, ha='center')
+        ax_a.set_xlabel('Timeframe', fontsize=10)
+        ax_a.set_title(f'Channel Importance Across Timeframes', fontsize=12,
+                       fontweight='bold')
+        plt.colorbar(im_a, ax=ax_a, shrink=0.8, label=_shap_label)
+        # Annotate cells with values when few enough to read
+        if max_channels <= 20:
+            for r in range(chan_matrix.shape[0]):
+                for c in range(chan_matrix.shape[1]):
+                    v = chan_matrix[r, c]
+                    color = 'white' if v > vmax_a * 0.6 else 'black'
+                    ax_a.text(c, r, f'{v:.4f}', ha='center', va='center',
+                              fontsize=7, color=color)
 
-            # ── Row 1: Temporal importance (mean ± std) ──
-            ax1 = fig.add_subplot(gs[0, col])
-            mean_t = results.temporal_importance[tf]
-            std_t = results.temporal_importance_std[tf]
-            x_range = range(len(mean_t))
-            ax1.plot(mean_t, lw=2, color='#ff0051')
-            ax1.fill_between(x_range, (mean_t - std_t).clip(0), mean_t + std_t,
-                             alpha=0.2, color='#ff0051')
-            ax1.set_xlim(0, display_limit)
-            ax1.set_ylim(0, temp_max * 1.1)
-            ax1.set_xticks(col_ticks)
-            ax1.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
-            ax1.set_title(f'{tf} {suffix}\nn={n_pat}', fontweight='bold')
-            ax1.grid(True, alpha=0.3)
-
-            # ── Row 2: Channel bars ──
-            ax2 = fig.add_subplot(gs[1, col])
-            ch_names = [results.channel2feature.get(int(i), f'Ch{i}')
-                        for i in top_idx]
-            ch_vals = results.channel_importance[tf][top_idx]
-            ch_errs = results.channel_importance_std[tf][top_idx]
-            ax2.barh(range(len(top_idx)), ch_vals,
-                     xerr=ch_errs, capsize=2,
-                     color=plt.cm.Blues(np.linspace(0.4, 0.9, len(top_idx))))
-            ax2.set_yticks(range(len(top_idx)))
-            ax2.set_yticklabels(ch_names, fontsize=9)
-            ax2.set_xlim(0, chan_max * 1.1)
-            ax2.invert_yaxis()
-            ax2.grid(True, alpha=0.3, axis='x')
-            if col == 0:
-                ax2.set_xlabel(_shap_label)
-
-            # ── Row 3: Mean |SHAP| heatmap ──
-            ax3 = fig.add_subplot(gs[2, col])
-            ts_top = results.ts_shap_mean[tf][top_idx]
-            vmax = max(np.abs(ts_top).max(), 1e-10)
-            im = ax3.imshow(ts_top, aspect='auto', cmap='YlOrRd',
-                            interpolation='nearest', vmin=0, vmax=vmax)
-            ax3.set_xlim(-0.5, display_limit - 0.5)
-            ax3.set_yticks(range(len(top_idx)))
-            ax3.set_yticklabels(ch_names, fontsize=8)
-            ax3.set_xticks(col_ticks)
-            ax3.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
-            plt.colorbar(im, ax=ax3, shrink=0.8)
-
-            # ── Row 4: Static features ──
-            ax4 = fig.add_subplot(gs[3, col])
-            static_names, static_vals = [], []
+        # ── Panel B: Static Feature × Timeframe heatmap ──
+        ax_b = fig.add_subplot(gs[0, 1])
+        static_names_all, static_matrix = [], []
+        for tf in tfs:
+            col_vals = []
+            if tf == tfs[0]:  # build names once
+                if results.static_cat_importance[tf] is not None:
+                    for i, nm in enumerate(
+                            results.static_cat_names[:len(results.static_cat_importance[tf])]):
+                        static_names_all.append(nm)
+                if results.static_cont_importance[tf] is not None:
+                    for i, nm in enumerate(
+                            results.static_cont_names[:len(results.static_cont_importance[tf])]):
+                        static_names_all.append(nm)
+            # Collect values for this timeframe
             if results.static_cat_importance[tf] is not None:
-                for i, nm in enumerate(
-                        results.static_cat_names[:len(results.static_cat_importance[tf])]):
+                for i in range(len(results.static_cat_importance[tf])):
                     val = results.static_cat_importance[tf][i]
-                    static_names.append(nm)
-                    static_vals.append(float(val) if np.isscalar(val)
-                                       or getattr(val, 'ndim', 1) == 0
-                                       else float(val.mean()))
+                    col_vals.append(float(val) if np.isscalar(val)
+                                   or getattr(val, 'ndim', 1) == 0
+                                   else float(val.mean()))
             if results.static_cont_importance[tf] is not None:
-                for i, nm in enumerate(
-                        results.static_cont_names[:len(results.static_cont_importance[tf])]):
+                for i in range(len(results.static_cont_importance[tf])):
                     val = results.static_cont_importance[tf][i]
-                    static_names.append(nm)
-                    static_vals.append(float(val) if np.isscalar(val)
-                                       or getattr(val, 'ndim', 1) == 0
-                                       else float(val.mean()))
-            if static_vals:
-                static_vals = np.array(static_vals)
-                sorted_s = np.argsort(static_vals)[::-1][:15]
-                ax4.barh(range(len(sorted_s)), static_vals[sorted_s],
-                         color='#ff0051', alpha=0.7)
-                ax4.set_yticks(range(len(sorted_s)))
-                ax4.set_yticklabels([static_names[i] for i in sorted_s],
-                                    fontsize=8)
-                ax4.invert_yaxis()
-                ax4.grid(True, alpha=0.3, axis='x')
-            else:
-                ax4.text(0.5, 0.5, 'No static features', ha='center',
-                         va='center', transform=ax4.transAxes)
+                    col_vals.append(float(val) if np.isscalar(val)
+                                   or getattr(val, 'ndim', 1) == 0
+                                   else float(val.mean()))
+            static_matrix.append(col_vals)
 
+        if static_names_all and static_matrix and len(static_matrix[0]) > 0:
+            static_matrix = np.array(static_matrix).T  # [n_features, n_tf]
+            # Sort by mean importance, take top 15
+            mean_imp = static_matrix.mean(axis=1)
+            sorted_s = np.argsort(mean_imp)[::-1][:15]
+            static_matrix = static_matrix[sorted_s]
+            static_names_sorted = [static_names_all[i] for i in sorted_s]
+
+            vmax_b = max(np.abs(static_matrix).max(), 1e-10)
+            im_b = ax_b.imshow(static_matrix, aspect='auto', cmap='YlOrRd',
+                               interpolation='nearest', vmin=0, vmax=vmax_b)
+            ax_b.set_yticks(range(len(static_names_sorted)))
+            ax_b.set_yticklabels(static_names_sorted, fontsize=9)
+            ax_b.set_xticks(range(n_tf))
+            ax_b.set_xticklabels(tfs, fontsize=8, rotation=45, ha='right')
+            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+            plt.colorbar(im_b, ax=ax_b, shrink=0.8, label=_shap_label)
+        else:
+            ax_b.text(0.5, 0.5, 'No static features', ha='center',
+                      va='center', transform=ax_b.transAxes, fontsize=12)
+            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+
+        # ── Panel C: Overlaid temporal importance curves ──
+        ax_c = fig.add_subplot(gs[1, :])
+        colors_c = plt.cm.viridis(np.linspace(0.15, 0.95, n_tf))
+        for i, tf in enumerate(tfs):
+            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
+            if tf_hours is not None:
+                display_limit = min(time_to_step(tf_hours, 'h') + 1, seq_len)
+            else:
+                display_limit = seq_len
+
+            mean_t = results.temporal_importance[tf][:display_limit]
+            std_t = results.temporal_importance_std[tf][:display_limit]
+            x = np.arange(display_limit)
+            label = f'{tf} (n={results.patient_counts[tf]})'
+            ax_c.plot(x, mean_t, lw=2, color=colors_c[i], label=label)
+            ax_c.fill_between(x, (mean_t - std_t).clip(0), mean_t + std_t,
+                              alpha=0.1, color=colors_c[i])
+
+        # X-axis ticks for full range
+        n_ticks = min(12, seq_len)
+        tick_idx = np.linspace(0, seq_len - 1, n_ticks, dtype=int)
+        ax_c.set_xticks(tick_idx)
+        ax_c.set_xticklabels([time_to_hours_str(step_to_time(i))
+                               for i in tick_idx], rotation=45, fontsize=9)
+        ax_c.set_xlabel('Time', fontsize=10)
+        ax_c.set_ylabel(_shap_label, fontsize=10)
+        ax_c.set_title('Temporal Importance by Timeframe', fontsize=12,
+                       fontweight='bold')
+        ax_c.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
+        ax_c.grid(True, alpha=0.3)
+
+        # ── Panel D: Full-timeframe SHAP heatmap ──
+        ax_d = fig.add_subplot(gs[2, :])
+        last_tf = tfs[-1]
+        ts_top = results.ts_shap_mean[last_tf][top_idx]
+        vmax_d = max(np.abs(ts_top).max(), 1e-10)
+        im_d = ax_d.imshow(ts_top, aspect='auto', cmap='YlOrRd',
+                           interpolation='nearest', vmin=0, vmax=vmax_d)
+        ax_d.set_yticks(range(len(top_idx)))
+        ax_d.set_yticklabels(ch_names, fontsize=10)
+        ax_d.set_xticks(tick_idx)
+        ax_d.set_xticklabels([time_to_hours_str(step_to_time(i))
+                               for i in tick_idx], rotation=45, fontsize=9)
+        ax_d.set_xlabel('Time', fontsize=10)
+        tf_hours_last = DEFAULT_TIMEFRAMES.get(last_tf)
+        tf_desc = f'{last_tf} ({tf_hours_last}h)' if tf_hours_last else last_tf
+        ax_d.set_title(f'|SHAP| Heatmap — {tf_desc} (n={results.patient_counts[last_tf]})',
+                       fontsize=12, fontweight='bold')
+        plt.colorbar(im_d, ax=ax_d, shrink=0.8, label=_shap_label)
+
+        # ── Suptitle & save ──
         dn_label = " [density-norm]" if results.density_normalize else ""
         active_label = " [active-only]" if results.active_only else ""
         fig.suptitle(
