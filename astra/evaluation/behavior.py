@@ -1479,8 +1479,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     if bg_cat_emb is not None:
         cat_shap_embedded = shap_values[idx]
         print(f"  cat_shap_embedded shape: {cat_shap_embedded.shape}")
-        cat_shap = cat_shap_embedded.mean(axis=2)
-        print(f"  cat_shap after mean: {cat_shap.shape}")
+        cat_shap = np.abs(cat_shap_embedded).mean(axis=2)
+        print(f"  cat_shap after mean(|embed|): {cat_shap.shape}")
         idx += 1
     
     cont_shap = shap_values[idx] if bg_cont.shape[1] > 0 else None
@@ -3095,7 +3095,7 @@ class TemporalSHAPAnalyzer:
             cat_ts_shap = np.abs(cat_ts_shap_per_cat).mean(axis=0)
             idx += 1
 
-        cat_shap = shap_values[idx][0].mean(axis=1) if bg_cat_emb is not None else None
+        cat_shap = np.abs(shap_values[idx][0]).mean(axis=1) if bg_cat_emb is not None else None
         if bg_cat_emb is not None:
             idx += 1
 
@@ -4387,21 +4387,20 @@ class TemporalSHAPAnalyzer:
         )
 
     def plot_cohort_temporal_comparison(self, results: CohortTemporalSHAPResults,
-                                        max_channels=15, figsize=(18, 20),
+                                        max_channels=15, figsize=(18, 10),
                                         save_path=None):
         """Cohort-averaged temporal SHAP comparison across timeframes.
 
-        Consolidated 4-panel layout (replaces old N-column grid):
-          A (top-left):  Channel × Timeframe importance heatmap
-          B (top-right): Static Feature × Timeframe importance heatmap
-          C (middle):    Overlaid temporal importance curves (all TFs)
-          D (bottom):    Full-timeframe SHAP heatmap (channels × timesteps)
+        2-panel layout:
+          A (left):  Channel × Timeframe importance heatmap (excludes 'full')
+          B (right): Static Feature × Timeframe importance heatmap
         """
-        tfs = results.get_available_timeframes()
+        tfs = [tf for tf in results.get_available_timeframes() if tf != 'full']
+        if not tfs:
+            tfs = results.get_available_timeframes()
         n_tf = len(tfs)
-        seq_len = results.ts_shap_mean[tfs[0]].shape[1]
 
-        # ── Top channels by mean importance across all timeframes ──
+        # ── Top channels by mean importance across timeframes ──
         has_ebm = _has_ebm_channels(results.channel2feature)
         all_chan = [results.channel_importance[t] for t in tfs]
         if has_ebm:
@@ -4423,8 +4422,7 @@ class TemporalSHAPAnalyzer:
 
         # ── Figure layout ──
         fig = plt.figure(figsize=figsize)
-        gs = fig.add_gridspec(3, 2, height_ratios=[1.2, 0.8, 1.2],
-                              width_ratios=[3, 1], hspace=0.35, wspace=0.25)
+        gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.3)
 
         # ── Panel A: Channel × Timeframe importance heatmap ──
         ax_a = fig.add_subplot(gs[0, 0])
@@ -4439,7 +4437,7 @@ class TemporalSHAPAnalyzer:
         ax_a.set_xticks(range(n_tf))
         ax_a.set_xticklabels(tf_labels, fontsize=9, ha='center')
         ax_a.set_xlabel('Timeframe', fontsize=10)
-        ax_a.set_title(f'Channel Importance Across Timeframes', fontsize=12,
+        ax_a.set_title('Channel Importance Across Timeframes', fontsize=12,
                        fontweight='bold')
         plt.colorbar(im_a, ax=ax_a, shrink=0.8, label=_shap_label)
         # Annotate cells with values when few enough to read
@@ -4501,56 +4499,6 @@ class TemporalSHAPAnalyzer:
             ax_b.text(0.5, 0.5, 'No static features', ha='center',
                       va='center', transform=ax_b.transAxes, fontsize=12)
             ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
-
-        # ── Panel C: Overlaid temporal importance curves ──
-        ax_c = fig.add_subplot(gs[1, :])
-        colors_c = plt.cm.viridis(np.linspace(0.15, 0.95, n_tf))
-        for i, tf in enumerate(tfs):
-            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
-            if tf_hours is not None:
-                display_limit = min(time_to_step(tf_hours, 'h') + 1, seq_len)
-            else:
-                display_limit = seq_len
-
-            mean_t = results.temporal_importance[tf][:display_limit]
-            std_t = results.temporal_importance_std[tf][:display_limit]
-            x = np.arange(display_limit)
-            label = f'{tf} (n={results.patient_counts[tf]})'
-            ax_c.plot(x, mean_t, lw=2, color=colors_c[i], label=label)
-            ax_c.fill_between(x, (mean_t - std_t).clip(0), mean_t + std_t,
-                              alpha=0.1, color=colors_c[i])
-
-        # X-axis ticks for full range
-        n_ticks = min(12, seq_len)
-        tick_idx = np.linspace(0, seq_len - 1, n_ticks, dtype=int)
-        ax_c.set_xticks(tick_idx)
-        ax_c.set_xticklabels([time_to_hours_str(step_to_time(i))
-                               for i in tick_idx], rotation=45, fontsize=9)
-        ax_c.set_xlabel('Time', fontsize=10)
-        ax_c.set_ylabel(_shap_label, fontsize=10)
-        ax_c.set_title('Temporal Importance by Timeframe', fontsize=12,
-                       fontweight='bold')
-        ax_c.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=9)
-        ax_c.grid(True, alpha=0.3)
-
-        # ── Panel D: Full-timeframe SHAP heatmap ──
-        ax_d = fig.add_subplot(gs[2, :])
-        last_tf = tfs[-1]
-        ts_top = results.ts_shap_mean[last_tf][top_idx]
-        vmax_d = max(np.abs(ts_top).max(), 1e-10)
-        im_d = ax_d.imshow(ts_top, aspect='auto', cmap='YlOrRd',
-                           interpolation='nearest', vmin=0, vmax=vmax_d)
-        ax_d.set_yticks(range(len(top_idx)))
-        ax_d.set_yticklabels(ch_names, fontsize=10)
-        ax_d.set_xticks(tick_idx)
-        ax_d.set_xticklabels([time_to_hours_str(step_to_time(i))
-                               for i in tick_idx], rotation=45, fontsize=9)
-        ax_d.set_xlabel('Time', fontsize=10)
-        tf_hours_last = DEFAULT_TIMEFRAMES.get(last_tf)
-        tf_desc = f'{last_tf} ({tf_hours_last}h)' if tf_hours_last else last_tf
-        ax_d.set_title(f'|SHAP| Heatmap — {tf_desc} (n={results.patient_counts[last_tf]})',
-                       fontsize=12, fontweight='bold')
-        plt.colorbar(im_d, ax=ax_d, shrink=0.8, label=_shap_label)
 
         # ── Suptitle & save ──
         dn_label = " [density-norm]" if results.density_normalize else ""
