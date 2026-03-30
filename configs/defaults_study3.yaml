@@ -150,6 +150,7 @@ exclusion_criteria:
     traumatext: true
     traumatext_12h: false
     max_duration_days: 365
+    min_bin_seq_len: 1
     first_hospital:
       - null
     custom_filters: []

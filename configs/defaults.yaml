@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '30032026_study'
+model_name: '30032026_h'
 
 target: deceased_30d
 
@@ -150,6 +150,7 @@ exclusion_criteria:
     traumatext: true
     traumatext_12h: false
     max_duration_days: 365
+    min_bin_seq_len: 1
     first_hospital:
       - null
     custom_filters: []
@@ -265,20 +266,18 @@ sweep:
     study_patience: 8
     search_space:
         # Architecture
-        d_model: [32, 64, 128]
-        n_layers: [2, 4, 6, 8]
-        n_heads: [4, 8]
-        fc_mults_1: [0.1, 0.5]
+        d_model: [64, 128, 192, 256]
+        n_layers: [4, 6, 8, 10, 12]
+        n_heads: [4, 8, 16]
+        fc_mults_1: [0.05, 0.5]
         fc_mults_2: [0.05, 0.3]
         fc_dropout: [0.1, 0.9]
-        res_dropout: [0.0, 0.6]
+        res_dropout: [0.0, 0.7]
         temporal_head_dropout: [0.0, 0.8]
         head_pool: [flatten, mean_cat]
-        # Training HPs (per-phase LRs swept independently)
-        phase1_lr: [1.0e-4, 1.0e-2]          # log scale
-        phase2_lr: [5.0e-5, 3.0e-3]          # log scale
-        phase3_lr: [1.0e-5, 1.0e-3]          # log scale
-        phase4_lr: [5.0e-6, 5.0e-4]          # log scale
+        # Training HPs (LR parameterized as base_lr × decay^phase)
+        base_lr: [5.0e-4, 1.0e-2]            # log scale; phase 1 LR
+        lr_phase_decay: [0.05, 0.5]          # log scale; ratio between consecutive phases
         phase1_epochs: [1, 10]
         phase2_epochs: [1, 20]
         phase3_epochs: [1, 20]
@@ -411,8 +410,8 @@ drop_features:
    - B-GROUP-LEUKOCYTES
   Medicin:
   - nan
-  - blood
-  - infusion
+  #- blood
+  #- infusion
   Procedurer:
     - nan
   IndUd:
@@ -430,7 +429,7 @@ drop_features:
 
 holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
-holdout_split_date: '2023-05-30'  # Temporal split cutoff: train <= date < test
+holdout_split_date: '2023-07-01'   # Temporal split cutoff: train <= date < test
 seed: 2024
 
 Medicin: 

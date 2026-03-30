@@ -52,15 +52,26 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
     if "temporal_head_dropout" in best:
         model_section["temporal_head_dropout"] = best["temporal_head_dropout"]
 
+    # Compute phase2_unfreeze_from dynamically from n_layers
+    n_layers = best["n_layers"]
+    n_groups = (n_layers + 1) // 2
+    unfreeze_idx = (n_groups // 2) * 2
+    unfreeze_end = min(unfreeze_idx + 1, n_layers - 1)
+
+    # Expand base_lr + lr_phase_decay back to per-phase LRs for config output
+    _base_lr = best["base_lr"]
+    _lr_decay = best["lr_phase_decay"]
+
     finetune_section = {
         "phase1_epochs": best["phase1_epochs"],
-        "phase1_lr": best["phase1_lr"],
+        "phase1_lr": _base_lr,
         "phase2_epochs": best["phase2_epochs"],
-        "phase2_lr": best["phase2_lr"],
+        "phase2_lr": round(_base_lr * _lr_decay, 7),
+        "phase2_unfreeze_from": f"transformer_{unfreeze_idx}_{unfreeze_end}",
         "phase3_epochs": best["phase3_epochs"],
-        "phase3_lr": best["phase3_lr"],
+        "phase3_lr": round(_base_lr * _lr_decay ** 2, 7),
         "phase4_epochs": best["phase4_epochs"],
-        "phase4_lr": best["phase4_lr"],
+        "phase4_lr": round(_base_lr * _lr_decay ** 3, 8),
         "enable_early_prediction": best["phase4_epochs"] > 0,
         "masking_prob": best["masking_prob"],
         "early_weight": best["early_weight"],
@@ -198,13 +209,13 @@ def joint_objective(
             n_heads -= 1
 
     # --- Training parameters ---
-    # Note: log-scale params can't use step (Optuna limitation), but we round
-    # them after suggestion for cleaner values. The rounding is fine because
-    # e.g. lr=3.4e-4 vs 3.5e-4 makes no practical difference.
-    phase1_lr = round(trial.suggest_float("phase1_lr", *ss["phase1_lr"], log=True), 6)
-    phase2_lr = round(trial.suggest_float("phase2_lr", *ss["phase2_lr"], log=True), 6)
-    phase3_lr = round(trial.suggest_float("phase3_lr", *ss["phase3_lr"], log=True), 6)
-    phase4_lr = round(trial.suggest_float("phase4_lr", *ss["phase4_lr"], log=True), 7)
+    # LR parameterized as base_lr × lr_phase_decay^phase (monotonically decreasing)
+    base_lr = round(trial.suggest_float("base_lr", *ss["base_lr"], log=True), 6)
+    lr_phase_decay = round(trial.suggest_float("lr_phase_decay", *ss["lr_phase_decay"], log=True), 3)
+    phase1_lr = base_lr
+    phase2_lr = round(base_lr * lr_phase_decay, 7)
+    phase3_lr = round(base_lr * lr_phase_decay ** 2, 7)
+    phase4_lr = round(base_lr * lr_phase_decay ** 3, 8)
 
     weight_decay = round(trial.suggest_float("weight_decay", *ss["weight_decay"], log=True), 5)
     label_smoothing = trial.suggest_float("label_smoothing", *ss["label_smoothing"], step=0.01)
@@ -271,11 +282,21 @@ def joint_objective(
         cfg_dict["model"]["head_pool"] = head_pool
         cfg_dict["model"]["temporal_head_dropout"] = temporal_head_dropout
 
+        # Compute phase2_unfreeze_from dynamically: unfreeze top ~half of layers
+        # Layer groups are pairs: transformer_0_1, transformer_2_3, ...
+        # For n_layers=8: 4 groups, unfreeze from transformer_4_5 (top 2 groups)
+        # For n_layers=12: 6 groups, unfreeze from transformer_6_7 (top 3 groups)
+        n_groups = (n_layers + 1) // 2  # number of transformer pair-groups
+        unfreeze_idx = (n_groups // 2) * 2  # start of top-half pair
+        unfreeze_end = min(unfreeze_idx + 1, n_layers - 1)
+        phase2_unfreeze = f"transformer_{unfreeze_idx}_{unfreeze_end}"
+
         finetune_cfg = FinetuneConfig(
             phase1_epochs=phase1_epochs,
             phase1_lr=phase1_lr,
             phase2_epochs=phase2_epochs,
             phase2_lr=phase2_lr,
+            phase2_unfreeze_from=phase2_unfreeze,
             phase3_epochs=phase3_epochs,
             phase3_lr=phase3_lr,
             enable_early_prediction=phase4_epochs > 0,
@@ -331,16 +352,28 @@ def joint_objective(
 
 def _build_best_finetune_cfg(best: dict, pretrain_checkpoint_dir: str = None) -> FinetuneConfig:
     """Reconstruct FinetuneConfig from best trial params."""
+    # Compute phase2_unfreeze_from based on best n_layers
+    n_layers = best["n_layers"]
+    n_groups = (n_layers + 1) // 2
+    unfreeze_idx = (n_groups // 2) * 2
+    unfreeze_end = min(unfreeze_idx + 1, n_layers - 1)
+    phase2_unfreeze = f"transformer_{unfreeze_idx}_{unfreeze_end}"
+
+    # Expand base_lr + lr_phase_decay back to per-phase LRs
+    _base_lr = best["base_lr"]
+    _lr_decay = best["lr_phase_decay"]
+
     return FinetuneConfig(
         phase1_epochs=best["phase1_epochs"],
-        phase1_lr=best["phase1_lr"],
+        phase1_lr=_base_lr,
         phase2_epochs=best["phase2_epochs"],
-        phase2_lr=best["phase2_lr"],
+        phase2_lr=round(_base_lr * _lr_decay, 7),
+        phase2_unfreeze_from=phase2_unfreeze,
         phase3_epochs=best["phase3_epochs"],
-        phase3_lr=best["phase3_lr"],
+        phase3_lr=round(_base_lr * _lr_decay ** 2, 7),
         enable_early_prediction=best["phase4_epochs"] > 0,
         phase4_epochs=best["phase4_epochs"],
-        phase4_lr=best["phase4_lr"],
+        phase4_lr=round(_base_lr * _lr_decay ** 3, 8),
         masking_prob=best["masking_prob"],
         early_weight=best["early_weight"],
         lr_decay_factor=best["lr_decay_factor"],
@@ -423,11 +456,12 @@ def run_sweep(
             "fc_mults_2": model_cfg.get("fc_mults_2", 0.1),
             "fc_dropout": model_cfg.get("fc_dropout", 0.75),
             "res_dropout": model_cfg.get("res_dropout", 0.22),
-            # Training
-            "phase1_lr": ft_cfg.get("phase1_lr", 1e-3),
-            "phase2_lr": ft_cfg.get("phase2_lr", 3e-4),
-            "phase3_lr": ft_cfg.get("phase3_lr", 1e-4),
-            "phase4_lr": ft_cfg.get("phase4_lr", 5e-5),
+            # Training (LR parameterized as base_lr × decay^phase)
+            "base_lr": ft_cfg.get("phase1_lr", 1e-3),
+            "lr_phase_decay": round(
+                (ft_cfg.get("phase4_lr", 5e-5) / ft_cfg.get("phase1_lr", 1e-3)) ** (1/3),
+                3,
+            ),  # geometric mean decay from phase1→phase4
             "phase1_epochs": ft_cfg.get("phase1_epochs", 5),
             "phase2_epochs": ft_cfg.get("phase2_epochs", 12),
             "phase3_epochs": ft_cfg.get("phase3_epochs", 16),
