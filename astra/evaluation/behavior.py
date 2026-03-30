@@ -1534,32 +1534,45 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     
     print(f"\ncompute_per_category_shap: {compute_per_category_shap}")
     
-    if compute_per_category_shap and has_cat_ts:
-        # Use wrapper that takes RAW categorical TS for per-category SHAP
+    if compute_per_category_shap and has_cat_ts and bg_cat_onehot is None:
+        # Per-category temporal SHAP with raw temporal cats, no static cats
         print("  Using ModelWrapperWithRawCatTS for per-category SHAP values")
         wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts,
                                                  eval_timestep=eval_timestep,
                                                  traj_lengths=test_traj)
-
-        # Ensure categorical TS is float and requires grad
         bg_ts_cat_input = bg_ts_cat.float()
         test_ts_cat_input = test_ts_cat.float()
         bg_ts_cat_input.requires_grad = True
         test_ts_cat_input.requires_grad = True
-
         bg_inputs = [bg_ts, bg_ts_cat_input]
         test_inputs = [test_ts, test_ts_cat_input]
+    elif compute_per_category_shap and has_cat_ts and bg_cat_onehot is not None:
+        # Both raw temporal cats AND one-hot static cats needed.
+        # ModelWrapperWithRawCatTS expects pre-embedded static cats (shape mismatch
+        # with one-hot), so we use ModelWrapperWithOneHotCategoricals and fall back
+        # to pre-embedded temporal cats (losing per-category temporal SHAP granularity).
+        print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats + embedded temporal TS)")
+        print("  NOTE: Per-category temporal SHAP unavailable when one-hot static cats are present")
+        compute_per_category_shap = False  # disable for parsing below
+        wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
+                                                           eval_timestep=eval_timestep,
+                                                           traj_lengths=test_traj,
+                                                           x_cat_onehot_ref=bg_cat_onehot)
+        bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
+        test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
+        bg_inputs = [bg_ts, bg_ts_cat_emb]
+        test_inputs = [test_ts, test_ts_cat_emb]
+        bg_inputs.append(bg_cat_onehot)
+        test_inputs.append(test_cat_onehot)
     else:
-        # Use wrapper with embedded categorical TS
+        # No per-category temporal SHAP: embed temporal cats
         if bg_cat_onehot is not None:
-            # For static categoricals: use one-hot wrapper that performs matmul embedding
             print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats, embedded categorical TS)")
             wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
                                                                eval_timestep=eval_timestep,
                                                                traj_lengths=test_traj,
                                                                x_cat_onehot_ref=bg_cat_onehot)
         else:
-            # No static categoricals: use standard wrapper
             print("  Using ModelWrapperWithEmbeddings (embedded categorical TS, no static cats)")
             wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
                                                        eval_timestep=eval_timestep,
@@ -1574,9 +1587,9 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             bg_inputs = [bg_ts]
             test_inputs = [test_ts]
 
-    if bg_cat_onehot is not None:
-        bg_inputs.append(bg_cat_onehot)
-        test_inputs.append(test_cat_onehot)
+        if bg_cat_onehot is not None:
+            bg_inputs.append(bg_cat_onehot)
+            test_inputs.append(test_cat_onehot)
     
     if bg_cont.shape[1] > 0:
         bg_inputs.append(bg_cont)
@@ -3209,23 +3222,30 @@ class TemporalSHAPAnalyzer:
         else:
             eval_ts = -1
 
-        # Choose wrapper based on whether we have static categorical features
+        # Choose wrapper based on whether we have static categorical features.
+        # ModelWrapperWithOneHotCategoricals expects PRE-EMBEDDED temporal cats,
+        # so when static cats exist we must embed temporal cats first.
         if bg_cat_onehot is not None:
-            # Use one-hot wrapper for static categoricals
             wrapped = ModelWrapperWithOneHotCategoricals(self.model, self.has_cat_ts, eval_timestep=eval_ts,
                                                          traj_lengths=wrapper_traj,
                                                          x_cat_onehot_ref=bg_cat_onehot)
-        else:
-            # Use raw wrapper for temporal categorical TS only
-            wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
-                                               traj_lengths=wrapper_traj)
-
-        bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
-        sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
-
-        if bg_cat_onehot is not None:
+            # Pre-embed temporal cats for this wrapper
+            bg_ts_cat_emb = embed_categorical_ts(self.model, bg_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
+            sample_ts_cat_emb = embed_categorical_ts(self.model, sample_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
+            if bg_ts_cat_emb is not None:
+                bg_inputs = [bg_ts_c, bg_ts_cat_emb]
+                sample_inputs = [sample_ts_c, sample_ts_cat_emb]
+            else:
+                bg_inputs = [bg_ts_c]
+                sample_inputs = [sample_ts_c]
             bg_inputs.append(bg_cat_onehot)
             sample_inputs.append(sample_cat_onehot)
+        else:
+            # No static cats: use raw wrapper for per-category temporal SHAP
+            wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                               traj_lengths=wrapper_traj)
+            bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
+            sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
         if bg['cont'].shape[1] > 0:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
@@ -4870,7 +4890,9 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                                       timeframes=None,
                                       save_dir='reports/shap',
                                       verbose=True, active_only=False,
-                                      density_normalize: bool = False):
+                                      density_normalize: bool = False,
+                                      representative: bool = False,
+                                      representative_seed: int = 42):
     """Run temporal SHAP analysis across a cohort of holdout patients.
 
     This is the cohort-level counterpart of ``run_temporal_shap_analysis``.
@@ -4887,6 +4909,9 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
         verbose: Print progress
         active_only: Only use background patients active at each timeframe
         density_normalize: Normalize channel importance by measurement density
+        representative: Select patients via stratified representative sampling
+            (matching cohort on outcome, trajectory, age, sex)
+        representative_seed: Random seed for representative sampling
 
     Returns:
         CohortTemporalSHAPResults
@@ -4901,6 +4926,18 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
     )
 
     holdout_pids = analyzer.get_holdout_pids()
+
+    if representative:
+        from astra.evaluation.shap_paper_figures import select_representative_sample
+        selected_pids, comparison_df = select_representative_sample(
+            data, n_target=max_patients, seed=representative_seed, verbose=verbose,
+        )
+        comparison_df.to_csv(f'{save_dir}/sample_representativeness.csv', index=False)
+        # Filter holdout_pids to selected, preserving dataloader order
+        selected_set = set(selected_pids)
+        holdout_pids = [p for p in holdout_pids if p in selected_set]
+        logger.info(f"Representative sampling: {len(holdout_pids)} patients selected")
+
     logger.info(f"Cohort temporal SHAP: analyzing up to {max_patients} of "
                 f"{len(holdout_pids)} holdout patients")
 
