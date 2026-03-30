@@ -501,7 +501,7 @@ def add_survival_labels(base):
     """
     from astra.evaluation.utils import time_to_step, step_to_time, get_total_steps
 
-    max_steps = get_total_steps(cfg.get("dataset"))
+    max_steps = get_total_steps()
     max_time_min = step_to_time(max_steps - 1)
     max_hours = max_time_min / 60 if max_time_min is not None else float("inf")
 
