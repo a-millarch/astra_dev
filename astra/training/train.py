@@ -88,6 +88,8 @@ def parse_args():
                         help="Run cohort temporal SHAP analysis with visualizations")
     parser.add_argument("--shap-max-patients", type=int, default=20,
                         help="Max holdout patients for temporal SHAP (default: 20)")
+    parser.add_argument("--shap-representative", action="store_true", default=False,
+                        help="Use stratified representative sampling for temporal SHAP")
 
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
@@ -268,6 +270,7 @@ def main():
             max_background_samples=1000,
             save_dir=f'reports/eval/temporal_shap_{model_name}',
             density_normalize=True,
+            representative=args.shap_representative,
         )
         logger.info("SHAP analysis complete")
 

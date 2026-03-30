@@ -159,6 +159,102 @@ def stratified_sample_at_timepoint(
     }
 
 
+def select_representative_sample(
+    data: Dict,
+    n_target: int = 100,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Tuple[List[int], pd.DataFrame]:
+    """Select holdout patients representative of the full cohort.
+
+    Stratifies by outcome x trajectory_duration x sex x age_bin, then
+    samples proportionally from each stratum.  Returns selected PIDs and
+    a comparison DataFrame (cohort vs sample statistics).
+    """
+    holdout_base = data["holdout"].base.copy()
+    holdout_traj = np.array(data["holdout_trajectory_lengths"])
+    holdout_base["trajectory_length"] = holdout_traj
+
+    target_col = data["holdout"].target  # e.g. 'deceased_30d'
+
+    # --- build stratification bins ---
+    holdout_base["traj_bin"] = pd.qcut(
+        holdout_base["trajectory_length"], q=3, labels=["short", "mid", "long"],
+        duplicates="drop",
+    )
+    holdout_base["age_bin"] = pd.qcut(
+        holdout_base["AGE"], q=3, labels=["young", "mid", "old"],
+        duplicates="drop",
+    )
+    holdout_base["stratum"] = (
+        holdout_base[target_col].astype(str) + "_"
+        + holdout_base["traj_bin"].astype(str) + "_"
+        + holdout_base["SEX"].astype(str) + "_"
+        + holdout_base["age_bin"].astype(str)
+    )
+
+    rng = np.random.default_rng(seed)
+    n_cohort = len(holdout_base)
+    selected_idx = []
+
+    for _stratum, group in holdout_base.groupby("stratum", observed=True):
+        n_stratum_target = max(1, round(n_target * len(group) / n_cohort))
+        n_pick = min(n_stratum_target, len(group))
+        chosen = rng.choice(group.index.values, size=n_pick, replace=False)
+        selected_idx.extend(chosen.tolist())
+
+    selected = holdout_base.loc[selected_idx]
+
+    # --- comparison table ---
+    comparison = _compare_sample_representativeness(
+        holdout_base, selected, target_col
+    )
+
+    if verbose:
+        logger.info(
+            f"Representative sample: {len(selected)}/{n_cohort} patients "
+            f"({len(holdout_base['stratum'].unique())} strata)"
+        )
+        logger.info(f"\n{comparison.to_string(index=False)}")
+
+    return selected["PID"].tolist(), comparison
+
+
+def _compare_sample_representativeness(
+    cohort: pd.DataFrame,
+    sample: pd.DataFrame,
+    target_col: str,
+) -> pd.DataFrame:
+    """Compare cohort vs sample on key variables."""
+    rows = []
+
+    def _add(name, cohort_val, sample_val):
+        rows.append({"variable": name, "cohort": cohort_val, "sample": sample_val})
+
+    _add("N", len(cohort), len(sample))
+    _add(f"{target_col} (%)", f"{cohort[target_col].mean()*100:.1f}", f"{sample[target_col].mean()*100:.1f}")
+    _add("age (mean±std)", f"{cohort['AGE'].mean():.1f}±{cohort['AGE'].std():.1f}",
+         f"{sample['AGE'].mean():.1f}±{sample['AGE'].std():.1f}")
+    _add("sex=Male (%)", f"{(cohort['SEX']=='Male').mean()*100:.1f}",
+         f"{(sample['SEX']=='Male').mean()*100:.1f}")
+    _add("traj_length (mean±std)", f"{cohort['trajectory_length'].mean():.1f}±{cohort['trajectory_length'].std():.1f}",
+         f"{sample['trajectory_length'].mean():.1f}±{sample['trajectory_length'].std():.1f}")
+
+    for col in ["ISS", "ASMT_ELIX"]:
+        if col in cohort.columns:
+            c_valid = cohort[col].dropna()
+            s_valid = sample[col].dropna()
+            _add(f"{col} (mean±std)",
+                 f"{c_valid.mean():.1f}±{c_valid.std():.1f}" if len(c_valid) else "N/A",
+                 f"{s_valid.mean():.1f}±{s_valid.std():.1f}" if len(s_valid) else "N/A")
+
+    if "LVL1TC" in cohort.columns:
+        _add("LVL1TC (%)", f"{cohort['LVL1TC'].mean()*100:.1f}",
+             f"{sample['LVL1TC'].mean()*100:.1f}")
+
+    return pd.DataFrame(rows)
+
+
 def run_stratified_sampling(data: Dict) -> Dict[str, Dict]:
     """Run stratified sampling at all evaluation timepoints.
 
