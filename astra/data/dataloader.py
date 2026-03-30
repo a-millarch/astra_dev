@@ -687,6 +687,42 @@ def prepare_data_and_dls(cfg):
     logger.info(f'Trajectory lengths - min: {traj_lengths.min()}, max: {traj_lengths.max()}, '
                f'mean: {traj_lengths.mean():.1f}')
 
+    # --- Filter samples with trajectory shorter than min_bin_seq_len ----------
+    from astra.data.datasets import resolve_exclusion_criteria
+    _excl = resolve_exclusion_criteria(cfg) or {}
+    min_seq_len = _excl.get('min_bin_seq_len',
+                            cfg.get('dataset', {}).get('min_bin_seq_len', 0))
+    if min_seq_len > 0:
+        keep_mask = traj_lengths >= min_seq_len
+        n_short = (~keep_mask).sum()
+        if n_short:
+            sorted_pids = sorted(trainval.complete['PID'].unique())
+            drop_pids = {sorted_pids[i] for i in range(len(sorted_pids))
+                         if not keep_mask[i]}
+            logger.info(f'Dropping {n_short} trainval samples with trajectory '
+                        f'< {min_seq_len} steps (PIDs: {len(drop_pids)})')
+            X = X[keep_mask]
+            X_raw = X_raw[keep_mask]
+            y = [y[i] for i in range(len(y)) if keep_mask[i]]
+            traj_lengths = traj_lengths[keep_mask]
+            if trainval_event_times is not None:
+                trainval_event_times = trainval_event_times[keep_mask]
+                trainval_event_indicators = trainval_event_indicators[keep_mask]
+            id_col = cfg['dataset']['id_col']
+            trainval.base = trainval.base[
+                ~trainval.base[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval._base_pids -= drop_pids
+            trainval.tab_df = trainval.tab_df[
+                ~trainval.tab_df[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval.complete = trainval.complete[
+                ~trainval.complete[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval.complete_cat = trainval.complete_cat[
+                ~trainval.complete_cat[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+
     # Per-channel normalization using trajectory_lengths + NaN awareness
     X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
 
@@ -843,6 +879,38 @@ def prepare_data_and_dls(cfg):
     holdout_traj_lengths = get_trajectory_lengths(tX, padding_value=0.0, exclude_channels=traj_exclude_chs)
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
                f'max: {holdout_traj_lengths.max()}, mean: {holdout_traj_lengths.mean():.1f}')
+
+    # --- Filter holdout samples with trajectory shorter than min_bin_seq_len --
+    if min_seq_len > 0:
+        keep_mask_h = holdout_traj_lengths >= min_seq_len
+        n_short_h = (~keep_mask_h).sum()
+        if n_short_h:
+            sorted_pids_h = sorted(holdout.complete['PID'].unique())
+            drop_pids_h = {sorted_pids_h[i] for i in range(len(sorted_pids_h))
+                           if not keep_mask_h[i]}
+            logger.info(f'Dropping {n_short_h} holdout samples with trajectory '
+                        f'< {min_seq_len} steps (PIDs: {len(drop_pids_h)})')
+            tX = tX[keep_mask_h]
+            tX_raw = tX_raw[keep_mask_h]
+            ty = [ty[i] for i in range(len(ty)) if keep_mask_h[i]]
+            holdout_traj_lengths = holdout_traj_lengths[keep_mask_h]
+            if holdout_event_times is not None:
+                holdout_event_times = holdout_event_times[keep_mask_h]
+                holdout_event_indicators = holdout_event_indicators[keep_mask_h]
+            id_col = cfg['dataset']['id_col']
+            holdout.base = holdout.base[
+                ~holdout.base[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout._base_pids -= drop_pids_h
+            holdout.tab_df = holdout.tab_df[
+                ~holdout.tab_df[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout.complete = holdout.complete[
+                ~holdout.complete[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout.complete_cat = holdout.complete_cat[
+                ~holdout.complete_cat[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
 
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
 
