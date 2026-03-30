@@ -35,6 +35,24 @@ logger = setup_logging()
 
 
 # ============================================================================
+# Helpers
+# ============================================================================
+
+def _normalize_journal_id(series: pd.Series) -> pd.Series:
+    """Normalize JournalID to consistent string representation.
+
+    Handles the float→string round-trip issue: pandas may read integer IDs
+    as float64 (e.g. 12345 → 12345.0), producing "12345.0" via astype(str)
+    instead of "12345". This strips trailing '.0' from numeric-looking IDs
+    while preserving UUID-style string IDs unchanged.
+    """
+    s = series.astype(str)
+    # Strip trailing .0 from float-like values (e.g. "12345.0" → "12345")
+    s = s.str.replace(r'\.0$', '', regex=True)
+    return s
+
+
+# ============================================================================
 # Config helpers
 # ============================================================================
 
@@ -112,7 +130,22 @@ def load_ppj_mapping(cfg) -> pd.DataFrame:
         df.drop_duplicates(inplace=True)
 
         logger.info(f"  [{name}] columns: {df.columns.tolist()}, "
-                     f"{len(df)} rows, {df['CPR_hash'].nunique()} unique CPR_hash")
+                     f"{len(df)} rows, dtypes:\n{df.dtypes.to_string()}")
+
+        # Validate required columns
+        required = {"CPR_hash", "JournalID"}
+        missing = required - set(df.columns)
+        if missing:
+            logger.error(f"  [{name}] Missing required columns: {missing} — skipping source")
+            continue
+        # Check for CreationTime (required for temporal filtering)
+        if "CreationTime" not in df.columns and "CreationTime_dt" not in df.columns:
+            logger.warning(f"  [{name}] No CreationTime column — temporal filtering will be limited")
+
+        # Log sample values for debugging
+        logger.info(f"  [{name}] CPR_hash samples: {df['CPR_hash'].head(3).tolist()}")
+        logger.info(f"  [{name}] JournalID samples (raw): {df['JournalID'].head(3).tolist()} "
+                     f"(dtype={df['JournalID'].dtype})")
 
         # Parse timestamps
         if "CreationTime" in df.columns:
@@ -120,12 +153,18 @@ def load_ppj_mapping(cfg) -> pd.DataFrame:
                 df["CreationTime_dt"] = parse_ppj_timestamps(df["CreationTime"])
             else:
                 df["CreationTime_dt"] = pd.to_datetime(df["CreationTime"], errors="coerce")
-        elif "CreationTime_dt" not in df.columns:
-            logger.warning(f"  [{name}] No CreationTime column found")
+            n_parsed = df["CreationTime_dt"].notna().sum()
+            logger.info(f"  [{name}] Parsed CreationTime: {n_parsed}/{len(df)} non-NaT")
+            if n_parsed == 0:
+                logger.error(f"  [{name}] All CreationTime values failed to parse!")
 
         # Normalize JournalID to string to prevent type mismatches across sources
         if "JournalID" in df.columns:
-            df["JournalID"] = df["JournalID"].astype(str)
+            df["JournalID"] = _normalize_journal_id(df["JournalID"])
+            logger.info(f"  [{name}] JournalID samples (normalized): {df['JournalID'].head(3).tolist()}")
+
+        logger.info(f"  [{name}] {len(df)} rows, {df['CPR_hash'].nunique()} unique CPR_hash, "
+                     f"{df['JournalID'].nunique()} unique JournalID")
 
         df["PrehospitalRegion"] = name
         dfs.append(df)
@@ -179,9 +218,37 @@ def load_ppj_data(cfg) -> pd.DataFrame:
 
         for csv_file in csv_files:
             logger.info(f"Loading PPJ data from {csv_file}")
-            df = pd.read_csv(csv_file, sep=";", encoding="utf-8", low_memory=False)
+            df = pd.read_csv(csv_file, sep=";", encoding="utf-8",
+                             low_memory=False, on_bad_lines="warn")
             # Drop unnamed index columns
             df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+            # Validate expected columns
+            expected_cols = {"EventCodeName", "CreationTime", "ValueFloat",
+                             "ValueString", "JournalID"}
+            actual_cols = set(df.columns)
+            missing = expected_cols - actual_cols
+            if missing:
+                logger.error(f"  {csv_file}: MISSING expected columns {missing}! "
+                             f"Got: {df.columns.tolist()}. "
+                             f"Possible column shift from bad delimiter handling.")
+            extra = actual_cols - expected_cols - {"ManualTime", "ValueDateTime", "ValueBool"}
+            if extra:
+                logger.warning(f"  {csv_file}: Unexpected extra columns: {extra}")
+
+            # Log per-file stats
+            n_journals = df["JournalID"].nunique() if "JournalID" in df.columns else "?"
+            logger.info(f"  → {len(df):,} rows, {n_journals} journals, "
+                         f"JournalID dtype={df['JournalID'].dtype if 'JournalID' in df.columns else 'N/A'}, "
+                         f"JournalID samples={df['JournalID'].head(3).tolist() if 'JournalID' in df.columns else []}")
+
+            # Check for signs of column shifting (e.g. JournalID contains timestamps)
+            if "JournalID" in df.columns:
+                jid_sample = df["JournalID"].dropna().head(10).astype(str)
+                if jid_sample.str.contains(r'\d{4}-\d{2}-\d{2}', regex=True).any():
+                    logger.error(f"  {csv_file}: JournalID contains date-like values — "
+                                  f"likely column shift! Samples: {jid_sample.tolist()}")
+
             dfs.append(df)
 
     if not dfs:
@@ -189,12 +256,21 @@ def load_ppj_data(cfg) -> pd.DataFrame:
             f"No PPJ data files found at configured paths: {ppj_paths}"
         )
 
+    n_before_concat = sum(len(d) for d in dfs)
     ppj = pd.concat(dfs, ignore_index=True)
+    n_after_concat = len(ppj)
     ppj.drop_duplicates(inplace=True)
+    n_after_dedup = len(ppj)
+    logger.info(f"PPJ data: {n_before_concat:,} rows from {len(dfs)} files → "
+                f"{n_after_concat:,} after concat → {n_after_dedup:,} after dedup "
+                f"(dropped {n_after_concat - n_after_dedup:,} duplicates)")
 
     # Normalize JournalID to string (must match mapping dtype)
     if "JournalID" in ppj.columns:
-        ppj["JournalID"] = ppj["JournalID"].astype(str)
+        ppj["JournalID"] = _normalize_journal_id(ppj["JournalID"])
+        logger.info(f"JournalID normalized: dtype={ppj['JournalID'].dtype}, "
+                     f"nunique={ppj['JournalID'].nunique()}, "
+                     f"samples={ppj['JournalID'].head(3).tolist()}")
 
     # Parse timestamps — try standard datetime first, fall back to PPJ SAS format
     for col in ["CreationTime", "ManualTime"]:
@@ -240,8 +316,8 @@ def _prefilter_raw_sources(cfg, matched_jids) -> None:
     Skips sources without ``raw_data_path`` or where the output already exists.
     """
     sources = _get_sources(cfg)
-    # Normalize to strings for consistent comparison
-    matched_jids_set = set(str(j) for j in matched_jids)
+    # Normalize using the same logic as _normalize_journal_id
+    matched_jids_set = set(_normalize_journal_id(pd.Series(matched_jids)))
 
     for source in sources:
         raw_path = source.get("raw_data_path")
@@ -277,7 +353,7 @@ def _prefilter_raw_sources(cfg, matched_jids) -> None:
             on_bad_lines="warn", low_memory=False
         ):
             n_total += len(chunk)
-            chunk["JournalID"] = chunk["JournalID"].astype(str)
+            chunk["JournalID"] = _normalize_journal_id(chunk["JournalID"])
             filtered = chunk[chunk["JournalID"].isin(matched_jids_set)]
             if len(filtered) > 0:
                 all_chunks.append(filtered)
@@ -317,6 +393,22 @@ def filter_ppj_to_population(
     # Link PPJ mapping to base population
     ppj_pop = ppj_map[ppj_map["CPR_hash"].isin(base_df["CPR_hash"])].copy()
     logger.info(f"PPJ mapping: {ppj_pop['CPR_hash'].nunique()} patients matched to study population")
+    if "PrehospitalRegion" in ppj_pop.columns:
+        logger.info(f"  Per-source match: {ppj_pop.groupby('PrehospitalRegion')['CPR_hash'].nunique().to_dict()}")
+
+    # Log JournalID overlap between mapping and raw PPJ data
+    map_jids = set(ppj_pop["JournalID"].unique())
+    ppj_jids = set(ppj["JournalID"].unique())
+    overlap = map_jids & ppj_jids
+    logger.info(f"  JournalID overlap: {len(overlap)} of {len(map_jids)} mapping JIDs "
+                f"found in {len(ppj_jids)} data JIDs")
+    if len(overlap) < len(map_jids):
+        map_only = map_jids - ppj_jids
+        logger.info(f"  JIDs in mapping but NOT in data: {len(map_only)} "
+                     f"(samples: {list(map_only)[:5]})")
+        ppj_only_sample = list(ppj_jids - map_jids)[:5]
+        logger.info(f"  JIDs in data but NOT in mapping: {len(ppj_jids - map_jids)} "
+                     f"(samples: {ppj_only_sample})")
 
     # Merge mapping with base_df to get admission/discharge times + PID
     base_cols = ["CPR_hash", "PID", "start", "end"]
@@ -340,20 +432,34 @@ def filter_ppj_to_population(
         ].drop_duplicates()
 
     logger.info(f"PPJ population after time filtering: {ph['PID'].nunique()} patients")
+    if "PrehospitalRegion" in ph.columns:
+        logger.info(f"  Per-source after time filter: "
+                     f"{ph.groupby('PrehospitalRegion')['PID'].nunique().to_dict()}")
 
     # Filter raw PPJ to matched JournalIDs
-    valid_jids = ph["JournalID"].unique()
+    valid_jids = set(ph["JournalID"].unique())
+    n_before_jid_filter = len(ppj)
     ppj_filtered = ppj[ppj["JournalID"].isin(valid_jids)].copy()
+    logger.info(f"PPJ data filtered by JournalID: {n_before_jid_filter:,} → {len(ppj_filtered):,} rows "
+                f"({len(valid_jids)} valid JIDs)")
 
     # Add PID and PrehospitalRegion via JournalID
     jid_cols = ["JournalID", "PID"]
     if "PrehospitalRegion" in ph.columns:
         jid_cols.append("PrehospitalRegion")
     jid_to_pid = ph[jid_cols].drop_duplicates()
+    n_before_pid = len(ppj_filtered)
     ppj_filtered = ppj_filtered.merge(jid_to_pid, on="JournalID", how="left")
+    n_no_pid = ppj_filtered["PID"].isna().sum()
+    if n_no_pid > 0:
+        logger.warning(f"  {n_no_pid:,} PPJ rows have no PID after JournalID merge — dropping")
     ppj_filtered = ppj_filtered[ppj_filtered["PID"].notnull()].copy()
 
-    logger.info(f"ppj_filtered: {len(ppj_filtered)} rows, columns: {ppj_filtered.columns.tolist()}")
+    logger.info(f"ppj_filtered: {len(ppj_filtered):,} rows, columns: {ppj_filtered.columns.tolist()}")
+    if "PrehospitalRegion" in ppj_filtered.columns:
+        logger.info(f"  Per-source: {ppj_filtered.groupby('PrehospitalRegion').size().to_dict()}")
+        logger.info(f"  Per-source unique PIDs: "
+                     f"{ppj_filtered.groupby('PrehospitalRegion')['PID'].nunique().to_dict()}")
     if "EventCodeName" in ppj_filtered.columns and len(ppj_filtered) > 0:
         logger.info(
             f"ppj_filtered unique EventCodeNames ({ppj_filtered['EventCodeName'].nunique()}): "
