@@ -3386,6 +3386,9 @@ class TemporalSHAPAnalyzer:
                 measured = ts_np[:, :eff] != 0.0       # [n_channels, eff_steps]
                 denom = measured.sum(axis=1).clip(1)   # [n_channels]
                 ts_channel_importance = (shap_eff * measured).sum(axis=1) / denom
+                # Debug: log a sample of denominator values for verification
+                if verbose:
+                    logger.debug(f"    Density-normalized denominators (sample): {denom[:5]}")
             elif eff > 0:
                 ts_channel_importance = np.abs(ts_shap[:, :eff]).mean(axis=1)
             else:
@@ -4189,7 +4192,7 @@ class TemporalSHAPAnalyzer:
                 return names, np.array(values)
             
             ref_static_names, ref_static_imp = get_static_importance(ref_result)
-            
+                
             if len(ref_static_imp) > 1:
                 top_static_idx = np.argsort(ref_static_imp)[-min(max_features, len(ref_static_imp)):]
                 
