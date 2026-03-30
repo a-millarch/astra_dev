@@ -4231,28 +4231,70 @@ class TemporalSHAPAnalyzer:
                        timeframes=None, verbose=True) -> CohortTemporalSHAPResults:
         """Run temporal SHAP analysis for multiple patients and aggregate.
 
+        ``max_patients`` is the target count **per timeframe**, not a global
+        cap.  Patients with short trajectories only contribute to early
+        timeframes, so we keep analyzing until every timeframe has reached
+        the target (or we run out of holdout patients).
+
+        Trajectory lengths are read upfront from the dataset to decide
+        which timeframes each patient can contribute to, skipping patients
+        and timeframes that are already saturated — avoiding unnecessary
+        SHAP computation.
+
         Args:
             test_loader: DataLoader for holdout set
             holdout_pids: List of all holdout PIDs (in dataloader order)
-            max_patients: Maximum number of patients to analyze
+            max_patients: Target number of patients per timeframe
             timeframes: List of timeframe names (default: all standard)
             verbose: Print progress
 
         Returns:
             CohortTemporalSHAPResults with per-timeframe aggregated SHAP
         """
-        pids_to_analyze = holdout_pids[:max_patients]
+        timeframes = timeframes or list(DEFAULT_TIMEFRAMES.keys())
+
+        # Pre-read trajectory lengths from dataset (cheap — no SHAP yet)
+        holdout_ds = self.data["holdout_mixed_dls"]._train_ds
+        if hasattr(holdout_ds, 'dataset'):
+            holdout_ds = holdout_ds.dataset  # unwrap Subset
+        all_traj = holdout_ds.traj_lengths.numpy()  # [n_holdout]
+
+        # Track per-timeframe saturation
+        tf_counts = {tf: 0 for tf in timeframes}
         patient_results = []
 
-        for i, pid in enumerate(pids_to_analyze):
+        for i, pid in enumerate(holdout_pids):
+            if all(c >= max_patients for c in tf_counts.values()):
+                break
+
+            # Determine which timeframes this patient can contribute to
+            # and that still need more patients
+            traj_steps = int(all_traj[i])
+            traj_hours = (step_to_time(traj_steps - 1) or 0) / 60 if traj_steps > 0 else 0
+            needed_tfs = []
+            for tf in timeframes:
+                if tf_counts[tf] >= max_patients:
+                    continue
+                tf_h = DEFAULT_TIMEFRAMES.get(tf)
+                if tf_h is None or tf_h <= traj_hours:
+                    needed_tfs.append(tf)
+
+            if not needed_tfs:
+                continue  # this patient can't help any unsaturated timeframe
+
             if verbose:
-                logger.info(f"\n[Patient {i+1}/{len(pids_to_analyze)}] PID: {pid}")
+                logger.info(f"\n[Patient {len(patient_results)+1}, PID {pid}] "
+                            f"traj={traj_hours:.1f}h, computing {len(needed_tfs)} timeframes")
             try:
                 result = self.analyze_patient(
                     test_loader, pid=pid, holdout_pids=holdout_pids,
-                    timeframes=timeframes, verbose=verbose
+                    timeframes=needed_tfs, verbose=verbose
                 )
                 patient_results.append(result)
+                for tf in result.timeframe_results:
+                    norm_tf = 'full' if tf.startswith('max(') else tf
+                    if norm_tf in tf_counts:
+                        tf_counts[norm_tf] += 1
             except Exception as e:
                 logger.warning(f"  FAILED for PID {pid}: {e}")
 
@@ -4260,7 +4302,8 @@ class TemporalSHAPAnalyzer:
             raise RuntimeError("No patients were successfully analyzed")
 
         if verbose:
-            logger.info(f"\nAggregating results from {len(patient_results)} patients...")
+            logger.info(f"\nAnalyzed {len(patient_results)} patients. "
+                        f"Per-timeframe counts: {tf_counts}")
 
         return self._aggregate_patient_results(patient_results)
 
