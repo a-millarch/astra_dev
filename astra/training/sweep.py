@@ -132,11 +132,18 @@ def _save_best_callback(study_name: str, save_path: Path):
     return callback
 
 
-def _study_early_stopping_callback(patience: int):
-    """Stop the study if the best score hasn't improved for `patience` completed trials."""
+def _study_early_stopping_callback(patience: int, min_delta: float = 0.005):
+    """Stop the study if the best score hasn't meaningfully improved.
+
+    Args:
+        patience: Number of completed trials without meaningful improvement before stopping.
+        min_delta: Minimum improvement over the reference score to reset patience.
+    """
+    # Track the reference score separately — only updated on meaningful improvements
+    state = {"ref_score": None, "ref_trial": None, "trials_since": 0}
 
     def callback(study: optuna.Study, trial: optuna.trial.FrozenTrial):
-        if trial.state != optuna.trial.TrialState.COMPLETE:
+        if trial.state != optuna.trial.TrialState.COMPLETE or trial.value is None:
             return
 
         completed = [
@@ -146,15 +153,26 @@ def _study_early_stopping_callback(patience: int):
         if len(completed) < patience:
             return
 
-        best_trial_number = study.best_trial.number
-        trials_since_best = sum(
-            1 for t in completed if t.number > best_trial_number
-        )
-        if trials_since_best >= patience:
+        # Initialize reference from first completed trial
+        if state["ref_score"] is None:
+            state["ref_score"] = study.best_value
+            state["ref_trial"] = study.best_trial.number
+            state["trials_since"] = 0
+            return
+
+        # Check if current best is a meaningful improvement over reference
+        if study.best_value >= state["ref_score"] + min_delta:
+            state["ref_score"] = study.best_value
+            state["ref_trial"] = study.best_trial.number
+            state["trials_since"] = 0
+        else:
+            state["trials_since"] += 1
+
+        if state["trials_since"] >= patience:
             logger.info(
-                f"Study early stopping: no improvement for {trials_since_best} "
-                f"trials after best trial #{best_trial_number} "
-                f"(score {study.best_value:.4f}). Stopping."
+                f"Study early stopping: no meaningful improvement (>{min_delta}) for "
+                f"{state['trials_since']} trials after reference trial "
+                f"#{state['ref_trial']} (score {state['ref_score']:.4f}). Stopping."
             )
             study.stop()
 
@@ -489,11 +507,12 @@ def run_sweep(
         logger.info("Enqueued seed trial with defaults.yaml hyperparameters")
 
     study_patience = cfg_dict.get("sweep", {}).get("study_patience", 0)
+    study_min_delta = cfg_dict.get("sweep", {}).get("study_min_delta", 0.005)
     save_path = SWEEP_RESULTS_DIR / f"{study_name}_best.yaml"
     callbacks = [_save_best_callback(study_name, save_path)]
     if study_patience > 0:
-        callbacks.append(_study_early_stopping_callback(study_patience))
-        logger.info(f"  Study early stopping: patience={study_patience} trials")
+        callbacks.append(_study_early_stopping_callback(study_patience, min_delta=study_min_delta))
+        logger.info(f"  Study early stopping: patience={study_patience} trials, min_delta={study_min_delta}")
     study.optimize(
         lambda trial: joint_objective(trial, data, cfg_dict, device),
         n_trials=n_trials,

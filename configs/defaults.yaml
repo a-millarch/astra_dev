@@ -262,8 +262,9 @@ finetune:
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
-    n_trials: 200
-    study_patience: 8
+    n_trials: 350
+    study_patience: 12
+    study_min_delta: 0.005   # minimum AUROC+AUPRC improvement to reset patience
     search_space:
         # Architecture
         d_model: [64, 128, 192, 256]
