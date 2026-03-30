@@ -173,14 +173,22 @@ def apply_exclusion_criteria(
 
     min_bins = criteria.get("min_bin_seq_len")
     if isinstance(min_bins, (int, float)) and min_bins > 0:
-        from astra.evaluation.utils import time_to_step
+        from astra.evaluation.utils import time_to_step, get_total_steps
         if "start" in base_df.columns and "end" in base_df.columns:
+            total_steps = get_total_steps()
             start = pd.to_datetime(base_df["start"])
             end = pd.to_datetime(base_df["end"])
             duration_hours = (end - start).dt.total_seconds() / 3600
-            bin_counts = duration_hours.apply(
-                lambda h: time_to_step(h, 'h') + 1 if h > 0 else 0
-            )
+
+            def _duration_to_bins(h):
+                if h <= 0:
+                    return 0
+                step = time_to_step(h, 'h')
+                if step is None:
+                    return total_steps  # exceeds max range → full trajectory
+                return step + 1
+
+            bin_counts = duration_hours.apply(_duration_to_bins)
             m = bin_counts >= min_bins
             excluded = (~m & mask).sum()
             if excluded:
