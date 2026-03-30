@@ -15,10 +15,21 @@ prehospital: false                     # Set true to enable pre-hospital data pi
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
-  ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
-  ppj_data_paths:
-    - data/raw/ppj/                                 # Directory containing raw PPJ CSVs
-  max_hours_before_admission: 48                    # Max hours before admission to include
+  sources:
+    - name: RegH
+      ppj_mapping_path: data/raw/ppj_mapping.csv
+      ppj_data_paths:
+        - data/raw/ppj/
+      mapping_sep: ";"
+      mapping_timestamp_format: sas
+    - name: RegSJ
+      ppj_mapping_path: data/raw/ppjsj_mapping.csv
+      ppj_data_paths:
+        - data/interim/ppjsj.csv
+      raw_data_path: data/dl/PPJ_RegSJ.csv
+      mapping_sep: ","
+      mapping_timestamp_format: iso
+  max_hours_before_admission: 48
   event_descriptions_path: data/external/event_descriptions_modified.xlsx
   # Override event codes if event_descriptions not available:
   # gcs_event_codes: []

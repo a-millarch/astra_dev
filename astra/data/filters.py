@@ -494,6 +494,14 @@ def filter_adt(adt, base_df=None):
     adt["TIMESTAMP"] = adt["Flyt_ind"]
     adt["END_TIMESTAMP"] = adt["Flyt_ud"]
 
+    # Concat pre-hospital ADT events when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_ADT.pkl"):
+        logger.info("> Adding prehospital ADT events")
+        ph_adt = pd.read_pickle("data/interim/prehospital_ADT.pkl")
+        adt = pd.concat([adt, ph_adt])
+        adt = adt.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> ADT after prehospital merge: {len(adt)} rows")
+
     logger.info(f"Using {len(adt)} ADT observations")
     return adt
 

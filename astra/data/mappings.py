@@ -410,3 +410,12 @@ PPJ_VITAL_BOUNDS: Dict[str, Tuple[float, float]] = {
     "SBP": (0.0, 300.0),
     "DBP": (0.0, 200.0),
 }
+
+# ABCD severity ordering (index 0 = least severe, last = most severe)
+# Used to pick the most severe assessment when a patient has PPJ data from multiple sources
+ABCD_SEVERITY: Dict[str, list] = {
+    "A": ["Fri", "Truede", "Blokerede"],
+    "B": ["Normal", "Let påvirket", "Meget påvirket", "Respirationsstop"],
+    "C": ["Normal", "Let påvirket", "Meget påvirket", "Hjertestop"],
+    "D": ["Vågen", "Bevidsthedspåvirket", "Bevidstløs"],
+}

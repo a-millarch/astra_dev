@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '29032026_sweep'
+model_name: '30032026_study'
 
 target: deceased_30d
 
@@ -15,10 +15,21 @@ prehospital: true                     # Set true to enable pre-hospital data pip
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
-  ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
-  ppj_data_paths:
-    - data/raw/ppj/                                 # Directory containing raw PPJ CSVs
-  max_hours_before_admission: 48                    # Max hours before admission to include
+  sources:
+    - name: RegH
+      ppj_mapping_path: data/raw/ppj_mapping.csv
+      ppj_data_paths:
+        - data/raw/ppj/
+      mapping_sep: ";"
+      mapping_timestamp_format: sas      # 22FEB2018:13:40:02.2750
+    - name: RegSJ
+      ppj_mapping_path: data/raw/ppjsj_mapping.csv
+      ppj_data_paths:
+        - data/interim/ppjsj.csv         # Pre-filtered from raw_data_path
+      raw_data_path: data/dl/PPJ_RegSJ.csv  # Large unfiltered file, chunked pre-filter
+      mapping_sep: ","
+      mapping_timestamp_format: iso      # standard datetime
+  max_hours_before_admission: 48
   event_descriptions_path: data/external/event_descriptions_modified.xlsx
   # Override event codes if event_descriptions not available:
   # gcs_event_codes: []
@@ -181,41 +192,39 @@ training:
     bs: 32
     
 model:
-    res_dropout: 0.22
-    fc_dropout: 0.75
-    fc_mults_1: 0.3
-    fc_mults_2: 0.1
-    n_layers: 8
-    n_heads: 8
-    d_model: 64
-    head_pool: mean_cat
-    d_ff: None
-    d_k: None
-    d_v: None
-    temporal_head: true
-    causal: true  # required for temporal_head
-    temporal_head_dropout: 0.3
-    survival_mode: false  # true = discrete-time survival, false = binary classification
+  d_model: 128
+  n_layers: 8
+  n_heads: 8
+  fc_mults_1: 0.10
+  fc_mults_2: 0.25
+  fc_dropout: 0.72
+  res_dropout: 0.29
+  head_pool: mean_cat
+    
+  temporal_head: true
+  causal: true  # required for temporal_head
+  temporal_head_dropout: 0.6
+  survival_mode: false  # true = discrete-time survival, false = binary classification
+
 finetune:
-  # ── Hyperparameter sweep results (paste over this section) ──
-  phase1_epochs: 5
-  phase1_lr: 1.0e-3
-  phase2_epochs: 12
-  phase2_lr: 3.0e-4
-  phase3_epochs: 16
-  phase3_lr: 1.0e-4
-  phase4_epochs: 8
-  phase4_lr: 5.0e-5
-  enable_early_prediction: false
-  masking_prob: 0.8
-  early_weight: 2.0
-  lr_decay_factor: 0.1
-  weight_decay: 0.01
-  label_smoothing: 0.1
-  pos_weight_factor: 0.0
-  time_weighting: uniform
-  temporal_crop_prob: 0.0
-  temporal_crop_all_phases: false
+  phase1_epochs: 4
+  phase1_lr: 0.0034069416021263346
+  phase2_epochs: 8
+  phase2_lr: 0.0001908557798982261
+  phase3_epochs: 11
+  phase3_lr: 0.0006191469401201928
+  phase4_epochs: 3
+  phase4_lr: 2.3558261806780157e-05
+  enable_early_prediction: true
+  masking_prob: 0.5631687557288182
+  early_weight: 1.9118170977991875
+  lr_decay_factor: 0.47227044823585246
+  weight_decay: 0.0463853858389733
+  label_smoothing: 0.19071867772674164
+  pos_weight_factor: 0.8645166062945272
+  time_weighting: early
+  temporal_crop_prob: 0.42987217500631086
+  temporal_crop_all_phases: true
   # ── End sweep results ──
 
   # Phase 2 architecture
@@ -252,7 +261,8 @@ finetune:
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
-    n_trials: 80
+    n_trials: 200
+    study_patience: 8
     search_space:
         # Architecture
         d_model: [32, 64, 128]
@@ -262,16 +272,16 @@ sweep:
         fc_mults_2: [0.05, 0.3]
         fc_dropout: [0.1, 0.9]
         res_dropout: [0.0, 0.6]
-        temporal_head_dropout: [0.0, 0.6]
+        temporal_head_dropout: [0.0, 0.8]
         head_pool: [flatten, mean_cat]
         # Training HPs (per-phase LRs swept independently)
         phase1_lr: [1.0e-4, 1.0e-2]          # log scale
         phase2_lr: [5.0e-5, 3.0e-3]          # log scale
         phase3_lr: [1.0e-5, 1.0e-3]          # log scale
         phase4_lr: [5.0e-6, 5.0e-4]          # log scale
-        phase1_epochs: [2, 8]
-        phase2_epochs: [5, 20]
-        phase3_epochs: [3, 20]
+        phase1_epochs: [1, 10]
+        phase2_epochs: [1, 20]
+        phase3_epochs: [1, 20]
         phase4_epochs: [0, 10]               # 0 = skip early prediction
         weight_decay: [1.0e-4, 1.0e-1]       # log scale
         label_smoothing: [0.0, 0.2]
@@ -279,7 +289,7 @@ sweep:
         masking_prob: [0.3, 0.9]
         early_weight: [1.0, 3.0]
         pos_weight_factor: [0.0, 1.0]        # linear (0 = no class weighting)
-        temporal_crop_prob: [0.0, 0.6]       # probability of cropping per batch
+        temporal_crop_prob: [0.0, 0.8]       # probability of cropping per batch
         # Temporal loss improvements (only active when temporal_head=true)
         temporal_loss_averaging: [per_sample, global]
         eval_timeframe_weighting: [true, false]
@@ -303,7 +313,6 @@ normalization:
 base_df_path: data/interim/base_df.pkl
 raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
 bin_df_path: data/interim/mapped/bin_df.pkl
-
 
 
 default_load_filenames:
@@ -402,8 +411,8 @@ drop_features:
    - B-GROUP-LEUKOCYTES
   Medicin:
   - nan
-  #- blood
-  #- infusion
+  - blood
+  - infusion
   Procedurer:
     - nan
   IndUd:
