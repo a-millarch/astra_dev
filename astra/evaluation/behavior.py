@@ -1,6 +1,7 @@
 #behavior.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -978,6 +979,119 @@ class ModelWrapperWithEmbeddings(nn.Module):
         return self.model.head(x)
 
 
+class ModelWrapperWithOneHotCategoricals(nn.Module):
+    """
+    Wrapper that takes ONE-HOT encoded static categorical features [batch, n_cat, max_classes].
+
+    Performs matmul(one_hot, embedding.weight) to embed static categoricals differentiably.
+    This allows GradientExplainer to compute meaningful gradients through the one-hot probability
+    differences rather than through the pre-computed embedding lookup.
+    """
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
+                 x_cat_onehot_ref=None):
+        super().__init__()
+        self.model = model
+        self.has_cat_ts = has_cat_ts
+        self.eval_timestep = eval_timestep
+        self.traj_lengths = traj_lengths
+        # Store reference one-hot shape to know which embedding weights to extract
+        self.x_cat_onehot_ref = x_cat_onehot_ref
+
+    def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_onehot=None, x_cont=None):
+        """
+        Args:
+            x_ts: [batch, c_in, seq_len]
+            x_ts_cat_embedded: [batch, seq_len, d_model] if has_cat_ts
+            x_cat_onehot: [batch, n_cat, max_classes] ONE-HOT encoded static cats
+            x_cont: [batch, n_cont] continuous statics
+        """
+        nan_mask = torch.isnan(x_ts)
+        if nan_mask.any():
+            x_ts = x_ts.clone()
+            x_ts[nan_mask] = 0
+
+        # Build padding mask from trajectory lengths
+        seq_len = x_ts.shape[2]
+        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
+        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)
+
+        # Extract elapsed_hours for positional encoding
+        if self.model.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
+        else:
+            elapsed_hours = None
+
+        # Strip auxiliary channels before W_P
+        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        x = self.model.W_P(x_ts_signal).transpose(1, 2)
+
+        if self.has_cat_ts and x_ts_cat_embedded is not None:
+            if self.model.cat_ts_combine == 'add':
+                x = x + x_ts_cat_embedded
+            else:
+                x = torch.cat([x, x_ts_cat_embedded], dim=-1)
+
+        # Embed one-hot static categoricals via matmul (differentiable)
+        if x_cat_onehot is not None and x_cat_onehot.shape[1] > 0:
+            # Matmul one-hot with embedding weights: [batch, n_cat, max_classes] x [max_classes, d_model]
+            # -> [batch, n_cat, d_model]
+            x_cat_embedded_list = []
+            for i, emb in enumerate(self.model.embeds):
+                # Extract relevant one-hot slice and embedding weight
+                oh_i = x_cat_onehot[:, i, :emb.num_embeddings]  # [batch, num_classes]
+                emb_w = emb.weight  # [num_classes, d_model]
+                x_cat_i = torch.matmul(oh_i, emb_w)  # [batch, d_model]
+                x_cat_embedded_list.append(x_cat_i.unsqueeze(1))  # [batch, 1, d_model]
+
+            x_cat_embedded = torch.cat(x_cat_embedded_list, dim=1)  # [batch, n_cat, d_model]
+            x = torch.cat([x, x_cat_embedded], 1)
+
+        if x_cont is not None and x_cont.shape[1] > 0:
+            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            x = torch.cat([x, x_cont_emb], 1)
+
+        # Positional encoding
+        ts_padding_mask = key_padding_mask[:, :seq_len]
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
+        if self.model.res_drop is not None:
+            x = self.model.res_drop(x)
+
+        # Extend padding mask for static tokens
+        n_static = x.shape[1] - key_padding_mask.shape[1]
+        if n_static > 0:
+            static_mask = torch.zeros(
+                key_padding_mask.shape[0], n_static,
+                dtype=torch.bool, device=key_padding_mask.device,
+            )
+            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+
+        attn_mask = self.model.causal_mask if self.model.causal else None
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # Zero out padding positions post-transformer
+        x = x * (~key_padding_mask).unsqueeze(-1).float()
+
+        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
+            logits = self.model.temporal_pred_head(x)
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
+        return self._apply_head(x, key_padding_mask)
+
+    def _apply_head(self, x, key_padding_mask):
+        """Apply head with pooling logic matching model.py forward()."""
+        if self.model.head_pool == 'mean_cat':
+            x_temporal = x[:, :self.model.seq_len, :]
+            x_static = x[:, self.model.seq_len:, :]
+            if key_padding_mask is not None:
+                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
+                ts_mask_f = ts_mask.unsqueeze(-1).float()
+                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                x_pooled = x_temporal.mean(dim=1)
+            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
+        return self.model.head(x)
+
+
 class ModelWrapperWithRawCatTS(nn.Module):
     """
     Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
@@ -1126,13 +1240,38 @@ def embed_categorical_ts(model, x_ts_cat, encoding_info):
 
 
 def embed_categorical_features(model, x_cat):
+    """
+    Convert static categorical features to one-hot encodings for SHAP.
+
+    Returns one-hot tensors [batch, n_cat, max_classes] with requires_grad=True.
+    The model wrapper will perform matmul(one_hot, embedding.weight) for differentiable embedding.
+
+    This allows GradientExplainer to compute meaningful gradients through the one-hot probability
+    differences between foreground and background, rather than through the pre-computed embedding
+    lookup (which gave near-zero SHAP for low-cardinality static categories).
+    """
     if x_cat is None or x_cat.shape[1] == 0:
         return None
-    with torch.no_grad():
-        x_cat_emb = [model.embeds[i](x_cat[:, i]).unsqueeze(1) for i in range(x_cat.shape[1])]
-        x_cat_emb = torch.cat(x_cat_emb, 1)
-    x_cat_emb.requires_grad = True
-    return x_cat_emb
+
+    # Get max embedding class count for padding
+    max_classes = max(emb.num_embeddings for emb in model.embeds)
+
+    # Convert to one-hot: [batch, n_cat, max_classes]
+    onehot_list = []
+    for i, emb in enumerate(model.embeds):
+        # One-hot encode this categorical feature
+        oh = F.one_hot(x_cat[:, i].long(), num_classes=emb.num_embeddings).float()  # [batch, num_classes]
+
+        # Pad to max_classes if needed
+        if emb.num_embeddings < max_classes:
+            pad_size = max_classes - emb.num_embeddings
+            oh = F.pad(oh, (0, pad_size), value=0.0)  # [batch, max_classes]
+
+        onehot_list.append(oh.unsqueeze(1))  # [batch, 1, max_classes]
+
+    x_cat_onehot = torch.cat(onehot_list, dim=1)  # [batch, n_cat, max_classes]
+    x_cat_onehot.requires_grad = True
+    return x_cat_onehot
 
 
 # ============================================================================
@@ -1377,9 +1516,10 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     has_cat_ts = model.n_ts_cat > 0 and bg_ts_cat is not None and bg_ts_cat.numel() > 0
     n_static_cat = bg_cat.shape[1]
     
-    # Pre-embed static categorical (always)
-    bg_cat_emb = embed_categorical_features(model, bg_cat) if n_static_cat > 0 else None
-    test_cat_emb = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
+    # Convert static categorical to one-hot (always)
+    # Returns [batch, n_cat, max_classes] with requires_grad=True for SHAP
+    bg_cat_onehot = embed_categorical_features(model, bg_cat) if n_static_cat > 0 else None
+    test_cat_onehot = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
     
     if model.temporal_head_enabled:
         if eval_timestep == -1:
@@ -1389,8 +1529,8 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         else:
             print(f"  Temporal head: eval_timestep={eval_timestep}")
 
-    if bg_cat_emb is not None:
-        print(f"  Static categorical embedded: {bg_cat_emb.shape}")
+    if bg_cat_onehot is not None:
+        print(f"  Static categorical one-hot: {bg_cat_onehot.shape}")
     
     print(f"\ncompute_per_category_shap: {compute_per_category_shap}")
     
@@ -1410,12 +1550,21 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         bg_inputs = [bg_ts, bg_ts_cat_input]
         test_inputs = [test_ts, test_ts_cat_input]
     else:
-        # Use wrapper with pre-embedded categorical TS (faster, less granular)
-        print("  Using ModelWrapperWithEmbeddings (embedded categorical TS)")
-        wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
-                                                   eval_timestep=eval_timestep,
-                                                   traj_lengths=test_traj)
-        
+        # Use wrapper with embedded categorical TS
+        if bg_cat_onehot is not None:
+            # For static categoricals: use one-hot wrapper that performs matmul embedding
+            print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats, embedded categorical TS)")
+            wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
+                                                               eval_timestep=eval_timestep,
+                                                               traj_lengths=test_traj,
+                                                               x_cat_onehot_ref=bg_cat_onehot)
+        else:
+            # No static categoricals: use standard wrapper
+            print("  Using ModelWrapperWithEmbeddings (embedded categorical TS, no static cats)")
+            wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
+                                                       eval_timestep=eval_timestep,
+                                                       traj_lengths=test_traj)
+
         if has_cat_ts:
             bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
             test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
@@ -1424,10 +1573,10 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         else:
             bg_inputs = [bg_ts]
             test_inputs = [test_ts]
-    
-    if bg_cat_emb is not None:
-        bg_inputs.append(bg_cat_emb)
-        test_inputs.append(test_cat_emb)
+
+    if bg_cat_onehot is not None:
+        bg_inputs.append(bg_cat_onehot)
+        test_inputs.append(test_cat_onehot)
     
     if bg_cont.shape[1] > 0:
         bg_inputs.append(bg_cont)
@@ -1475,12 +1624,15 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             cat_ts_shap = np.abs(cat_ts_shap_embedded).mean(axis=2)
         idx += 1
     
-    cat_shap, cat_shap_embedded = None, None
-    if bg_cat_emb is not None:
-        cat_shap_embedded = shap_values[idx]
-        print(f"  cat_shap_embedded shape: {cat_shap_embedded.shape}")
-        cat_shap = np.abs(cat_shap_embedded).mean(axis=2)
-        print(f"  cat_shap after mean(|embed|): {cat_shap.shape}")
+    cat_shap, cat_shap_onehot = None, None
+    if bg_cat_onehot is not None:
+        cat_shap_onehot = shap_values[idx]
+        print(f"  cat_shap_onehot shape (one-hot SHAP): {cat_shap_onehot.shape}")
+        # cat_shap_onehot is [n_samples, n_cat, max_classes]
+        # Aggregate over the one-hot class dimension: sum absolute value per feature
+        # This gives overall feature importance (sum of all class probabilities' contribution)
+        cat_shap = np.abs(cat_shap_onehot).sum(axis=2)  # [n_samples, n_cat]
+        print(f"  cat_shap after sum(|one_hot|): {cat_shap.shape}")
         idx += 1
     
     cont_shap = shap_values[idx] if bg_cont.shape[1] > 0 else None
@@ -1504,7 +1656,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         'cat_ts_shap_per_category': cat_ts_shap_per_category,  # NEW: per-category SHAP
         'cat_ts_shap_embedded': cat_ts_shap_embedded,
         'cat_shap': cat_shap,
-        'cat_shap_embedded': cat_shap_embedded,
+        'cat_shap_onehot': cat_shap_onehot,
         'cont_shap': cont_shap,
         'n_static_cat': n_static_cat,
         'eval_timestep': eval_timestep,  # stored for visualization cropping
@@ -2914,18 +3066,7 @@ class CohortTemporalSHAPResults:
 
 # NOTE: ModelWrapperWithRawCatTS is defined above (used by both
 # calculate_shap_from_dataloaders and TemporalSHAPAnalyzer).
-
-
-def embed_categorical_features(model, x_cat):
-    """Pre-embed static categorical features."""
-    if x_cat is None or x_cat.shape[1] == 0:
-        return None
-    with torch.no_grad():
-        x_cat_emb = [model.embeds[i](x_cat[:, i]).unsqueeze(1) for i in range(x_cat.shape[1])]
-        x_cat_emb = torch.cat(x_cat_emb, 1)
-    x_cat_emb.requires_grad = True
-    return x_cat_emb
-
+# NOTE: embed_categorical_features is defined above (converts to one-hot for SHAP).
 
 # ============================================================================
 # MAIN ANALYZER
@@ -3042,8 +3183,9 @@ class TemporalSHAPAnalyzer:
 
         sample_ts_c, sample_ts_cat_c = self._censor_data(sample_ts, sample_ts_cat, censor_step)
 
-        bg_cat_emb = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
-        sample_cat_emb = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
+        # Convert static categorical to one-hot encoding for SHAP
+        bg_cat_onehot = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
+        sample_cat_onehot = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
 
         # Build traj_lengths tensor for wrapper (single sample -> [1])
         # Clamp to censor_step+1 so the padding mask excludes censored positions
@@ -3066,15 +3208,24 @@ class TemporalSHAPAnalyzer:
             eval_ts = 'mean'
         else:
             eval_ts = -1
-        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
-                                           traj_lengths=wrapper_traj)
+
+        # Choose wrapper based on whether we have static categorical features
+        if bg_cat_onehot is not None:
+            # Use one-hot wrapper for static categoricals
+            wrapped = ModelWrapperWithOneHotCategoricals(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                                         traj_lengths=wrapper_traj,
+                                                         x_cat_onehot_ref=bg_cat_onehot)
+        else:
+            # Use raw wrapper for temporal categorical TS only
+            wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                               traj_lengths=wrapper_traj)
 
         bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
         sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
 
-        if bg_cat_emb is not None:
-            bg_inputs.append(bg_cat_emb)
-            sample_inputs.append(sample_cat_emb)
+        if bg_cat_onehot is not None:
+            bg_inputs.append(bg_cat_onehot)
+            sample_inputs.append(sample_cat_onehot)
         if bg['cont'].shape[1] > 0:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
@@ -3082,8 +3233,11 @@ class TemporalSHAPAnalyzer:
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
         shap_values = explainer.shap_values(sample_inputs)
 
+        # For multi-output models (e.g. 2-class): select class 1 (mortality)
         if isinstance(shap_values, list) and shap_values and isinstance(shap_values[0], list):
-            shap_values = shap_values[0]
+            n_classes = len(shap_values)
+            selected_class = min(1, n_classes - 1)  # class 1 if available
+            shap_values = shap_values[selected_class]
 
         idx = 0
         ts_shap = shap_values[idx][0]
@@ -3095,8 +3249,10 @@ class TemporalSHAPAnalyzer:
             cat_ts_shap = np.abs(cat_ts_shap_per_cat).mean(axis=0)
             idx += 1
 
-        cat_shap = np.abs(shap_values[idx][0]).mean(axis=1) if bg_cat_emb is not None else None
-        if bg_cat_emb is not None:
+        # Static categorical SHAP: one-hot encoding -> [n_cat, max_classes]
+        # Aggregate over class dimension (sum absolute values per feature)
+        cat_shap = np.abs(shap_values[idx][0]).sum(axis=1) if bg_cat_onehot is not None else None
+        if bg_cat_onehot is not None:
             idx += 1
 
         cont_shap = shap_values[idx][0] if bg['cont'].shape[1] > 0 else None

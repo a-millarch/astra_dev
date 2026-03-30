@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Dict, Optional, Union
 
 import numpy as np
@@ -907,8 +908,10 @@ def map_concept_optimized(
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
     elif concept == "ISS":
-        from astra.data.notes_features import build_iss_from_notes
-        concept_df = build_iss_from_notes(notater_df)
+        # Load pre-built combined ISS (notes + R-computed) from make_data pipeline
+        iss_pkl = "data/interim/concepts/ISS.pkl"
+        concept_df = pd.read_pickle(iss_pkl)
+        logger.info(f"Loaded ISS (notes + R-computed): {len(concept_df)} rows")
         concept_df = filter_function(concept_df)
     elif concept == "Events":
         from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes

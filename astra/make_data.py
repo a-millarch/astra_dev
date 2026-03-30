@@ -174,7 +174,11 @@ def _build_r_iss(base: pd.DataFrame) -> pd.DataFrame:
     result["FEATURE"] = "ISS"
     result = result.rename(columns={"iss_value": "VALUE"})
     result = result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
-    logger.info(f"R-computed ISS: {len(result)} patients with valid scores")
+
+    # Filter to only patients in the cohort (base_df)
+    cohort_pids = set(base["PID"].unique())
+    result = result[result["PID"].isin(cohort_pids)]
+    logger.info(f"R-computed ISS: {len(result)} patients with valid scores (after cohort filter)")
     return result
 
 

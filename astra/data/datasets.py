@@ -1,5 +1,6 @@
 import logging
 import operator
+import os
 import warnings
 from typing import List, Dict, Optional, Union
 
@@ -484,14 +485,24 @@ class AggregatedDS:
         return filtered_df[['PID', 'FEATURE', 'VALUE', 'TIMESTAMP']]
 
     def _build_notater_derived_concept(self, concept: str) -> pd.DataFrame:
-        """Build ISS or Events concept from Notater.pkl (clinical notes)."""
-        notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
-        if 'PID' in notater_df.columns:
-            notater_df = notater_df[notater_df['PID'].isin(self._base_pids)]
+        """Build ISS or Events concept from Notater.pkl (clinical notes).
 
+        For ISS: try pre-built pickle (which may include R-computed sources),
+        fall back to rebuilding from Notater if not available.
+        """
         if concept == "ISS":
-            from astra.data.notes_features import build_iss_from_notes
-            filtered_df = build_iss_from_notes(notater_df)
+            # Load pre-built combined ISS (notes + R-computed) from make_data pipeline
+            iss_pkl = "data/interim/concepts/ISS.pkl"
+            filtered_df = pd.read_pickle(iss_pkl)
+            if 'PID' in filtered_df.columns:
+                filtered_df = filtered_df[filtered_df['PID'].isin(self._base_pids)]
+            logger.debug(f"Loaded ISS (notes + R-computed): {len(filtered_df)} rows")
+        else:
+            # For non-ISS derived concepts (Events), rebuild from Notater
+            notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
+            if 'PID' in notater_df.columns:
+                notater_df = notater_df[notater_df['PID'].isin(self._base_pids)]
+
         elif concept == "Events":
             from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
             from astra.data.notes_features import build_intubation_from_notes

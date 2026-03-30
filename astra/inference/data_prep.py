@@ -17,6 +17,7 @@ Usage:
     session.predict(**result)
 """
 
+import os
 import time
 from contextlib import contextmanager, nullcontext as _nullcontext
 
@@ -1783,17 +1784,58 @@ def _filter_concepts_for_patient(
     for concept in cfg['concepts']:
         # --- Notes-derived concepts: built entirely from Notater, no CSV ---
         if concept == 'ISS':
-            # ISS from notes (mirrors mapper.py)
+            # ISS from both notes and R-computed sources
+            from astra.data.notes_features import build_iss_from_notes
+            filter_fn = collect_filter(concept)
+            iss_frames = []
+
+            # Source 1: Notes-extracted ISS
             if notater_inhospital is not None and not notater_inhospital.empty:
-                from astra.data.notes_features import build_iss_from_notes
-                filter_fn = collect_filter(concept)
-                concept_filtered = build_iss_from_notes(notater_inhospital)
+                iss_notes = build_iss_from_notes(notater_inhospital)
+                if not iss_notes.empty:
+                    iss_frames.append(iss_notes)
+                    logger.info(f"ISS from notes: {len(iss_notes)} row(s)")
+
+            # Source 2: R-computed ISS (if available in pre-built CSV)
+            iss_r_csv = "data/interim/computed_iss_df.csv"
+            if os.path.exists(iss_r_csv):
+                try:
+                    iss_r_full = pd.read_csv(iss_r_csv, low_memory=False)
+                    patient_pid = base_df['PID'].iloc[0]
+                    iss_r_patient = iss_r_full[iss_r_full['PID'] == patient_pid]
+                    if not iss_r_patient.empty:
+                        # Extract riss/niss and format as standard ISS entry
+                        riss = pd.to_numeric(iss_r_patient.get('riss'), errors='coerce').iloc[0]
+                        niss = pd.to_numeric(iss_r_patient.get('niss'), errors='coerce').iloc[0]
+                        iss_val = riss if pd.notna(riss) else niss
+                        if pd.notna(iss_val):
+                            iss_r = pd.DataFrame({
+                                'PID': [patient_pid],
+                                'TIMESTAMP': [base_df['start'].iloc[0]],  # use admission time
+                                'FEATURE': ['ISS'],
+                                'VALUE': [float(iss_val)],
+                            })
+                            iss_frames.append(iss_r)
+                            logger.info(f"ISS from R-computed: {iss_val}")
+                except Exception as e:
+                    logger.warning(f"Failed to load R-computed ISS: {e}")
+
+            # Merge both sources: keep max VALUE per PID
+            if iss_frames:
+                concept_filtered = pd.concat(iss_frames, ignore_index=True)
+                concept_filtered = concept_filtered.sort_values(
+                    ['PID', 'VALUE', 'TIMESTAMP'],
+                    ascending=[True, False, True]
+                )
+                concept_filtered = concept_filtered.drop_duplicates(
+                    subset=['PID'], keep='first'
+                ).reset_index(drop=True)
                 concept_filtered = filter_fn(concept_filtered)
                 if not concept_filtered.empty:
                     filtered[concept] = concept_filtered
-                    logger.info(f"ISS from notes: {len(concept_filtered)} rows")
+                    logger.info(f"ISS (notes + R-computed): {len(concept_filtered)} row(s)")
             else:
-                logger.info("No Notater data — skipping ISS")
+                logger.info("No ISS data from notes or R-computed sources")
             continue
 
         if concept == 'Events':
