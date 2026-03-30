@@ -123,6 +123,10 @@ def load_ppj_mapping(cfg) -> pd.DataFrame:
         elif "CreationTime_dt" not in df.columns:
             logger.warning(f"  [{name}] No CreationTime column found")
 
+        # Normalize JournalID to string to prevent type mismatches across sources
+        if "JournalID" in df.columns:
+            df["JournalID"] = df["JournalID"].astype(str)
+
         df["PrehospitalRegion"] = name
         dfs.append(df)
 
@@ -188,6 +192,10 @@ def load_ppj_data(cfg) -> pd.DataFrame:
     ppj = pd.concat(dfs, ignore_index=True)
     ppj.drop_duplicates(inplace=True)
 
+    # Normalize JournalID to string (must match mapping dtype)
+    if "JournalID" in ppj.columns:
+        ppj["JournalID"] = ppj["JournalID"].astype(str)
+
     # Parse timestamps — try standard datetime first, fall back to PPJ SAS format
     for col in ["CreationTime", "ManualTime"]:
         if col in ppj.columns:
@@ -232,7 +240,8 @@ def _prefilter_raw_sources(cfg, matched_jids) -> None:
     Skips sources without ``raw_data_path`` or where the output already exists.
     """
     sources = _get_sources(cfg)
-    matched_jids_set = set(matched_jids)
+    # Normalize to strings for consistent comparison
+    matched_jids_set = set(str(j) for j in matched_jids)
 
     for source in sources:
         raw_path = source.get("raw_data_path")
@@ -268,6 +277,7 @@ def _prefilter_raw_sources(cfg, matched_jids) -> None:
             on_bad_lines="warn", low_memory=False
         ):
             n_total += len(chunk)
+            chunk["JournalID"] = chunk["JournalID"].astype(str)
             filtered = chunk[chunk["JournalID"].isin(matched_jids_set)]
             if len(filtered) > 0:
                 all_chunks.append(filtered)
@@ -720,23 +730,33 @@ def extract_ppj_abcd(
         subset = subset[subset["value"].notna() & (subset["value"] != "nan")]
         logger.info(f"    After NaN filter: {len(subset)} rows")
 
-        # Pick most severe observation per PID (fall back to latest if unknown values)
-        severity_order = ABCD_SEVERITY.get(short_name, [])
-        if severity_order:
-            unknown_vals = set(subset["value"].unique()) - set(severity_order)
-            if unknown_vals:
-                logger.warning(f"    Unknown {short_name} values not in severity list: {unknown_vals}")
-            subset["_severity"] = subset["value"].map(
-                {v: i for i, v in enumerate(severity_order)}
-            )
-            # For unknown values, assign -1 so they lose to known values
-            subset["_severity"] = subset["_severity"].fillna(-1).astype(int)
+        # Pick most severe observation per PID.
+        # ABCD values can be numeric (1.0, 2.0, 4.0, 8.0 — higher = more severe)
+        # or text (Fri, Truede, Blokerede). Try numeric first, fall back to
+        # text-based severity ordering, then to latest observation.
+        subset["_severity"] = pd.to_numeric(subset["value"], errors="coerce")
+        if subset["_severity"].notna().any():
+            # Numeric encoding: higher = more severe → take max per PID
+            logger.info(f"    Using numeric severity (max): range [{subset['_severity'].min()}, {subset['_severity'].max()}]")
             subset = subset.sort_values("_severity").groupby("PID").last().reset_index()
             subset = subset.drop(columns=["_severity"])
         else:
-            # Fallback: take latest observation
-            subset["ts"] = subset["ManualTime"].fillna(subset["CreationTime"])
-            subset = subset.sort_values("ts").groupby("PID").last().reset_index()
+            # Text encoding: use ABCD_SEVERITY ordering
+            severity_order = ABCD_SEVERITY.get(short_name, [])
+            subset = subset.drop(columns=["_severity"])
+            if severity_order:
+                unknown_vals = set(subset["value"].unique()) - set(severity_order)
+                if unknown_vals:
+                    logger.warning(f"    Unknown {short_name} values not in severity list: {unknown_vals}")
+                subset["_sev"] = subset["value"].map(
+                    {v: i for i, v in enumerate(severity_order)}
+                ).fillna(-1).astype(int)
+                subset = subset.sort_values("_sev").groupby("PID").last().reset_index()
+                subset = subset.drop(columns=["_sev"])
+            else:
+                # Last resort: take latest observation
+                subset["ts"] = subset["ManualTime"].fillna(subset["CreationTime"])
+                subset = subset.sort_values("ts").groupby("PID").last().reset_index()
         subset = subset[["PID", "value"]].rename(columns={"value": short_name})
 
         result_dfs.append(subset)
