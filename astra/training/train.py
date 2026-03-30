@@ -66,6 +66,8 @@ def parse_args():
                         help="Load pretrained weights before finetuning")
     parser.add_argument("--skip-valid", action=argparse.BooleanOptionalAction, default=True,
                         help="Train on full trainval without validation split (use --no-skip-valid for 80/20 split with early stopping)")
+    parser.add_argument("--valid-size", type=float, default=None,
+                        help="Validation split fraction (e.g. 0.1). Implies --no-skip-valid.")
     parser.add_argument("--early-prediction", action="store_true", default=False,
                         help="Enable Phase 4: progressive time masking + weighted loss")
 
@@ -193,7 +195,10 @@ def main():
         finetune_cfg.model_name = model_name
         finetune_cfg.pretrain_checkpoint_dir = pretrain_cfg.checkpoint_dir
 
-        if args.skip_valid:
+        if args.valid_size is not None:
+            finetune_cfg.valid_size = args.valid_size
+            logger.info(f"--valid-size={args.valid_size}: using {args.valid_size:.0%} validation split")
+        elif args.skip_valid:
             finetune_cfg.valid_size = 0.0
             logger.info("--skip-valid: training on full trainval data (valid_size=0.0)")
 
