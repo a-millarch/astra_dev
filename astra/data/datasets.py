@@ -171,6 +171,27 @@ def apply_exclusion_criteria(
                 "not found in base_df."
             )
 
+    min_bins = criteria.get("min_bin_seq_len")
+    if isinstance(min_bins, (int, float)) and min_bins > 0:
+        from astra.evaluation.utils import time_to_step
+        if "start" in base_df.columns and "end" in base_df.columns:
+            start = pd.to_datetime(base_df["start"])
+            end = pd.to_datetime(base_df["end"])
+            duration_hours = (end - start).dt.total_seconds() / 3600
+            bin_counts = duration_hours.apply(
+                lambda h: time_to_step(h, 'h') + 1 if h > 0 else 0
+            )
+            m = bin_counts >= min_bins
+            excluded = (~m & mask).sum()
+            if excluded:
+                logger.info(f"  exclusion  min_bin_seq_len >= {min_bins}: -{excluded}")
+            mask &= m
+        else:
+            logger.warning(
+                "  exclusion  min_bin_seq_len requested but start/end columns "
+                "not found in base_df."
+            )
+
     first_hospital = [v for v in (criteria.get("first_hospital") or []) if v is not None]
     if first_hospital:
         m = base_df["FIRST_HOSPITAL"].isin(first_hospital)
