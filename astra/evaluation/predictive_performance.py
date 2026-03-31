@@ -2313,7 +2313,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         key_timepoints = None
         if multicurve:
-            max_step = get_total_steps() - 2
+            max_step = get_total_steps() - 1
             key_timepoints = sorted({
                 min(t, max_step) for t in [
                     time_to_step(1, 'h'), time_to_step(6, 'h'),
