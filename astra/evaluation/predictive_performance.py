@@ -2287,7 +2287,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             key_timepoints = [
                 time_to_step(1, 'h'), time_to_step(6, 'h'),
                 time_to_step(12, 'h'), time_to_step(72, 'h'),
-                time_to_step(7, 'D'), time_to_step(13, 'D'),
+                time_to_step(7, 'D'), time_to_step(14, 'D'),
                 time_to_step(30, 'D'), time_to_step(90, 'D'),
             ]
             key_timepoints = [t for t in key_timepoints if t is not None]
@@ -2472,7 +2472,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             time_to_step(12, 'h'),
             time_to_step(72, 'h'),
             time_to_step(7, 'D'),
-            time_to_step(13, 'D'),
+            time_to_step(14, 'D'),
             time_to_step(30, 'D'),
             time_to_step(90, 'D'),
         ]

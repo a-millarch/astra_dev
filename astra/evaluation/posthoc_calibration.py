@@ -973,7 +973,7 @@ def run_posthoc_calibration(
         key_timepoints = [
             time_to_step(1, 'h'), time_to_step(6, 'h'),
             time_to_step(12, 'h'), time_to_step(72, 'h'),
-            time_to_step(7, 'D'), time_to_step(13, 'D'),
+            time_to_step(7, 'D'), time_to_step(14, 'D'),
             time_to_step(30, 'D'), time_to_step(90, 'D'),
         ]
         key_timepoints = sorted([t for t in key_timepoints if t is not None])
@@ -1140,11 +1140,29 @@ def run_posthoc_calibration(
     _plot_reliability_diagrams(
         holdout_preds, calibrated_holdout, best_method, model_name, save_dir, n_bins
     )
+
+    # DCA plots: collect predictions at all timepoints with a lower threshold
+    # so that later timepoints (7D, 14D, 30D) are not dropped
+    dca_holdout_preds = _collect_predictions(
+        holdout_eval, key_timepoints, min_positive=5, label="holdout-dca"
+    )
+    # Calibrate the extra DCA-only steps using global calibrator
+    dca_calibrated = dict(calibrated_holdout)  # copy existing per-tp calibrated
+    for step in dca_holdout_preds:
+        if step not in dca_calibrated:
+            dca_calibrated[step] = {}
+            ho = dca_holdout_preds[step]
+            for method in methods:
+                g_cal = global_calibrators[method]
+                dca_calibrated[step][method] = apply_calibrator(
+                    g_cal, ho.y_prob, method
+                )
+
     _plot_dca_calibrated(
-        holdout_preds, calibrated_holdout, best_method, model_name, save_dir
+        dca_holdout_preds, dca_calibrated, best_method, model_name, save_dir
     )
     _plot_dca_comparison(
-        holdout_preds, calibrated_holdout, best_method, model_name, save_dir
+        dca_holdout_preds, dca_calibrated, best_method, model_name, save_dir
     )
     _plot_per_timepoint_vs_global(all_results, best_method, model_name, save_dir)
 
