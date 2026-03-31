@@ -28,6 +28,16 @@ from astra.visualize.evaluation import plot_evaluation, evaluate_detection_rate
 
 logger = logging.getLogger(__name__)
 
+# ── Figure style constants for readability ───────────────────────────────
+_FIG_STYLE = dict(
+    title=16,
+    axis_label=14,
+    tick_label=12,
+    legend=12,
+    annotation=11,
+    suptitle=18,
+)
+
 
 @dataclass
 class TimeMetricResult:
@@ -171,7 +181,7 @@ def plot_decision_curve(
         y_true, y_prob, thresholds
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(9, 6))
 
     # Determine y-range from model curve, then clip Treat All to that range
     ymin = min(nb_model.min(), -0.01) - 0.005
@@ -183,10 +193,11 @@ def plot_decision_curve(
             label='Treat All')
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curve Analysis", fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curve Analysis", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -274,11 +285,12 @@ def plot_decision_curves_over_time(
     # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
-              title="Time Available", title_fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -374,11 +386,12 @@ def _plot_decision_curves_temporal(
     # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
-              title="Time Available", title_fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -1074,7 +1087,7 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     auprc_lower = np.array([r.auprc_ci[0] for r in results])
     auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
 
     mask_cut = times_h <= cut_hours
 
@@ -1096,14 +1109,15 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
             ax1.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
             ax1.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
 
-    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_xlim(0, cut_hours)
     ax1.set_xticks(np.arange(0, cut_hours+1, 6))
     ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax1.set_ylabel("Score", fontsize=11)
-    ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title("A) Performance over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=10)
+    ax1.legend(fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax1.set_ylim(0.0, 1.0)
 
     for metric, vals, lower, upper, marker, color, label in [
@@ -1124,14 +1138,15 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
             ax2.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
             ax2.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
 
-    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_xlim(0, max_days)
     ax2.set_xticks(np.arange(0, max_days+1, 5))
     ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax2.set_ylabel("Score", fontsize=11)
-    ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_title("B) Performance over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=10)
+    ax2.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax2.set_ylim(0.0, 1.0)
 
     plt.tight_layout()
@@ -1242,7 +1257,7 @@ def plot_prediction_distribution(
             n_pos = len(preds_pos)
             ax.text(
                 i, -0.06, f"n={n_neg}/{n_pos}",
-                ha='center', va='top', fontsize=7, color='gray',
+                ha='center', va='top', fontsize=9, color='gray',
                 transform=ax.get_xaxis_transform(), clip_on=False,
             )
 
@@ -1252,7 +1267,7 @@ def plot_prediction_distribution(
             labels = [f"{int(t)}h" for t, _ in timepoint_pairs]
         else:
             labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
-        ax.set_xticklabels(labels, fontsize=10)
+        ax.set_xticklabels(labels, fontsize=_FIG_STYLE['tick_label'])
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
 
@@ -1262,9 +1277,9 @@ def plot_prediction_distribution(
     if hour_pairs:
         _draw_split_violins(ax1, df, 'time_hours', hour_pairs, 'hours')
 
-    ax1.set_title("A) Prediction Distribution over Hours", fontsize=12, fontweight='bold')
-    ax1.set_ylabel("Predicted Mortality Risk", fontsize=11)
-    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_title("A) Prediction Distribution over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax1.set_ylabel("Predicted Mortality Risk", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_ylim(0, 1.05)
     ax1.set_yticks(np.arange(0, 1.1, 0.1))
     ax1.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
@@ -1276,9 +1291,9 @@ def plot_prediction_distribution(
     if day_pairs:
         _draw_split_violins(ax2, df, 'time_days', day_pairs, 'days')
 
-    ax2.set_title("B) Prediction Distribution over Days", fontsize=12, fontweight='bold')
-    ax2.set_ylabel("Predicted Mortality Risk", fontsize=11)
-    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_title("B) Prediction Distribution over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax2.set_ylabel("Predicted Mortality Risk", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_ylim(0, 1.05)
     ax2.set_yticks(np.arange(0, 1.1, 0.1))
     ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
@@ -1290,7 +1305,9 @@ def plot_prediction_distribution(
         Patch(facecolor=COLOR_NEG, edgecolor='black', alpha=0.7, label='Survived'),
         Patch(facecolor=COLOR_POS, edgecolor='black', alpha=0.7, label='Deceased'),
     ]
-    ax1.legend(handles=legend_elements, loc='upper right', fontsize=10)
+    ax1.legend(handles=legend_elements, loc='upper right', fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     plt.tight_layout()
     plt.subplots_adjust(hspace=0.35)
@@ -1368,26 +1385,28 @@ def plot_multi_percentile_recall(
             ax2.fill_between(x_d, lo_d, hi_d, color=color, alpha=0.15)
 
     # Left panel formatting
-    ax1.set_xlabel("Time (hours)", fontsize=12)
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_xlim(0, cut_hours)
     ax1.set_xticks(np.arange(0, cut_hours + 1, 6 if cut_hours <= 72 else 4))
     ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
     ax1.set_ylim(0.0, 1.0)
-    ax1.set_ylabel("Recall", fontsize=12)
-    ax1.set_title(f"A) High-Risk Recall until {cut_hours}h", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Recall", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title(f"A) High-Risk Recall until {cut_hours}h", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(loc='lower right', fontsize=10)
+    ax1.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     # Right panel formatting
-    ax2.set_xlabel("Time (days)", fontsize=12)
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_xlim(0, max_days)
     ax2.set_xticks(np.arange(0, max_days + 1, 5))
     ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
     ax2.set_ylim(0.0, 1.0)
-    ax2.set_ylabel("Recall", fontsize=12)
-    ax2.set_title(f"B) High-Risk Recall up to {int(max_days)} days", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Recall", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_title(f"B) High-Risk Recall up to {int(max_days)} days", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=10)
+    ax2.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     plt.tight_layout(pad=3.0)
     return fig
@@ -1497,13 +1516,14 @@ def plot_time_metrics_comparison(
         (ax_perf_d, "Time (days)", max_days,
          np.arange(0, max_days + 1, 5), "B) Performance over Days"),
     ]:
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
         ax.set_xticks(xticks)
         ax.set_yticks(np.arange(0.0, 1.1, 0.1))
-        ax.set_ylabel("Score", fontsize=11)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax.set_ylim(0.0, 1.0)
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
@@ -1534,33 +1554,34 @@ def plot_time_metrics_comparison(
                 label=f"{_display_target(target_name)} (active)")
         ax.axhline(y=all_n, color=ALL_COLOR, linestyle=":", linewidth=1.2,
                     label=f"All patients (N={all_n})")
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel("Count", fontsize=11)
+        ax.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
         ax.set_ylim(bottom=0)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
         ax_prev = ax.twinx()
         ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
                      linestyle="--", linewidth=1.5, label="Prevalence (%)")
-        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
         ax_prev.set_ylim(0, 12)
-        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
     # ── Legends ──────────────────────────────────────────────────────────
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     # Position legend in the hspace gap between rows
-    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=2, fontsize=9,
+    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=2, fontsize=_FIG_STYLE['legend'],
                frameon=True, framealpha=0.9,
                bbox_to_anchor=(0.5, 0.52))
 
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
     fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=4, fontsize=9, frameon=True,
+               loc='lower center', ncol=4, fontsize=_FIG_STYLE['legend'], frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
     #plt.subplots_adjust(bottom=0.06, top=0.96)
@@ -1661,19 +1682,20 @@ def plot_trauma_score_comparison(
          np.arange(0, max_days + 1, 5),
          f"B) HNN vs {score_name}{subset_label} — Days"),
     ]:
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
         ax.set_xticks(xticks)
         ax.set_yticks(np.arange(0.0, 1.1, 0.1))
-        ax.set_ylabel("Score", fontsize=11)
-        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax.set_ylim(0.0, 1.0)
 
     # Performance legend — snug below top row (in the hspace gap)
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
     fig.legend(perf_handles, perf_labels, loc='upper center',
-               ncol=2, fontsize=9, frameon=True, framealpha=0.9,
+               ncol=2, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
                bbox_to_anchor=(0.5, 0.52))
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
@@ -1710,19 +1732,20 @@ def plot_trauma_score_comparison(
         ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
         ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
                 label=f"{_display_target(target_name)} (active)")
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel("Count", fontsize=11)
+        ax.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
         ax.set_ylim(bottom=0)
-        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
         ax_prev = ax.twinx()
         ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
                      linestyle="--", linewidth=1.5, label="Prevalence (%)")
-        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
         ax_prev.set_ylim(0, 12)
-        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
@@ -1730,7 +1753,7 @@ def plot_trauma_score_comparison(
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
     fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=3, fontsize=9, frameon=True,
+               loc='lower center', ncol=3, fontsize=_FIG_STYLE['legend'], frameon=True,
                framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
 
     plt.tight_layout()
@@ -1811,20 +1834,21 @@ def plot_delong_comparison(
         # Reference line at 0
         ax.axhline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
 
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel(r"$\Delta$ AUROC (HNN $-$ " + score_name + ")", fontsize=10)
+        ax.set_ylabel(r"$\Delta$ AUROC (HNN $-$ " + score_name + ")", fontsize=_FIG_STYLE['axis_label'])
         ax.set_title(
             f"{title_lbl}) Delta AUROC: HNN vs {score_name}",
-            fontsize=11, fontweight='bold',
+            fontsize=_FIG_STYLE['title'], fontweight='bold',
         )
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     # Legend for top row
     d_handles, d_labels = ax_d_h.get_legend_handles_labels()
     if d_handles:
         fig.legend(d_handles, d_labels, loc='upper center',
-                   ncol=1, fontsize=9, frameon=True, framealpha=0.9,
+                   ncol=1, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
                    bbox_to_anchor=(0.5, 0.53))
 
     # ── Bottom row: -log10(p_adj) trajectory ─────────────────────────────
@@ -1850,21 +1874,22 @@ def plot_delong_comparison(
         ax.axhline(threshold, color='red', linewidth=1.0, linestyle='--',
                     alpha=0.6, label=r"$\alpha$ = 0.05")
 
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel(r"$-\log_{10}(p_{adj})$", fontsize=11)
+        ax.set_ylabel(r"$-\log_{10}(p_{adj})$", fontsize=_FIG_STYLE['axis_label'])
         ax.set_ylim(bottom=0)
         ax.set_title(
             f"{title_lbl}) DeLong p-value (FDR-corrected)",
-            fontsize=11, fontweight='bold',
+            fontsize=_FIG_STYLE['title'], fontweight='bold',
         )
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     # Legend for bottom row
     p_handles, p_labels = ax_p_h.get_legend_handles_labels()
     if p_handles:
         fig.legend(p_handles, p_labels, loc='lower center',
-                   ncol=3, fontsize=9, frameon=True, framealpha=0.9,
+                   ncol=3, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
                    bbox_to_anchor=(0.5, 0.01))
 
     # Summary annotation
@@ -1875,10 +1900,10 @@ def plot_delong_comparison(
     )
     fig.suptitle(
         f"HNN vs {score_name} — Statistical Comparison",
-        fontsize=13, fontweight='bold', y=1.01,
+        fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.01,
     )
     fig.text(0.5, 0.98, summary, ha='center', va='top',
-             fontsize=9, fontstyle='italic', color='#444444')
+             fontsize=_FIG_STYLE['annotation'], fontstyle='italic', color='#444444')
 
     plt.tight_layout(rect=[0, 0.04, 1, 0.97])
     return fig
@@ -1905,7 +1930,7 @@ def plot_n_active_over_time(
     ACTIVE_COLOR = "#2CA02C"  # green
     POSITIVE_COLOR = "#D62728"  # red
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4.5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
     for ax in [ax1, ax2]:
         ax.set_box_aspect(1)
 
@@ -1914,41 +1939,43 @@ def plot_n_active_over_time(
     # Hours panel
     ax1.plot(times_h[mask_cut], n_samples[mask_cut], color=ACTIVE_COLOR, label="Active patients")
     ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
-    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_xlim(0, cut_hours)
-    ax1.set_ylabel("Count", fontsize=11)
+    ax1.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_ylim(bottom=0)
-    ax1.set_title("A) Active Patients over Hours", fontsize=12, fontweight='bold')
+    ax1.set_title("A) Active Patients over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax1.grid(True, alpha=0.3)
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     ax1_prev = ax1.twinx()
     ax1_prev.plot(times_h[mask_cut], prevalence[mask_cut] * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax1_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax1_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
     ax1_prev.set_ylim(0, 12)
-    ax1_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+    ax1_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
 
     # Days panel
     ax2.plot(times_d, n_samples, color=ACTIVE_COLOR, label="Active patients")
     ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
-    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_xlim(0, max_days)
-    ax2.set_ylabel("Count", fontsize=11)
+    ax2.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_ylim(bottom=0)
-    ax2.set_title("B) Active Patients over Days", fontsize=12, fontweight='bold')
+    ax2.set_title("B) Active Patients over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax2.grid(True, alpha=0.3)
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     ax2_prev = ax2.twinx()
     ax2_prev.plot(times_d, prevalence * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax2_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax2_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
     ax2_prev.set_ylim(0, 12)
-    ax2_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+    ax2_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
 
     # Combined legend below
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax1_prev.get_legend_handles_labels()
-    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=9,
+    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=_FIG_STYLE['legend'],
                bbox_to_anchor=(0.5, -0.02))
     plt.tight_layout(rect=[0, 0.06, 1, 1])
     return fig
@@ -1998,21 +2025,23 @@ def _plot_roc_pr_curves_from_arrays(
         ax_pr.plot(recall, precision, color=color, label=f"{label} (AUC={auprc:.3f})", linewidth=2)
 
     ax_roc.plot([0, 1], [0, 1], 'k--', lw=1.5, c="grey", alpha=0.7, label='Chance')
-    ax_roc.set_title("ROC Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_roc.set_xlabel("False Positive Rate", fontsize=11)
-    ax_roc.set_ylabel("True Positive Rate", fontsize=11)
+    ax_roc.set_title("ROC Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax_roc.set_xlabel("False Positive Rate", fontsize=_FIG_STYLE['axis_label'])
+    ax_roc.set_ylabel("True Positive Rate", fontsize=_FIG_STYLE['axis_label'])
     ax_roc.grid(alpha=0.3)
-    ax_roc.legend(fontsize=9, title="Time Available", title_fontsize=10)
+    ax_roc.legend(fontsize=_FIG_STYLE['legend'], title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax_roc.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax_roc.set_aspect('equal', adjustable='box')
 
     if baseline is not None:
         ax_pr.axhline(y=baseline, color='grey', linestyle='--', lw=1.5, alpha=0.7, label=f'Baseline ({baseline:.3f})')
-    ax_pr.set_title("Precision-Recall Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_pr.set_xlabel("Recall", fontsize=11)
-    ax_pr.set_ylabel("Precision", fontsize=11)
+    ax_pr.set_title("Precision-Recall Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax_pr.set_xlabel("Recall", fontsize=_FIG_STYLE['axis_label'])
+    ax_pr.set_ylabel("Precision", fontsize=_FIG_STYLE['axis_label'])
     ax_pr.grid(alpha=0.3)
-    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
-                title="Time Available", title_fontsize=10)
+    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+                title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax_pr.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax_pr.set_aspect('equal', adjustable='box')
 
     fig.subplots_adjust(right=0.82, wspace=0.3)

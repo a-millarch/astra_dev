@@ -28,7 +28,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from astra.utils import cfg, setup_logging
+from astra.utils import cfg, get_cfg, setup_logging
 
 logger = logging.getLogger(__name__)
 from astra.data.caching import prepare_data_and_dls_cached
@@ -44,6 +44,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="ASTRA Training Pipeline v2 (transfer learning + HP search)"
     )
+
+    # Config
+    parser.add_argument("--config", type=str, default="defaults.yaml",
+                        help="Config YAML filename in configs/ dir (default: defaults.yaml)")
 
     # Pipeline stages
     parser.add_argument("--pretrain", action="store_true", default=False,
@@ -136,6 +140,12 @@ def _get_pretrain_cfg() -> MLMConfig:
 def main():
     args = parse_args()
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    # Load config from configs/ dir (always applied, defaults to defaults.yaml)
+    import astra.utils as _utils
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / args.config)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
 
     # ========================================================================
     # Load data (shared across all stages)

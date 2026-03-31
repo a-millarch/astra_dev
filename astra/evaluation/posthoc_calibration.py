@@ -38,6 +38,16 @@ from astra.evaluation.calibration import calculate_ece
 
 logger = logging.getLogger(__name__)
 
+# ── Figure style constants for readability ───────────────────────────────
+_FIG_STYLE = dict(
+    title=16,
+    axis_label=14,
+    tick_label=12,
+    legend=12,
+    annotation=11,
+    suptitle=18,
+)
+
 
 # ============================================================================
 # DATA CLASSES
@@ -595,14 +605,16 @@ def _plot_calibration_metrics_over_time(
                      color=color, linewidth=2, marker='o', markersize=4,
                      label=f'{method.capitalize()} calibrated')
 
-    axes[0].set_ylabel('Expected Calibration Error (ECE)')
-    axes[0].set_title('Calibration Metrics Over Time: Raw vs Calibrated')
-    axes[0].legend()
+    axes[0].set_ylabel('Expected Calibration Error (ECE)', fontsize=_FIG_STYLE['axis_label'])
+    axes[0].set_title('Calibration Metrics Over Time: Raw vs Calibrated', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    axes[0].legend(fontsize=_FIG_STYLE['legend'])
+    axes[0].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].set_xlabel('Time (hours)')
-    axes[1].set_ylabel('Brier Score')
-    axes[1].legend()
+    axes[1].set_xlabel('Time (hours)', fontsize=_FIG_STYLE['axis_label'])
+    axes[1].set_ylabel('Brier Score', fontsize=_FIG_STYLE['axis_label'])
+    axes[1].legend(fontsize=_FIG_STYLE['legend'])
+    axes[1].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -663,18 +675,18 @@ def _plot_reliability_diagrams(
                 pass
 
         ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
-        ax.set_title(format_step_label(step), fontsize=16, fontweight='bold')
+        ax.set_title(format_step_label(step), fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.set_xlim([0, 1])
         ax.set_ylim([0, 1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.2)
-        ax.tick_params(axis='both', labelsize=13)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         if idx == 0:
-            ax.legend(fontsize=13)
+            ax.legend(fontsize=_FIG_STYLE['legend'])
         if row == nrows - 1:
-            ax.set_xlabel('Predicted probability', fontsize=14)
+            ax.set_xlabel('Predicted probability', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
-            ax.set_ylabel('Observed frequency', fontsize=14)
+            ax.set_ylabel('Observed frequency', fontsize=_FIG_STYLE['axis_label'])
 
     # Hide unused axes
     for idx in range(n, nrows * ncols):
@@ -682,7 +694,7 @@ def _plot_reliability_diagrams(
         axes[row, col].set_visible(False)
 
     fig.suptitle(f'Reliability Diagrams: Raw vs {best_method.capitalize()} Calibrated',
-                 fontsize=18, fontweight='bold')
+                 fontsize=_FIG_STYLE['suptitle'], fontweight='bold')
     plt.tight_layout()
     save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir)
     plt.close(fig)
@@ -737,21 +749,22 @@ def _plot_dca_comparison(
             ymax = max(ymax, nb_cal.max() * 1.15 + 0.005)
 
         ax.set_ylim(ymin, ymax)
-        ax.set_title(format_step_label(step), fontsize=11)
+        ax.set_title(format_step_label(step), fontsize=_FIG_STYLE['title'])
         ax.grid(True, alpha=0.2)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         if idx == 0:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=_FIG_STYLE['legend'])
         if row == nrows - 1:
-            ax.set_xlabel('Threshold')
+            ax.set_xlabel('Threshold', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
-            ax.set_ylabel('Net Benefit')
+            ax.set_ylabel('Net Benefit', fontsize=_FIG_STYLE['axis_label'])
 
     for idx in range(n, nrows * ncols):
         row, col = divmod(idx, ncols)
         axes[row, col].set_visible(False)
 
     fig.suptitle(f'Decision Curve Analysis: Raw vs {best_method.capitalize()} Calibrated',
-                 fontsize=14, fontweight='bold')
+                 fontsize=_FIG_STYLE['suptitle'], fontweight='bold')
     plt.tight_layout()
     save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir)
     plt.close(fig)
@@ -819,14 +832,15 @@ def _plot_dca_calibrated(
 
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
     ax.set_title(
         f"Decision Curves (Calibrated — {best_method.capitalize()})",
-        fontsize=13, fontweight='bold',
+        fontsize=_FIG_STYLE['title'], fontweight='bold',
     )
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
-              title="Time Available", title_fontsize=10)
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -870,12 +884,14 @@ def _plot_per_timepoint_vs_global(
     ax.bar(x + width, [r.ece_cal for r in glob], width,
            label='Global', color='#A23B72')
 
-    ax.set_xlabel('Timepoint')
-    ax.set_ylabel('ECE')
-    ax.set_title(f'ECE: Raw vs Per-Timepoint vs Global ({best_method.capitalize()})')
+    ax.set_xlabel('Timepoint', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel('ECE', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title(f'ECE: Raw vs Per-Timepoint vs Global ({best_method.capitalize()})',
+                 fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha='right')
-    ax.legend()
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=_FIG_STYLE['tick_label'])
+    ax.tick_params(axis='y', labelsize=_FIG_STYLE['tick_label'])
+    ax.legend(fontsize=_FIG_STYLE['legend'])
     ax.grid(True, alpha=0.2, axis='y')
 
     plt.tight_layout()

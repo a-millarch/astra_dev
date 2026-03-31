@@ -23,6 +23,16 @@ from astra.evaluation.predictive_performance import (
 
 logger = logging.getLogger(__name__)
 
+# ── Figure style constants for readability ───────────────────────────────
+_FIG_STYLE = dict(
+    title=16,
+    axis_label=14,
+    tick_label=12,
+    legend=12,
+    annotation=11,
+    suptitle=18,
+)
+
 
 def run_eval_with_calibration(
     data, 
@@ -491,18 +501,19 @@ def plot_calibration_curve(
     textstr = f'ECE: {ece:.4f}\nBrier Score: {brier:.4f}\nBins: {n_bins}'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax1.text(
-        0.05, 0.95, 
-        textstr, 
+        0.05, 0.95,
+        textstr,
         transform=ax1.transAxes,
-        fontsize=11,
+        fontsize=_FIG_STYLE['annotation'],
         verticalalignment='top',
         bbox=props
     )
-    
-    ax1.set_xlabel('Mean Predicted Probability', fontsize=12)
-    ax1.set_ylabel('Fraction of Positives (Actual)', fontsize=12)
-    ax1.set_title('Calibration Curve (Reliability Diagram)', fontsize=13, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=10)
+
+    ax1.set_xlabel('Mean Predicted Probability', fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_ylabel('Fraction of Positives (Actual)', fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title('Calibration Curve (Reliability Diagram)', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax1.legend(loc='upper left', fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim([0, 1])
     ax1.set_ylim([0, 1])
@@ -543,16 +554,17 @@ def plot_calibration_curve(
     
     ax2.axvline(mean_pred, color='blue', linestyle=':', linewidth=2, alpha=0.7, label=f'Mean={mean_pred:.3f}')
     
-    ax2.set_xlabel('Predicted Probability', fontsize=12)
-    ax2.set_ylabel('Density', fontsize=12)
-    ax2.set_title('Distribution of Predicted Probabilities', fontsize=13, fontweight='bold')
-    ax2.legend(loc='upper right', fontsize=10)
+    ax2.set_xlabel('Predicted Probability', fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_ylabel('Density', fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_title('Distribution of Predicted Probabilities', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=_FIG_STYLE['legend'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax2.grid(True, alpha=0.3, axis='y')
     ax2.set_xlim([0, 1])
-    
+
     # Overall title
     if title:
-        fig.suptitle(title, fontsize=14, fontweight='bold', y=1.00)
+        fig.suptitle(title, fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.00)
     
     plt.tight_layout()
     
@@ -616,10 +628,11 @@ def plot_calibration_comparison(
             label=f'{name} (ECE={ece:.3f}, Brier={brier:.3f})'
         )
     
-    ax.set_xlabel('Mean Predicted Probability', fontsize=12)
-    ax.set_ylabel('Fraction of Positives', fontsize=12)
-    ax.set_title(title, fontsize=13, fontweight='bold')
-    ax.legend(loc='upper left', fontsize=10)
+    ax.set_xlabel('Mean Predicted Probability', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel('Fraction of Positives', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(loc='upper left', fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
     ax.set_ylim([0, 1])
@@ -708,15 +721,16 @@ def plot_calibration_over_time(
                 alpha=0.8
             )
     
-    ax1.set_xlabel('Mean Predicted Probability', fontsize=12)
-    ax1.set_ylabel('Fraction of Positives', fontsize=12)
-    ax1.set_title('Calibration Curves Over Time', fontsize=13, fontweight='bold')
-    ax1.legend(loc='upper left', fontsize=9, ncol=2)
+    ax1.set_xlabel('Mean Predicted Probability', fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_ylabel('Fraction of Positives', fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title('Calibration Curves Over Time', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax1.legend(loc='upper left', fontsize=_FIG_STYLE['legend'], ncol=2)
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax1.grid(True, alpha=0.3)
     ax1.set_xlim([0, 1])
     ax1.set_ylim([0, 1])
     ax1.set_aspect('equal', adjustable='box')
-    
+
     # =========================================================================
     # RIGHT: ECE over time
     # =========================================================================
@@ -730,10 +744,11 @@ def plot_calibration_over_time(
             color='#2E86AB'
         )
         ax2.set_xticks(range(len(time_labels)))
-        ax2.set_xticklabels(time_labels, rotation=45)
-        ax2.set_xlabel('Time Available', fontsize=12)
-        ax2.set_ylabel('Expected Calibration Error (ECE)', fontsize=12)
-        ax2.set_title('Model Calibration Over Time', fontsize=13, fontweight='bold')
+        ax2.set_xticklabels(time_labels, rotation=45, fontsize=_FIG_STYLE['tick_label'])
+        ax2.set_xlabel('Time Available', fontsize=_FIG_STYLE['axis_label'])
+        ax2.set_ylabel('Expected Calibration Error (ECE)', fontsize=_FIG_STYLE['axis_label'])
+        ax2.set_title('Model Calibration Over Time', fontsize=_FIG_STYLE['title'], fontweight='bold')
+        ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax2.grid(True, alpha=0.3)
         ax2.axhline(0, color='black', linestyle='--', linewidth=1, alpha=0.3)
     
