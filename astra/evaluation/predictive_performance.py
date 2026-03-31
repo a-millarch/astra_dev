@@ -648,7 +648,7 @@ class TimeDependentEvaluator:
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
             os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
-            preds_df.to_pickle(ff'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            preds_df.to_pickle(f'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
             logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
@@ -928,7 +928,7 @@ class TemporalEvaluator:
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
             os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
-            preds_df.to_pickle(ff'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            preds_df.to_pickle(f'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
             logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
@@ -2337,7 +2337,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
             if preds_df is not None:
                 preds_df.to_csv(
-                    ff'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False
+                    f'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False
                 )
 
             fig_time = plot_time_metrics(results, cut_hours=72)
@@ -2367,7 +2367,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 if results_active:
                     if preds_df_active is not None:
                         preds_df_active.to_csv(
-                            ff'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
+                            f'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                         )
                     fig_cmp = plot_time_metrics_comparison(
                         results, results_active, target_name=cfg["target"]
@@ -2527,7 +2527,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         logger.info(f"Evaluated at {len(results)} time points")
 
         os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
-        preds_df.to_csv(ff'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False)
+        preds_df.to_csv(f'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False)
         logger.info(f"Predictions saved to CSV")
 
         logger.info("Creating time-dependent metrics plot...")
@@ -2559,7 +2559,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             if results_active:
                 if preds_df_active is not None:
                     preds_df_active.to_csv(
-                        ff'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
+                        f'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                     )
                 fig_cmp = plot_time_metrics_comparison(
                     results, results_active, target_name=cfg["target"]
