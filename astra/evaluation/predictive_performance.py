@@ -73,6 +73,28 @@ class PercentileRecallResult:
 
 _TARGET_DISPLAY = {"deceased_30d": "30-day Mortality"}
 
+
+def _save_time_metrics_csv(results: List['TimeMetricResult'], path: str) -> None:
+    """Persist a list of TimeMetricResult to CSV for downstream reporting."""
+    rows = []
+    for r in results:
+        rows.append({
+            "censor_step": r.censor_step,
+            "time_min": r.time_min,
+            "time_hours": r.time_hours,
+            "time_days": r.time_days,
+            "auroc": r.auroc,
+            "auroc_ci_lower": r.auroc_ci[0],
+            "auroc_ci_upper": r.auroc_ci[1],
+            "auprc": r.auprc,
+            "auprc_ci_lower": r.auprc_ci[0],
+            "auprc_ci_upper": r.auprc_ci[1],
+            "n_samples": r.n_samples,
+            "n_positive": r.n_positive,
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+    logger.info(f"Time metrics saved to {path}")
+
 def _display_target(name: str) -> str:
     return _TARGET_DISPLAY.get(name, name)
 
@@ -2370,6 +2392,9 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 preds_df.to_csv(
                     f'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False
                 )
+            _save_time_metrics_csv(
+                results, f'reports/eval/{model_name}/predictions/time_metrics_{model_name}.csv'
+            )
 
             fig_time = plot_time_metrics(results, cut_hours=72)
             save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
@@ -2400,6 +2425,9 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         preds_df_active.to_csv(
                             f'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                         )
+                    _save_time_metrics_csv(
+                        results_active, f'reports/eval/{model_name}/predictions/time_metrics_{model_name}_active.csv'
+                    )
                     fig_cmp = plot_time_metrics_comparison(
                         results, results_active, target_name=cfg["target"]
                     )
