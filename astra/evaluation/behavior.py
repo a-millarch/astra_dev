@@ -4970,6 +4970,54 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
     summary.to_csv(f'{save_dir}/cohort_temporal_shap_summary{suffix}.csv',
                    index=False)
 
+    # Save full results: pickle + all-features CSV
+    import pickle
+    pickle_path = f'{save_dir}/cohort_temporal_shap_results{suffix}.pkl'
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(results, f)
+    logger.info(f"Full results saved to {pickle_path}")
+
+    # Detailed CSV: all features x timeframes (mean |SHAP| ± std)
+    detail_rows = []
+    for tf in results.get_available_timeframes():
+        ch_imp = results.channel_importance[tf]
+        ch_std = results.channel_importance_std[tf]
+        for i in range(len(ch_imp)):
+            detail_rows.append({
+                'timeframe': tf,
+                'channel_idx': i,
+                'feature': results.channel2feature.get(int(i), f'Ch{i}'),
+                'mean_abs_shap': ch_imp[i],
+                'std_abs_shap': ch_std[i],
+                'n_patients': results.patient_counts[tf],
+            })
+        # Static categorical features
+        cat_imp = results.static_cat_importance.get(tf)
+        if cat_imp is not None:
+            for j, name in enumerate(results.static_cat_names):
+                if j < len(cat_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cat:{name}',
+                        'mean_abs_shap': cat_imp[j], 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        # Static continuous features
+        cont_imp = results.static_cont_importance.get(tf)
+        if cont_imp is not None:
+            for j, name in enumerate(results.static_cont_names):
+                if j < len(cont_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cont:{name}',
+                        'mean_abs_shap': cont_imp[j], 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+    detail_df = pd.DataFrame(detail_rows)
+    detail_path = f'{save_dir}/cohort_shap_all_features{suffix}.csv'
+    detail_df.to_csv(detail_path, index=False)
+    logger.info(f"All-features SHAP saved to {detail_path}")
+
     if verbose:
         logger.info(f"\n{'='*60}\nCOHORT TEMPORAL SHAP SUMMARY (n={results.n_patients})"
                     f"\n{'='*60}")
