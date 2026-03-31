@@ -4539,10 +4539,10 @@ class TemporalSHAPAnalyzer:
             ts_shap_mean[tf] = np.mean(
                 [np.abs(r.ts_shap) for r in tf_results], axis=0)
 
-            # Static features
-            cat_shaps = [np.abs(r.cat_shap) for r in tf_results
+            # Static features (squeeze trailing singleton class dim if present)
+            cat_shaps = [np.abs(r.cat_shap).squeeze() for r in tf_results
                          if r.cat_shap is not None]
-            cont_shaps = [np.abs(r.cont_shap) for r in tf_results
+            cont_shaps = [np.abs(r.cont_shap).squeeze() for r in tf_results
                           if r.cont_shap is not None]
             static_cat_importance[tf] = (
                 np.mean(cat_shaps, axis=0) if cat_shaps else None)
