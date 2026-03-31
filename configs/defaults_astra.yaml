@@ -92,7 +92,8 @@ concepts:
   #- Procedurer
   - ADTHaendelser
   - EWS
-  - ISS
+  - ISS_notes
+  - ISS_computed
   - Events
   #- IndUd
   #- ITARespirator
@@ -358,7 +359,9 @@ agg_func: #also for datasets, split it up
       - max
   EWS:
       - max
-  ISS:
+  ISS_notes:
+      - max
+  ISS_computed:
       - max
   Events:
       - max
@@ -372,7 +375,8 @@ npartitions:
   Labsvar: 4
   Medicin: 4
   EWS: 1
-  ISS: 1
+  ISS_notes: 1
+  ISS_computed: 1
   Events: 1
 
 mapping:
@@ -404,7 +408,9 @@ drop_features:
     - AMB
   EWS:
     - nan
-  ISS:
+  ISS_notes:
+    - nan
+  ISS_computed:
     - nan
   Events:
     - nan

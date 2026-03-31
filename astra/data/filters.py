@@ -380,12 +380,13 @@ def filter_ews(ews):
     return ews[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 
-def filter_iss(df):
-    """Filter for ISS (Injury Severity Score from notes).
+def filter_iss_notes(df):
+    """Filter for ISS_notes (Injury Severity Score from clinical notes)."""
+    return df
 
-    Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE],
-    so no additional mapping needed.
-    """
+
+def filter_iss_computed(df):
+    """Filter for ISS_computed (R-computed ISS from ICD-10 diagnosis codes)."""
     return df
 
 
@@ -576,7 +577,8 @@ def collect_filter(concept: str):
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
         "EWS": filter_ews,
-        "ISS": filter_iss,
+        "ISS_notes": filter_iss_notes,
+        "ISS_computed": filter_iss_computed,
         "Events": filter_events,
     }
 

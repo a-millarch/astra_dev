@@ -321,18 +321,21 @@ def _prepare_long_df(base: pd.DataFrame) -> None:
 
 
 def add_iss_to_df(base: pd.DataFrame) -> pd.DataFrame:
-    """Add ISS columns to base_df from combined ISS concept (notes + R-computed)
+    """Add ISS columns to base_df from ISS_notes and ISS_computed concept pickles
     and R-computed auxiliary columns (maxais, niss, mechmaj).
 
-    ISS.pkl contains the merged max ISS per patient from both notes extraction
-    and R-computed ICD-10 codes (built by make_data._save_notater_derived_concepts).
+    For TRISS evaluation, take the max ISS per patient across both sources.
     """
     from astra.utils import is_file_present
 
-    # Primary ISS source: combined pickle (notes + R-computed, merged in make_data)
-    iss_pkl_path = "data/interim/concepts/ISS.pkl"
-    if os.path.exists(iss_pkl_path):
-        iss_combined = pd.read_pickle(iss_pkl_path)
+    # Load both ISS sources and take max per PID for TRISS evaluation
+    iss_frames = []
+    for pkl_name in ("ISS_notes.pkl", "ISS_computed.pkl"):
+        pkl_path = f"data/interim/concepts/{pkl_name}"
+        if os.path.exists(pkl_path):
+            iss_frames.append(pd.read_pickle(pkl_path))
+    if iss_frames:
+        iss_combined = pd.concat(iss_frames, ignore_index=True)
         iss_seq = (
             iss_combined.groupby("PID")["VALUE"]
             .max()
@@ -340,10 +343,10 @@ def add_iss_to_df(base: pd.DataFrame) -> pd.DataFrame:
             .rename(columns={"VALUE": "riss"})
         )
         base = base.merge(iss_seq, how="left", on="PID")
-        logger.info(f"Merged combined ISS (notes + R-computed): {len(iss_seq)} patients")
+        logger.info(f"Merged ISS (notes + R-computed): {len(iss_seq)} patients")
     else:
         base["riss"] = np.nan
-        logger.warning("ISS.pkl not found — no ISS data available")
+        logger.warning("ISS_notes.pkl and ISS_computed.pkl not found — no ISS data available")
 
     # Auxiliary R-computed columns (maxais, niss, mechmaj) for TRISS mechanism
     iss_r_path = "data/interim/computed_iss_df.csv"

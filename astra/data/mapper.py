@@ -203,7 +203,7 @@ def map_concept(
 
     
     # Notater-derived concepts must use map_concept_optimized
-    _NOTATER_DERIVED = {"ISS", "Events"}
+    _NOTATER_DERIVED = {"ISS_notes", "ISS_computed", "Events"}
     if concept in _NOTATER_DERIVED:
         raise ValueError(
             f"'{concept}' is derived from Notater.pkl. Use map_concept_optimized() instead."
@@ -892,7 +892,7 @@ def map_concept_optimized(
     filter_function = collect_filter(concept)
 
     # Load Notater.pkl once for concepts that need it
-    notes_concepts = ("ITAOversigtsrapport", "ISS", "Events")
+    notes_concepts = ("ITAOversigtsrapport", "ISS_notes", "ISS_computed", "Events")
     notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl") if concept in notes_concepts else None
 
     # Cross-concept augmentation
@@ -907,11 +907,10 @@ def map_concept_optimized(
         gcs_df = build_gcs_from_notes(notater_df)
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
-    elif concept == "ISS":
-        # Load pre-built combined ISS (notes + R-computed) from make_data pipeline
-        iss_pkl = "data/interim/concepts/ISS.pkl"
+    elif concept in ("ISS_notes", "ISS_computed"):
+        iss_pkl = f"data/interim/concepts/{concept}.pkl"
         concept_df = pd.read_pickle(iss_pkl)
-        logger.info(f"Loaded ISS (notes + R-computed): {len(concept_df)} rows")
+        logger.info(f"Loaded {concept}: {len(concept_df)} rows")
         concept_df = filter_function(concept_df)
     elif concept == "Events":
         from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes

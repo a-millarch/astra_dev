@@ -171,7 +171,7 @@ def _build_r_iss(base: pd.DataFrame) -> pd.DataFrame:
 
     # Join ISS values with timestamps
     result = iss_r[["PID", "iss_value"]].merge(max_diag_date, on="PID", how="inner")
-    result["FEATURE"] = "ISS"
+    result["FEATURE"] = "ISS_computed"
     result = result.rename(columns={"iss_value": "VALUE"})
     result = result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
@@ -183,12 +183,12 @@ def _build_r_iss(base: pd.DataFrame) -> pd.DataFrame:
 
 
 def _save_notater_derived_concepts(cfg, base: pd.DataFrame):
-    """Extract ISS/Events from Notater.pkl (+ R-computed ISS) and save as concept pickles.
+    """Extract ISS_notes/ISS_computed/Events and save as concept pickles.
 
-    These concepts are derived from clinical notes rather than having their own
-    raw CSVs, so filter_subsets_inhospital() does not create them.  Saving them
-    as standard concept pickles makes all downstream consumers (AggregatedDS,
-    inference) work without special-casing.
+    These concepts are derived from clinical notes or computed from diagnosis
+    codes rather than having their own raw CSVs, so filter_subsets_inhospital()
+    does not create them.  Saving them as standard concept pickles makes all
+    downstream consumers (AggregatedDS, inference) work without special-casing.
     """
     notater_path = "data/interim/concepts/Notater.pkl"
     if not os.path.exists(notater_path):
@@ -198,35 +198,21 @@ def _save_notater_derived_concepts(cfg, base: pd.DataFrame):
     notater_df = pd.read_pickle(notater_path)
     bin_df = pd.read_pickle(cfg["bin_df_path"])
 
-    if "ISS" in cfg["concepts"]:
+    if "ISS_notes" in cfg["concepts"]:
         from astra.data.notes_features import build_iss_from_notes
 
-        # Source 1: Notes-extracted ISS
         iss_notes = build_iss_from_notes(notater_df)
         n_notes = iss_notes["PID"].nunique() if len(iss_notes) else 0
+        ensure_parent_dir("data/interim/concepts/ISS_notes.pkl")
+        iss_notes.to_pickle("data/interim/concepts/ISS_notes.pkl", protocol=4)
+        logger.info(f"Saved ISS_notes: {len(iss_notes)} rows, {n_notes} patients")
 
-        # Source 2: R-computed ISS from ICD-10 diagnosis codes
+    if "ISS_computed" in cfg["concepts"]:
         iss_r = _build_r_iss(base)
         n_r = iss_r["PID"].nunique() if len(iss_r) else 0
-
-        # Merge: per PID keep the max VALUE; if tied prefer earlier TIMESTAMP
-        iss_df = pd.concat([iss_notes, iss_r], ignore_index=True)
-        if len(iss_df):
-            iss_df = iss_df.sort_values(
-                ["PID", "VALUE", "TIMESTAMP"],
-                ascending=[True, False, True],
-            )
-            iss_df = iss_df.drop_duplicates(subset=["PID"], keep="first").reset_index(drop=True)
-
-        n_combined = iss_df["PID"].nunique() if len(iss_df) else 0
-        logger.info(
-            f"ISS sources: {n_notes} from notes, {n_r} from R-computed, "
-            f"{n_combined} combined unique patients"
-        )
-
-        ensure_parent_dir("data/interim/concepts/ISS.pkl")
-        iss_df.to_pickle("data/interim/concepts/ISS.pkl", protocol=4)
-        logger.info(f"Saved ISS concept: {len(iss_df)} rows, {n_combined} patients")
+        ensure_parent_dir("data/interim/concepts/ISS_computed.pkl")
+        iss_r.to_pickle("data/interim/concepts/ISS_computed.pkl", protocol=4)
+        logger.info(f"Saved ISS_computed: {len(iss_r)} rows, {n_r} patients")
 
     if "Events" in cfg["concepts"]:
         from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
@@ -312,7 +298,10 @@ if __name__ =='__main__':
 
     map_data_optimized(cfg, overwrite=overwrite)
 
-    # Forward-fill ISS (semi-static feature)
-    _forward_fill_concept(cfg, "ISS")
+    # Forward-fill ISS channels (semi-static features)
+    if "ISS_notes" in cfg["concepts"]:
+        _forward_fill_concept(cfg, "ISS_notes")
+    if "ISS_computed" in cfg["concepts"]:
+        _forward_fill_concept(cfg, "ISS_computed")
   
     data = prepare_data_and_dls_cached(cfg)

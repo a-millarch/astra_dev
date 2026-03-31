@@ -123,13 +123,10 @@ def save_data_cache(data, cfg, cache_dir='data/cache'):
         'seq_len': data['seq_len'],
         'ts_cat_dims': data['ts_cat_dims'],
 
-        # Config snapshot for validation
+        # Config
+        'cfg': dict(cfg),
         '_cache_key': cache_key,
         '_cache_version': _CACHE_VERSION,
-        '_cfg_snapshot': {
-            'target': cfg.get('target'),
-            'holdout_split_date': cfg.get('holdout_split_date'),
-        }
     }
 
     with open(cache_path, 'wb') as f:
@@ -240,6 +237,7 @@ def load_data_cache(cfg, cache_dir='data/cache'):
         "c_in": cache_data['c_in'],
         "seq_len": cache_data['seq_len'],
         "ts_cat_dims": cache_data['ts_cat_dims'],
+        "cfg": cache_data.get('cfg'),
     }
 
     logger.info("Data loaded from cache successfully")

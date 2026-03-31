@@ -440,7 +440,7 @@ class AggregatedDS:
         than having their own raw CSVs, so they are built on-the-fly here.
         """
         # Notater-derived concepts: build from clinical notes
-        _NOTATER_DERIVED = {"ISS", "Events"}
+        _NOTATER_DERIVED = {"ISS_notes", "ISS_computed", "Events"}
         if concept in _NOTATER_DERIVED:
             return self._build_notater_derived_concept(concept)
 
@@ -490,13 +490,12 @@ class AggregatedDS:
         For ISS: try pre-built pickle (which may include R-computed sources),
         fall back to rebuilding from Notater if not available.
         """
-        if concept == "ISS":
-            # Load pre-built combined ISS (notes + R-computed) from make_data pipeline
-            iss_pkl = "data/interim/concepts/ISS.pkl"
+        if concept in ("ISS_notes", "ISS_computed"):
+            iss_pkl = f"data/interim/concepts/{concept}.pkl"
             filtered_df = pd.read_pickle(iss_pkl)
             if 'PID' in filtered_df.columns:
                 filtered_df = filtered_df[filtered_df['PID'].isin(self._base_pids)]
-            logger.debug(f"Loaded ISS (notes + R-computed): {len(filtered_df)} rows")
+            logger.debug(f"Loaded {concept}: {len(filtered_df)} rows")
         elif concept == "Events":
             # For Events, rebuild from Notater
             notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl")
