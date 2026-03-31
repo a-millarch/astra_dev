@@ -9,7 +9,7 @@ from matplotlib.colors import TwoSlopeNorm, ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 import seaborn as sns
 from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from scipy import stats
 import shap
 from collections import OrderedDict
@@ -3067,6 +3067,9 @@ class CohortTemporalSHAPResults:
     encoding_info: Dict
     active_only: bool = False
     density_normalize: bool = False
+    # Categorical TS per-category importance (optional)
+    cat_ts_per_category_importance: Dict[str, Optional[np.ndarray]] = field(default_factory=dict)  # tf -> [n_categories]
+    cat_ts_category_names: List[str] = field(default_factory=list)
     # Individual patient results (optional, for deep-dive)
     patient_results: Optional[List[TemporalSHAPResults]] = None
 
@@ -4546,6 +4549,24 @@ class TemporalSHAPAnalyzer:
             static_cont_importance[tf] = (
                 np.mean(cont_shaps, axis=0) if cont_shaps else None)
 
+        # Categorical TS per-category importance
+        cat_ts_per_category_importance = OrderedDict()
+        cat_ts_category_names = get_category_names_from_encoding_info(self.encoding_info) if self.encoding_info else []
+        for tf in ordered_tfs:
+            tf_results = tf_collections[tf]
+            cat_ts_arrays = []
+            for r in tf_results:
+                if r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
+                    arr = r.cat_ts_shap_per_category
+                    if arr.ndim == 2:
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))  # [n_cats, seq_len] -> [n_cats]
+                    elif arr.ndim == 1:
+                        cat_ts_arrays.append(np.abs(arr))
+                    elif arr.ndim == 3:
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=(1, 2)))
+            cat_ts_per_category_importance[tf] = (
+                np.mean(cat_ts_arrays, axis=0) if cat_ts_arrays else None)
+
         return CohortTemporalSHAPResults(
             n_patients=len(patient_results),
             pids=[pr.pid for pr in patient_results],
@@ -4563,6 +4584,8 @@ class TemporalSHAPAnalyzer:
             encoding_info=self.encoding_info,
             active_only=self.active_only,
             density_normalize=self.density_normalize,
+            cat_ts_per_category_importance=cat_ts_per_category_importance,
+            cat_ts_category_names=cat_ts_category_names,
             patient_results=patient_results,
         )
 
@@ -5014,6 +5037,17 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                         'timeframe': tf, 'channel_idx': None,
                         'feature': f'static_cont:{name}',
                         'mean_abs_shap': cont_imp[j], 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        # Categorical TS per-category features
+        cat_ts_imp = results.cat_ts_per_category_importance.get(tf)
+        if cat_ts_imp is not None:
+            for j, name in enumerate(results.cat_ts_category_names):
+                if j < len(cat_ts_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'cat_ts:{name}',
+                        'mean_abs_shap': cat_ts_imp[j], 'std_abs_shap': None,
                         'n_patients': results.patient_counts[tf],
                     })
     detail_df = pd.DataFrame(detail_rows)

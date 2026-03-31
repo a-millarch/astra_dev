@@ -783,6 +783,371 @@ def figure_e_categorical_ts(
 
 
 # ============================================================================
+# Figure F: Summary Panel (paper-quality version of visualize_shap_summary)
+# ============================================================================
+
+# Channels to exclude from clinical display (temporal/auxiliary)
+_EXCLUDED_CHANNELS = {'elapsed_hours', 'bin_width_hours', '_data_present'}
+_EBM_CHANNEL_NAMES = {'_ebm_pred'}
+
+# Canonical timeframe order (excluding 'full')
+_TF_ORDER = ['1H', '6H', '12H', '1D', '3D', '7D', '14D', '30D']
+
+RC_PARAMS_SUMMARY = {
+    'font.size': 13,
+    'axes.labelsize': 14,
+    'axes.titlesize': 15,
+    'xtick.labelsize': 11,
+    'ytick.labelsize': 11,
+    'legend.fontsize': 11,
+    'figure.dpi': 300,
+}
+
+
+def _add_subplot_label(ax, label, fontsize=18):
+    """Add a bold subplot label (A, B, C, ...) to top-left of axes."""
+    ax.text(-0.08, 1.05, label, transform=ax.transAxes,
+            fontsize=fontsize, fontweight='bold', va='top', ha='right')
+
+
+def _load_csv_data(csv_path: str) -> dict:
+    """Load and parse cohort_shap_all_features CSV into structured dicts.
+
+    Returns dict with keys:
+        temporal: DataFrame of temporal channel rows
+        static_cat: DataFrame of static categorical rows
+        static_cont: DataFrame of static continuous rows
+        cat_ts: DataFrame of categorical TS rows
+        channel2feature: {channel_idx: feature_name}
+        timeframes: ordered list of available timeframes (excluding 'full')
+    """
+    df = pd.read_csv(csv_path)
+
+    # Split by feature prefix
+    temporal = df[~df['feature'].str.startswith(('static_cat:', 'static_cont:', 'cat_ts:'))].copy()
+    static_cat = df[df['feature'].str.startswith('static_cat:')].copy()
+    static_cont = df[df['feature'].str.startswith('static_cont:')].copy()
+    cat_ts = df[df['feature'].str.startswith('cat_ts:')].copy()
+
+    # Strip prefixes for display names
+    static_cat['display_name'] = static_cat['feature'].str.replace('static_cat:', '', n=1)
+    static_cont['display_name'] = static_cont['feature'].str.replace('static_cont:', '', n=1)
+    cat_ts['display_name'] = cat_ts['feature'].str.replace('cat_ts:', '', n=1)
+
+    # Build channel2feature from temporal rows
+    ch2feat = {}
+    for _, row in temporal.drop_duplicates('channel_idx').iterrows():
+        if pd.notna(row['channel_idx']):
+            ch2feat[int(row['channel_idx'])] = row['feature']
+
+    # Available timeframes in canonical order, excluding 'full'
+    available = set(df['timeframe'].unique())
+    timeframes = [tf for tf in _TF_ORDER if tf in available]
+
+    return {
+        'temporal': temporal,
+        'static_cat': static_cat,
+        'static_cont': static_cont,
+        'cat_ts': cat_ts,
+        'channel2feature': ch2feat,
+        'timeframes': timeframes,
+    }
+
+
+def _load_cat_ts_from_pickle(pickle_path: str, timeframes: list) -> Optional[pd.DataFrame]:
+    """Fallback: aggregate categorical TS per-category data from pickle."""
+    import pickle as pkl
+    with open(pickle_path, 'rb') as f:
+        results = pkl.load(f)
+
+    # Try the new aggregated field first
+    if hasattr(results, 'cat_ts_per_category_importance') and results.cat_ts_per_category_importance:
+        cat_names = getattr(results, 'cat_ts_category_names', [])
+        if not cat_names and results.encoding_info:
+            cat_names = get_category_names_from_encoding_info(results.encoding_info)
+
+        rows = []
+        for tf in timeframes:
+            imp = results.cat_ts_per_category_importance.get(tf)
+            if imp is not None:
+                for j, name in enumerate(cat_names):
+                    if j < len(imp):
+                        rows.append({
+                            'timeframe': tf, 'feature': f'cat_ts:{name}',
+                            'display_name': name, 'mean_abs_shap': imp[j],
+                        })
+        if rows:
+            return pd.DataFrame(rows)
+
+    # Fallback: aggregate from patient_results
+    if results.patient_results:
+        cat_names = get_category_names_from_encoding_info(results.encoding_info) if results.encoding_info else []
+        rows = []
+        for tf in timeframes:
+            cat_arrays = []
+            for pr in results.patient_results:
+                norm_tf = 'full' if tf.startswith('max(') else tf
+                tfr = pr.timeframe_results.get(norm_tf) or pr.timeframe_results.get(tf)
+                if tfr and tfr.cat_ts_shap_per_category is not None and tfr.cat_ts_shap_per_category.size > 0:
+                    arr = tfr.cat_ts_shap_per_category
+                    if arr.ndim == 2:
+                        cat_arrays.append(np.abs(arr).mean(axis=1))
+                    elif arr.ndim == 1:
+                        cat_arrays.append(np.abs(arr))
+            if cat_arrays:
+                mean_imp = np.mean(cat_arrays, axis=0)
+                for j, name in enumerate(cat_names):
+                    if j < len(mean_imp):
+                        rows.append({
+                            'timeframe': tf, 'feature': f'cat_ts:{name}',
+                            'display_name': name, 'mean_abs_shap': mean_imp[j],
+                        })
+        if rows:
+            return pd.DataFrame(rows)
+
+    return None
+
+
+def figure_shap_summary_panel(
+    csv_path: str,
+    save_dir: str,
+    pickle_path: Optional[str] = None,
+    max_display: int = 20,
+) -> None:
+    """Paper-quality 3x2 SHAP summary panel from saved CSV data.
+
+    Produces a figure similar to ``visualize_shap_summary`` but with:
+    - Active-only temporal SHAP evaluation data
+    - Larger text for paper readability
+    - Subplot labels (A-F)
+    - Symmetric 3x2 layout (all panels half-width)
+
+    Args:
+        csv_path: Path to cohort_shap_all_features*.csv
+        save_dir: Output directory for PNG and PDF
+        pickle_path: Optional path to cohort_temporal_shap_results*.pkl
+            (used as fallback for categorical TS data if not in CSV)
+        max_display: Maximum features to show in bar charts and heatmaps
+    """
+    plt.style.use(FIGSTYLE)
+    plt.rcParams.update(RC_PARAMS_SUMMARY)
+
+    data = _load_csv_data(csv_path)
+    temporal = data['temporal']
+    static_cat = data['static_cat']
+    static_cont = data['static_cont']
+    cat_ts = data['cat_ts']
+    ch2feat = data['channel2feature']
+    timeframes = data['timeframes']
+
+    if not timeframes:
+        logger.error("No valid timeframes found in CSV")
+        return
+
+    # If no cat_ts data in CSV, try pickle fallback
+    if len(cat_ts) == 0 and pickle_path and os.path.exists(pickle_path):
+        logger.info("No cat_ts data in CSV, loading from pickle...")
+        cat_ts_fallback = _load_cat_ts_from_pickle(pickle_path, timeframes)
+        if cat_ts_fallback is not None:
+            cat_ts = cat_ts_fallback
+
+    # Filter out excluded/auxiliary channels from temporal data
+    clinical_temporal = temporal[
+        ~temporal['feature'].isin(_EXCLUDED_CHANNELS | _EBM_CHANNEL_NAMES)
+    ]
+
+    # ========================================================================
+    # Figure setup: 3x2 grid
+    # ========================================================================
+    fig = plt.figure(figsize=(20, 16))
+    gs = fig.add_gridspec(3, 2, hspace=0.40, wspace=0.30,
+                          height_ratios=[1, 1.2, 1])
+
+    # ========================================================================
+    # Panel A: Feature Importance Over Time (line plot)
+    # ========================================================================
+    ax_a = fig.add_subplot(gs[0, 0])
+    _add_subplot_label(ax_a, 'A')
+
+    # Aggregate mean |SHAP| across all clinical channels per timeframe
+    cont_ts_by_tf = []
+    for tf in timeframes:
+        tf_data = clinical_temporal[clinical_temporal['timeframe'] == tf]
+        cont_ts_by_tf.append(tf_data['mean_abs_shap'].mean() if len(tf_data) > 0 else 0.0)
+
+    ax_a.plot(range(len(timeframes)), cont_ts_by_tf, linewidth=2.5,
+              color='#ff0051', marker='o', markersize=6, label='Continuous TS')
+    ax_a.fill_between(range(len(timeframes)), cont_ts_by_tf, alpha=0.2, color='#ff0051')
+
+    # Categorical TS line (if data available)
+    if len(cat_ts) > 0:
+        cat_ts_by_tf = []
+        for tf in timeframes:
+            tf_data = cat_ts[cat_ts['timeframe'] == tf]
+            cat_ts_by_tf.append(tf_data['mean_abs_shap'].mean() if len(tf_data) > 0 else 0.0)
+        ax_a.plot(range(len(timeframes)), cat_ts_by_tf, linewidth=2.5,
+                  color='#00d4aa', marker='s', markersize=5, label='Categorical TS',
+                  linestyle='--')
+        ax_a.fill_between(range(len(timeframes)), cat_ts_by_tf, alpha=0.15, color='#00d4aa')
+
+    ax_a.set_xticks(range(len(timeframes)))
+    ax_a.set_xticklabels(timeframes, rotation=45, ha='right')
+    ax_a.set_xlabel('Timeframe')
+    ax_a.set_ylabel('Mean |SHAP|')
+    ax_a.set_title('Feature Importance Over Time', fontweight='bold')
+    ax_a.legend()
+    ax_a.grid(True, alpha=0.3)
+
+    # ========================================================================
+    # Panel B: Top N Channels (bar chart)
+    # ========================================================================
+    ax_b = fig.add_subplot(gs[0, 1])
+    _add_subplot_label(ax_b, 'B')
+
+    # Average importance across timeframes per channel
+    channel_avg = (clinical_temporal
+                   .groupby('feature')['mean_abs_shap']
+                   .mean()
+                   .sort_values(ascending=False)
+                   .head(max_display))
+
+    # Color: EBM channels orange, clinical blue
+    bar_colors = []
+    for feat in channel_avg.index:
+        if feat in _EBM_CHANNEL_NAMES:
+            bar_colors.append('#FF9800')
+        else:
+            bar_colors.append('#008bfb')
+
+    y_pos = range(len(channel_avg))
+    ax_b.barh(y_pos, channel_avg.values, color=bar_colors, alpha=0.7)
+    ax_b.set_yticks(y_pos)
+    ax_b.set_yticklabels(channel_avg.index)
+    ax_b.set_xlabel('Mean |SHAP|')
+    ax_b.set_title(f'Top {len(channel_avg)} Channels (per-measurement)', fontweight='bold')
+    ax_b.grid(True, alpha=0.3, axis='x')
+    ax_b.invert_yaxis()
+
+    # ========================================================================
+    # Panel C: Categorical TS |SHAP| Heatmap
+    # ========================================================================
+    ax_c = fig.add_subplot(gs[1, 0])
+    _add_subplot_label(ax_c, 'C')
+
+    if len(cat_ts) > 0:
+        # Build matrix: categories x timeframes
+        cat_names_all = cat_ts['display_name'].unique()
+        # Average importance across timeframes, pick top N
+        cat_avg = (cat_ts
+                   .groupby('display_name')['mean_abs_shap']
+                   .mean()
+                   .sort_values(ascending=False))
+        top_cats = cat_avg.head(max_display).index.tolist()
+
+        cat_matrix = np.zeros((len(top_cats), len(timeframes)))
+        for col_idx, tf in enumerate(timeframes):
+            tf_data = cat_ts[cat_ts['timeframe'] == tf]
+            for row_idx, cat_name in enumerate(top_cats):
+                match = tf_data[tf_data['display_name'] == cat_name]
+                if len(match) > 0:
+                    cat_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
+
+        df_heat_c = pd.DataFrame(cat_matrix, index=top_cats, columns=timeframes)
+        sns.heatmap(df_heat_c, annot=True, fmt='.4f', cmap='YlOrRd', ax=ax_c,
+                    linewidths=0.5, linecolor='white',
+                    cbar_kws={'shrink': 0.8, 'label': 'Mean |SHAP|'},
+                    annot_kws={'fontsize': 8})
+        ax_c.set_ylabel('')
+        ax_c.set_xlabel('Timeframe')
+        ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
+        ax_c.tick_params(axis='y', labelsize=9)
+    else:
+        ax_c.text(0.5, 0.5, 'No categorical TS data available',
+                  ha='center', va='center', transform=ax_c.transAxes, fontsize=12)
+        ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
+
+    # ========================================================================
+    # Panel D: Continuous TS |SHAP| Heatmap
+    # ========================================================================
+    ax_d = fig.add_subplot(gs[1, 1])
+    _add_subplot_label(ax_d, 'D')
+
+    # Build matrix: channels x timeframes (top N by overall importance)
+    top_channels = channel_avg.head(max_display).index.tolist()
+
+    cont_matrix = np.zeros((len(top_channels), len(timeframes)))
+    for col_idx, tf in enumerate(timeframes):
+        tf_data = clinical_temporal[clinical_temporal['timeframe'] == tf]
+        for row_idx, ch_name in enumerate(top_channels):
+            match = tf_data[tf_data['feature'] == ch_name]
+            if len(match) > 0:
+                cont_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
+
+    df_heat_d = pd.DataFrame(cont_matrix, index=top_channels, columns=timeframes)
+    sns.heatmap(df_heat_d, annot=True, fmt='.4f', cmap='YlOrRd', ax=ax_d,
+                linewidths=0.5, linecolor='white',
+                cbar_kws={'shrink': 0.8, 'label': 'Mean |SHAP|'},
+                annot_kws={'fontsize': 8})
+    ax_d.set_ylabel('')
+    ax_d.set_xlabel('Timeframe')
+    ax_d.set_title('Continuous TS |SHAP| (per-measurement)', fontweight='bold')
+    ax_d.tick_params(axis='y', labelsize=9)
+
+    # ========================================================================
+    # Panel E: Static Categorical
+    # ========================================================================
+    ax_e = fig.add_subplot(gs[2, 0])
+    _add_subplot_label(ax_e, 'E')
+
+    if len(static_cat) > 0:
+        cat_avg_static = (static_cat
+                          .groupby('display_name')['mean_abs_shap']
+                          .mean()
+                          .sort_values(ascending=False)
+                          .head(max_display))
+        y_pos_e = range(len(cat_avg_static))
+        ax_e.barh(y_pos_e, cat_avg_static.values, color='#ff0051', alpha=0.7)
+        ax_e.set_yticks(y_pos_e)
+        ax_e.set_yticklabels(cat_avg_static.index)
+        ax_e.set_xlabel('Mean |SHAP|')
+        ax_e.grid(True, alpha=0.3, axis='x')
+        ax_e.invert_yaxis()
+    ax_e.set_title('Static Categorical', fontweight='bold')
+
+    # ========================================================================
+    # Panel F: Static Continuous
+    # ========================================================================
+    ax_f = fig.add_subplot(gs[2, 1])
+    _add_subplot_label(ax_f, 'F')
+
+    if len(static_cont) > 0:
+        cont_avg_static = (static_cont
+                           .groupby('display_name')['mean_abs_shap']
+                           .mean()
+                           .sort_values(ascending=False)
+                           .head(max_display))
+        y_pos_f = range(len(cont_avg_static))
+        ax_f.barh(y_pos_f, cont_avg_static.values, color='#008bfb', alpha=0.7)
+        ax_f.set_yticks(y_pos_f)
+        ax_f.set_yticklabels(cont_avg_static.index)
+        ax_f.set_xlabel('Mean |SHAP|')
+        ax_f.grid(True, alpha=0.3, axis='x')
+        ax_f.invert_yaxis()
+    ax_f.set_title('Static Continuous', fontweight='bold')
+
+    # ========================================================================
+    # Save
+    # ========================================================================
+    plt.tight_layout()
+    for fmt in ('png', 'pdf'):
+        path = os.path.join(save_dir, f'figure_shap_summary_panel.{fmt}')
+        ensure_parent_dir(path)
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    logger.info(f"Summary panel figure saved to {save_dir}")
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -883,6 +1248,23 @@ def main():
 
     logger.info("Figure E: Categorical TS Feature Importance...")
     figure_e_categorical_ts(all_results, encoding_info, save_dir)
+
+    # Summary panel from cohort temporal SHAP CSV (if available)
+    model_name = cfg.get("model_name", "")
+    temporal_shap_dir = f'reports/eval/{model_name}/temporal_shap'
+    # Try active+dn variant first, then plain
+    for suffix in ('_active_dn', '_dn', '_active', ''):
+        csv_candidate = os.path.join(temporal_shap_dir, f'cohort_shap_all_features{suffix}.csv')
+        pkl_candidate = os.path.join(temporal_shap_dir, f'cohort_temporal_shap_results{suffix}.pkl')
+        if os.path.exists(csv_candidate):
+            logger.info(f"Figure F: Summary Panel from {csv_candidate}...")
+            figure_shap_summary_panel(
+                csv_path=csv_candidate, save_dir=save_dir,
+                pickle_path=pkl_candidate if os.path.exists(pkl_candidate) else None,
+            )
+            break
+    else:
+        logger.warning("No cohort_shap_all_features CSV found — skipping summary panel")
 
     logger.info(f"\nAll figures saved to {save_dir}/")
     logger.info(f"Random seed used: {SEED}")

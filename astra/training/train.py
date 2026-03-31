@@ -270,15 +270,26 @@ def main():
             density_normalize=True,
         )
 
-        # Per-timeframe cohort temporal SHAP
+        # Per-timeframe cohort temporal SHAP (active-only background)
         run_cohort_temporal_shap_analysis(
             data, model,
             max_patients=args.shap_max_patients,
             max_background_samples=1000,
             save_dir=f'reports/eval/{model_name}/temporal_shap',
             density_normalize=True,
+            active_only=True,
             representative=args.shap_representative,
         )
+
+        # Paper-quality summary panel from saved CSV
+        from astra.evaluation.shap_paper_figures import figure_shap_summary_panel
+        shap_dir = f'reports/eval/{model_name}/temporal_shap'
+        csv_path = f'{shap_dir}/cohort_shap_all_features_active_dn.csv'
+        pkl_path = f'{shap_dir}/cohort_temporal_shap_results_active_dn.pkl'
+        if Path(csv_path).exists():
+            figure_shap_summary_panel(
+                csv_path=csv_path, save_dir=shap_dir, pickle_path=pkl_path,
+            )
         logger.info("SHAP analysis complete")
 
     # ========================================================================
