@@ -804,6 +804,35 @@ RC_PARAMS_SUMMARY = {
 }
 
 
+_AGG_SUFFIXES = ('_max', '_min', '_mean', '_std', '_count')
+
+
+def _clean_feature_name(name: str) -> str:
+    """Strip aggregation suffixes (_max, _min, _mean, _std) for display."""
+    for suffix in _AGG_SUFFIXES:
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+    return name
+
+
+def _clean_feature_names(names: list) -> list:
+    """Clean a list of feature names, adding suffix back in parens if duplicates arise."""
+    cleaned = [_clean_feature_name(n) for n in names]
+    # Check for duplicates — disambiguate with suffix in parens
+    from collections import Counter
+    counts = Counter(cleaned)
+    if any(c > 1 for c in counts.values()):
+        result = []
+        for orig, clean in zip(names, cleaned):
+            if counts[clean] > 1:
+                suffix = orig[len(clean):]  # e.g. '_max'
+                result.append(f'{clean} ({suffix.strip("_")})')
+            else:
+                result.append(clean)
+        return result
+    return cleaned
+
+
 def _add_subplot_label(ax, label, fontsize=18):
     """Add a bold subplot label (A, B, C, ...) to top-left of axes."""
     ax.text(-0.08, 1.05, label, transform=ax.transAxes,
@@ -1019,7 +1048,7 @@ def figure_shap_summary_panel(
     csv_path: str,
     save_dir: str,
     pickle_path: Optional[str] = None,
-    max_display: int = 20,
+    max_display: int = 15,
 ) -> None:
     """Paper-quality 3x2 SHAP summary panel.
 
@@ -1147,9 +1176,10 @@ def figure_shap_summary_panel(
             bar_colors.append('#008bfb')
 
     y_pos = range(len(channel_avg))
+    channel_display_names = _clean_feature_names(list(channel_avg.index))
     ax_b.barh(y_pos, channel_avg.values, color=bar_colors, alpha=0.7)
     ax_b.set_yticks(y_pos)
-    ax_b.set_yticklabels(channel_avg.index)
+    ax_b.set_yticklabels(channel_display_names)
     ax_b.set_xlabel(_shap_label)
     ax_b.set_title(f'Top {len(channel_avg)} Channels{_dn_suffix}', fontweight='bold')
     ax_b.grid(True, alpha=0.3, axis='x')
@@ -1177,15 +1207,17 @@ def figure_shap_summary_panel(
                 if len(match) > 0:
                     cat_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
 
-        df_heat_c = pd.DataFrame(cat_matrix, index=top_cats, columns=timeframes)
+        cat_display_names = _clean_feature_names(top_cats)
+        df_heat_c = pd.DataFrame(cat_matrix, index=cat_display_names, columns=timeframes)
         sns.heatmap(df_heat_c, annot=True, fmt='.4f', cmap='YlOrRd', ax=ax_c,
                     linewidths=0.5, linecolor='white',
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
-                    annot_kws={'fontsize': 8})
+                    annot_kws={'fontsize': 10})
         ax_c.set_ylabel('')
         ax_c.set_xlabel('Timeframe')
         ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
-        ax_c.tick_params(axis='y', labelsize=9)
+        ax_c.tick_params(axis='y', labelsize=12)
+        ax_c.tick_params(axis='x', labelsize=12)
     else:
         ax_c.text(0.5, 0.5, 'No categorical TS data available',
                   ha='center', va='center', transform=ax_c.transAxes, fontsize=12)
@@ -1208,15 +1240,17 @@ def figure_shap_summary_panel(
             if len(match) > 0:
                 cont_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
 
-    df_heat_d = pd.DataFrame(cont_matrix, index=top_channels, columns=timeframes)
+    cont_display_names = _clean_feature_names(top_channels)
+    df_heat_d = pd.DataFrame(cont_matrix, index=cont_display_names, columns=timeframes)
     sns.heatmap(df_heat_d, annot=True, fmt='.4f', cmap='YlOrRd', ax=ax_d,
                 linewidths=0.5, linecolor='white',
                 cbar_kws={'shrink': 0.8, 'label': _shap_label},
-                annot_kws={'fontsize': 8})
+                annot_kws={'fontsize': 10})
     ax_d.set_ylabel('')
     ax_d.set_xlabel('Timeframe')
     ax_d.set_title(f'Continuous TS |SHAP|{_dn_suffix}', fontweight='bold')
-    ax_d.tick_params(axis='y', labelsize=9)
+    ax_d.tick_params(axis='y', labelsize=12)
+    ax_d.tick_params(axis='x', labelsize=12)
 
     # ========================================================================
     # Panel E: Static Categorical Heatmap (features × timeframes)
@@ -1240,11 +1274,12 @@ def figure_shap_summary_panel(
                 if len(match) > 0:
                     scat_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
 
-        df_heat_e = pd.DataFrame(scat_matrix, index=top_scat, columns=timeframes)
+        scat_display_names = _clean_feature_names(top_scat)
+        df_heat_e = pd.DataFrame(scat_matrix, index=scat_display_names, columns=timeframes)
         sns.heatmap(df_heat_e, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax_e,
                     linewidths=0.5, linecolor='white',
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
-                    annot_kws={'fontsize': 8})
+                    annot_kws={'fontsize': 10})
         ax_e.set_ylabel('')
         ax_e.set_xlabel('Timeframe')
     ax_e.set_title('Static Categorical', fontweight='bold')
@@ -1270,11 +1305,12 @@ def figure_shap_summary_panel(
                 if len(match) > 0:
                     scont_matrix[row_idx, col_idx] = match['mean_abs_shap'].values[0]
 
-        df_heat_f = pd.DataFrame(scont_matrix, index=top_scont, columns=timeframes)
+        scont_display_names = _clean_feature_names(top_scont)
+        df_heat_f = pd.DataFrame(scont_matrix, index=scont_display_names, columns=timeframes)
         sns.heatmap(df_heat_f, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax_f,
                     linewidths=0.5, linecolor='white',
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
-                    annot_kws={'fontsize': 8})
+                    annot_kws={'fontsize': 10})
         ax_f.set_ylabel('')
         ax_f.set_xlabel('Timeframe')
     ax_f.set_title('Static Continuous', fontweight='bold')
