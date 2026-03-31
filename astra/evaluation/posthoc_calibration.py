@@ -29,7 +29,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score, average_precision_s
 from astra.utils import cfg as global_cfg, save_figure, ensure_parent_dir
 from astra.data.mixed_dataloader import AstraMixedDataset, AstraMixedDataLoader
 from astra.evaluation.utils import (
-    prepare_model, time_to_step, step_to_time,
+    prepare_model, time_to_step, step_to_time, get_total_steps,
 )
 from astra.evaluation.predictive_performance import (
     _get_predictions, _to_device, compute_net_benefit, format_step_label,
@@ -970,13 +970,16 @@ def run_posthoc_calibration(
 
     # Default key timepoints
     if key_timepoints is None:
-        key_timepoints = [
+        max_step = get_total_steps() - 2  # last step needs full-length traj; cap to N-2
+        raw = [
             time_to_step(1, 'h'), time_to_step(6, 'h'),
             time_to_step(12, 'h'), time_to_step(72, 'h'),
             time_to_step(7, 'D'), time_to_step(14, 'D'),
             time_to_step(30, 'D'), time_to_step(90, 'D'),
         ]
-        key_timepoints = sorted([t for t in key_timepoints if t is not None])
+        key_timepoints = sorted({
+            min(t, max_step) for t in raw if t is not None
+        })
 
     logger.info(f"Posthoc calibration: {len(key_timepoints)} timepoints, methods={methods}")
 

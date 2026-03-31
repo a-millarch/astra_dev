@@ -20,7 +20,7 @@ from astra.evaluation.utils import (
     calculate_roc_auc_ci, calculate_average_precision_ci,
     bootstrap_recall_ci, find_optimal_fbeta_threshold,
     _parse_timedelta_to_minutes, _get_intervals_from_cfg,
-    time_to_step, step_to_time, prepare_model, get_max_days
+    time_to_step, step_to_time, prepare_model, get_max_days, get_total_steps
 )
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone
@@ -2284,13 +2284,15 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         key_timepoints = None
         if multicurve:
-            key_timepoints = [
-                time_to_step(1, 'h'), time_to_step(6, 'h'),
-                time_to_step(12, 'h'), time_to_step(72, 'h'),
-                time_to_step(7, 'D'), time_to_step(14, 'D'),
-                time_to_step(30, 'D'), time_to_step(90, 'D'),
-            ]
-            key_timepoints = [t for t in key_timepoints if t is not None]
+            max_step = get_total_steps() - 2
+            key_timepoints = sorted({
+                min(t, max_step) for t in [
+                    time_to_step(1, 'h'), time_to_step(6, 'h'),
+                    time_to_step(12, 'h'), time_to_step(72, 'h'),
+                    time_to_step(7, 'D'), time_to_step(14, 'D'),
+                    time_to_step(30, 'D'), time_to_step(90, 'D'),
+                ] if t is not None
+            })
 
             logger.info("Performance at key time points (temporal model):")
             for step in key_timepoints:
@@ -2466,19 +2468,15 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     if multicurve:
         logger.info("Creating multiple ROC/PR curves at key timepoints...")
 
-        key_timepoints = [
-            time_to_step(1, 'h'),
-            time_to_step(6, 'h'),
-            time_to_step(12, 'h'),
-            time_to_step(72, 'h'),
-            time_to_step(7, 'D'),
-            time_to_step(14, 'D'),
-            time_to_step(30, 'D'),
-            time_to_step(90, 'D'),
-        ]
-
-        key_timepoints = [t for t in key_timepoints if t is not None]
-        key_timepoints.reverse()
+        max_step = get_total_steps() - 2
+        key_timepoints = sorted({
+            min(t, max_step) for t in [
+                time_to_step(1, 'h'), time_to_step(6, 'h'),
+                time_to_step(12, 'h'), time_to_step(72, 'h'),
+                time_to_step(7, 'D'), time_to_step(14, 'D'),
+                time_to_step(30, 'D'), time_to_step(90, 'D'),
+            ] if t is not None
+        }, reverse=True)
 
         labels = [format_step_label(step) for step in key_timepoints]
 
