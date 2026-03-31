@@ -2412,7 +2412,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             # Active-only evaluation and comparison
             results_active = None
             preds_df_active = None
-            if active_only or trauma_scores:
+            if active_only or trauma_scores or comprehensive_eval:
                 logger.info("Running active-only temporal evaluation...")
                 temporal_eval_active = TemporalEvaluator(
                     data, model, cfg, device=device, active_only=True
@@ -2624,7 +2624,15 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
                 logger.info("Active-only comparison plots saved")
 
-        # Prediction distribution plot (prefer active-only predictions)
+        # Prediction distribution plot (active-only predictions)
+        if preds_df_active is None and preds_df is not None:
+            logger.info("Running active-only evaluation for distribution plot...")
+            evaluator_active = TimeDependentEvaluator(
+                data, model, cfg, device=device, active_only=True
+            )
+            _, preds_df_active = evaluator_active.evaluate_over_time_ultra_fast(
+                censor_thresholds, save_predictions=True, model_name=f"{model_name}_active"
+            )
         dist_preds = preds_df_active if preds_df_active is not None else preds_df
         if dist_preds is not None:
             fig_dist = plot_prediction_distribution(
