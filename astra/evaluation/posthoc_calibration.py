@@ -636,7 +636,7 @@ def _plot_reliability_diagrams(
 
     steps = sorted(holdout_preds.keys())
     n = len(steps)
-    ncols = min(4, n)
+    ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows))
     if nrows == 1 and ncols == 1:
@@ -713,7 +713,7 @@ def _plot_dca_comparison(
     """DCA at key timepoints: raw vs calibrated net benefit."""
     steps = sorted(holdout_preds.keys())
     n = len(steps)
-    ncols = min(4, n)
+    ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
     if nrows == 1 and ncols == 1:
