@@ -822,6 +822,8 @@ def _load_csv_data(csv_path: str) -> dict:
         timeframes: ordered list of available timeframes (excluding 'full')
     """
     df = pd.read_csv(csv_path)
+    # Ensure numeric columns are parsed correctly (guards against serialization edge cases)
+    df['mean_abs_shap'] = pd.to_numeric(df['mean_abs_shap'], errors='coerce')
 
     # Split by feature prefix
     temporal = df[~df['feature'].str.startswith(('static_cat:', 'static_cont:', 'cat_ts:'))].copy()

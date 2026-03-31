@@ -5004,6 +5004,7 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
     logger.info(f"Full results saved to {pickle_path}")
 
     # Detailed CSV: all features x timeframes (mean |SHAP| ± std)
+    # Use float() casts to ensure numpy scalars serialize correctly in CSV.
     detail_rows = []
     for tf in results.get_available_timeframes():
         ch_imp = results.channel_importance[tf]
@@ -5013,8 +5014,8 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                 'timeframe': tf,
                 'channel_idx': i,
                 'feature': results.channel2feature.get(int(i), f'Ch{i}'),
-                'mean_abs_shap': ch_imp[i],
-                'std_abs_shap': ch_std[i],
+                'mean_abs_shap': float(ch_imp[i]),
+                'std_abs_shap': float(ch_std[i]),
                 'n_patients': results.patient_counts[tf],
             })
         # Static categorical features
@@ -5025,7 +5026,7 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                     detail_rows.append({
                         'timeframe': tf, 'channel_idx': None,
                         'feature': f'static_cat:{name}',
-                        'mean_abs_shap': cat_imp[j], 'std_abs_shap': None,
+                        'mean_abs_shap': float(cat_imp[j]), 'std_abs_shap': None,
                         'n_patients': results.patient_counts[tf],
                     })
         # Static continuous features
@@ -5036,7 +5037,7 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                     detail_rows.append({
                         'timeframe': tf, 'channel_idx': None,
                         'feature': f'static_cont:{name}',
-                        'mean_abs_shap': cont_imp[j], 'std_abs_shap': None,
+                        'mean_abs_shap': float(cont_imp[j]), 'std_abs_shap': None,
                         'n_patients': results.patient_counts[tf],
                     })
         # Categorical TS per-category features
@@ -5047,7 +5048,7 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                     detail_rows.append({
                         'timeframe': tf, 'channel_idx': None,
                         'feature': f'cat_ts:{name}',
-                        'mean_abs_shap': cat_ts_imp[j], 'std_abs_shap': None,
+                        'mean_abs_shap': float(cat_ts_imp[j]), 'std_abs_shap': None,
                         'n_patients': results.patient_counts[tf],
                     })
     detail_df = pd.DataFrame(detail_rows)
