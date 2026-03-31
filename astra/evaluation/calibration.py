@@ -69,7 +69,7 @@ def run_eval_with_calibration(
     
     # Plot and save baseline evaluation
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir=f'reports/eval/{model_name}')
     logger.info("✓ Baseline ROC/PR plot saved")
     
     # ============================================================================
@@ -122,7 +122,7 @@ def run_eval_with_calibration(
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
+        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("✓ Multiple curves plot saved")
     
     if comprehensive_eval:
@@ -185,7 +185,7 @@ def run_eval_with_calibration(
         
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+        save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("✓ Time metrics plot saved")
         
         # ========================================================================

@@ -459,14 +459,10 @@ def build_trauma_score_df(data: dict, cfg: dict) -> pd.DataFrame:
     )
 
     # Step 8: Compute TRISS where possible
-    # For TRISS comparison, treat ISS=0 as missing (conservative: "diagnoses
-    # registered, none relevant" is not a meaningful injury severity for TRISS)
-    if 'ISS_COMPOUND' in result.columns:
-        result['ISS_TRISS'] = result['ISS_COMPOUND'].replace(0, np.nan)
-    if 'mechanism' in result.columns and 'ISS_TRISS' in result.columns:
+    if 'mechanism' in result.columns and 'ISS_COMPOUND' in result.columns:
         result = compute_triss(
             result,
-            iss_col='ISS_TRISS',
+            iss_col='ISS_COMPOUND',
             age_col='AGE',
             mechanism_col='mechanism',
             rts_col='RTS',

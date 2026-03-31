@@ -1,4 +1,6 @@
 import os
+import io
+import base64
 import hashlib
 import pandas as pd
 import numpy as np
@@ -152,9 +154,37 @@ logger = logging.getLogger('astra')
 
 
 def save_figure(fig, filename, save_dir='reports/studyfigs'):
+    import matplotlib.pyplot as plt
+
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
     fig.savefig(png_path, dpi=1200, bbox_inches='tight')
+
+    # Save base64 version
+    base64_dir = os.path.join(save_dir, 'base64')
+    os.makedirs(base64_dir, exist_ok=True)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', dpi=1200, bbox_inches='tight')
+    buffer.seek(0)
+    base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    base64_path = os.path.join(base64_dir, f'{filename}_base64.txt')
+    with open(base64_path, 'w') as f:
+        f.write(base64_image)
+
+    plt.close(fig)
+
+def save_base64(fig, save_path, dpi=1200):
+    """Save a base64 version of *fig* alongside *save_path* in a ``base64/`` sibling dir."""
+    parent = os.path.dirname(save_path)
+    stem = Path(save_path).stem
+    base64_dir = os.path.join(parent, 'base64')
+    os.makedirs(base64_dir, exist_ok=True)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', dpi=dpi, bbox_inches='tight')
+    buffer.seek(0)
+    b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    with open(os.path.join(base64_dir, f'{stem}_base64.txt'), 'w') as f:
+        f.write(b64)
 
 def ensure_parent_dir(path):
     """Create parent directory of *path* if it does not exist."""

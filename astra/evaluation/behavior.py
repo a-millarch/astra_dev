@@ -19,7 +19,7 @@ import logging
 import pickle
 from pathlib import Path
 
-from astra.utils import cfg, setup_logging, ensure_parent_dir
+from astra.utils import cfg, setup_logging, ensure_parent_dir, save_base64
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours, get_total_steps
@@ -2829,6 +2829,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     if save_path:
         ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        save_base64(fig, save_path, dpi=150)
     plt.show()
 
 
@@ -4689,6 +4690,7 @@ class TemporalSHAPAnalyzer:
         if save_path:
             ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            save_base64(fig, save_path, dpi=150)
             logger.info(f"Saved: {save_path}")
         return fig
 
@@ -4751,6 +4753,7 @@ class TemporalSHAPAnalyzer:
         if save_path:
             ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            save_base64(fig, save_path, dpi=150)
             logger.info(f"Saved: {save_path}")
         return fig
 

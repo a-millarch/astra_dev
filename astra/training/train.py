@@ -235,7 +235,9 @@ def main():
     if args.calibrate:
         from astra.evaluation.posthoc_calibration import run_posthoc_calibration
         logger.info("=== Running Posthoc Calibration ===")
-        cal_summary = run_posthoc_calibration(data, cfg)
+        cal_summary = run_posthoc_calibration(
+            data, cfg, save_dir=f'reports/eval/{model_name}/calibration',
+        )
         if len(cal_summary) > 0:
             logger.info(f"Calibration summary: {len(cal_summary)} results saved")
 
@@ -264,7 +266,7 @@ def main():
             feature_names_cat=shap_results["static_cat_names"],
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
-            save_path=f'reports/eval/shap_class1_{model_name}.png',
+            save_path=f'reports/eval/{model_name}/shap_class1.png',
             density_normalize=True,
         )
 
@@ -273,7 +275,7 @@ def main():
             data, model,
             max_patients=args.shap_max_patients,
             max_background_samples=1000,
-            save_dir=f'reports/eval/temporal_shap_{model_name}',
+            save_dir=f'reports/eval/{model_name}/temporal_shap',
             density_normalize=True,
             representative=args.shap_representative,
         )

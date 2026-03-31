@@ -647,9 +647,9 @@ class TimeDependentEvaluator:
 
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
-            os.makedirs('reports/predictions', exist_ok=True)
-            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+            preds_df.to_pickle(ff'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
         return results, None
@@ -927,9 +927,9 @@ class TemporalEvaluator:
 
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
-            os.makedirs('reports/predictions', exist_ok=True)
-            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+            preds_df.to_pickle(ff'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
         return results, pd.DataFrame(preds_over_time) if preds_over_time else (results, None)
@@ -2130,7 +2130,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
             save_figure(
                 fig_cmp_ts,
                 f"time_metrics_comparison_trauma_{model_name}",
-                save_dir='reports/eval',
+                save_dir=f'reports/eval/{model_name}',
             )
             logger.info("Comparison plot with trauma score baselines saved")
 
@@ -2160,7 +2160,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                     save_figure(
                         fig_trauma,
                         f"trauma_{sname.lower()}_comparison_{model_name}",
-                        save_dir='reports/eval',
+                        save_dir=f'reports/eval/{model_name}',
                     )
                     logger.info(f"HNN vs {sname} comparison plot saved")
 
@@ -2170,7 +2170,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                         save_figure(
                             fig_dl,
                             f"delong_{sname.lower()}_comparison_{model_name}",
-                            save_dir='reports/eval',
+                            save_dir=f'reports/eval/{model_name}',
                         )
                         logger.info(f"DeLong {sname} comparison plot saved")
         else:
@@ -2234,13 +2234,12 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         evalplt = plot_evaluation(
             torch.tensor(baseline_preds), torch.tensor(targs), cfg["target"]
         )
-        save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+        save_figure(evalplt, f"baseline_eval_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("Baseline temporal evaluation saved")
 
         # Decision Curve Analysis (baseline — full trajectory)
         fig_dca = plot_decision_curve(targs, baseline_preds, model_name=model_name)
-        save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
-        plt.close(fig_dca)
+        save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("Baseline decision curve saved")
 
         # Confusion matrices at F-beta optimised thresholds (calibrated)
@@ -2281,8 +2280,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_cm, _, _ = evaluate_detection_rate(
                 ho_cal, targs, threshold=thr, label=label
             )
-            save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
-            plt.close(fig_cm)
+            save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir=f'reports/eval/{model_name}')
 
         key_timepoints = None
         if multicurve:
@@ -2314,16 +2312,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_curves = plot_multiple_roc_pr_curves_temporal(
                 temporal_eval, key_timepoints, labels=labels
             )
-            save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
-            plt.close(fig_curves)
+            save_figure(fig_curves, f"multi_curves_{model_name}", save_dir=f'reports/eval/{model_name}')
             logger.info("Multiple ROC/PR curves plot saved (temporal)")
 
             # Decision curves at key timepoints (temporal)
             fig_dca_time = _plot_decision_curves_temporal(
                 preds_all, targs, traj_lens, key_timepoints, labels=labels
             )
-            save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
-            plt.close(fig_dca_time)
+            save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir=f'reports/eval/{model_name}')
             logger.info("Time-dependent decision curves saved (temporal)")
 
         if comprehensive_eval:
@@ -2338,14 +2334,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 logger.error("No valid results from temporal evaluation!")
                 return None, None
 
-            os.makedirs('reports/predictions', exist_ok=True)
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
             if preds_df is not None:
                 preds_df.to_csv(
-                    f'reports/predictions/preds_df_{model_name}.csv', index=False
+                    ff'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False
                 )
 
             fig_time = plot_time_metrics(results, cut_hours=72)
-            save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+            save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
 
             # Percentile recall plot
             percentiles = [5, 10, 15, 20, 25]
@@ -2354,7 +2350,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             )
             if recall_results:
                 fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
-                save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir='reports/eval')
+                save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir=f'reports/eval/{model_name}')
                 logger.info("Percentile recall plot saved")
 
             # Active-only evaluation and comparison
@@ -2371,14 +2367,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 if results_active:
                     if preds_df_active is not None:
                         preds_df_active.to_csv(
-                            f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                            ff'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                         )
                     fig_cmp = plot_time_metrics_comparison(
                         results, results_active, target_name=cfg["target"]
                     )
-                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir=f'reports/eval/{model_name}')
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                    save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                    save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
                     logger.info("Active-only comparison plots saved")
 
             # Prediction distribution plot (prefer active-only predictions)
@@ -2388,8 +2384,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     dist_preds, np.array(data["ty"]),
                     data["holdout"].base.PID.values
                 )
-                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
-                plt.close(fig_dist)
+                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir=f'reports/eval/{model_name}')
                 logger.info("Prediction distribution plot saved")
 
             # Trauma score comparison (temporal path)
@@ -2430,15 +2425,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     preds, targs = _get_predictions(model, holdout_mixed_dls.train, device)
 
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir=f'reports/eval/{model_name}')
     logger.info("Baseline ROC/PR plot saved")
 
     # Decision Curve Analysis (baseline — full trajectory)
     fig_dca = plot_decision_curve(
         targs.numpy(), preds[:, 1].numpy(), model_name=model_name
     )
-    save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
-    plt.close(fig_dca)
+    save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir=f'reports/eval/{model_name}')
     logger.info("Baseline decision curve saved")
 
     # Confusion matrices at F-beta optimised thresholds (calibrated)
@@ -2463,8 +2457,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_cm, _, _ = evaluate_detection_rate(
             ho_y_cal, holdout_y_true, threshold=thr, label=label
         )
-        save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir='reports/eval')
-        plt.close(fig_cm)
+        save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir=f'reports/eval/{model_name}')
 
     # Initialize evaluator with pre-normalized data
     evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
@@ -2494,7 +2487,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
+        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("Multiple curves plot saved")
 
         # Decision curves at key timepoints (active-only for correct prevalence)
@@ -2504,8 +2497,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_dca_time = plot_decision_curves_over_time(
             evaluator_dca, key_timepoints, labels=labels
         )
-        save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
-        plt.close(fig_dca_time)
+        save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("Time-dependent decision curves saved")
 
     # COMPREHENSIVE TIME-DEPENDENT EVALUATION
@@ -2534,13 +2526,13 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         logger.info(f"Evaluated at {len(results)} time points")
 
-        os.makedirs('reports/predictions', exist_ok=True)
-        preds_df.to_csv(f'reports/predictions/preds_df_{model_name}.csv', index=False)
+        os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+        preds_df.to_csv(ff'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False)
         logger.info(f"Predictions saved to CSV")
 
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+        save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
         logger.info("Time metrics plot saved")
 
         # Percentile recall plot
@@ -2550,7 +2542,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         )
         if recall_results:
             fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
-            save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir='reports/eval')
+            save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir=f'reports/eval/{model_name}')
             logger.info("Percentile recall plot saved")
 
         # Active-only evaluation and comparison
@@ -2567,14 +2559,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             if results_active:
                 if preds_df_active is not None:
                     preds_df_active.to_csv(
-                        f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                        ff'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                     )
                 fig_cmp = plot_time_metrics_comparison(
                     results, results_active, target_name=cfg["target"]
                 )
-                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir=f'reports/eval/{model_name}')
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
                 logger.info("Active-only comparison plots saved")
 
         # Prediction distribution plot (prefer active-only predictions)
@@ -2584,8 +2576,7 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 dist_preds, np.array(data["ty"]),
                 data["holdout"].base.PID.values
             )
-            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir='reports/eval')
-            plt.close(fig_dist)
+            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir=f'reports/eval/{model_name}')
             logger.info("Prediction distribution plot saved")
 
         # ================================================================
