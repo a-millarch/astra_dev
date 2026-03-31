@@ -106,10 +106,10 @@ def compute_triss(df: pd.DataFrame, iss_col: str = 'ISS', age_col: str = 'AGE',
 
 
 def compound_iss(df: pd.DataFrame) -> pd.DataFrame:
-    """Create unified ISS column: priority ISS_DTR > riss > niss > iss_notes."""
+    """Create unified ISS column: max across ISS_DTR, riss, and niss."""
     df = df.copy()
     candidates = []
-    for col in ['ISS', 'riss', 'niss', 'iss_notes']:
+    for col in ['ISS_DTR', 'riss', 'niss']:
         if col in df.columns:
             candidates.append(pd.to_numeric(df[col], errors='coerce'))
 
@@ -459,10 +459,14 @@ def build_trauma_score_df(data: dict, cfg: dict) -> pd.DataFrame:
     )
 
     # Step 8: Compute TRISS where possible
-    if 'mechanism' in result.columns and 'ISS_COMPOUND' in result.columns:
+    # For TRISS comparison, treat ISS=0 as missing (conservative: "diagnoses
+    # registered, none relevant" is not a meaningful injury severity for TRISS)
+    if 'ISS_COMPOUND' in result.columns:
+        result['ISS_TRISS'] = result['ISS_COMPOUND'].replace(0, np.nan)
+    if 'mechanism' in result.columns and 'ISS_TRISS' in result.columns:
         result = compute_triss(
             result,
-            iss_col='ISS_COMPOUND',
+            iss_col='ISS_TRISS',
             age_col='AGE',
             mechanism_col='mechanism',
             rts_col='RTS',
