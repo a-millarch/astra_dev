@@ -296,6 +296,9 @@ sweep:
         eval_timeframe_weighting: [true, false]
         eval_timeframe_weight: [1.5, 5.0]    # multiplier when eval_timeframe_weighting=true
         ranking_loss_weight: [0.0, 0.3]      # 0=disabled; blended as (1-w)*bce + w*rank
+        early_weight_factor: [1.0, 5.0]      # time-weighting magnitude for early/late modes
+        # Validation objective balance (only active when temporal_head=true)
+        val_auroc_weight: [0.1, 0.9]         # val_auprc_weight = 1 - val_auroc_weight
 
 evaluation:
     max_f_beta: 10

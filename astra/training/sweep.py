@@ -43,12 +43,15 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "d_model": best["d_model"],
         "n_layers": best["n_layers"],
         "n_heads": best["n_heads"],
-        "fc_mults_1": best["fc_mults_1"],
-        "fc_mults_2": best["fc_mults_2"],
-        "fc_dropout": best["fc_dropout"],
         "res_dropout": best["res_dropout"],
         "head_pool": best.get("head_pool", "mean_cat"),
     }
+    # fc_mults / fc_dropout only present when non-temporal head was searched
+    if "fc_mults_1" in best:
+        model_section["fc_mults_1"] = best["fc_mults_1"]
+        model_section["fc_mults_2"] = best["fc_mults_2"]
+    if "fc_dropout" in best:
+        model_section["fc_dropout"] = best["fc_dropout"]
     if "temporal_head_dropout" in best:
         model_section["temporal_head_dropout"] = best["temporal_head_dropout"]
 
@@ -84,8 +87,11 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         "eval_timeframe_weighting": best.get("eval_timeframe_weighting", False),
         "eval_timeframe_weight": best.get("eval_timeframe_weight", 3.0),
         "ranking_loss_weight": best.get("ranking_loss_weight", 0.0),
+        "early_weight_factor": best.get("early_weight_factor", 2.0),
         "temporal_crop_prob": best.get("temporal_crop_prob", 0.0),
         "temporal_crop_all_phases": best.get("temporal_crop_prob", 0.0) > 0,
+        "val_auroc_weight": best.get("val_auroc_weight", 0.3),
+        "val_auprc_weight": best.get("val_auprc_weight", 0.7),
     }
 
     # Override epoch counts with actual (early-stopped) values if available
@@ -205,18 +211,22 @@ def joint_objective(
     d_model = trial.suggest_categorical("d_model", ss["d_model"])
     n_layers = trial.suggest_categorical("n_layers", ss["n_layers"])
     n_heads = trial.suggest_categorical("n_heads", ss["n_heads"])
-    fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"], step=0.05)
-    fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"], step=0.05)
-    fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"], step=0.05)
     res_dropout = trial.suggest_float("res_dropout", *ss["res_dropout"], step=0.05)
     temporal_head = cfg_dict["model"].get("temporal_head", False)
     if temporal_head:
-        head_pool = "mean_cat"  # temporal head replaces the standard head
+        # Temporal head replaces the standard MLP head — fc_mults and fc_dropout are unused
+        fc_mults_1 = cfg_dict["model"].get("fc_mults_1", 0.3)
+        fc_mults_2 = cfg_dict["model"].get("fc_mults_2", 0.1)
+        fc_dropout = cfg_dict["model"].get("fc_dropout", 0.5)
+        head_pool = "mean_cat"
         temporal_head_dropout = trial.suggest_float(
             "temporal_head_dropout", *ss.get("temporal_head_dropout", [0.0, 0.6]),
             step=0.05,
         )
     else:
+        fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"], step=0.05)
+        fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"], step=0.05)
+        fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"], step=0.05)
         head_pool = trial.suggest_categorical("head_pool", ss["head_pool"])
         temporal_head_dropout = cfg_dict["model"].get("temporal_head_dropout", 0.3)
 
@@ -272,12 +282,24 @@ def joint_objective(
             "ranking_loss_weight", *ss.get("ranking_loss_weight", [0.0, 0.3]),
             step=0.05,
         )
+        early_weight_factor = trial.suggest_float(
+            "early_weight_factor", *ss.get("early_weight_factor", [1.0, 5.0]),
+            step=0.5,
+        )
+        val_auroc_weight = trial.suggest_float(
+            "val_auroc_weight", *ss.get("val_auroc_weight", [0.1, 0.9]),
+            step=0.1,
+        )
+        val_auprc_weight = round(1.0 - val_auroc_weight, 2)
     else:
         time_weighting = "uniform"
         temporal_loss_averaging = "per_sample"
         eval_timeframe_weighting = False
         eval_timeframe_weight = 3.0
         ranking_loss_weight = 0.0
+        early_weight_factor = 2.0
+        val_auroc_weight = 0.3
+        val_auprc_weight = 0.7
 
     # Temporal cropping augmentation
     temporal_crop_prob = trial.suggest_float("temporal_crop_prob", *ss["temporal_crop_prob"], step=0.05)
@@ -293,9 +315,10 @@ def joint_objective(
         cfg_dict["model"]["d_model"] = d_model
         cfg_dict["model"]["n_layers"] = n_layers
         cfg_dict["model"]["n_heads"] = n_heads
-        cfg_dict["model"]["fc_mults_1"] = fc_mults_1
-        cfg_dict["model"]["fc_mults_2"] = fc_mults_2
-        cfg_dict["model"]["fc_dropout"] = fc_dropout
+        if not temporal_head:
+            cfg_dict["model"]["fc_mults_1"] = fc_mults_1
+            cfg_dict["model"]["fc_mults_2"] = fc_mults_2
+            cfg_dict["model"]["fc_dropout"] = fc_dropout
         cfg_dict["model"]["res_dropout"] = res_dropout
         cfg_dict["model"]["head_pool"] = head_pool
         cfg_dict["model"]["temporal_head_dropout"] = temporal_head_dropout
@@ -335,8 +358,11 @@ def joint_objective(
             eval_timeframe_weighting=eval_timeframe_weighting,
             eval_timeframe_weight=eval_timeframe_weight,
             ranking_loss_weight=ranking_loss_weight,
+            early_weight_factor=early_weight_factor,
             temporal_crop_prob=temporal_crop_prob,
             temporal_crop_all_phases=True,
+            val_auroc_weight=val_auroc_weight,
+            val_auprc_weight=val_auprc_weight,
         )
 
         result = run_finetune_v2(
@@ -398,17 +424,20 @@ def _build_best_finetune_cfg(best: dict, pretrain_checkpoint_dir: str = None) ->
         weight_decay=best["weight_decay"],
         label_smoothing=best["label_smoothing"],
         pos_weight_factor=best["pos_weight_factor"],
-        fc_dropout=best["fc_dropout"],
+        fc_dropout=best.get("fc_dropout"),
         res_dropout=best["res_dropout"],
         use_pretrained=True,  # Final retrain uses pretrained weights
         pretrain_checkpoint_dir=pretrain_checkpoint_dir,
         time_weighting=best.get("time_weighting", "uniform"),
+        early_weight_factor=best.get("early_weight_factor", 2.0),
         temporal_loss_averaging=best.get("temporal_loss_averaging", "per_sample"),
         eval_timeframe_weighting=best.get("eval_timeframe_weighting", False),
         eval_timeframe_weight=best.get("eval_timeframe_weight", 3.0),
         ranking_loss_weight=best.get("ranking_loss_weight", 0.0),
         temporal_crop_prob=best.get("temporal_crop_prob", 0.0),
         temporal_crop_all_phases=best.get("temporal_crop_prob", 0.0) > 0,
+        val_auroc_weight=best.get("val_auroc_weight", 0.3),
+        val_auprc_weight=best.get("val_auprc_weight", 0.7),
     )
 
 
@@ -470,9 +499,6 @@ def run_sweep(
             "d_model": model_cfg.get("d_model", 64),
             "n_layers": model_cfg.get("n_layers", 8),
             "n_heads": model_cfg.get("n_heads", 8),
-            "fc_mults_1": model_cfg.get("fc_mults_1", 0.3),
-            "fc_mults_2": model_cfg.get("fc_mults_2", 0.1),
-            "fc_dropout": model_cfg.get("fc_dropout", 0.75),
             "res_dropout": model_cfg.get("res_dropout", 0.22),
             # Training (LR parameterized as base_lr × decay^phase)
             "base_lr": ft_cfg.get("phase1_lr", 1e-3),
@@ -492,8 +518,11 @@ def run_sweep(
             "pos_weight_factor": ft_cfg.get("pos_weight_factor", 0.0),
             "temporal_crop_prob": ft_cfg.get("temporal_crop_prob", 0.0),
         }
-        # head_pool and time_weighting only searched for certain configs
+        # head_pool, fc_mults, fc_dropout only searched for non-temporal head
         if not model_cfg.get("temporal_head", False):
+            seed_params["fc_mults_1"] = model_cfg.get("fc_mults_1", 0.3)
+            seed_params["fc_mults_2"] = model_cfg.get("fc_mults_2", 0.1)
+            seed_params["fc_dropout"] = model_cfg.get("fc_dropout", 0.75)
             seed_params["head_pool"] = model_cfg.get("head_pool", "mean_cat")
         else:
             seed_params["time_weighting"] = ft_cfg.get("time_weighting", "uniform")
@@ -503,6 +532,8 @@ def run_sweep(
             if ft_cfg.get("eval_timeframe_weighting", False):
                 seed_params["eval_timeframe_weight"] = ft_cfg.get("eval_timeframe_weight", 3.0)
             seed_params["ranking_loss_weight"] = ft_cfg.get("ranking_loss_weight", 0.0)
+            seed_params["early_weight_factor"] = ft_cfg.get("early_weight_factor", 2.0)
+            seed_params["val_auroc_weight"] = ft_cfg.get("val_auroc_weight", 0.3)
         study.enqueue_trial(seed_params)
         logger.info("Enqueued seed trial with defaults.yaml hyperparameters")
 
@@ -530,9 +561,11 @@ def run_sweep(
     cfg_dict["model"]["d_model"] = best["d_model"]
     cfg_dict["model"]["n_layers"] = best["n_layers"]
     cfg_dict["model"]["n_heads"] = best["n_heads"]
-    cfg_dict["model"]["fc_mults_1"] = best["fc_mults_1"]
-    cfg_dict["model"]["fc_mults_2"] = best["fc_mults_2"]
-    cfg_dict["model"]["fc_dropout"] = best["fc_dropout"]
+    if "fc_mults_1" in best:
+        cfg_dict["model"]["fc_mults_1"] = best["fc_mults_1"]
+        cfg_dict["model"]["fc_mults_2"] = best["fc_mults_2"]
+    if "fc_dropout" in best:
+        cfg_dict["model"]["fc_dropout"] = best["fc_dropout"]
     cfg_dict["model"]["res_dropout"] = best["res_dropout"]
     if "head_pool" in best:
         cfg_dict["model"]["head_pool"] = best["head_pool"]
