@@ -33,7 +33,7 @@ from astra.evaluation.behavior import (
     get_static_cat_names_from_classes,
 )
 from astra.evaluation.utils import prepare_model, time_to_step
-from astra.utils import cfg, ensure_parent_dir
+from astra.utils import cfg, ensure_parent_dir, save_base64
 
 logger = logging.getLogger(__name__)
 
@@ -1323,6 +1323,7 @@ def figure_shap_summary_panel(
         path = os.path.join(save_dir, f'figure_shap_summary_panel.{fmt}')
         ensure_parent_dir(path)
         fig.savefig(path, dpi=300, bbox_inches='tight')
+    save_base64(fig, os.path.join(save_dir, 'figure_shap_summary_panel.png'))
     plt.close(fig)
     logger.info(f"Summary panel figure saved to {save_dir}")
 
