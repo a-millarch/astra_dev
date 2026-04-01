@@ -1129,7 +1129,7 @@ def figure_shap_summary_panel(
     cont_ts_by_tf = []
     for tf in timeframes:
         tf_data = clinical_temporal[clinical_temporal['timeframe'] == tf]
-        cont_ts_by_tf.append(tf_data['mean_abs_shap'].mean() if len(tf_data) > 0 else 0.0)
+        cont_ts_by_tf.append(tf_data['mean_abs_shap'].sum() if len(tf_data) > 0 else 0.0)
 
     ax_a.plot(range(len(timeframes)), cont_ts_by_tf, linewidth=2.5,
               color='#ff0051', marker='o', markersize=6, label='Continuous TS')
@@ -1140,7 +1140,7 @@ def figure_shap_summary_panel(
         cat_ts_by_tf = []
         for tf in timeframes:
             tf_data = cat_ts[cat_ts['timeframe'] == tf]
-            cat_ts_by_tf.append(tf_data['mean_abs_shap'].mean() if len(tf_data) > 0 else 0.0)
+            cat_ts_by_tf.append(tf_data['mean_abs_shap'].sum() if len(tf_data) > 0 else 0.0)
         ax_a.plot(range(len(timeframes)), cat_ts_by_tf, linewidth=2.5,
                   color='#00d4aa', marker='s', markersize=5, label='Categorical TS',
                   linestyle='--')
@@ -1149,8 +1149,9 @@ def figure_shap_summary_panel(
     ax_a.set_xticks(range(len(timeframes)))
     ax_a.set_xticklabels(timeframes, rotation=45, ha='right')
     ax_a.set_xlabel('Timeframe')
-    ax_a.set_ylabel(_shap_label)
-    ax_a.set_title(f'Feature Importance Over Time{_dn_suffix}', fontweight='bold')
+    _shap_label_sum = 'Sum |SHAP| / measured cell' if density_normalize else 'Sum |SHAP|'
+    ax_a.set_ylabel(_shap_label_sum)
+    ax_a.set_title(f'Total Feature Importance Over Time{_dn_suffix}', fontweight='bold')
     ax_a.legend()
     ax_a.grid(True, alpha=0.3)
 
