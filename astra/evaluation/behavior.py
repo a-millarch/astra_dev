@@ -26,7 +26,19 @@ from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, ti
 from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
 logger = setup_logging()
- 
+
+
+def _seed_shap(seed):
+    """Reset RNG state for reproducible GradientExplainer results."""
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
 def get_centered_norm(data, center=0.0):
     """
     Create a TwoSlopeNorm that centers the colormap at the specified value.
@@ -1595,11 +1607,14 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         bg_inputs.append(bg_cont)
         test_inputs.append(test_cont)
     
+    shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
+    shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
     print("\nCreating SHAP GradientExplainer...")
     explainer = shap.GradientExplainer(wrapped_model, bg_inputs)
-    
+
     print("Calculating SHAP values...")
-    shap_values = explainer.shap_values(test_inputs)
+    _seed_shap(shap_seed)
+    shap_values = explainer.shap_values(test_inputs, nsamples=shap_nsamples)
     print("SHAP calculation complete!")
 
     # For multi-output models (e.g. 2-class), GradientExplainer returns
@@ -3254,8 +3269,11 @@ class TemporalSHAPAnalyzer:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
 
+        shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
+        shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
-        shap_values = explainer.shap_values(sample_inputs)
+        _seed_shap(shap_seed)
+        shap_values = explainer.shap_values(sample_inputs, nsamples=shap_nsamples)
 
         # For multi-output models (e.g. 2-class): select class 1 (mortality)
         if isinstance(shap_values, list) and shap_values and isinstance(shap_values[0], list):

@@ -29,7 +29,14 @@ class MLMConfig:
     mask_prob_cont: float = 0.15     # Static continuous
     replace_prob: float = 0.8
     random_prob: float = 0.1
-    
+
+    # Sparse-aware masking (Fix 6): preferentially mask non-empty timesteps
+    sparse_aware_masking: bool = False
+    mask_prob_ts_data: float = 0.30       # Mask prob for non-empty continuous TS timesteps
+    mask_prob_ts_empty: float = 0.05      # Mask prob for empty continuous TS timesteps
+    mask_prob_cat_ts_data: float = 0.40   # Mask prob for non-empty categorical TS timesteps
+    mask_prob_cat_ts_empty: float = 0.03  # Mask prob for empty categorical TS timesteps
+
     # Training hyperparameters
     epochs: int = 50
     lr: float = 1e-4
@@ -147,9 +154,19 @@ class TSTabFusionMLM(nn.Module):
         """Mask continuous time series data."""
         bs, c_in, seq_len = x_ts.shape
         device = x_ts.device
-        
+
         # Create mask per timestep (same mask for all channels)
-        mask = self.create_mlm_mask((bs, seq_len), device, self.config.mask_prob_ts)
+        if self.config.sparse_aware_masking:
+            # Fix 6: Preferentially mask non-empty timesteps
+            has_data = (x_ts.abs().sum(dim=1) > 0)  # [bs, seq_len]
+            probs = torch.where(
+                has_data,
+                torch.tensor(self.config.mask_prob_ts_data, device=device),
+                torch.tensor(self.config.mask_prob_ts_empty, device=device),
+            )
+            mask = torch.rand((bs, seq_len), device=device) < probs
+        else:
+            mask = self.create_mlm_mask((bs, seq_len), device, self.config.mask_prob_ts)
         
         original_x_ts = x_ts.clone()
         masked_x_ts = x_ts.clone()
@@ -191,7 +208,17 @@ class TSTabFusionMLM(nn.Module):
         device = x_ts_cat.device
         
         # Create mask per timestep (mask all categories at once)
-        mask = self.create_mlm_mask((bs, seq_len), device, self.config.mask_prob_cat_ts)
+        if self.config.sparse_aware_masking:
+            # Fix 6: Preferentially mask non-empty timesteps
+            has_data = (x_ts_cat.sum(dim=1) > 0)  # [bs, seq_len]
+            probs = torch.where(
+                has_data,
+                torch.tensor(self.config.mask_prob_cat_ts_data, device=device),
+                torch.tensor(self.config.mask_prob_cat_ts_empty, device=device),
+            )
+            mask = torch.rand((bs, seq_len), device=device) < probs
+        else:
+            mask = self.create_mlm_mask((bs, seq_len), device, self.config.mask_prob_cat_ts)
         
         original_x_ts_cat = x_ts_cat.clone()
         masked_x_ts_cat = x_ts_cat.clone()
@@ -293,14 +320,29 @@ class TSTabFusionMLM(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation (Fix 5 mirror)
+        if self.backbone.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.backbone.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P (mirrors backbone.forward)
         x_ts_signal = (
             x_ts[:, self.backbone._signal_indices, :]
             if self.backbone.exclude_channel_indices else x_ts
         )
 
+        # Fix 9 mirror: Local temporal context before W_P
+        if self.backbone.local_temporal_conv is not None:
+            x_ts_signal = self.backbone.local_temporal_conv(x_ts_signal)
+
         # Continuous TS encoding (signal channels only)
         x_encoded = self.backbone.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
+
+        # Fix 5 mirror: Bin-width modulation
+        if self.backbone.bin_width_mod is not None and bin_width_hours is not None:
+            bw_scale = self.backbone.bin_width_mod(bin_width_hours.unsqueeze(-1))
+            x_encoded = x_encoded * bw_scale
         
         # Multi-hot categorical TS encoding (if present)
         if self.backbone.n_ts_cat > 0 and x_ts_cat is not None:
@@ -325,8 +367,12 @@ class TSTabFusionMLM(nn.Module):
             
             # Combine embeddings
             if self.backbone.cat_ts_combine == 'add':
-                x_ts_cat_sum = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-                x_encoded = x_encoded + x_ts_cat_sum
+                stacked = torch.stack(x_ts_cat_embedded_list, dim=0)  # [n_groups, B, T, d]
+                if self.backbone.cat_ts_gate_params is not None:
+                    # Fix 3 mirror: Learned sigmoid gate per categorical group
+                    gates = torch.sigmoid(self.backbone.cat_ts_gate_params)
+                    stacked = stacked * gates[:, None, None, None]
+                x_encoded = x_encoded + stacked.sum(dim=0)
             else:  # 'concat'
                 x_ts_cat_concat = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x_encoded = torch.cat([x_encoded, x_ts_cat_concat], dim=-1)
@@ -339,7 +385,13 @@ class TSTabFusionMLM(nn.Module):
         
         # Static continuous encoding
         if self.backbone.n_cont != 0 and x_cont is not None and x_cont.numel() > 0:
-            x_cont_proj = self.backbone.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.backbone.cont_projections is not None:
+                # Fix 1 mirror: Per-feature projection
+                x_cont_proj = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.backbone.cont_projections)
+                ], dim=1)  # [batch, n_cont, d_model]
+            else:
+                x_cont_proj = self.backbone.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x_encoded = torch.cat([x_encoded, x_cont_proj], 1)
         
         # Positional encoding (time-aware if elapsed_hours available, else zero TS PE)

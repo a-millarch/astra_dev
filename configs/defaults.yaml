@@ -41,14 +41,14 @@ prehospital_config:
 
 
 temporal_features:
-  enabled: false
+  enabled: true
   # mode controls how temporal features are used when enabled:
   #   channel    – elapsed_hours and bin_width_hours are normalized and fed through W_P
   #                as regular input channels (Option A). No change to positional encoding.
   #   sinusoidal – elapsed_hours drives sinusoidal positional encoding; both temporal
   #                features are excluded from W_P (Option B). W_P operates on clinical
   #                channels only (~N(0,1)), raw hours used for sin/cos encoding.
-  mode: channel #sinusoidal
+  mode: sinusoidal
   features:
     - elapsed_hours
     - bin_width_hours
@@ -188,6 +188,13 @@ pretrain:
     save_best: True
     checkpoint_dir: './pretrain_checkpoints'
 
+    # Sparse-aware masking (Fix 6): preferentially mask non-empty timesteps
+    sparse_aware_masking: true
+    mask_prob_ts_data: 0.30
+    mask_prob_ts_empty: 0.05
+    mask_prob_cat_ts_data: 0.40
+    mask_prob_cat_ts_empty: 0.03
+
 training:
     folds: 5
     epochs: 30
@@ -207,6 +214,12 @@ model:
   causal: true  # required for temporal_head
   temporal_head_dropout: 0.6
   survival_mode: false  # true = discrete-time survival, false = binary classification
+
+  # Architecture enhancements
+  per_feature_cont_proj: true    # Per-feature static continuous projection (Fix 1)
+  cat_ts_gate: true              # Learned sigmoid gate per categorical group (Fix 3)
+  local_temporal_kernel: 3       # Depthwise conv kernel before W_P, 1=disabled (Fix 9)
+  bin_width_modulation: true     # Modulate W_P output by bin width (Fix 5)
 
 finetune:
   phase1_epochs: 4
@@ -304,6 +317,9 @@ evaluation:
     max_f_beta: 10
     f_beta: 4
     threshold_mode: f1 #fbeta
+    mc_dropout_samples: 30  # MC Dropout forward passes for uncertainty (Fix 8)
+    shap_seed: 42           # RNG seed for reproducible SHAP values (null to disable)
+    shap_nsamples: 200      # Number of interpolation samples for GradientExplainer
 
 normalization:
   ts_method: adaptive       # standard | quantile | power | robust | adaptive

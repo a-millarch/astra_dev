@@ -16,12 +16,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import random
+
 import numpy as np
 import pandas as pd
 import torch
 
 logger = logging.getLogger(__name__)
 
+from astra.utils import cfg
 from astra.data.dataloader import (
     get_trajectory_lengths,
     load_deployment_bundle,
@@ -39,10 +42,12 @@ class InferenceResult:
     """Result of a single-patient prediction."""
     pid: Any
     probability: float                              # P(deceased) or cumulative risk
-    trajectory_length: int                          # Actual data timesteps
+    trajectory_length: int = 0                      # Actual data timesteps
     censor_step: Optional[int] = None               # Timestep evaluated at
     predictions_over_time: Optional[np.ndarray] = None  # [seq_len] (temporal only)
     survival_curve: Optional[np.ndarray] = None     # [seq_len] S(t) (survival mode only)
+    label: Optional[int] = None                     # Predicted label (thresholded)
+    uncertainty: Optional[float] = None             # MC Dropout std (Fix 8)
 
 
 @dataclass
@@ -55,6 +60,25 @@ class SHAPResult:
     static_cont_shap: Optional[Dict[str, float]] = None  # {feature: importance}
     top_features: List[Tuple[str, float]] = field(default_factory=list)
     eval_timestep: Optional[int] = None                  # step the model was evaluated at
+
+
+@dataclass
+class DifferentialSHAPResult:
+    """Differential SHAP between two timepoints: ΔSHAP = SHAP(T2) - SHAP(T1)."""
+    pid: Any
+    t1_hours: float
+    t2_hours: float
+    t1_step: int
+    t2_step: int
+    t1_probability: float
+    t2_probability: float
+    delta_ts_shap: Dict[str, np.ndarray]                       # {channel: [seq_len]}
+    delta_cat_ts_shap: Optional[Dict[str, np.ndarray]] = None  # {category: [seq_len]}
+    delta_static_cat_shap: Optional[Dict[str, float]] = None
+    delta_static_cont_shap: Optional[Dict[str, float]] = None
+    top_delta_features: List[Tuple[str, float]] = field(default_factory=list)
+    shap_t1: Optional[SHAPResult] = None
+    shap_t2: Optional[SHAPResult] = None
 
 
 # _SHAPModelWrapper and _embed_categorical_features live in
@@ -130,6 +154,11 @@ class InferenceSession:
             temporal_channel_idx=params.get('temporal_channel_idx', None),
             exclude_channel_indices=params.get('exclude_channel_indices', []),
             head_pool=params.get('head_pool', 'flatten'),
+            per_feature_cont_proj=params.get('per_feature_cont_proj', False),
+            cat_ts_gate=params.get('cat_ts_gate', False),
+            local_temporal_kernel=params.get('local_temporal_kernel', 1),
+            bin_width_channel_idx=params.get('bin_width_channel_idx', None),
+            bin_width_modulation=params.get('bin_width_modulation', False),
         )
 
         # Load weights (FastAI format: {'model': state_dict, ...})
@@ -455,8 +484,16 @@ class InferenceSession:
             bg_inputs.append(self._bg['cont'])
             sample_inputs.append(x_cont_t)
 
+        shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
+        shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
-        shap_values = explainer.shap_values(sample_inputs)
+        if shap_seed is not None:
+            random.seed(shap_seed)
+            np.random.seed(shap_seed)
+            torch.manual_seed(shap_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(shap_seed)
+        shap_values = explainer.shap_values(sample_inputs, nsamples=shap_nsamples)
 
         # Parse SHAP output — normalise to flat list [per_input][n_samples, ...]
         # GradientExplainer may return one of two formats depending on SHAP version:
@@ -558,6 +595,68 @@ class InferenceSession:
             static_cont_shap=static_cont_dict,
             top_features=all_importances[:20],
             eval_timestep=target_step,
+        )
+
+    # ------------------------------------------------------------------
+    # Uncertainty estimation (Fix 8: MC Dropout)
+    # ------------------------------------------------------------------
+
+    def predict_with_uncertainty(self, x_ts, x_ts_cat, tab_df,
+                                  censor_step=None, pid=None,
+                                  trajectory_length=None, n_samples=30):
+        """
+        MC Dropout prediction: run N stochastic forward passes to estimate
+        prediction uncertainty. Returns mean probability and standard deviation.
+
+        Args:
+            x_ts, x_ts_cat, tab_df: Same as predict()
+            censor_step: Optional timestep for temporal head
+            pid: Optional patient ID
+            trajectory_length: Optional trajectory length override
+            n_samples: Number of MC dropout forward passes
+
+        Returns:
+            InferenceResult with uncertainty field populated
+        """
+        import torch.nn as nn
+
+        x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len = self._prepare_tensors(
+            x_ts, x_ts_cat, tab_df, trajectory_length=trajectory_length,
+        )
+        traj_lengths_t = torch.tensor([traj_len], dtype=torch.long, device=self.device)
+        inputs = (x_ts_t, (x_cat_t, x_cont_t), x_ts_cat_t, traj_lengths_t)
+
+        # Enable dropout, freeze normalization layers
+        self.model.train()
+        for m in self.model.modules():
+            if isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                m.eval()
+
+        preds = []
+        with torch.no_grad():
+            for _ in range(n_samples):
+                logits = self.model(inputs)
+                preds.append(torch.sigmoid(logits))
+
+        self.model.eval()  # Restore
+
+        preds = torch.stack(preds)  # [n_samples, 1, ...]
+        mean_pred = preds.mean(dim=0)
+        std_pred = preds.std(dim=0)
+
+        if self.is_temporal and censor_step is not None:
+            target_step = min(censor_step, mean_pred.shape[-1] - 1)
+            prob = mean_pred[0, target_step].item()
+            unc = std_pred[0, target_step].item()
+        else:
+            prob = mean_pred[0, 1].item() if mean_pred.dim() > 1 and mean_pred.shape[-1] == 2 else mean_pred[0].item()
+            unc = std_pred[0, 1].item() if std_pred.dim() > 1 and std_pred.shape[-1] == 2 else std_pred[0].item()
+
+        return InferenceResult(
+            probability=prob,
+            label=int(prob >= 0.5),
+            pid=pid,
+            uncertainty=unc,
         )
 
     # ------------------------------------------------------------------
@@ -765,6 +864,128 @@ class InferenceSession:
             pid=context.pid,
             trajectory_length=context.trajectory_length,
         )
+
+    def explain_differential(self, context, t1_hours, t2_hours):
+        """Compute differential SHAP between two timepoints.
+
+        Uses the same patient context with different censor_step values
+        to get SHAP at T1 and T2, then computes ΔSHAP = SHAP(T2) - SHAP(T1).
+
+        Args:
+            context: A :class:`PatientContext` advanced to at least T2.
+            t1_hours: Earlier timepoint (hours after admission).
+            t2_hours: Later timepoint (hours after admission).
+
+        Returns:
+            :class:`DifferentialSHAPResult`
+        """
+        from astra.evaluation.utils import time_to_step
+
+        # Ensure t1 < t2
+        if t1_hours > t2_hours:
+            t1_hours, t2_hours = t2_hours, t1_hours
+
+        step_t1 = time_to_step(t1_hours, 'h')
+        step_t2 = time_to_step(t2_hours, 'h')
+
+        logger.info("Differential SHAP: pid=%s T1=%.1fh (step %d) → T2=%.1fh (step %d)",
+                     context.pid, t1_hours, step_t1, t2_hours, step_t2)
+
+        # SHAP at both timepoints
+        shap_t1 = self.explain_from_context(context, censor_step=step_t1)
+        shap_t2 = self.explain_from_context(context, censor_step=step_t2)
+
+        # Predictions at both timepoints
+        pred_t1 = self.predict_from_context(context, censor_step=step_t1)
+        pred_t2 = self.predict_from_context(context, censor_step=step_t2)
+
+        # Delta for time-series channels
+        all_channels = set(shap_t1.ts_shap) | set(shap_t2.ts_shap)
+        seq_len = next(iter(shap_t2.ts_shap.values())).shape[0]
+        delta_ts = {}
+        for ch in all_channels:
+            v1 = shap_t1.ts_shap.get(ch, np.zeros(seq_len))
+            v2 = shap_t2.ts_shap.get(ch, np.zeros(seq_len))
+            delta_ts[ch] = np.asarray(v2) - np.asarray(v1)
+
+        # Delta for categorical TS
+        delta_cat_ts = None
+        if shap_t1.cat_ts_shap or shap_t2.cat_ts_shap:
+            cats_t1 = shap_t1.cat_ts_shap or {}
+            cats_t2 = shap_t2.cat_ts_shap or {}
+            all_cats = set(cats_t1) | set(cats_t2)
+            delta_cat_ts = {}
+            for cat in all_cats:
+                v1 = cats_t1.get(cat, np.zeros(seq_len))
+                v2 = cats_t2.get(cat, np.zeros(seq_len))
+                delta_cat_ts[cat] = np.asarray(v2) - np.asarray(v1)
+
+        # Delta for static features
+        delta_static_cat = None
+        if shap_t1.static_cat_shap or shap_t2.static_cat_shap:
+            sc1 = shap_t1.static_cat_shap or {}
+            sc2 = shap_t2.static_cat_shap or {}
+            delta_static_cat = {k: sc2.get(k, 0.0) - sc1.get(k, 0.0)
+                                for k in set(sc1) | set(sc2)}
+
+        delta_static_cont = None
+        if shap_t1.static_cont_shap or shap_t2.static_cont_shap:
+            sn1 = shap_t1.static_cont_shap or {}
+            sn2 = shap_t2.static_cont_shap or {}
+            delta_static_cont = {k: sn2.get(k, 0.0) - sn1.get(k, 0.0)
+                                 for k in set(sn1) | set(sn2)}
+
+        # Top features by absolute delta
+        all_importances = []
+        for name, arr in delta_ts.items():
+            all_importances.append((name, float(np.abs(arr).mean())))
+        if delta_static_cont:
+            for name, val in delta_static_cont.items():
+                all_importances.append((name, abs(val)))
+        if delta_static_cat:
+            for name, val in delta_static_cat.items():
+                all_importances.append((name, abs(val)))
+        all_importances.sort(key=lambda x: x[1], reverse=True)
+
+        return DifferentialSHAPResult(
+            pid=context.pid,
+            t1_hours=t1_hours,
+            t2_hours=t2_hours,
+            t1_step=step_t1,
+            t2_step=step_t2,
+            t1_probability=pred_t1.probability,
+            t2_probability=pred_t2.probability,
+            delta_ts_shap=delta_ts,
+            delta_cat_ts_shap=delta_cat_ts,
+            delta_static_cat_shap=delta_static_cat,
+            delta_static_cont_shap=delta_static_cont,
+            top_delta_features=all_importances[:20],
+            shap_t1=shap_t1,
+            shap_t2=shap_t2,
+        )
+
+    def differential_shap_to_viz_dict(self, diff_result, x_ts, x_ts_cat, tab_df):
+        """Convert a DifferentialSHAPResult into the viz dict format.
+
+        Produces the same structure as :meth:`shap_to_viz_dict` but populated
+        with delta values (SHAP(T2) - SHAP(T1)).  Existing plot functions
+        (heatmaps, bar charts) work directly on this dict.
+
+        Returns:
+            (shap_dict, channel2feature, feature_names_cat, feature_names_cont)
+        """
+        # Build a temporary SHAPResult with delta values so we can delegate
+        # to the existing shap_to_viz_dict.
+        delta_shap = SHAPResult(
+            pid=diff_result.pid,
+            ts_shap=diff_result.delta_ts_shap,
+            cat_ts_shap=diff_result.delta_cat_ts_shap,
+            static_cat_shap=diff_result.delta_static_cat_shap,
+            static_cont_shap=diff_result.delta_static_cont_shap,
+            top_features=diff_result.top_delta_features,
+            eval_timestep=diff_result.t2_step,
+        )
+        return self.shap_to_viz_dict(delta_shap, x_ts, x_ts_cat, tab_df)
 
     def explain_ebm(self, context, save_path=None, top_n=20, top_k_lines=5):
         """Compute and optionally visualize per-patient EBM feature importance.

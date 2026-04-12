@@ -317,6 +317,7 @@ def run_validation(
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
 
     from astra.data.mixed_dataloader import load_model_state

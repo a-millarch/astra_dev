@@ -732,6 +732,7 @@ def prepare_data_and_dls(cfg):
     tf_mode = tf_cfg.get('mode', 'channel')
 
     temporal_channel_idx = None
+    bin_width_channel_idx = None
     exclude_channel_indices = []
 
     if tf_enabled and tf_mode == 'sinusoidal':
@@ -747,6 +748,13 @@ def prepare_data_and_dls(cfg):
             logger.warning(
                 "temporal_features.mode=sinusoidal but 'elapsed_hours' not found in channels; "
                 "falling back to learned positional encoding."
+            )
+        if 'bin_width_hours' in ts_channel_names:
+            bw_idx = ts_channel_names.index('bin_width_hours')
+            X_normalized[:, bw_idx, :] = X_raw[:, bw_idx, :]
+            bin_width_channel_idx = bw_idx
+            logger.info(
+                f'Temporal PE (sinusoidal): restored raw bin_width_hours at channel {bw_idx}'
             )
         exclude_channel_indices = [i for i, n in enumerate(ts_channel_names) if n in _aux_names]
         if exclude_channel_indices:
@@ -916,6 +924,8 @@ def prepare_data_and_dls(cfg):
 
     if tf_enabled and tf_mode == 'sinusoidal' and temporal_channel_idx is not None:
         tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
+    if tf_enabled and tf_mode == 'sinusoidal' and bin_width_channel_idx is not None:
+        tX_normalized[:, bin_width_channel_idx, :] = tX_raw[:, bin_width_channel_idx, :]
 
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
@@ -1013,6 +1023,7 @@ def prepare_data_and_dls(cfg):
         "holdout_trajectory_lengths": holdout_traj_lengths,
         "ebm_channel_idx": ebm_channel_idx,
         "temporal_channel_idx": temporal_channel_idx,
+        "bin_width_channel_idx": bin_width_channel_idx,
         "exclude_channel_indices": exclude_channel_indices,
         # Survival labels (None when survival_mode is disabled)
         "event_times": trainval_event_times,
@@ -1209,8 +1220,13 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'causal': cfg.get("model", {}).get("causal", False),
             'temporal_head_dropout': cfg.get("model", {}).get("temporal_head_dropout", 0.3),
             'temporal_channel_idx': data.get('temporal_channel_idx', None),
+            'bin_width_channel_idx': data.get('bin_width_channel_idx', None),
             'exclude_channel_indices': data.get('exclude_channel_indices', []),
             'head_pool': cfg.get("model", {}).get("head_pool", "flatten"),
+            'per_feature_cont_proj': cfg.get("model", {}).get("per_feature_cont_proj", False),
+            'cat_ts_gate': cfg.get("model", {}).get("cat_ts_gate", False),
+            'local_temporal_kernel': cfg.get("model", {}).get("local_temporal_kernel", 1),
+            'bin_width_modulation': cfg.get("model", {}).get("bin_width_modulation", False),
             'survival_mode': cfg.get("model", {}).get("survival_mode", False),
         },
 

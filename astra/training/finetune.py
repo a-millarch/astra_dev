@@ -198,6 +198,7 @@ def load_pretrained_backbone(
         temporal_head_dropout=temporal_head_dropout,
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
 
     if checkpoint_dir is None:
@@ -1009,6 +1010,7 @@ def run_finetune_v2(
             temporal_head_dropout=temporal_head_dropout,
             temporal_channel_idx=data.get('temporal_channel_idx'),
             exclude_channel_indices=data.get('exclude_channel_indices', []),
+            bin_width_channel_idx=data.get('bin_width_channel_idx'),
         )
         logger.info("Using randomly initialized backbone (no pretraining)")
 

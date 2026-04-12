@@ -293,6 +293,7 @@ def prepare_model(data, cfg):
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
 
     state_dict = load_model_state(model_name)
@@ -303,6 +304,40 @@ def prepare_model(data, cfg):
     backbone.eval()
     logger.info(f"Model loaded (temporal_head={is_temporal})")
     return backbone, device
+
+
+def mc_dropout_predict(model, inputs, n_samples=30):
+    """
+    MC Dropout: run N forward passes with dropout active for uncertainty estimation.
+
+    Args:
+        model: trained backbone model
+        inputs: tuple of input tensors (same format as model.forward)
+        n_samples: number of stochastic forward passes
+
+    Returns:
+        mean_probs: [batch, ...] mean predicted probabilities
+        std_probs: [batch, ...] standard deviation of predicted probabilities
+    """
+    import torch.nn as nn
+
+    # Enable dropout but keep normalization layers in eval mode
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            logits = model(inputs)
+            probs = torch.sigmoid(logits)
+            preds.append(probs)
+
+    model.eval()  # Restore
+    preds = torch.stack(preds)  # [n_samples, batch, ...]
+    return preds.mean(dim=0), preds.std(dim=0)
+
 
 def delong_roc_variance(ground_truth, predictions):
     order = np.argsort(predictions)
