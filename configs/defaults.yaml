@@ -213,6 +213,7 @@ model:
   temporal_head: true
   causal: true  # required for temporal_head
   temporal_head_dropout: 0.6
+  temporal_head_mult: 0.5  # hidden = int(d_model * mult); 0.5 = d_model//2
   survival_mode: false  # true = discrete-time survival, false = binary classification
 
   # Architecture enhancements
@@ -289,6 +290,7 @@ sweep:
         fc_dropout: [0.1, 0.9]
         res_dropout: [0.0, 0.7]
         temporal_head_dropout: [0.0, 0.8]
+        temporal_head_mult: [0.25, 2.0]
         head_pool: [flatten, mean_cat]
         # Training HPs (LR parameterized as base_lr × decay^phase)
         base_lr: [5.0e-4, 1.0e-2]            # log scale; phase 1 LR

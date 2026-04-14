@@ -54,6 +54,8 @@ def _best_to_config_sections(best: dict, best_attrs: dict = None) -> dict:
         model_section["fc_dropout"] = best["fc_dropout"]
     if "temporal_head_dropout" in best:
         model_section["temporal_head_dropout"] = best["temporal_head_dropout"]
+    if "temporal_head_mult" in best:
+        model_section["temporal_head_mult"] = best["temporal_head_mult"]
 
     # Compute phase2_unfreeze_from dynamically from n_layers
     n_layers = best["n_layers"]
@@ -223,12 +225,17 @@ def joint_objective(
             "temporal_head_dropout", *ss.get("temporal_head_dropout", [0.0, 0.6]),
             step=0.05,
         )
+        temporal_head_mult = trial.suggest_float(
+            "temporal_head_mult", *ss.get("temporal_head_mult", [0.25, 2.0]),
+            step=0.05,
+        )
     else:
         fc_mults_1 = trial.suggest_float("fc_mults_1", *ss["fc_mults_1"], step=0.05)
         fc_mults_2 = trial.suggest_float("fc_mults_2", *ss["fc_mults_2"], step=0.05)
         fc_dropout = trial.suggest_float("fc_dropout", *ss["fc_dropout"], step=0.05)
         head_pool = trial.suggest_categorical("head_pool", ss["head_pool"])
         temporal_head_dropout = cfg_dict["model"].get("temporal_head_dropout", 0.3)
+        temporal_head_mult = cfg_dict["model"].get("temporal_head_mult", 0.5)
 
     # Ensure d_model is divisible by n_heads
     if d_model % n_heads != 0:
@@ -307,7 +314,7 @@ def joint_objective(
     # --- Temporarily override global cfg with trial architecture ---
     orig_model_cfg = {k: cfg_dict["model"][k] for k in [
         "d_model", "n_layers", "n_heads", "fc_mults_1", "fc_mults_2",
-        "fc_dropout", "res_dropout", "temporal_head_dropout",
+        "fc_dropout", "res_dropout", "temporal_head_dropout", "temporal_head_mult",
     ] if k in cfg_dict["model"]}
     orig_head_pool = cfg_dict["model"].get("head_pool")
 
@@ -322,6 +329,7 @@ def joint_objective(
         cfg_dict["model"]["res_dropout"] = res_dropout
         cfg_dict["model"]["head_pool"] = head_pool
         cfg_dict["model"]["temporal_head_dropout"] = temporal_head_dropout
+        cfg_dict["model"]["temporal_head_mult"] = temporal_head_mult
 
         # Compute phase2_unfreeze_from dynamically: unfreeze top ~half of layers
         # Layer groups are pairs: transformer_0_1, transformer_2_3, ...
@@ -527,6 +535,7 @@ def run_sweep(
         else:
             seed_params["time_weighting"] = ft_cfg.get("time_weighting", "uniform")
             seed_params["temporal_head_dropout"] = model_cfg.get("temporal_head_dropout", 0.3)
+            seed_params["temporal_head_mult"] = model_cfg.get("temporal_head_mult", 0.5)
             seed_params["temporal_loss_averaging"] = ft_cfg.get("temporal_loss_averaging", "per_sample")
             seed_params["eval_timeframe_weighting"] = str(ft_cfg.get("eval_timeframe_weighting", False)).lower()
             if ft_cfg.get("eval_timeframe_weighting", False):
@@ -571,6 +580,8 @@ def run_sweep(
         cfg_dict["model"]["head_pool"] = best["head_pool"]
     if "temporal_head_dropout" in best:
         cfg_dict["model"]["temporal_head_dropout"] = best["temporal_head_dropout"]
+    if "temporal_head_mult" in best:
+        cfg_dict["model"]["temporal_head_mult"] = best["temporal_head_mult"]
     logger.info(f"Updated global model config with best architecture")
 
     best_cfg = _build_best_finetune_cfg(best)

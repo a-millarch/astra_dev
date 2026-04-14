@@ -190,12 +190,14 @@ def load_pretrained_backbone(
     temporal_head = model_cfg.get("temporal_head", False)
     causal = model_cfg.get("causal", False)
     temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+    temporal_head_mult = model_cfg.get("temporal_head_mult", 0.5)
 
     backbone = get_backbone(
         data, cfg_dict,
         temporal_head=temporal_head,
         causal=causal,
         temporal_head_dropout=temporal_head_dropout,
+        temporal_head_mult=temporal_head_mult,
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
         bin_width_channel_idx=data.get('bin_width_channel_idx'),
@@ -987,6 +989,7 @@ def run_finetune_v2(
     temporal_head = model_cfg.get("temporal_head", False)
     causal = model_cfg.get("causal", False)
     temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+    temporal_head_mult = model_cfg.get("temporal_head_mult", 0.5)
     survival_mode = model_cfg.get("survival_mode", False)
 
     # Auto-enable causal masking when temporal head is on (prevents silent leakage)
@@ -1008,6 +1011,7 @@ def run_finetune_v2(
             temporal_head=temporal_head,
             causal=causal,
             temporal_head_dropout=temporal_head_dropout,
+            temporal_head_mult=temporal_head_mult,
             temporal_channel_idx=data.get('temporal_channel_idx'),
             exclude_channel_indices=data.get('exclude_channel_indices', []),
             bin_width_channel_idx=data.get('bin_width_channel_idx'),

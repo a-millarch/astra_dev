@@ -151,6 +151,7 @@ class InferenceSession:
             temporal_head=params['temporal_head'],
             causal=params['causal'],
             temporal_head_dropout=params['temporal_head_dropout'],
+            temporal_head_mult=params.get('temporal_head_mult', 0.5),
             temporal_channel_idx=params.get('temporal_channel_idx', None),
             exclude_channel_indices=params.get('exclude_channel_indices', []),
             head_pool=params.get('head_pool', 'flatten'),

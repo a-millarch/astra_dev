@@ -61,16 +61,18 @@ class TemporalPredictionHead(nn.Module):
     positions (temporal only), applies a shared MLP to each, outputs [batch, seq_len].
     """
 
-    def __init__(self, d_model: int, seq_len: int, dropout: float = 0.3):
+    def __init__(self, d_model: int, seq_len: int, dropout: float = 0.3,
+                 head_mult: float = 0.5):
         super().__init__()
         self.seq_len = seq_len
+        hidden = max(1, int(d_model * head_mult))
         self.mlp = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1),
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -451,6 +453,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         temporal_head: bool = False,            # Per-timestep prediction head
         causal: bool = False,                   # Causal attention masking
         temporal_head_dropout: float = 0.3,     # Dropout for temporal head MLP
+        temporal_head_mult: float = 0.5,        # Hidden dim = int(d_model * mult)
         temporal_channel_idx: Optional[int] = None,          # Index of elapsed_hours in x_ts
         exclude_channel_indices: Optional[List[int]] = None, # Aux channels to skip in W_P
         head_pool: str = 'flatten',             # 'flatten' (legacy) or 'mean_cat' (pooled)
@@ -590,7 +593,8 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         if temporal_head:
             # Per-timestep prediction head (~2K params)
             self.temporal_pred_head = TemporalPredictionHead(
-                d_model, seq_len, dropout=temporal_head_dropout
+                d_model, seq_len, dropout=temporal_head_dropout,
+                head_mult=temporal_head_mult,
             )
             self.head = None  # Skip large flatten+MLP
             self.head_nf = d_model

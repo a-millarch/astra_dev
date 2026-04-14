@@ -291,6 +291,7 @@ def prepare_model(data, cfg):
         temporal_head=is_temporal,
         causal=model_cfg.get("causal", False),
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+        temporal_head_mult=model_cfg.get("temporal_head_mult", 0.5),
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
         bin_width_channel_idx=data.get('bin_width_channel_idx'),
