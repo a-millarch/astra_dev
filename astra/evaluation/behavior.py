@@ -932,11 +932,22 @@ class ModelWrapperWithEmbeddings(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation (before stripping aux channels)
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P (same as model forward)
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
         x = self.model.W_P(x_ts_signal).transpose(1, 2)
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
         if self.has_cat_ts and x_ts_cat_embedded is not None:
+            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
             if self.model.cat_ts_combine == 'add':
                 x = x + x_ts_cat_embedded
             else:
@@ -946,7 +957,12 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x = torch.cat([x, x_cat_embedded], 1)
 
         if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
         # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
@@ -1033,11 +1049,22 @@ class ModelWrapperWithOneHotCategoricals(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
         x = self.model.W_P(x_ts_signal).transpose(1, 2)
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
         if self.has_cat_ts and x_ts_cat_embedded is not None:
+            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
             if self.model.cat_ts_combine == 'add':
                 x = x + x_ts_cat_embedded
             else:
@@ -1059,7 +1086,12 @@ class ModelWrapperWithOneHotCategoricals(nn.Module):
             x = torch.cat([x, x_cat_embedded], 1)
 
         if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
         # Positional encoding
@@ -1142,9 +1174,19 @@ class ModelWrapperWithRawCatTS(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P (same as model forward)
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
         x = self.model.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
         # Embed categorical TS from raw multi-hot (this is differentiable!)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
@@ -1161,8 +1203,11 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 dim_offset += n_classes
 
             if self.model.cat_ts_combine == 'add':
-                x_ts_cat_embedded = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-                x = x + x_ts_cat_embedded
+                stacked = torch.stack(x_ts_cat_embedded_list, dim=0)
+                if self.model.cat_ts_gate_params is not None:
+                    gates = torch.sigmoid(self.model.cat_ts_gate_params)
+                    stacked = stacked * gates[:, None, None, None]
+                x = x + stacked.sum(dim=0)
             else:
                 x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_embedded], dim=-1)
@@ -1173,7 +1218,12 @@ class ModelWrapperWithRawCatTS(nn.Module):
 
         # Static continuous
         if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
         # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
@@ -1243,7 +1293,11 @@ def embed_categorical_ts(model, x_ts_cat, encoding_info):
             dim_offset += n_classes
         
         if model.cat_ts_combine == 'add':
-            x_ts_cat_embedded = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
+            stacked = torch.stack(x_ts_cat_embedded_list, dim=0)
+            if model.cat_ts_gate_params is not None:
+                gates = torch.sigmoid(model.cat_ts_gate_params)
+                stacked = stacked * gates[:, None, None, None]
+            x_ts_cat_embedded = stacked.sum(dim=0)
         else:
             x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
     
