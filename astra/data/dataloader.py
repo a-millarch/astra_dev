@@ -679,10 +679,17 @@ def prepare_data_and_dls(cfg):
                 + (f" with clip_range={clip_range}" if clip_range else ""))
 
     # Get trajectory lengths (works with NaN for missing measurements).
-    # Exclude EBM channel so forward-filled predictions cannot extend
-    # the trajectory beyond where clinical measurements exist.
+    # Exclude non-clinical channels (EBM, temporal features) whose values
+    # are non-zero everywhere and would inflate trajectory length detection.
     ebm_enabled = cfg.get('ebm_feature', {}).get('enabled', False)
-    traj_exclude_chs = [ebm_channel_idx] if ebm_enabled else None
+    traj_exclude_chs = [ebm_channel_idx] if ebm_enabled else []
+    tf_cfg = cfg.get('temporal_features', {})
+    if tf_cfg.get('enabled', False):
+        _tf_names = set(tf_cfg.get('features', []))
+        for i, name in enumerate(ts_channel_names):
+            if name in _tf_names:
+                traj_exclude_chs.append(i)
+    traj_exclude_chs = traj_exclude_chs or None
     traj_lengths = get_trajectory_lengths(X, padding_value=0.0, exclude_channels=traj_exclude_chs)
     logger.info(f'Trajectory lengths - min: {traj_lengths.min()}, max: {traj_lengths.max()}, '
                f'mean: {traj_lengths.mean():.1f}')
@@ -727,7 +734,7 @@ def prepare_data_and_dls(cfg):
     X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
 
     # === TEMPORAL FEATURES: mode-aware index computation + elapsed_hours restoration ===
-    tf_cfg = cfg.get('temporal_features', {})
+    # tf_cfg already assigned above for trajectory length exclusion
     tf_enabled = tf_cfg.get('enabled', False)
     tf_mode = tf_cfg.get('mode', 'channel')
 
@@ -762,6 +769,15 @@ def prepare_data_and_dls(cfg):
             logger.info(
                 f'Temporal PE: excluding {excluded_names} (indices {exclude_channel_indices}) from W_P'
             )
+        # Re-zero padding positions in restored temporal channels.
+        # normalize_with_padding_mask already zeroed them, but restoring raw
+        # values above re-introduced non-zero time data in padding positions.
+        _s_len = X_normalized.shape[2]
+        _pos = np.arange(_s_len)[np.newaxis, :]
+        _beyond = _pos >= traj_lengths[:, np.newaxis]  # [n_samples, seq_len]
+        for ch_idx in exclude_channel_indices:
+            X_normalized[:, ch_idx, :][_beyond] = 0.0
+        logger.info(f'Zeroed temporal features in {_beyond.sum()} padding positions')
     elif tf_enabled and tf_mode == 'channel':
         logger.info('Temporal features mode=channel: elapsed_hours/bin_width_hours go through W_P normally')
 
@@ -922,10 +938,17 @@ def prepare_data_and_dls(cfg):
 
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
 
-    if tf_enabled and tf_mode == 'sinusoidal' and temporal_channel_idx is not None:
-        tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
-    if tf_enabled and tf_mode == 'sinusoidal' and bin_width_channel_idx is not None:
-        tX_normalized[:, bin_width_channel_idx, :] = tX_raw[:, bin_width_channel_idx, :]
+    if tf_enabled and tf_mode == 'sinusoidal':
+        if temporal_channel_idx is not None:
+            tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
+        if bin_width_channel_idx is not None:
+            tX_normalized[:, bin_width_channel_idx, :] = tX_raw[:, bin_width_channel_idx, :]
+        # Re-zero padding in restored temporal channels
+        _h_slen = tX_normalized.shape[2]
+        _h_pos = np.arange(_h_slen)[np.newaxis, :]
+        _h_beyond = _h_pos >= holdout_traj_lengths[:, np.newaxis]
+        for ch_idx in exclude_channel_indices:
+            tX_normalized[:, ch_idx, :][_h_beyond] = 0.0
 
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
