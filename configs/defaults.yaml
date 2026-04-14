@@ -200,50 +200,48 @@ training:
     epochs: 30
     bs: 32
     
+  
 model:
-  d_model: 128
-  n_layers: 8
-  n_heads: 8
-  fc_mults_1: 0.10
-  fc_mults_2: 0.25
-  fc_dropout: 0.72
-  res_dropout: 0.29
+  d_model: 192
+  n_layers: 4
+  n_heads: 16
+  fc_mults_1: 0.1
+  fc_mults_2: 0.05
+  fc_dropout: 0.4
+  res_dropout: 0.1
   head_pool: mean_cat
+  temporal_head_dropout: 0.55
     
   temporal_head: true
   causal: true  # required for temporal_head
-  temporal_head_dropout: 0.6
+
   survival_mode: false  # true = discrete-time survival, false = binary classification
 
-  # Architecture enhancements
-  per_feature_cont_proj: true    # Per-feature static continuous projection (Fix 1)
-  cat_ts_gate: true              # Learned sigmoid gate per categorical group (Fix 3)
-  local_temporal_kernel: 3       # Depthwise conv kernel before W_P, 1=disabled (Fix 9)
-  bin_width_modulation: true     # Modulate W_P output by bin width (Fix 5)
-
 finetune:
-  phase1_epochs: 4
-  phase1_lr: 0.0034069416021263346
-  phase2_epochs: 8
-  phase2_lr: 0.0001908557798982261
-  phase3_epochs: 11
-  phase3_lr: 0.0006191469401201928
-  phase4_epochs: 3
-  phase4_lr: 2.3558261806780157e-05
+  phase1_epochs: 3
+  phase1_lr: 0.002095169972417103
+  phase2_epochs: 17
+  phase2_lr: 0.0003896
+  phase2_unfreeze_from: transformer_2_3
+  phase3_epochs: 9
+  phase3_lr: 7.25e-05
+  phase4_epochs: 10
+  phase4_lr: 1.348e-05
   enable_early_prediction: true
-  masking_prob: 0.5631687557288182
-  early_weight: 1.9118170977991875
-  lr_decay_factor: 0.47227044823585246
-  weight_decay: 0.0463853858389733
-  label_smoothing: 0.19071867772674164
-  pos_weight_factor: 0.8645166062945272
+  masking_prob: 0.6000000000000001
+  early_weight: 1.8
+  lr_decay_factor: 0.05623310957562682
+  weight_decay: 0.005374083850821259
+  label_smoothing: 0.09
+  pos_weight_factor: 0.6000000000000001
   time_weighting: early
-  temporal_crop_prob: 0.42987217500631086
-  temporal_crop_all_phases: true
+  temporal_loss_averaging: per_sample
+  eval_timeframe_weighting: 'true'
+  eval_timeframe_weight: 1.5
+  ranking_loss_weight: 0.15000000000000002
+  temporal_crop_prob: 0.0
+  temporal_crop_all_phases: false
   # ── End sweep results ──
-
-  # Phase 2 architecture
-  phase2_unfreeze_from: transformer_4_5
 
   # Phase 4 settings
   min_timesteps: 2
@@ -261,18 +259,9 @@ finetune:
 
   # Temporal head
   early_weight_factor: 2.0
-
-  # Temporal loss averaging
-  temporal_loss_averaging: per_sample
-
-  # Evaluation-timeframe weighting
-  eval_timeframe_weighting: false
-  eval_timeframe_weight: 3.0
-
-  # Pairwise ranking loss
-  ranking_loss_weight: 0.0
   ranking_loss_n_timeframes: 5
   ranking_loss_max_pairs: 10000
+
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
