@@ -1839,9 +1839,9 @@ def _try_add_elixhauser(
                                               patient_dir=patient_dir)
     except Exception as e:
         logger.warning(
-            f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=NaN."
+            f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=0.0."
         )
-        base_df["ASMT_ELIX"] = np.nan
+        base_df["ASMT_ELIX"] = 0.0
         return base_df
 
 

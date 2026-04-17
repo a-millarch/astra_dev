@@ -769,7 +769,9 @@ def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
                 elix[["PID", ]+cols_to_add], how="left", on="PID"
             )
             assert baselen - len(base) == 0
-            logger.info("Merged Elix onto base")
+            n_missing = int(base["ASMT_ELIX"].isna().sum())
+            base["ASMT_ELIX"] = base["ASMT_ELIX"].fillna(0.0)
+            logger.info(f"Merged Elix onto base (filled {n_missing} missing ASMT_ELIX with 0.0)")
             return base
         # TODO: merge onto base
         except FileNotFoundError:
