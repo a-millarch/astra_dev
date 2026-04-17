@@ -263,12 +263,12 @@ class AstraMixedDataset(Dataset):
         return self.X_ts_cat_profiles is not None
 
     def __getitem__(self, idx):
-        profile = self.X_ts_cat_profiles[idx] if self.has_profiles else None
         inputs = (
             self.X_ts[idx], (self.x_cat[idx], self.x_cont[idx]),
             self.X_ts_cat[idx], self.traj_lengths[idx],
-            profile,
         )
+        if self.has_profiles:
+            inputs = inputs + (self.X_ts_cat_profiles[idx],)
         if self.has_survival_labels:
             targets = (self.y[idx], self.event_times[idx], self.event_indicators[idx])
         else:
