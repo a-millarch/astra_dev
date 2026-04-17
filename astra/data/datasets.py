@@ -939,6 +939,7 @@ class TSDS:
         concepts = {}
         concepts_raw = {}
         self.timestep_cols = []
+        self._profile_data = {}  # {concept: (profile_array, profile_dims, category_order)}
         for concept in self.concepts:
             logger.debug(f"getting {concept}")
             concepts_raw[concept] = get_concept(concept, self.cfg, self._base_pids)
@@ -948,6 +949,30 @@ class TSDS:
                 agg_func_name = self.cfg["agg_func"][concept]
                 concept_long_df = concepts_raw[concept][self.cfg["agg_func"][concept][0]].copy(deep=True)
                 concepts[concept] = _get_long_concept_df_multi_label(concept_long_df, self.base, self.cfg, self._base_pids)
+
+                # Compute categorical profiles if enabled for this concept
+                from astra.data.profiles import profiles_enabled, get_profiled_categories, CategoricalProfileEncoder, load_profiles_config
+                if profiles_enabled(self.cfg):
+                    profiles_cfg = load_profiles_config(self.cfg)
+                    concept_profiles = profiles_cfg.get(concept, {})
+                    profiled_cats = concept_profiles.get("categories", {})
+                    sub_code_long = concepts[concept].attrs.get("sub_code_long")
+
+                    if profiled_cats and sub_code_long is not None:
+                        encoder = CategoricalProfileEncoder(concept_profiles)
+                        sub_code_index = encoder.build_sub_code_index_fast(sub_code_long)
+                        pids = sorted(concepts[concept]['PID'].unique())
+                        timestep_cols = concepts[concept].attrs["timestep_cols"]
+                        profile_array, profile_dims, category_order = encoder.compute_profiles(
+                            sub_code_index, pids, timestep_cols
+                        )
+                        self._profile_data[concept] = (profile_array, profile_dims, category_order, pids)
+                        # Remove profiled category values from wide df (they'll use the profile tensor)
+                        concepts[concept] = encoder.strip_profiled_from_wide(
+                            concepts[concept], timestep_cols
+                        )
+                        logger.info(f"Profiles for {concept}: {profile_dims}")
+
                 # specifcy max ts dims
                 if len(concepts[concept].attrs["timestep_cols"]) > len(self.timestep_cols):
                     self.timestep_cols = concepts[concept].attrs["timestep_cols"]
@@ -1243,7 +1268,14 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
     logger.debug(f"Initial PID count {df_long.PID.nunique()}")
     df_long = df_long[df_long.bin_freq.isin(cfg["bin_freq_include"])].copy(deep=True)
     logger.debug(f">>minus bin freq: {df_long.PID.nunique()}")
-    df_long = df_long[['PID', 'bin_counter','FEATURE', 'VALUE']].rename(columns={'bin_counter':'TIMESTEP'})
+
+    # Preserve SUB_CODE for categorical profile encoding if present
+    keep_cols = ['PID', 'bin_counter', 'FEATURE', 'VALUE']
+    has_sub_code = 'SUB_CODE' in df_long.columns
+    if has_sub_code:
+        keep_cols.append('SUB_CODE')
+
+    df_long = df_long[keep_cols].rename(columns={'bin_counter':'TIMESTEP'})
     df_long["TIMESTEP"] = df_long["TIMESTEP"]-1 # matching df2xy function index 0
 
     # Re-index to contiguous 0-based positions (matching single-label behavior)
@@ -1255,6 +1287,12 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
     # Filter to relevant PIDs BEFORE expensive pivot
     df_long = df_long[df_long.PID.isin(base_pids)]
     logger.debug(f">>after PID filter: {df_long.PID.nunique()}")
+
+    # Store sub-code long-format data before pivot (for profile encoding)
+    # The pivot aggregates values into lists, losing per-row sub-code detail.
+    sub_code_long = None
+    if has_sub_code:
+        sub_code_long = df_long[['PID', 'TIMESTEP', 'VALUE', 'SUB_CODE']].copy()
 
     # Pivot to wide format (your format)
     df_wide = df_long.pivot_table(
@@ -1282,6 +1320,8 @@ def _get_long_concept_df_multi_label(df_long:pd.DataFrame, base:pd.DataFrame, cf
         df_wide = pd.concat([df_wide, placeholder], ignore_index=True)
 
     df_wide.attrs["timestep_cols"] = timestep_cols
+    if sub_code_long is not None:
+        df_wide.attrs["sub_code_long"] = sub_code_long
     logger.debug(f">>> after wide: {df_wide.PID.nunique()}")
     return df_wide
 

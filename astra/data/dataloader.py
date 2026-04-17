@@ -519,6 +519,54 @@ def encode_categorical_ts(df_wide, y, cfg, encoder=None):
     return X_multi_hot, encoding_info, ts_cat_dims, encoder
 
 
+def _extract_profile_tensors(tsds, final_pids, cfg):
+    """Extract and re-index profile tensors from a TSDS to match final PID order.
+
+    Args:
+        tsds: TSDS instance with ``_profile_data`` populated by ``collect_concepts()``.
+        final_pids: Sorted list of PIDs matching the final X/y ordering.
+        cfg: Config dict.
+
+    Returns:
+        profiles: np.ndarray [n_samples, total_profiled_categories, seq_len] (int8)
+                  or None if profiles are disabled / no profiled categories.
+        profile_dims: Dict {category_name: n_levels} across all concepts, or None.
+        category_order: List of profiled category names (matches tensor dim 1 order), or None.
+    """
+    from astra.data.profiles import profiles_enabled
+
+    if not profiles_enabled(cfg) or not hasattr(tsds, '_profile_data') or not tsds._profile_data:
+        return None, None, None
+
+    all_profile_arrays = []
+    all_profile_dims = {}
+    all_category_order = []
+
+    for concept, (profile_array, profile_dims, category_order, original_pids) in tsds._profile_data.items():
+        # Re-index profile_array rows to match final_pids
+        pid_to_orig_idx = {pid: idx for idx, pid in enumerate(original_pids)}
+        reindexed = np.zeros(
+            (len(final_pids), profile_array.shape[1], profile_array.shape[2]),
+            dtype=np.int8,
+        )
+        for new_idx, pid in enumerate(final_pids):
+            if pid in pid_to_orig_idx:
+                reindexed[new_idx] = profile_array[pid_to_orig_idx[pid]]
+
+        all_profile_arrays.append(reindexed)
+        all_profile_dims.update(profile_dims)
+        all_category_order.extend(category_order)
+
+    if not all_profile_arrays:
+        return None, None, None
+
+    # Concatenate along category dimension (dim 1) across concepts
+    profiles = np.concatenate(all_profile_arrays, axis=1)
+    logger.info(f"Profile tensor shape: {profiles.shape} (dims: {all_profile_dims})")
+
+    return profiles, all_profile_dims, all_category_order
+
+
 # ============================================================================
 # Main data preparation function
 # ============================================================================
@@ -849,6 +897,11 @@ def prepare_data_and_dls(cfg):
         trainval.complete_cat, y, cfg, encoder=None,
     )
 
+    # Extract and align profile tensors from TSDS (if profiles enabled)
+    trainval_profiles, ts_cat_profile_dims, profile_category_order = _extract_profile_tensors(
+        trainval, sorted(trainval.complete_cat['PID'].unique()), cfg
+    )
+
     trainval_dataset = AstraMixedDataset(
         X_ts=X_normalized,
         x_cat=trainval_x_cat,
@@ -858,6 +911,7 @@ def prepare_data_and_dls(cfg):
         trajectory_lengths=traj_lengths,
         event_times=trainval_event_times,
         event_indicators=trainval_event_indicators,
+        X_ts_cat_profiles=trainval_profiles,
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -979,6 +1033,10 @@ def prepare_data_and_dls(cfg):
         holdout.complete_cat, ty, cfg, encoder=cat_encoder,
     )
 
+    holdout_profiles, _, _ = _extract_profile_tensors(
+        holdout, sorted(holdout.complete_cat['PID'].unique()), cfg
+    )
+
     holdout_dataset = AstraMixedDataset(
         X_ts=tX_normalized,
         x_cat=holdout_x_cat,
@@ -988,6 +1046,7 @@ def prepare_data_and_dls(cfg):
         trajectory_lengths=holdout_traj_lengths,
         event_times=holdout_event_times,
         event_indicators=holdout_event_indicators,
+        X_ts_cat_profiles=holdout_profiles,
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,
@@ -1058,6 +1117,11 @@ def prepare_data_and_dls(cfg):
         "c_in": c_in,
         "seq_len": seq_len,
         "ts_cat_dims": ts_cat_dims,
+        # Profile-based categorical TS (None when profiles disabled)
+        "ts_cat_profile_dims": ts_cat_profile_dims,
+        "profile_category_order": profile_category_order,
+        "X_ts_cat_profiles": trainval_profiles,
+        "tX_ts_cat_profiles": holdout_profiles,
     }
 
 
@@ -1252,6 +1316,7 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'local_temporal_kernel': cfg.get("model", {}).get("local_temporal_kernel", 1),
             'bin_width_modulation': cfg.get("model", {}).get("bin_width_modulation", False),
             'survival_mode': cfg.get("model", {}).get("survival_mode", False),
+            'ts_cat_profile_dims': data.get('ts_cat_profile_dims'),
         },
 
         # --- SHAP background data ---
@@ -1267,7 +1332,12 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'concepts': list(cfg.get('concepts', [])),
             'temporal_features': cfg.get('temporal_features', {}),
             'ebm_channel_idx': data.get('ebm_channel_idx'),
+            'categorical_profiles': cfg.get('categorical_profiles', {}),
         },
+
+        # --- Profile-based categorical TS ---
+        'ts_cat_profile_dims': data.get('ts_cat_profile_dims'),
+        'profile_category_order': data.get('profile_category_order'),
 
         # --- Metadata ---
         'model_name': model_name,

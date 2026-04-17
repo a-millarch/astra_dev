@@ -462,6 +462,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         local_temporal_kernel: int = 1,         # Depthwise conv kernel before W_P (1=disabled)
         bin_width_channel_idx: Optional[int] = None,  # Index of bin_width_hours in x_ts
         bin_width_modulation: bool = False,     # Modulate W_P output by bin width
+        ts_cat_profile_dims: Optional[Dict[str, int]] = None,  # {category: n_levels} for profiled categories
     ):
         """
         Args:
@@ -509,7 +510,23 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             self.ts_cat_dims = {}
             self.cat_ts_gate_params = None
             continuous_dim = d_model
-        
+
+        # === PROFILED CATEGORICAL TIME SERIES ===
+        # Per-category ordinal embeddings for categories with clinician-defined profiles.
+        # These are separate from multi-hot binary categories.
+        if ts_cat_profile_dims:
+            from astra.data.preprocessing import ProfileEmbedding
+            profile_emb_dim = d_model  # always 'add' mode for profiles
+            self.profile_embedding = ProfileEmbedding(
+                profile_dims=ts_cat_profile_dims,
+                embedding_dim=profile_emb_dim,
+                zero_absent=True,
+            )
+            self.ts_cat_profile_dims = ts_cat_profile_dims
+        else:
+            self.profile_embedding = None
+            self.ts_cat_profile_dims = {}
+
         # === AUXILIARY CHANNEL EXCLUSION ===
         # Channels listed in exclude_channel_indices (e.g. elapsed_hours, bin_width_hours)
         # remain in x_ts for extraction but are NOT projected through W_P.
@@ -672,7 +689,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         traj_lengths = None
         if isinstance(x_input, (tuple, list)):
             if len(x_input) >= 3:
-                # TSAI format: (x_ts, x_tab, x_ts_cat) or (x_ts, x_tab, x_ts_cat, traj_lengths)
+                # TSAI format: (x_ts, x_tab, x_ts_cat, traj_lengths[, profiles])
                 x_ts = x_input[0]                    # Continuous TS
                 x_tab = x_input[1]                   # Tabular (tuple)
                 x_ts_cat_multi_hot = x_input[2]      # Categorical TS
@@ -711,6 +728,11 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x_cat = torch.tensor([], device=x_input.device)
             x_cont = torch.tensor([], device=x_input.device)
         
+        # === EXTRACT PROFILE TENSOR ===
+        x_ts_cat_profiles = None
+        if isinstance(x_input, (tuple, list)) and len(x_input) >= 5:
+            x_ts_cat_profiles = x_input[4]  # [bs, n_profiled, seq_len] or None
+
         # === HANDLE KEY PADDING MASK ===
         if traj_lengths is not None:
             # Proper padding mask from trajectory lengths (preferred)
@@ -794,6 +816,13 @@ class TSTabFusionTransformerMultiHot(nn.Module):
                 x_ts_cat_concat = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_concat], dim=-1)
         
+        # === PROCESS PROFILED CATEGORICAL TIME SERIES ===
+        if self.profile_embedding is not None and x_ts_cat_profiles is not None:
+            # x_ts_cat_profiles: [bs, n_profiled, seq_len] → [bs, seq_len, n_profiled]
+            x_profiles = x_ts_cat_profiles.transpose(1, 2)
+            profile_embedded = self.profile_embedding(x_profiles)  # [bs, seq_len, d_model]
+            x = x + profile_embedded
+
         # === PROCESS STATIC CATEGORICAL FEATURES ===
         if self.n_emb != 0 and x_cat.numel() > 0:
             x_cat_list = [e(x_cat[:, i]).unsqueeze(1) for i, e in enumerate(self.embeds)]

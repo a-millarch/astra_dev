@@ -55,6 +55,7 @@ def get_backbone(
         local_temporal_kernel=model_cfg.get("local_temporal_kernel", 1),
         bin_width_channel_idx=bin_width_channel_idx,
         bin_width_modulation=model_cfg.get("bin_width_modulation", False),
+        ts_cat_profile_dims=data.get("ts_cat_profile_dims"),
     )
     return backbone
 
@@ -170,6 +171,7 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         x_cont=x_cont,
         X_ts_cat=X_multi_hot,
         y=y,
+        X_ts_cat_profiles=data.get("X_ts_cat_profiles"),
     )
     mixed_dls_ul = AstraMixedDataLoader(
         pretrain_dataset,

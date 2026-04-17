@@ -111,6 +111,19 @@ class TSTabFusionMLM(nn.Module):
         else:
             self.cat_ts_heads = None
         
+        # 2b. Profile categorical TS reconstruction (per-category cross-entropy)
+        if backbone.ts_cat_profile_dims:
+            self.profile_heads = nn.ModuleDict()
+            for cat_name, n_levels in backbone.ts_cat_profile_dims.items():
+                self.profile_heads[cat_name] = nn.Sequential(
+                    nn.Linear(d_model, d_model),
+                    nn.GELU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(d_model, n_levels + 1)  # +1 for absent level 0
+                )
+        else:
+            self.profile_heads = None
+
         # 3. Static categorical reconstruction
         if backbone.n_emb != 0:
             n_classes = [emb.num_embeddings for emb in backbone.embeds]
@@ -290,15 +303,16 @@ class TSTabFusionMLM(nn.Module):
         
         return masked_x_cont, mask, original_x_cont
     
-    def forward_encoder(self, x_ts, x_ts_cat, x_cat, x_cont):
+    def forward_encoder(self, x_ts, x_ts_cat, x_cat, x_cont, x_ts_cat_profiles=None):
         """
         Forward pass through encoder (UPDATED for TSAI format).
-        
+
         Args:
             x_ts: Continuous TS
             x_ts_cat: Multi-hot categorical TS (NEW)
             x_cat: Static categorical
             x_cont: Static continuous
+            x_ts_cat_profiles: Profile categorical TS [bs, n_profiled, seq_len] (optional)
         """
         # Pack into TSAI format: (x_ts, x_tab, x_ts_cat)
         x_tab = (x_cat, x_cont)
@@ -377,12 +391,18 @@ class TSTabFusionMLM(nn.Module):
                 x_ts_cat_concat = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x_encoded = torch.cat([x_encoded, x_ts_cat_concat], dim=-1)
         
+        # Profile categorical TS encoding (if present)
+        if self.backbone.profile_embedding is not None and x_ts_cat_profiles is not None:
+            x_profiles = x_ts_cat_profiles.transpose(1, 2)  # [bs, seq_len, n_profiled]
+            profile_embedded = self.backbone.profile_embedding(x_profiles)
+            x_encoded = x_encoded + profile_embedded
+
         # Static categorical encoding
         if self.backbone.n_emb != 0 and x_cat is not None and x_cat.numel() > 0:
             x_cat_list = [e(x_cat[:, i]).unsqueeze(1) for i, e in enumerate(self.backbone.embeds)]
             x_cat_embedded = torch.cat(x_cat_list, 1)
             x_encoded = torch.cat([x_encoded, x_cat_embedded], 1)
-        
+
         # Static continuous encoding
         if self.backbone.n_cont != 0 and x_cont is not None and x_cont.numel() > 0:
             if self.backbone.cont_projections is not None:
@@ -433,17 +453,34 @@ class TSTabFusionMLM(nn.Module):
         
         return loss
     
-    def forward(self, x_ts, x_ts_cat, x_cat, x_cont, return_contrastive=False):
+    def forward(self, x_ts, x_ts_cat, x_cat, x_cont,
+                return_contrastive=False, x_ts_cat_profiles=None):
         """
         Forward pass with MLM (UPDATED for multi-hot categorical TS).
-        
+
         Args:
             x_ts: [bs, c_in, seq_len] - continuous time series
             x_ts_cat: [bs, n_categories, seq_len] - multi-hot categorical TS
             x_cat: [bs, n_cat] - static categorical
             x_cont: [bs, n_cont] - static continuous
             return_contrastive: Whether to compute contrastive loss
+            x_ts_cat_profiles: [bs, n_profiled, seq_len] - profile levels (optional)
         """
+        # Mask profiles (same timestep mask as categorical TS, set to 0 = absent)
+        original_profiles = None
+        masked_profiles = x_ts_cat_profiles
+        profile_mask = None
+        if x_ts_cat_profiles is not None and self.profile_heads is not None:
+            original_profiles = x_ts_cat_profiles.clone()
+            bs, n_prof, sl = x_ts_cat_profiles.shape
+            profile_mask = self.create_mlm_mask(
+                (bs, sl), x_ts_cat_profiles.device,
+                self.config.mask_prob_cat_ts,
+            )
+            masked_profiles = x_ts_cat_profiles.clone()
+            # Set masked timesteps to 0 (absent) across all profiled categories
+            masked_profiles[:, :, profile_mask] = 0
+
         # Create augmented views for contrastive learning
         if return_contrastive and self.config.contrastive_weight > 0:
             # First view
@@ -451,20 +488,26 @@ class TSTabFusionMLM(nn.Module):
             masked_ts_cat1, ts_cat_mask1, original_ts_cat = self.mask_categorical_ts(x_ts_cat)
             masked_cat1, cat_mask1, original_cat = self.mask_categorical(x_cat)
             masked_cont1, cont_mask1, original_cont = self.mask_continuous(x_cont)
-            
+
             # Second view
             masked_ts2, _, _ = self.mask_time_series(x_ts)
             masked_ts_cat2, _, _ = self.mask_categorical_ts(x_ts_cat)
             masked_cat2, _, _ = self.mask_categorical(x_cat)
             masked_cont2, _, _ = self.mask_continuous(x_cont)
-            
-            encoder_output1 = self.forward_encoder(masked_ts1, masked_ts_cat1, masked_cat1, masked_cont1)
-            encoder_output2 = self.forward_encoder(masked_ts2, masked_ts_cat2, masked_cat2, masked_cont2)
-            
+
+            encoder_output1 = self.forward_encoder(
+                masked_ts1, masked_ts_cat1, masked_cat1, masked_cont1,
+                x_ts_cat_profiles=masked_profiles,
+            )
+            encoder_output2 = self.forward_encoder(
+                masked_ts2, masked_ts_cat2, masked_cat2, masked_cont2,
+                x_ts_cat_profiles=masked_profiles,
+            )
+
             encoder_output = encoder_output1
             ts_mask, ts_cat_mask = ts_mask1, ts_cat_mask1
             cat_mask, cont_mask = cat_mask1, cont_mask1
-            
+
             # Global pooling for contrastive
             z1 = encoder_output1.mean(dim=1)
             z2 = encoder_output2.mean(dim=1)
@@ -477,8 +520,11 @@ class TSTabFusionMLM(nn.Module):
             masked_ts_cat, ts_cat_mask, original_ts_cat = self.mask_categorical_ts(x_ts_cat)
             masked_cat, cat_mask, original_cat = self.mask_categorical(x_cat)
             masked_cont, cont_mask, original_cont = self.mask_continuous(x_cont)
-            
-            encoder_output = self.forward_encoder(masked_ts, masked_ts_cat, masked_cat, masked_cont)
+
+            encoder_output = self.forward_encoder(
+                masked_ts, masked_ts_cat, masked_cat, masked_cont,
+                x_ts_cat_profiles=masked_profiles,
+            )
             contrastive_loss = None
         
         seq_len = x_ts.shape[2]
@@ -528,6 +574,27 @@ class TSTabFusionMLM(nn.Module):
             if cat_ts_losses:
                 losses['cat_ts_loss'] = torch.stack(cat_ts_losses).mean() * self.config.cat_ts_loss_weight
         
+        # 2b. Profile categorical TS reconstruction (per-category cross-entropy)
+        if (profile_mask is not None and profile_mask.any()
+                and self.profile_heads is not None and original_profiles is not None):
+            profile_losses = []
+            for i, (cat_name, n_levels) in enumerate(self.backbone.ts_cat_profile_dims.items()):
+                # Predict profile level from transformer output at masked timesteps
+                feat_pred = self.profile_heads[cat_name](ts_output)  # [bs, seq_len, n_levels+1]
+                feat_target = original_profiles[:, i, :]              # [bs, seq_len]
+
+                # Apply mask: only compute loss at masked positions
+                masked_pred = feat_pred[profile_mask]                 # [n_masked, n_levels+1]
+                masked_target = feat_target[profile_mask].long()      # [n_masked]
+
+                if masked_pred.numel() > 0:
+                    profile_losses.append(F.cross_entropy(masked_pred, masked_target))
+
+            if profile_losses:
+                losses['profile_loss'] = (
+                    torch.stack(profile_losses).mean() * self.config.cat_ts_loss_weight
+                )
+
         # 3. Static categorical reconstruction
         if cat_mask is not None and cat_mask.any() and cat_output is not None:
             cat_losses = []
@@ -675,26 +742,30 @@ def pretrain_mlm_enhanced(
             # Unpack TSAI format: ((x_ts, x_tab, x_ts_cat), y)
             inputs, targets = batch
             
-            # inputs is a tuple: (x_ts, x_tab, x_ts_cat)
+            # inputs is a tuple: (x_ts, x_tab, x_ts_cat, traj_lengths[, profiles])
             x_ts = inputs[0]           # Continuous TS
             x_tab = inputs[1]          # Tabular (tuple)
             x_ts_cat = inputs[2]       # Categorical TS (multi-hot)
-            
+            x_profiles = inputs[4] if len(inputs) >= 5 else None  # Profile TS (optional)
+
             # Unpack tabular
             x_cat, x_cont = x_tab
-            
+
             # Move to device
             x_ts = x_ts.to(device)
             x_ts_cat = x_ts_cat.to(device) if x_ts_cat is not None else None
             x_cat = x_cat.to(device) if x_cat is not None and x_cat.numel() > 0 else None
             x_cont = x_cont.to(device) if x_cont is not None and x_cont.numel() > 0 else None
-            
+            if x_profiles is not None:
+                x_profiles = x_profiles.to(device)
+
             # Forward pass
             optimizer.zero_grad()
-            
+
             losses = model(
                 x_ts, x_ts_cat, x_cat, x_cont,
-                return_contrastive=(config.contrastive_weight > 0)
+                return_contrastive=(config.contrastive_weight > 0),
+                x_ts_cat_profiles=x_profiles,
             )
             
             loss = losses['total_loss']
@@ -766,15 +837,21 @@ def pretrain_mlm_enhanced(
                     x_ts = inputs[0]
                     x_tab = inputs[1]
                     x_ts_cat = inputs[2]
+                    x_profiles = inputs[4] if len(inputs) >= 5 else None
                     x_cat, x_cont = x_tab
-                    
+
                     # Move to device
                     x_ts = x_ts.to(device)
                     x_ts_cat = x_ts_cat.to(device) if x_ts_cat is not None else None
                     x_cat = x_cat.to(device) if x_cat is not None and x_cat.numel() > 0 else None
                     x_cont = x_cont.to(device) if x_cont is not None and x_cont.numel() > 0 else None
-                    
-                    losses = model(x_ts, x_ts_cat, x_cat, x_cont)
+                    if x_profiles is not None:
+                        x_profiles = x_profiles.to(device)
+
+                    losses = model(
+                        x_ts, x_ts_cat, x_cat, x_cont,
+                        x_ts_cat_profiles=x_profiles,
+                    )
                     
                     val_meters['total']['sum'] += losses['total_loss'].item()
                     val_meters['total']['count'] += 1

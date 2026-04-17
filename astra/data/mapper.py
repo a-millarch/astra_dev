@@ -117,9 +117,10 @@ def merge_and_aggregate(
     if is_categorical:
         if is_multi_label:
             # Keep all values as separate rows
-            aggregated_df = filtered_df[
-                ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
-            ].drop_duplicates()
+            keep_cols = ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
+            if "SUB_CODE" in filtered_df.columns:
+                keep_cols.append("SUB_CODE")
+            aggregated_df = filtered_df[keep_cols].drop_duplicates()
 
         else:
             # Single-label: Take mode (most common) or last value
@@ -741,9 +742,10 @@ def merge_and_aggregate_optimized(
     
     if is_categorical:
         if is_multi_label:
-            aggregated_df = filtered_df[
-                ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
-            ].drop_duplicates()
+            keep_cols = ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
+            if "SUB_CODE" in filtered_df.columns:
+                keep_cols.append("SUB_CODE")
+            aggregated_df = filtered_df[keep_cols].drop_duplicates()
         else:
             if agg_func == "mode":
                 aggregated_df = (

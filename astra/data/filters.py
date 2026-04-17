@@ -278,6 +278,12 @@ def filter_procedures(proc):
         inplace=True,
     )
 
+    # Preserve procedure sub-code for profile-based encoding (before VALUE is overwritten)
+    from astra.data.profiles import get_sub_code_level
+    sub_code_level = get_sub_code_level(cfg, "Procedurer")
+    if sub_code_level > 0:
+        proc["SUB_CODE"] = proc["VALUE"].str[:sub_code_level]
+
     def _map_prefix(code):
         for prefix in PROCEDURE_PREFIXES:
             if code.startswith(prefix):
@@ -432,6 +438,12 @@ def filter_medicin(med):
     med = med[med["FEATURE"].notnull()].copy()
     med["VALUE"] = med["FEATURE"]
     med["FEATURE"] = "medication"
+
+    # Preserve ATC sub-code for profile-based encoding
+    from astra.data.profiles import get_sub_code_level
+    sub_code_level = get_sub_code_level(cfg, "Medicin")
+    if sub_code_level > 0:
+        med["SUB_CODE"] = med["ATC"].str[:sub_code_level]
 
     med.rename(
         columns={"Administrationstidspunkt": "start", "Seponeringstidspunkt": "end"},

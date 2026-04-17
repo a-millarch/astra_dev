@@ -53,6 +53,10 @@ temporal_features:
     - elapsed_hours
     - bin_width_hours
 
+categorical_profiles:
+  enabled: false
+  config_file: configs/profiles.yaml     # path to profile definitions
+
 ebm_feature:
   enabled: false
   save_dir: data/interim/ebm_features

@@ -160,6 +160,7 @@ class InferenceSession:
             local_temporal_kernel=params.get('local_temporal_kernel', 1),
             bin_width_channel_idx=params.get('bin_width_channel_idx', None),
             bin_width_modulation=params.get('bin_width_modulation', False),
+            ts_cat_profile_dims=params.get('ts_cat_profile_dims', None),
         )
 
         # Load weights (FastAI format: {'model': state_dict, ...})

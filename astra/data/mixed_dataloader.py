@@ -214,6 +214,7 @@ class AstraMixedDataset(Dataset):
         trajectory_lengths: Optional[np.ndarray] = None,
         event_times: Optional[np.ndarray] = None,
         event_indicators: Optional[np.ndarray] = None,
+        X_ts_cat_profiles: Optional[np.ndarray] = None,
     ):
         self.X_ts = torch.from_numpy(np.asarray(X_ts, dtype=np.float32))
         self.x_cat = torch.from_numpy(np.asarray(x_cat, dtype=np.int64))
@@ -242,6 +243,14 @@ class AstraMixedDataset(Dataset):
             self.event_times = None
             self.event_indicators = None
 
+        # Profile-based categorical TS (optional — None when profiles disabled)
+        if X_ts_cat_profiles is not None:
+            self.X_ts_cat_profiles = torch.from_numpy(
+                np.asarray(X_ts_cat_profiles, dtype=np.int64)
+            )
+        else:
+            self.X_ts_cat_profiles = None
+
     def __len__(self):
         return len(self.y)
 
@@ -249,10 +258,16 @@ class AstraMixedDataset(Dataset):
     def has_survival_labels(self) -> bool:
         return self.event_times is not None
 
+    @property
+    def has_profiles(self) -> bool:
+        return self.X_ts_cat_profiles is not None
+
     def __getitem__(self, idx):
+        profile = self.X_ts_cat_profiles[idx] if self.has_profiles else None
         inputs = (
             self.X_ts[idx], (self.x_cat[idx], self.x_cont[idx]),
             self.X_ts_cat[idx], self.traj_lengths[idx],
+            profile,
         )
         if self.has_survival_labels:
             targets = (self.y[idx], self.event_times[idx], self.event_indicators[idx])
