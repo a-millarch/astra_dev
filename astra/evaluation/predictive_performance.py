@@ -1284,15 +1284,14 @@ def plot_prediction_distribution(
                 med = np.median(preds_pos)
                 ax.hlines(med, i, i + 0.35, colors='black', linewidth=1.5)
 
-            # Sample count annotation inside axis, above x-axis (avoids clipping)
+            # Sample count annotation below the x-axis label (outside the plot area
+            # so it can't cover data). constrained_layout reserves bottom margin.
             n_neg = len(preds_neg)
             n_pos = len(preds_pos)
             ax.text(
-                i, 0.02, f"n={n_neg}/{n_pos}",
-                ha='center', va='bottom', fontsize=9, color='#333333',
-                transform=ax.get_xaxis_transform(),
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
-                          edgecolor='none', alpha=0.75),
+                i, -0.22, f"n={n_neg}/{n_pos}",
+                ha='center', va='top', fontsize=9, color='#555555',
+                transform=ax.get_xaxis_transform(), clip_on=False,
             )
 
         # Format x-axis with requested timepoint labels (combine time + n= on one tick)
@@ -1303,7 +1302,15 @@ def plot_prediction_distribution(
             labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
         ax.set_xticklabels(labels, fontsize=_FIG_STYLE['tick_label'])
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 7.5))
+    # 3-row layout: panel A, panel B, dedicated legend row below both.
+    # constrained_layout auto-reserves bottom margin for the n=X/Y annotations
+    # that live below each panel's x-axis label.
+    fig = plt.figure(figsize=(6, 7.5), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.0, 0.10])
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax_legend = fig.add_subplot(gs[2, 0])
+    ax_legend.axis('off')
 
     # Panel A: Hours
     avail_hours = sorted(df['time_hours'].unique())
@@ -1333,18 +1340,19 @@ def plot_prediction_distribution(
     ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
     ax2.grid(True, alpha=0.3, axis='y')
 
-    # Legend
+    # Shared legend in the dedicated bottom row (below both panels)
     from matplotlib.patches import Patch
     legend_elements = [
         Patch(facecolor=COLOR_NEG, edgecolor='black', alpha=0.7, label='Survived'),
         Patch(facecolor=COLOR_POS, edgecolor='black', alpha=0.7, label='Deceased'),
     ]
-    ax1.legend(handles=legend_elements, loc='upper right', fontsize=_FIG_STYLE['legend'])
+    ax_legend.legend(
+        handles=legend_elements, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
     ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
-    plt.tight_layout()
-    plt.subplots_adjust(hspace=0.55)
     return fig
 
 

@@ -365,11 +365,13 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
 
     # Filter to the same 8 key timepoints production uses — otherwise the grid
     # helpers build a (ncols * 3.5, nrows * 3.5) figure that grows unboundedly.
+    # Max 14 days — matches the original production output. The 30D/90D
+    # timepoints have too few non-survivors active (min_positive filter dropped
+    # them in the original run), so we omit them upfront here for consistency.
     max_step = get_total_steps() - 2
     raw_key = [
         time_to_step(1, 'h'), time_to_step(6, 'h'), time_to_step(12, 'h'),
         time_to_step(72, 'h'), time_to_step(7, 'D'), time_to_step(14, 'D'),
-        time_to_step(30, 'D'), time_to_step(90, 'D'),
     ]
     key_timepoints = sorted({min(t, max_step) for t in raw_key if t is not None})
     holdout_preds = {s: tp for s, tp in holdout_preds.items() if s in key_timepoints}
