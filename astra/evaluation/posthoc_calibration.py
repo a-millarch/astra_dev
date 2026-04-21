@@ -48,6 +48,13 @@ _FIG_STYLE = dict(
     suptitle=18,
 )
 
+# Journal submission output constraints — see predictive_performance._SUBMISSION_KW
+_SUBMISSION_KW = dict(
+    fit_long_side_px=1200,
+    max_long_side_px=1200,
+    max_bytes=5_000_000,
+)
+
 
 # ============================================================================
 # DATA CLASSES
@@ -618,7 +625,7 @@ def _plot_calibration_metrics_over_time(
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    save_figure(fig, f"calibration_analysis_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"calibration_analysis_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved calibration_analysis_{model_name}.png")
 
@@ -695,7 +702,7 @@ def _plot_reliability_diagrams(
     fig.suptitle(f'Reliability Diagrams: Raw vs {best_method.capitalize()} Calibrated',
                  fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved reliability_diagrams_{model_name}.png")
 
@@ -765,7 +772,7 @@ def _plot_dca_comparison(
     fig.suptitle(f'Decision Curve Analysis: Raw vs {best_method.capitalize()} Calibrated',
                  fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
-    save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved dca_comparison_{model_name}.png")
 
@@ -846,7 +853,7 @@ def _plot_dca_calibrated(
 
     fig.subplots_adjust(right=0.78)
     plt.tight_layout()
-    save_figure(fig, f"dca_calibrated_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"dca_calibrated_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved dca_calibrated_{model_name}.png")
 
@@ -894,7 +901,7 @@ def _plot_per_timepoint_vs_global(
     ax.grid(True, alpha=0.2, axis='y')
 
     plt.tight_layout()
-    save_figure(fig, f"per_timepoint_vs_global_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"per_timepoint_vs_global_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved per_timepoint_vs_global_{model_name}.png")
 

@@ -33,7 +33,7 @@ from astra.evaluation.behavior import (
     get_static_cat_names_from_classes,
 )
 from astra.evaluation.utils import prepare_model, time_to_step
-from astra.utils import cfg, ensure_parent_dir, save_base64
+from astra.utils import cfg, ensure_parent_dir, save_base64, save_figure
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,26 @@ RC_PARAMS = {
 COLOR_POS = '#d62728'   # risk-increasing (red-ish)
 COLOR_NEG = '#1f77b4'   # protective (blue)
 COLOR_BAR = '#4c72b0'   # neutral bar color
+
+# Journal submission output constraints for PNG outputs (PDFs skip the pixel cap —
+# they are vector-friendly). Mirrors predictive_performance._SUBMISSION_KW.
+_SUBMISSION_KW = dict(
+    fit_long_side_px=1200,
+    max_long_side_px=1200,
+    max_bytes=5_000_000,
+)
+
+
+def _save_shap_figure(fig, save_dir, stem):
+    """Save *fig* as PDF (vector) + PNG + base64 sidecar, applying submission caps.
+
+    PDF is written first (raw fig.savefig) so matplotlib still has the live figure;
+    save_figure then handles PNG + base64 and closes the figure.
+    """
+    ensure_parent_dir(os.path.join(save_dir, stem))
+    pdf_path = os.path.join(save_dir, f'{stem}.pdf')
+    fig.savefig(pdf_path, dpi=300, bbox_inches='tight')
+    save_figure(fig, stem, save_dir=save_dir, **_SUBMISSION_KW)
 
 
 # ============================================================================
@@ -468,11 +488,7 @@ def figure_a_topk_importance(
 
     fig.suptitle('Top Clinical Feature Importance by Timepoint', fontsize=11, y=1.01)
 
-    for fmt in ('png', 'pdf'):
-        path = os.path.join(save_dir, f'figure_a_topk_importance.{fmt}')
-        ensure_parent_dir(path)
-        fig.savefig(path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _save_shap_figure(fig, save_dir, 'figure_a_topk_importance')
     logger.info(f"Figure A saved to {save_dir}")
 
 
@@ -559,11 +575,7 @@ def figure_b_heatmap(
     ax.tick_params(axis='y', labelsize=8)
     ax.tick_params(axis='x', labelsize=9)
 
-    for fmt in ('png', 'pdf'):
-        path = os.path.join(save_dir, f'figure_b_heatmap.{fmt}')
-        ensure_parent_dir(path)
-        fig.savefig(path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _save_shap_figure(fig, save_dir, 'figure_b_heatmap')
     logger.info(f"Figure B saved to {save_dir}")
 
 
@@ -659,11 +671,7 @@ def figure_c_static_features(
 
     fig.suptitle('Static Feature Importance', fontsize=11)
 
-    for fmt in ('png', 'pdf'):
-        path = os.path.join(save_dir, f'figure_c_static_features.{fmt}')
-        ensure_parent_dir(path)
-        fig.savefig(path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _save_shap_figure(fig, save_dir, 'figure_c_static_features')
     logger.info(f"Figure C saved to {save_dir}")
 
 
@@ -774,11 +782,7 @@ def figure_e_categorical_ts(
     ax.tick_params(axis='y', labelsize=7)
     ax.tick_params(axis='x', labelsize=9)
 
-    for fmt in ('png', 'pdf'):
-        path = os.path.join(save_dir, f'figure_e_categorical_ts.{fmt}')
-        ensure_parent_dir(path)
-        fig.savefig(path, dpi=300, bbox_inches='tight')
-    plt.close(fig)
+    _save_shap_figure(fig, save_dir, 'figure_e_categorical_ts')
     logger.info(f"Figure E saved to {save_dir}")
 
 
@@ -1320,12 +1324,7 @@ def figure_shap_summary_panel(
     # Save
     # ========================================================================
     plt.tight_layout()
-    for fmt in ('png', 'pdf'):
-        path = os.path.join(save_dir, f'figure_shap_summary_panel.{fmt}')
-        ensure_parent_dir(path)
-        fig.savefig(path, dpi=300, bbox_inches='tight')
-    save_base64(fig, os.path.join(save_dir, 'figure_shap_summary_panel.png'))
-    plt.close(fig)
+    _save_shap_figure(fig, save_dir, 'figure_shap_summary_panel')
     logger.info(f"Summary panel figure saved to {save_dir}")
 
 

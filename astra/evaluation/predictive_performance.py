@@ -38,9 +38,15 @@ _FIG_STYLE = dict(
     suptitle=18,
 )
 
-# Journal submission output constraints (longest PNG side ≤ 1200 px, ≤ 5 MB, 300 DPI).
-# Applied to the four paper-revision figures via save_figure(**_SUBMISSION_KW).
-_SUBMISSION_KW = dict(dpi=300, max_long_side_px=1200, max_bytes=5_000_000)
+# Journal submission output constraints.
+# fit_long_side_px=1200 computes the highest DPI that keeps the tight-bbox output
+# under 1200 px on the long side (≥300 DPI for the figsizes used here). Warnings
+# fire if the final file exceeds 1200 px or 5 MB.
+_SUBMISSION_KW = dict(
+    fit_long_side_px=1200,
+    max_long_side_px=1200,
+    max_bytes=5_000_000,
+)
 
 
 @dataclass
@@ -2234,6 +2240,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                         fig_trauma,
                         f"trauma_{sname.lower()}_comparison_{model_name}",
                         save_dir=f'reports/eval/{model_name}',
+                        **_SUBMISSION_KW,
                     )
                     logger.info(f"HNN vs {sname} comparison plot saved")
 
@@ -2308,12 +2315,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         evalplt = plot_evaluation(
             torch.tensor(baseline_preds), torch.tensor(targs), cfg["target"]
         )
-        save_figure(evalplt, f"baseline_eval_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(evalplt, f"baseline_eval_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Baseline temporal evaluation saved")
 
         # Decision Curve Analysis (baseline — full trajectory)
         fig_dca = plot_decision_curve(targs, baseline_preds, model_name=model_name)
-        save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(fig_dca, f"dca_baseline_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Baseline decision curve saved")
 
         # Confusion matrices at F-beta optimised thresholds (calibrated)
@@ -2354,7 +2363,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_cm, _, _ = evaluate_detection_rate(
                 ho_cal, targs, threshold=thr, label=label
             )
-            save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_cm, f"cm_{label}_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
 
         key_timepoints = None
         if multicurve:
@@ -2388,14 +2398,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             fig_curves = plot_multiple_roc_pr_curves_temporal(
                 temporal_eval, key_timepoints, labels=labels
             )
-            save_figure(fig_curves, f"multi_curves_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_curves, f"multi_curves_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Multiple ROC/PR curves plot saved (temporal)")
 
             # Decision curves at key timepoints (temporal)
             fig_dca_time = _plot_decision_curves_temporal(
                 preds_all, targs, traj_lens, key_timepoints, labels=labels
             )
-            save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_dca_time, f"dca_multicurve_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Time-dependent decision curves saved (temporal)")
 
         if comprehensive_eval:
@@ -2420,7 +2432,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             )
 
             fig_time = plot_time_metrics(results, cut_hours=72)
-            save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_time, f"time_metrics_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
 
             # Percentile recall plot
             percentiles = [5, 10, 15, 20, 25]
@@ -2429,7 +2442,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             )
             if recall_results:
                 fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
-                save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir=f'reports/eval/{model_name}')
+                save_figure(fig_recall, f"multi_percentile_recall_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 logger.info("Percentile recall plot saved")
 
             # Active-only evaluation and comparison
@@ -2457,7 +2471,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
                                 save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                    save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
+                    save_figure(fig_n, f"n_active_{model_name}",
+                                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                     logger.info("Active-only comparison plots saved")
 
             # Prediction distribution plot (prefer active-only predictions)
@@ -2509,14 +2524,16 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     preds, targs = _get_predictions(model, holdout_mixed_dls.train, device)
 
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir=f'reports/eval/{model_name}')
+    save_figure(evalplt, f"baseline_eval_{model_name}",
+                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
     logger.info("Baseline ROC/PR plot saved")
 
     # Decision Curve Analysis (baseline — full trajectory)
     fig_dca = plot_decision_curve(
         targs.numpy(), preds[:, 1].numpy(), model_name=model_name
     )
-    save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir=f'reports/eval/{model_name}')
+    save_figure(fig_dca, f"dca_baseline_{model_name}",
+                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
     logger.info("Baseline decision curve saved")
 
     # Confusion matrices at F-beta optimised thresholds (calibrated)
@@ -2541,7 +2558,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_cm, _, _ = evaluate_detection_rate(
             ho_y_cal, holdout_y_true, threshold=thr, label=label
         )
-        save_figure(fig_cm, f"cm_{label}_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(fig_cm, f"cm_{label}_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
 
     # Initialize evaluator with pre-normalized data
     evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
@@ -2567,7 +2585,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(fig_curves, f"multi_curves_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Multiple curves plot saved")
 
         # Decision curves at key timepoints (active-only for correct prevalence)
@@ -2577,7 +2596,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         fig_dca_time = plot_decision_curves_over_time(
             evaluator_dca, key_timepoints, labels=labels
         )
-        save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(fig_dca_time, f"dca_multicurve_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Time-dependent decision curves saved")
 
     # COMPREHENSIVE TIME-DEPENDENT EVALUATION
@@ -2612,7 +2632,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir=f'reports/eval/{model_name}')
+        save_figure(fig_time, f"time_metrics_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Time metrics plot saved")
 
         # Percentile recall plot
@@ -2622,7 +2643,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         )
         if recall_results:
             fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
-            save_figure(fig_recall, f"multi_percentile_recall_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_recall, f"multi_percentile_recall_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Percentile recall plot saved")
 
         # Active-only evaluation and comparison
@@ -2647,7 +2669,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
                             save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
+                save_figure(fig_n, f"n_active_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 logger.info("Active-only comparison plots saved")
 
         # Prediction distribution plot (active-only predictions)

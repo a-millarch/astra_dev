@@ -153,6 +153,28 @@ if not _bootstrap_logger.handlers:
 logger = logging.getLogger('astra')
 
 
+def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=100, dpi_ceiling=1200):
+    """Compute the highest DPI that renders *fig* within ``fit_long_side_px``.
+
+    Uses the tight bbox (what ``bbox_inches='tight'`` will crop to) when available,
+    falling back to the raw figsize. Clamped to [dpi_floor, dpi_ceiling].
+    """
+    import matplotlib
+    width_in, height_in = fig.get_size_inches()
+    try:
+        # Tight bbox is what bbox_inches='tight' crops to — use it when available
+        # so the pixel budget matches what actually lands on disk.
+        renderer = fig.canvas.get_renderer()
+        tight = fig.get_tightbbox(renderer)
+        long_in = max(tight.width, tight.height)
+    except Exception:
+        long_in = max(width_in, height_in)
+    if long_in <= 0:
+        return dpi_ceiling
+    target = int(fit_long_side_px // long_in)
+    return max(dpi_floor, min(dpi_ceiling, target))
+
+
 def _check_figure_size_limits(png_path, max_long_side_px=None, max_bytes=None):
     """Log a warning if saved PNG exceeds pixel/byte caps. Does not modify the file."""
     if max_long_side_px is not None:
@@ -180,18 +202,25 @@ def _check_figure_size_limits(png_path, max_long_side_px=None, max_bytes=None):
 
 
 def save_figure(fig, filename, save_dir='reports/studyfigs', dpi=1200,
-                max_long_side_px=None, max_bytes=None):
+                max_long_side_px=None, max_bytes=None, fit_long_side_px=None):
     """Save *fig* as PNG + base64 text sidecar.
 
     Args:
         fig: matplotlib Figure
         filename: stem (no extension)
         save_dir: output directory for the PNG; base64 goes to ``<save_dir>/base64/``
-        dpi: rasterization DPI (default 1200 for legacy; pass 300 for journal submissions)
-        max_long_side_px: if set, log a warning when the PNG's longest side exceeds this
-        max_bytes: if set, log a warning when the PNG file size exceeds this
+        dpi: rasterization DPI (default 1200 for legacy callers).
+        max_long_side_px: warn when the saved PNG's longest side exceeds this.
+        max_bytes: warn when the saved PNG size exceeds this.
+        fit_long_side_px: if set, compute the largest DPI that keeps the tight-bbox
+            output within this pixel budget, overriding ``dpi``. Preferred for
+            journal submissions — picks the highest sharpness that still fits the cap.
     """
     import matplotlib.pyplot as plt
+
+    if fit_long_side_px is not None:
+        dpi = _resolve_fit_dpi(fig, fit_long_side_px)
+        logger.debug(f"{filename}: auto-dpi={dpi} to fit {fit_long_side_px}px cap")
 
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
@@ -211,8 +240,11 @@ def save_figure(fig, filename, save_dir='reports/studyfigs', dpi=1200,
     _check_figure_size_limits(png_path, max_long_side_px, max_bytes)
     plt.close(fig)
 
-def save_base64(fig, save_path, dpi=1200, max_long_side_px=None, max_bytes=None):
+def save_base64(fig, save_path, dpi=1200, max_long_side_px=None, max_bytes=None,
+                fit_long_side_px=None):
     """Save a base64 version of *fig* alongside *save_path* in a ``base64/`` sibling dir."""
+    if fit_long_side_px is not None:
+        dpi = _resolve_fit_dpi(fig, fit_long_side_px)
     parent = os.path.dirname(save_path)
     stem = Path(save_path).stem
     base64_dir = os.path.join(parent, 'base64')
