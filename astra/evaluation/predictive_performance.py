@@ -38,6 +38,10 @@ _FIG_STYLE = dict(
     suptitle=18,
 )
 
+# Journal submission output constraints (longest PNG side ≤ 1200 px, ≤ 5 MB, 300 DPI).
+# Applied to the four paper-revision figures via save_figure(**_SUBMISSION_KW).
+_SUBMISSION_KW = dict(dpi=300, max_long_side_px=1200, max_bytes=5_000_000)
+
 
 @dataclass
 class TimeMetricResult:
@@ -1274,16 +1278,18 @@ def plot_prediction_distribution(
                 med = np.median(preds_pos)
                 ax.hlines(med, i, i + 0.35, colors='black', linewidth=1.5)
 
-            # Sample count annotation below x-axis
+            # Sample count annotation inside axis, above x-axis (avoids clipping)
             n_neg = len(preds_neg)
             n_pos = len(preds_pos)
             ax.text(
-                i, -0.06, f"n={n_neg}/{n_pos}",
-                ha='center', va='top', fontsize=9, color='gray',
-                transform=ax.get_xaxis_transform(), clip_on=False,
+                i, 0.02, f"n={n_neg}/{n_pos}",
+                ha='center', va='bottom', fontsize=9, color='#333333',
+                transform=ax.get_xaxis_transform(),
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white',
+                          edgecolor='none', alpha=0.75),
             )
 
-        # Format x-axis with requested timepoint labels
+        # Format x-axis with requested timepoint labels (combine time + n= on one tick)
         ax.set_xticks(positions)
         if time_unit == 'hours':
             labels = [f"{int(t)}h" for t, _ in timepoint_pairs]
@@ -1291,7 +1297,7 @@ def plot_prediction_distribution(
             labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
         ax.set_xticklabels(labels, fontsize=_FIG_STYLE['tick_label'])
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(6, 7.5))
 
     # Panel A: Hours
     avail_hours = sorted(df['time_hours'].unique())
@@ -1332,7 +1338,7 @@ def plot_prediction_distribution(
     ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     plt.tight_layout()
-    plt.subplots_adjust(hspace=0.35)
+    plt.subplots_adjust(hspace=0.55)
     return fig
 
 
@@ -1457,13 +1463,19 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig = plt.figure(figsize=(12, 9))
-    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.45,
-                          height_ratios=[1, 1])
+    # 4-row layout: panels A/B, dedicated legend axis, panels C/D, dedicated legend axis.
+    # Dedicated legend axes prevent overlap with panel titles and x-axis tick labels.
+    fig = plt.figure(figsize=(10, 7.5))
+    gs = fig.add_gridspec(4, 2, hspace=0.55, wspace=0.35,
+                          height_ratios=[1.0, 0.12, 1.0, 0.12])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
-    ax_count_h = fig.add_subplot(gs[1, 0])
-    ax_count_d = fig.add_subplot(gs[1, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_count_h = fig.add_subplot(gs[2, 0])
+    ax_count_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
 
     # ── Top row: performance curves ──────────────────────────────────────
     datasets = [
@@ -1593,20 +1605,21 @@ def plot_time_metrics_comparison(
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
-    # ── Legends ──────────────────────────────────────────────────────────
+    # ── Legends in dedicated gridspec rows (no overlap with panels) ──────
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    # Position legend in the hspace gap between rows
-    fig.legend(perf_handles, perf_labels, loc='upper center', ncol=2, fontsize=_FIG_STYLE['legend'],
-               frameon=True, framealpha=0.9,
-               bbox_to_anchor=(0.5, 0.52))
+    ax_legend_top.legend(
+        perf_handles, perf_labels, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
 
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
-    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=4, fontsize=_FIG_STYLE['legend'], frameon=True,
-               framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
+    ax_legend_bot.legend(
+        count_handles + prev_handles, count_labels + prev_labels,
+        loc='center', ncol=4, fontsize=_FIG_STYLE['legend'],
+        frameon=True, framealpha=0.9,
+    )
 
-    #plt.subplots_adjust(bottom=0.06, top=0.96)
     return fig
 
 
@@ -1822,13 +1835,20 @@ def plot_delong_comparison(
     NONSIG_COLOR = "#999999"
     DELTA_COLOR = "C0"
 
-    fig = plt.figure(figsize=(12, 8))
-    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.40,
-                          height_ratios=[1, 1])
+    # 4-row layout: suptitle at top, panels A/B, dedicated legend axis,
+    # panels C/D, dedicated legend axis. Matches plot_time_metrics_comparison.
+    fig = plt.figure(figsize=(10, 7))
+    gs = fig.add_gridspec(4, 2, hspace=0.55, wspace=0.32,
+                          height_ratios=[1.0, 0.10, 1.0, 0.12],
+                          top=0.86, bottom=0.05, left=0.08, right=0.97)
     ax_d_h = fig.add_subplot(gs[0, 0])
     ax_d_d = fig.add_subplot(gs[0, 1])
-    ax_p_h = fig.add_subplot(gs[1, 0])
-    ax_p_d = fig.add_subplot(gs[1, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_p_h = fig.add_subplot(gs[2, 0])
+    ax_p_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
 
     n_sig = int(sig.sum())
     n_total = len(sig)
@@ -1866,12 +1886,13 @@ def plot_delong_comparison(
         ax.grid(True, alpha=0.3)
         ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
-    # Legend for top row
+    # Legend for top row (dedicated axis, no overlap with titles)
     d_handles, d_labels = ax_d_h.get_legend_handles_labels()
     if d_handles:
-        fig.legend(d_handles, d_labels, loc='upper center',
-                   ncol=1, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
-                   bbox_to_anchor=(0.5, 0.53))
+        ax_legend_top.legend(
+            d_handles, d_labels, loc='center', ncol=2,
+            fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+        )
 
     # ── Bottom row: -log10(p_adj) trajectory ─────────────────────────────
     threshold = -np.log10(0.05)
@@ -1907,14 +1928,15 @@ def plot_delong_comparison(
         ax.grid(True, alpha=0.3)
         ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
-    # Legend for bottom row
+    # Legend for bottom row (dedicated axis)
     p_handles, p_labels = ax_p_h.get_legend_handles_labels()
     if p_handles:
-        fig.legend(p_handles, p_labels, loc='lower center',
-                   ncol=3, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
-                   bbox_to_anchor=(0.5, 0.01))
+        ax_legend_bot.legend(
+            p_handles, p_labels, loc='center', ncol=3,
+            fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+        )
 
-    # Summary annotation
+    # Suptitle + summary inside figure coords (top=0.86 reserved by GridSpec)
     mean_delta = float(np.mean(delta))
     summary = (
         f"DeLong paired test: {n_sig}/{n_total} time points significant "
@@ -1922,12 +1944,11 @@ def plot_delong_comparison(
     )
     fig.suptitle(
         f"HNN vs {score_name} — Statistical Comparison",
-        fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.01,
+        fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=0.97,
     )
-    fig.text(0.5, 0.98, summary, ha='center', va='top',
+    fig.text(0.5, 0.91, summary, ha='center', va='center',
              fontsize=_FIG_STYLE['annotation'], fontstyle='italic', color='#444444')
 
-    plt.tight_layout(rect=[0, 0.04, 1, 0.97])
     return fig
 
 
@@ -2182,6 +2203,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                 fig_cmp_ts,
                 f"time_metrics_comparison_trauma_{model_name}",
                 save_dir=f'reports/eval/{model_name}',
+                **_SUBMISSION_KW,
             )
             logger.info("Comparison plot with trauma score baselines saved")
 
@@ -2222,6 +2244,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
                             fig_dl,
                             f"delong_{sname.lower()}_comparison_{model_name}",
                             save_dir=f'reports/eval/{model_name}',
+                            **_SUBMISSION_KW,
                         )
                         logger.info(f"DeLong {sname} comparison plot saved")
         else:
@@ -2431,7 +2454,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     fig_cmp = plot_time_metrics_comparison(
                         results, results_active, target_name=cfg["target"]
                     )
-                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir=f'reports/eval/{model_name}')
+                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
+                                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                     save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
                     logger.info("Active-only comparison plots saved")
@@ -2443,7 +2467,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     dist_preds, np.array(data["ty"]),
                     data["holdout"].base.PID.values
                 )
-                save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir=f'reports/eval/{model_name}')
+                save_figure(fig_dist, f"pred_distribution_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 logger.info("Prediction distribution plot saved")
 
             # Trauma score comparison (temporal path)
@@ -2619,7 +2644,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 fig_cmp = plot_time_metrics_comparison(
                     results, results_active, target_name=cfg["target"]
                 )
-                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir=f'reports/eval/{model_name}')
+                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
                 save_figure(fig_n, f"n_active_{model_name}", save_dir=f'reports/eval/{model_name}')
                 logger.info("Active-only comparison plots saved")
@@ -2639,7 +2665,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 dist_preds, np.array(data["ty"]),
                 data["holdout"].base.PID.values
             )
-            save_figure(fig_dist, f"pred_distribution_{model_name}", save_dir=f'reports/eval/{model_name}')
+            save_figure(fig_dist, f"pred_distribution_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Prediction distribution plot saved")
 
         # ================================================================

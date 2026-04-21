@@ -153,27 +153,65 @@ if not _bootstrap_logger.handlers:
 logger = logging.getLogger('astra')
 
 
-def save_figure(fig, filename, save_dir='reports/studyfigs'):
+def _check_figure_size_limits(png_path, max_long_side_px=None, max_bytes=None):
+    """Log a warning if saved PNG exceeds pixel/byte caps. Does not modify the file."""
+    if max_long_side_px is not None:
+        try:
+            from PIL import Image
+            with Image.open(png_path) as im:
+                w, h = im.size
+            long_side = max(w, h)
+            if long_side > max_long_side_px:
+                logger.warning(
+                    f"{os.path.basename(png_path)}: longest side {long_side}px > cap {max_long_side_px}px "
+                    f"(actual {w}x{h}). Consider lowering dpi or figsize."
+                )
+        except Exception as e:
+            logger.debug(f"Could not check pixel size for {png_path}: {e}")
+    if max_bytes is not None:
+        try:
+            size = os.path.getsize(png_path)
+            if size > max_bytes:
+                logger.warning(
+                    f"{os.path.basename(png_path)}: {size / 1e6:.2f} MB > cap {max_bytes / 1e6:.2f} MB."
+                )
+        except OSError:
+            pass
+
+
+def save_figure(fig, filename, save_dir='reports/studyfigs', dpi=1200,
+                max_long_side_px=None, max_bytes=None):
+    """Save *fig* as PNG + base64 text sidecar.
+
+    Args:
+        fig: matplotlib Figure
+        filename: stem (no extension)
+        save_dir: output directory for the PNG; base64 goes to ``<save_dir>/base64/``
+        dpi: rasterization DPI (default 1200 for legacy; pass 300 for journal submissions)
+        max_long_side_px: if set, log a warning when the PNG's longest side exceeds this
+        max_bytes: if set, log a warning when the PNG file size exceeds this
+    """
     import matplotlib.pyplot as plt
 
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
-    fig.savefig(png_path, dpi=1200, bbox_inches='tight')
+    fig.savefig(png_path, dpi=dpi, bbox_inches='tight')
 
-    # Save base64 version
+    # Save base64 version (same bytes as the PNG on disk)
     base64_dir = os.path.join(save_dir, 'base64')
     os.makedirs(base64_dir, exist_ok=True)
     buffer = io.BytesIO()
-    fig.savefig(buffer, format='png', dpi=1200, bbox_inches='tight')
+    fig.savefig(buffer, format='png', dpi=dpi, bbox_inches='tight')
     buffer.seek(0)
     base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
     base64_path = os.path.join(base64_dir, f'{filename}_base64.txt')
     with open(base64_path, 'w') as f:
         f.write(base64_image)
 
+    _check_figure_size_limits(png_path, max_long_side_px, max_bytes)
     plt.close(fig)
 
-def save_base64(fig, save_path, dpi=1200):
+def save_base64(fig, save_path, dpi=1200, max_long_side_px=None, max_bytes=None):
     """Save a base64 version of *fig* alongside *save_path* in a ``base64/`` sibling dir."""
     parent = os.path.dirname(save_path)
     stem = Path(save_path).stem
@@ -185,6 +223,8 @@ def save_base64(fig, save_path, dpi=1200):
     b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
     with open(os.path.join(base64_dir, f'{stem}_base64.txt'), 'w') as f:
         f.write(b64)
+    if os.path.exists(save_path):
+        _check_figure_size_limits(save_path, max_long_side_px, max_bytes)
 
 def ensure_parent_dir(path):
     """Create parent directory of *path* if it does not exist."""
