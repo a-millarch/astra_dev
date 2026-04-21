@@ -1119,7 +1119,7 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     auprc_lower = np.array([r.auprc_ci[0] for r in results])
     auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
     mask_cut = times_h <= cut_hours
 
@@ -1469,11 +1469,11 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    # 4-row layout: panels A/B, dedicated legend axis, panels C/D, dedicated legend axis.
-    # Dedicated legend axes prevent overlap with panel titles and x-axis tick labels.
-    fig = plt.figure(figsize=(10, 7.5))
-    gs = fig.add_gridspec(4, 2, hspace=0.55, wspace=0.35,
-                          height_ratios=[1.0, 0.12, 1.0, 0.12])
+    # 4-row layout with dedicated legend rows. constrained_layout auto-sizes each
+    # row based on actual artist extents (panel titles, x-labels, legend heights)
+    # so legends never collide with adjacent panel content.
+    fig = plt.figure(figsize=(11, 8.25), constrained_layout=True)
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.18, 1.0, 0.18])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
     ax_legend_top = fig.add_subplot(gs[1, :])
@@ -1655,13 +1655,18 @@ def plot_trauma_score_comparison(
         max_days = get_max_days()
 
     score_n = paired["score"][0].n_samples if paired["score"] else 0
-    fig = plt.figure(figsize=(12, 9))
-    gs = fig.add_gridspec(2, 2, hspace=0.45, wspace=0.45,
-                          height_ratios=[1, 1])
+    # 4-row layout with dedicated legend rows (mirrors plot_time_metrics_comparison).
+    # constrained_layout auto-sizes rows to avoid overlap with titles/x-labels.
+    fig = plt.figure(figsize=(11, 8.25), constrained_layout=True)
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.18, 1.0, 0.18])
     ax_perf_h = fig.add_subplot(gs[0, 0])
     ax_perf_d = fig.add_subplot(gs[0, 1])
-    ax_count_h = fig.add_subplot(gs[1, 0])
-    ax_count_d = fig.add_subplot(gs[1, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_count_h = fig.add_subplot(gs[2, 0])
+    ax_count_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
 
     # ── Color assignments ────────────────────────────────────────────────
     score_color = "C3"
@@ -1733,11 +1738,12 @@ def plot_trauma_score_comparison(
         ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax.set_ylim(0.0, 1.0)
 
-    # Performance legend — snug below top row (in the hspace gap)
+    # Performance legend — dedicated gridspec row (no overlap risk)
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    fig.legend(perf_handles, perf_labels, loc='upper center',
-               ncol=2, fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
-               bbox_to_anchor=(0.5, 0.52))
+    ax_legend_top.legend(
+        perf_handles, perf_labels, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
     PREV_COLOR = "#1F77B4"
@@ -1790,14 +1796,15 @@ def plot_trauma_score_comparison(
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
-    # Count legend — snug below bottom row
+    # Count legend — dedicated gridspec row
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
-    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=3, fontsize=_FIG_STYLE['legend'], frameon=True,
-               framealpha=0.9, bbox_to_anchor=(0.5, 0.01))
+    ax_legend_bot.legend(
+        count_handles + prev_handles, count_labels + prev_labels,
+        loc='center', ncol=3, fontsize=_FIG_STYLE['legend'],
+        frameon=True, framealpha=0.9,
+    )
 
-    plt.tight_layout()
     return fig
 
 

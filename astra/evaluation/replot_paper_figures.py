@@ -44,7 +44,7 @@ from typing import Dict, Optional
 import numpy as np
 import pandas as pd
 
-from astra.utils import cfg, save_figure, setup_logging
+from astra.utils import cfg, get_cfg, save_figure, setup_logging
 from astra.data.caching import prepare_data_and_dls_cached
 
 logger = logging.getLogger(__name__)
@@ -263,9 +263,13 @@ def _regen_multicurve(preds_df, preds_df_active, holdout_y, holdout_pids,
     preds_list, targs_list, valid_steps, valid_labels = [], [], [], []
     for step, lbl in zip(key_timepoints, labels):
         grp = preds_df_active[preds_df_active["censor_step"] == step]
-        if len(grp) < 10 or len(set(pid_to_y[p] for p in grp["PID"].values if p in pid_to_y)) < 2:
+        # Filter to PIDs present in holdout set (preds_df can contain stragglers).
+        grp = grp[grp["PID"].isin(pid_to_y)]
+        if len(grp) < 10:
             continue
         y = np.array([pid_to_y[p] for p in grp["PID"].values])
+        if len(set(y)) < 2:
+            continue
         p = grp["pred"].values.astype(float)
         preds_list.append(p)
         targs_list.append(y)
@@ -347,6 +351,7 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
         _plot_dca_calibrated,
         _plot_per_timepoint_vs_global,
     )
+    from astra.evaluation.utils import time_to_step, get_total_steps
 
     calibrator_dir = f"models/calibrators/{model_name}"
     per_tp, globals_ = _load_calibrators(calibrator_dir)
@@ -356,6 +361,20 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
 
     methods = sorted({m for methods in per_tp.values() for m in methods.keys()})
     if not methods:
+        return
+
+    # Filter to the same 8 key timepoints production uses — otherwise the grid
+    # helpers build a (ncols * 3.5, nrows * 3.5) figure that grows unboundedly.
+    max_step = get_total_steps() - 2
+    raw_key = [
+        time_to_step(1, 'h'), time_to_step(6, 'h'), time_to_step(12, 'h'),
+        time_to_step(72, 'h'), time_to_step(7, 'D'), time_to_step(14, 'D'),
+        time_to_step(30, 'D'), time_to_step(90, 'D'),
+    ]
+    key_timepoints = sorted({min(t, max_step) for t in raw_key if t is not None})
+    holdout_preds = {s: tp for s, tp in holdout_preds.items() if s in key_timepoints}
+    if not holdout_preds:
+        logger.warning("No predictions at key calibration timepoints — skipping")
         return
 
     # Build calibrated_preds dict matching what the plot helpers expect
@@ -382,15 +401,17 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
         except Exception as e:
             logger.debug(f"Could not parse calibration summary: {e}")
 
-    suffixed = f"{model_name}{suffix}"
+    # Plot helpers hardcode filenames as f"{stem}_{model_name}.{ext}". We pass the
+    # bare model_name so the first part matches disk layout; then rename outputs
+    # so they line up with the predictive-perf naming convention ``{stem}{suffix}``.
+    _plot_reliability_diagrams(holdout_preds, calibrated, best_method, model_name, out_dir)
+    _plot_dca_comparison(holdout_preds, calibrated, best_method, model_name, out_dir)
+    _plot_dca_calibrated(holdout_preds, calibrated, best_method, model_name, out_dir)
 
-    # These four helpers call save_figure with save_dir=save_dir internally.
-    _plot_reliability_diagrams(holdout_preds, calibrated, best_method, suffixed, out_dir)
-    _plot_dca_comparison(holdout_preds, calibrated, best_method, suffixed, out_dir)
-    _plot_dca_calibrated(holdout_preds, calibrated, best_method, suffixed, out_dir)
+    calibration_stems = ["reliability_diagrams", "dca_comparison", "dca_calibrated"]
 
-    # per_timepoint_vs_global reads from a CalibratorResult list which we'd have
-    # to reconstruct from summary_df. Only replot if the CSV is available.
+    # per_timepoint_vs_global reads from a CalibratorResult list; only replot if
+    # the calibration summary CSV is available.
     if os.path.exists(summary_path):
         try:
             from astra.evaluation.posthoc_calibration import CalibratorResult
@@ -410,22 +431,45 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
                 )
                 for _, r in df.iterrows()
             ]
-            _plot_per_timepoint_vs_global(all_results, best_method, suffixed, out_dir)
+            _plot_per_timepoint_vs_global(all_results, best_method, model_name, out_dir)
+            calibration_stems.append("per_timepoint_vs_global")
         except Exception as e:
             logger.warning(f"per_timepoint_vs_global skipped: {e}")
 
+    # Rename to match {stem}{suffix} convention (e.g. reliability_diagrams_rev20260430)
+    if suffix:
+        import shutil
+        for stem in calibration_stems:
+            src = os.path.join(out_dir, f"{stem}_{model_name}.png")
+            dst = os.path.join(out_dir, f"{stem}{suffix}.png")
+            if os.path.exists(src):
+                shutil.move(src, dst)
+            # Also move base64 sidecar
+            src_b64 = os.path.join(out_dir, "base64", f"{stem}_{model_name}_base64.txt")
+            dst_b64 = os.path.join(out_dir, "base64", f"{stem}{suffix}_base64.txt")
+            if os.path.exists(src_b64):
+                shutil.move(src_b64, dst_b64)
+
 
 @_safe("SHAP paper figures")
-def _regen_shap(skip: bool):
+def _regen_shap(skip: bool, config: Optional[str]):
     """Invoke the existing shap_paper_figures --figures-only entry point."""
     if skip:
         logger.info("SHAP replot skipped (--skip-shap)")
         return
     logger.info("Delegating SHAP replot to shap_paper_figures --figures-only")
     cmd = [sys.executable, "-m", "astra.evaluation.shap_paper_figures", "--figures-only"]
+    if config:
+        cmd.extend(["--config", config])
     result = subprocess.run(cmd, capture_output=False)
     if result.returncode != 0:
-        logger.warning(f"shap_paper_figures returned non-zero exit code {result.returncode}")
+        logger.warning(
+            f"shap_paper_figures returned non-zero exit code {result.returncode}. "
+            f"If you see an IndexError about 'axis 1', the cached shap_cache.pkl "
+            f"was computed against a different config (different channel count) "
+            f"than the one currently loaded. Pass --config <same-as-original-run> "
+            f"to both this script and the SHAP replot."
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -438,6 +482,7 @@ def replot(
     dpi: Optional[int],
     output_dir: Optional[str],
     skip_shap: bool,
+    config: Optional[str] = None,
 ) -> None:
     preds_dir = f"reports/eval/{model_name}/predictions"
     out_dir = output_dir or f"reports/eval/{model_name}/revision{suffix}"
@@ -506,7 +551,7 @@ def replot(
         _regen_calibration(model_name, holdout_preds, out_dir, suffix)
 
     # ── SHAP ────────────────────────────────────────────────────────────
-    _regen_shap(skip_shap)
+    _regen_shap(skip_shap, config)
 
     logger.info(f"Replot complete. Output: {out_dir}")
     logger.info(
@@ -520,6 +565,12 @@ def replot(
 def main():
     parser = argparse.ArgumentParser(
         description="Regenerate paper-submission figures from saved eval artifacts.",
+    )
+    parser.add_argument(
+        "--config", type=str, default="defaults.yaml",
+        help="Config YAML filename in configs/ dir (default: defaults.yaml). "
+             "Must match the config used during the original eval run. "
+             "Passed through to the SHAP replot subprocess.",
     )
     parser.add_argument("--model-name", type=str, default=None,
                         help="Defaults to cfg['model_name'].")
@@ -540,6 +591,12 @@ def main():
 
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
+    # Load config from configs/ dir (mutate in place so imported references stay valid)
+    import astra.utils as _utils
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / args.config)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
+
     model_name = args.model_name or cfg["model_name"]
     replot(
         model_name=model_name,
@@ -547,6 +604,7 @@ def main():
         dpi=args.dpi,
         output_dir=args.output_dir,
         skip_shap=args.skip_shap,
+        config=args.config,
     )
 
 

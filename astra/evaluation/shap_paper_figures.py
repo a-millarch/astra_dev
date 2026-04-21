@@ -33,7 +33,7 @@ from astra.evaluation.behavior import (
     get_static_cat_names_from_classes,
 )
 from astra.evaluation.utils import prepare_model, time_to_step
-from astra.utils import cfg, ensure_parent_dir, save_base64, save_figure
+from astra.utils import cfg, ensure_parent_dir, get_cfg, save_base64, save_figure
 
 logger = logging.getLogger(__name__)
 
@@ -1337,6 +1337,12 @@ def main():
         description='SHAP analysis figures for JMIR paper'
     )
     parser.add_argument(
+        '--config', type=str, default='defaults.yaml',
+        help='Config YAML filename in configs/ dir (default: defaults.yaml). '
+             'Must match the config used to produce the cached SHAP values, '
+             'otherwise channel counts will mismatch.',
+    )
+    parser.add_argument(
         '--recompute', action='store_true',
         help='Force recomputation of SHAP values'
     )
@@ -1353,6 +1359,12 @@ def main():
     # Logging setup
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+
+    # Load config from configs/ dir (mutate in place so imported references stay valid)
+    import astra.utils as _utils
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / args.config)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
 
     logger.info("Loading data...")
     data = prepare_data_and_dls_cached(cfg)

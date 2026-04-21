@@ -578,7 +578,7 @@ def _plot_calibration_metrics_over_time(
     save_dir: str,
 ):
     """Plot ECE and Brier score over time: raw vs calibrated per method."""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
 
     colors = {'isotonic': '#2E86AB', 'platt': '#A23B72'}
 
@@ -645,7 +645,8 @@ def _plot_reliability_diagrams(
     n = len(steps)
     ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows))
+    # Smaller per-panel size (3.5 in) so a 3x3 grid lands within the 1200 px cap.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.5 * nrows))
     if nrows == 1 and ncols == 1:
         axes = np.array([axes])
     axes = np.atleast_2d(axes)
@@ -721,7 +722,8 @@ def _plot_dca_comparison(
     n = len(steps)
     ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
+    # Smaller per-panel size so a 3x3 grid lands within the 1200 px cap.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.0 * nrows))
     if nrows == 1 and ncols == 1:
         axes = np.array([axes])
     axes = np.atleast_2d(axes)

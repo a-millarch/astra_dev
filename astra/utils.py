@@ -153,13 +153,15 @@ if not _bootstrap_logger.handlers:
 logger = logging.getLogger('astra')
 
 
-def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=100, dpi_ceiling=1200):
+def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=100, dpi_ceiling=1200,
+                     pad_inches=0.1):
     """Compute the highest DPI that renders *fig* within ``fit_long_side_px``.
 
     Uses the tight bbox (what ``bbox_inches='tight'`` will crop to) when available,
-    falling back to the raw figsize. Clamped to [dpi_floor, dpi_ceiling].
+    falling back to the raw figsize. Adds ``2 * pad_inches`` to account for the
+    padding matplotlib's ``bbox_inches='tight'`` applies on save (default 0.1 in
+    per side). Result is clamped to [dpi_floor, dpi_ceiling].
     """
-    import matplotlib
     width_in, height_in = fig.get_size_inches()
     try:
         # Tight bbox is what bbox_inches='tight' crops to — use it when available
@@ -171,7 +173,9 @@ def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=100, dpi_ceiling=1200):
         long_in = max(width_in, height_in)
     if long_in <= 0:
         return dpi_ceiling
-    target = int(fit_long_side_px // long_in)
+    # savefig with bbox_inches='tight' adds pad_inches on each side (default 0.1).
+    long_in_padded = long_in + 2 * pad_inches
+    target = int(fit_long_side_px // long_in_padded)
     return max(dpi_floor, min(dpi_ceiling, target))
 
 
