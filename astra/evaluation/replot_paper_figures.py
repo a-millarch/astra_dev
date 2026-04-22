@@ -242,7 +242,7 @@ def _regen_baseline(preds_df, holdout_y, holdout_pids, target, out_dir, suffix, 
 
 
 @_safe("multi_curves + dca_multicurve")
-def _regen_multicurve(preds_df, preds_df_active, holdout_y, holdout_pids,
+def _regen_multicurve(preds_df, holdout_y, holdout_pids,
                        out_dir, suffix, kw):
     """Reuse the from-arrays helpers with predictions assembled from preds_df."""
     from astra.evaluation.predictive_performance import (
@@ -266,7 +266,7 @@ def _regen_multicurve(preds_df, preds_df_active, holdout_y, holdout_pids,
     pid_to_y = dict(zip(holdout_pids, holdout_y))
     preds_list, targs_list, valid_steps, valid_labels = [], [], [], []
     for step, lbl in zip(key_timepoints, labels):
-        grp = preds_df_active[preds_df_active["censor_step"] == step]
+        grp = preds_df[preds_df["censor_step"] == step]
         # Filter to PIDs present in holdout set (preds_df can contain stragglers).
         grp = grp[grp["PID"].isin(pid_to_y)]
         if len(grp) < 10:
@@ -545,8 +545,8 @@ def replot(
     if preds_df is not None:
         _regen_baseline(preds_df, holdout_y, holdout_pids, target,
                         out_dir, suffix, submission_kw)
-    if preds_df is not None and preds_df_active is not None:
-        _regen_multicurve(preds_df, preds_df_active, holdout_y, holdout_pids,
+    if preds_df is not None:
+        _regen_multicurve(preds_df, holdout_y, holdout_pids,
                           out_dir, suffix, submission_kw)
 
     # ── Trauma scores + DeLong ──────────────────────────────────────────
