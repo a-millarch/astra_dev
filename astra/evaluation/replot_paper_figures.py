@@ -396,7 +396,7 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
 
     # Best method: fall back to first (calibration_summary CSV would tell us
     # definitively, but picking any present method still lets us replot)
-    summary_path = f"reports/calibration/calibration_summary_{model_name}.csv"
+    summary_path = f"reports/eval/{model_name}/calibration/calibration_summary_{model_name}.csv"
     best_method = methods[0]
     if os.path.exists(summary_path):
         try:

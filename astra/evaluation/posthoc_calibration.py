@@ -689,7 +689,7 @@ def _plot_reliability_diagrams(
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.2)
         ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
-        ax.legend(fontsize=_FIG_STYLE['legend'])
+        ax.legend(fontsize=8, handlelength=1.5, labelspacing=0.3)
         if row == nrows - 1:
             ax.set_xlabel('Predicted probability', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
