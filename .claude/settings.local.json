@@ -1,4 +1,4 @@
-{
+{"model": "claude-opus-4-6",
   "permissions": {
     "allow": [
       "Bash(python -m py_compile:*)",

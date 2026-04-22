@@ -17,12 +17,16 @@ Covered (from saved artifacts):
         trauma_rts_comparison, trauma_triss_comparison,
         delong_rts_comparison, delong_triss_comparison
     calibration
-        reliability_diagrams, dca_comparison, dca_calibrated, per_timepoint_vs_global
+        calibration_analysis, reliability_diagrams, dca_comparison,
+        dca_calibrated, per_timepoint_vs_global
     SHAP
         delegated to ``python -m astra.evaluation.shap_paper_figures --figures-only``
 
-Not covered (artifacts not persisted by run_eval — must rerun train.py --eval):
-    cm_F1, cm_F5  — need calibrated trainval predictions (not saved)
+Not covered — methodology cannot be preserved without rerunning the eval pipeline:
+    cm_F1, cm_F5  — production finds F-beta thresholds on calibrated TRAINVAL
+        predictions and applies an inline isotonic calibrator to holdout. Neither
+        the calibrator nor the threshold is persisted by run_eval; recomputing
+        either from holdout would constitute a methodology change.
     multi_percentile_recall  — PercentileRecallResult list not saved
     shap_class1  — tied to a fresh SHAP computation in train.py
 
@@ -346,6 +350,7 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
     """
     from astra.evaluation.posthoc_calibration import (
         apply_calibrator,
+        _plot_calibration_metrics_over_time,
         _plot_reliability_diagrams,
         _plot_dca_comparison,
         _plot_dca_calibrated,
@@ -412,8 +417,8 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
 
     calibration_stems = ["reliability_diagrams", "dca_comparison", "dca_calibrated"]
 
-    # per_timepoint_vs_global reads from a CalibratorResult list; only replot if
-    # the calibration summary CSV is available.
+    # calibration_analysis + per_timepoint_vs_global both read from a
+    # CalibratorResult list. Reconstruct once from the summary CSV and call both.
     if os.path.exists(summary_path):
         try:
             from astra.evaluation.posthoc_calibration import CalibratorResult
@@ -433,10 +438,14 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
                 )
                 for _, r in df.iterrows()
             ]
+            _plot_calibration_metrics_over_time(
+                all_results, methods, model_name, out_dir,
+            )
+            calibration_stems.append("calibration_analysis")
             _plot_per_timepoint_vs_global(all_results, best_method, model_name, out_dir)
             calibration_stems.append("per_timepoint_vs_global")
         except Exception as e:
-            logger.warning(f"per_timepoint_vs_global skipped: {e}")
+            logger.warning(f"calibration_analysis / per_timepoint_vs_global skipped: {e}")
 
     # Rename to match {stem}{suffix} convention (e.g. reliability_diagrams_rev20260430)
     if suffix:
@@ -557,10 +566,23 @@ def replot(
 
     logger.info(f"Replot complete. Output: {out_dir}")
     logger.info(
-        "Not regenerated (artifacts not persisted by run_eval): "
-        "cm_F1, cm_F5, multi_percentile_recall, shap_class1. "
-        "To produce these, rerun `python -m astra.training.train --eval "
-        "--comprehensive-eval --trauma-scores [--calibrate] [--shap]`."
+        "Not regenerated — methodology cannot be preserved from saved artifacts "
+        "alone. Rerun `python -m astra.training.train --eval --comprehensive-eval "
+        "[--calibrate] [--shap]` to regenerate these with the updated formatting:"
+    )
+    logger.info(
+        "  - cm_F1, cm_F5: production finds the F-beta threshold on calibrated "
+        "TRAINVAL predictions and applies an inline isotonic calibrator to holdout. "
+        "Neither the calibrator nor the threshold is persisted; recomputing either "
+        "from holdout would constitute a methodology change."
+    )
+    logger.info(
+        "  - multi_percentile_recall: PercentileRecallResult list is only held in "
+        "memory during the eval run."
+    )
+    logger.info(
+        "  - shap_class1 (from train.py): tied to a fresh SHAP computation inside "
+        "the training pipeline."
     )
 
 
