@@ -153,24 +153,33 @@ if not _bootstrap_logger.handlers:
 logger = logging.getLogger('astra')
 
 
-def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=100, dpi_ceiling=1200,
+def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=50, dpi_ceiling=1200,
                      pad_inches=0.1):
     """Compute the highest DPI that renders *fig* within ``fit_long_side_px``.
 
-    Uses the tight bbox (what ``bbox_inches='tight'`` will crop to) when available,
-    falling back to the raw figsize. Adds ``2 * pad_inches`` to account for the
-    padding matplotlib's ``bbox_inches='tight'`` applies on save (default 0.1 in
-    per side). Result is clamped to [dpi_floor, dpi_ceiling].
+    Calls ``fig.canvas.draw()`` first so ``constrained_layout`` (if enabled) has
+    settled artist positions. Then takes the max of tight bbox and raw figsize as
+    the long-side estimate (constrained_layout can expand beyond the tight bbox
+    at save time). Adds ``2 * pad_inches`` to account for the padding matplotlib's
+    ``bbox_inches='tight'`` applies on save. Result is clamped to [dpi_floor, dpi_ceiling].
     """
     width_in, height_in = fig.get_size_inches()
+    # Force a draw so constrained_layout finalizes all artist positions before
+    # we measure — without this, get_tightbbox returns stale/narrower values.
     try:
-        # Tight bbox is what bbox_inches='tight' crops to — use it when available
-        # so the pixel budget matches what actually lands on disk.
+        fig.canvas.draw()
+    except Exception:
+        pass
+    try:
         renderer = fig.canvas.get_renderer()
         tight = fig.get_tightbbox(renderer)
-        long_in = max(tight.width, tight.height)
+        tight_long_in = max(tight.width, tight.height)
     except Exception:
-        long_in = max(width_in, height_in)
+        tight_long_in = 0.0
+    # Use whichever is larger: the measured tight bbox or the configured figsize.
+    # constrained_layout can grow the figure beyond its initial figsize when
+    # accommodating legends / outside text.
+    long_in = max(tight_long_in, max(width_in, height_in))
     if long_in <= 0:
         return dpi_ceiling
     # savefig with bbox_inches='tight' adds pad_inches on each side (default 0.1).
@@ -229,6 +238,25 @@ def save_figure(fig, filename, save_dir='reports/studyfigs', dpi=1200,
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
     fig.savefig(png_path, dpi=dpi, bbox_inches='tight')
+
+    # If auto-fit still overshoots (constrained_layout expanded the figure
+    # more than we estimated), re-save with a corrected DPI. Hard guarantees
+    # the pixel cap regardless of layout engine behaviour.
+    if fit_long_side_px is not None:
+        try:
+            from PIL import Image
+            with Image.open(png_path) as im:
+                actual_long = max(im.size)
+            if actual_long > fit_long_side_px:
+                corrected_dpi = max(10, int(dpi * fit_long_side_px / actual_long))
+                logger.debug(
+                    f"{filename}: re-saving at dpi={corrected_dpi} "
+                    f"(initial {dpi} produced {actual_long}px, over {fit_long_side_px}px cap)"
+                )
+                fig.savefig(png_path, dpi=corrected_dpi, bbox_inches='tight')
+                dpi = corrected_dpi
+        except Exception as e:
+            logger.debug(f"Could not verify/correct size for {png_path}: {e}")
 
     # Save base64 version (same bytes as the PNG on disk)
     base64_dir = os.path.join(save_dir, 'base64')
