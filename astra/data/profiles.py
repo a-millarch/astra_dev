@@ -583,12 +583,16 @@ class CategoricalProfileEncoder:
             col_data = df_out[ts_col]
             new_col = []
             for cell in col_data:
-                if pd.isna(cell):
+                try:
+                    is_na = bool(pd.isna(cell))
+                except (ValueError, TypeError):
+                    is_na = False
+                if is_na:
                     new_col.append(cell)
                 elif isinstance(cell, list):
                     filtered = [v for v in cell if v not in profiled_set]
                     new_col.append(filtered if filtered else np.nan)
-                elif cell in profiled_set:
+                elif isinstance(cell, str) and cell in profiled_set:
                     new_col.append(np.nan)
                 else:
                     new_col.append(cell)
