@@ -4,54 +4,393 @@
 # Each concept (Medicin, Procedurer, etc.) can define profile rules for its categories.
 # Categories not listed under a concept keep binary (present/absent) encoding.
 #
-# Rule types:
-#   count  — profile matches if min <= distinct_sub_codes <= max (max is optional)
-#   codes  — profile matches if ALL listed sub-codes are present in the bin
+# Profile types:
+#   tier_mapping — Maps individual ATC codes to ordinal tiers using a registered
+#                  TierMapping (defined in astra/data/tier_mappings.py), or uses
+#                  auto-binary mode when 'mapping' is omitted (all matched → tier 1).
+#                  Produces continuous TS features (injected into cont_concepts).
+#   count        — Profile matches if min <= distinct_sub_codes <= max.
+#                  Produces ordinal profile tensor (existing behavior).
+#   codes        — Profile matches if ALL listed sub-codes are present.
 #
-# Rules are evaluated in descending level order; first match wins.
-# Level 0 (absent) is implicit and always applies when no sub-codes are present.
-version: 1
+# For tier_mapping categories:
+#   mapping:      Name of a registered TierMapping. Omit for auto-binary mode.
+#   atc_prefixes: ATC prefix strings for scanning raw data. Variable-length:
+#                 "J01" matches all J01*, "C01CA03" matches only that code.
+#   atc_codes:    Shorthand for exact ATC codes (used when atc_prefixes absent).
+#   short_name:   Prefix for output feature names (e.g. abx → abx_max_level).
+#                 Must be unique across all categories.
+#   features:     List of per-bin aggregates: max_level, n_distinct.
+#   exclusions:   Optional code-level exclusion rules (e.g. dose-based).
+#
+# strip_categories: List of parent category names (from ATC_LVL3_MAP/ATC_LVL4_MAP)
+#   to remove from the multi-hot encoding. Required when subcategory config keys
+#   don't match the multi-hot value names.
+version: 3
 
 Medicin:
-  sub_code_level: 4                      # ATC chars to preserve (4 = chemical subgroup)
+  sub_code_level: 4
+  strip_categories:
+    - cardiovascular_drugs
+    - antibiotics
+    - neuro_drugs
+    - anti_thrombotic
+    - diuretics
+    - hemostatics
+    - infusion
+    - blood
+    - opiods
+    - local_anastethics
+    - anastethics
+    - insulin
+
   categories:
+    # ==================================================================
+    # ANTIBIOTICS (existing — 6-tier escalation)
+    # ==================================================================
     antibiotics:
-      rules:
-        - level: 1
-          name: prophylactic
-          type: count
-          min: 1
-          max: 1
-        - level: 2
-          name: severe_injury
-          type: count
-          min: 2
-          max: 3
-        - level: 3
-          name: multiresistant
-          type: count
-          min: 4
-    # Example combo-based rule (commented out, clinician fills in):
-    # cardiovascular_drugs:
-    #   rules:
-    #     - level: 1
-    #       name: single_agent
-    #       type: count
-    #       min: 1
-    #       max: 1
-    #     - level: 2
-    #       name: combination_therapy
-    #       type: count
-    #       min: 2
+      tier_mapping:
+        mapping: antibiotic_escalation
+        short_name: abx
+        features:
+          - max_level
+          - n_distinct
+        atc_prefixes: [J01]
+        exclusions:
+          - code: J01FA01              # Erythromycin low-dose prokinetic use
+            condition: dose_lte
+            threshold: 250
+            dose_column: Administrationsdosis
+            unit_column: Dosisenhed
+            unit_value: mg
+
+    # ==================================================================
+    # CARDIOVASCULAR (7 features)
+    # ==================================================================
+
+    # 1A. Vasopressor support — ordinal via n_distinct (single vs multi-agent)
+    vasopressor_support:
+      tier_mapping:
+        mapping: vasopressor_escalation
+        short_name: vaso
+        features: [max_level, n_distinct]
+        atc_codes: [C01CA03, C01CA24, C01CA04, C01CA07, C01CA02, H01BA01, H01BA04]
+
+    # 1B. Perioperative hemodynamic support (surgery proxy)
+    periop_vasopressor:
+      tier_mapping:
+        short_name: periop_vaso
+        atc_codes: [C01CA26, C01CA06]
+        features: [max_level]
+
+    # 1C. Beta-blocker / rate control (any)
+    beta_blocker:
+      tier_mapping:
+        short_name: beta
+        atc_prefixes: [C07]
+        features: [max_level]
+
+    # 1C. Propranolol specifically (TBI sympatholysis flag)
+    propranolol_tbi:
+      tier_mapping:
+        short_name: propranolol
+        atc_codes: [C07AA05]
+        features: [max_level]
+
+    # 1C. Amiodarone (new-onset AF / arrhythmia severity)
+    amiodarone_flag:
+      tier_mapping:
+        short_name: amiodarone
+        atc_codes: [C01BD01]
+        features: [max_level]
+
+    # 1D. Clonidine (sedation adjunct in Danish ICU — cross-listed with sedation)
+    clonidine_flag:
+      tier_mapping:
+        short_name: clonidine
+        atc_codes: [C02AC01]
+        features: [max_level]
+
+    # 1E. CV comorbidity drugs (digoxin, ISMN, methyldopa)
+    cv_comorbidity:
+      tier_mapping:
+        short_name: cv_comorb
+        atc_codes: [C01AA05, C01DA14, C02AB01]
+        features: [max_level]
+
+    # ==================================================================
+    # NEURO / SEDATION (8 features)
+    # ==================================================================
+
+    # 2A. Sedation intensity — ordinal 0-3 (agent-type, no dose)
+    sedation_intensity:
+      tier_mapping:
+        mapping: sedation_escalation
+        short_name: sedation
+        features: [max_level, n_distinct]
+        atc_codes:
+          - N05CH01    # Melatonin
+          - N05CF01    # Zopiclone
+          - N05BA04    # Oxazepam
+          - N05BA01    # Diazepam
+          - N05BA02    # Chlordiazepoxide
+          - C02AC01    # Clonidine (cross-category)
+          - N05CM18    # Dexmedetomidine
+          - N01AX10    # Propofol (cross-category)
+          - N05CD08    # Midazolam
+          - N05BA06    # Lorazepam
+
+    # 2A sub-flags
+    propofol_flag:
+      tier_mapping:
+        short_name: propofol
+        atc_codes: [N01AX10]
+        features: [max_level]
+
+    benzo_flag:
+      tier_mapping:
+        short_name: benzo
+        atc_codes: [N05CD08, N05BA06]
+        features: [max_level]
+
+    # 2B. Delirium management
+    delirium_treatment:
+      tier_mapping:
+        short_name: delirium
+        atc_codes: [N05AD01, N05AH03, N05AH04]
+        features: [max_level]
+
+    haloperidol_flag:
+      tier_mapping:
+        short_name: haloperidol
+        atc_codes: [N05AD01]
+        features: [max_level]
+
+    # 2C. Neuromuscular blockade — ordinal 0-2 (bolus vs infusion)
+    nmba:
+      tier_mapping:
+        mapping: nmba_escalation
+        short_name: nmba
+        features: [max_level]
+        atc_codes: [M03AB01, M03AC09, M03AC11]
+
+    # 2D. Ward-level sleep/anxiolysis
+    sleep_anxiolysis:
+      tier_mapping:
+        short_name: sleep
+        atc_codes: [N05CH01, N05CF01, N05BA04, N05BA01, N05BA02]
+        features: [max_level]
+
+    # ==================================================================
+    # ANTITHROMBOTICS (5 features)
+    # ==================================================================
+
+    # 3A. Anticoagulation intensity — ordinal 0-2
+    anticoagulation:
+      tier_mapping:
+        mapping: anticoag_escalation
+        short_name: anticoag
+        features: [max_level]
+        atc_prefixes: [B01AB, B01AF, B01AE07, B01AA03]
+
+    doac_flag:
+      tier_mapping:
+        short_name: doac
+        atc_codes: [B01AF02, B01AF01, B01AE07]
+        features: [max_level]
+
+    vka_flag:
+      tier_mapping:
+        short_name: vka
+        atc_codes: [B01AA03]
+        features: [max_level]
+
+    # 3B. Antiplatelet — ordinal via n_distinct (single vs DAPT)
+    antiplatelet:
+      tier_mapping:
+        mapping: antiplatelet_escalation
+        short_name: antiplatelet
+        features: [max_level, n_distinct]
+        atc_codes: [B01AC06, B01AC04, B01AC24]
+
+    # ==================================================================
+    # DIURETICS (2 features)
+    # ==================================================================
+
+    diuretic:
+      tier_mapping:
+        mapping: diuretic_escalation
+        short_name: diuretic
+        features: [max_level]
+        atc_prefixes: [C03AA, C03AB, C03DA, C03CA]
+
+    # Metolazone — sequential nephron blockade proxy
+    metolazone_flag:
+      tier_mapping:
+        short_name: metolazone
+        atc_codes: [C03BA08]
+        features: [max_level]
+
+    # ==================================================================
+    # HEMOSTATICS (6 features)
+    # ==================================================================
+
+    txa_flag:
+      tier_mapping:
+        short_name: txa
+        atc_codes: [B02AA02]
+        features: [max_level]
+
+    fibrinogen_flag:
+      tier_mapping:
+        short_name: fibrinogen
+        atc_codes: [B02BB01]
+        features: [max_level]
+
+    pcc_flag:
+      tier_mapping:
+        short_name: pcc
+        atc_codes: [B02BD01]
+        features: [max_level]
+
+    rfviia_flag:
+      tier_mapping:
+        short_name: rfviia
+        atc_codes: [B02BD08]
+        features: [max_level]
+
+    vitamin_k_flag:
+      tier_mapping:
+        short_name: vitamin_k
+        atc_codes: [B02BA01]
+        features: [max_level]
+
+    coag_factor_any:
+      tier_mapping:
+        short_name: coag_factor
+        atc_codes: [B02BB01, B02BD01, B02BD08, B02BD02]
+        features: [max_level]
+
+    # ==================================================================
+    # INFUSION SOLUTIONS (7 features)
+    # ==================================================================
+
+    albumin_flag:
+      tier_mapping:
+        short_name: albumin
+        atc_codes: [B05AA01]
+        features: [max_level]
+
+    balanced_crystalloid:
+      tier_mapping:
+        short_name: balanced_cryst
+        atc_codes: [B05BB02]
+        features: [max_level]
+
+    calcium_replacement:
+      tier_mapping:
+        short_name: calcium
+        atc_codes: [B05XA03]
+        features: [max_level]
+
+    potassium_replacement:
+      tier_mapping:
+        short_name: potassium
+        atc_codes: [B05XA01]
+        features: [max_level]
+
+    magnesium_replacement:
+      tier_mapping:
+        short_name: magnesium
+        atc_codes: [B05XA05, B05XA06]
+        features: [max_level]
+
+    bicarbonate_flag:
+      tier_mapping:
+        short_name: bicarbonate
+        atc_codes: [B05XA02]
+        features: [max_level]
+
+    parenteral_nutrition:
+      tier_mapping:
+        short_name: tpn
+        atc_prefixes: [B05BA]
+        features: [max_level]
+
+    # ==================================================================
+    # OPIOIDS (3 features)
+    # ==================================================================
+
+    # Ward/floor opioids (N02A)
+    opioid_any:
+      tier_mapping:
+        short_name: opioid
+        atc_prefixes: [N02A]
+        features: [max_level]
+
+    # Strong opioids only (morphine, oxycodone, ketobemidone, pethidine)
+    opioid_strong:
+      tier_mapping:
+        short_name: opioid_strong
+        atc_codes: [N02AA01, N02AA05, N02AB01, N02AG01, N02AG02]
+        features: [max_level]
+
+    # ICU anesthetic opioids (fentanyl, remifentanil, sufentanil, alfentanil)
+    icu_opioid:
+      tier_mapping:
+        short_name: icu_opioid
+        atc_prefixes: [N01AH]
+        features: [max_level]
+
+    # ==================================================================
+    # ANESTHETICS (3 features)
+    # ==================================================================
+
+    thiopental_flag:
+      tier_mapping:
+        short_name: thiopental
+        atc_codes: [N01AF03]
+        features: [max_level]
+
+    esketamine_flag:
+      tier_mapping:
+        short_name: esketamine
+        atc_codes: [N01AX14, N01AX03]
+        features: [max_level]
+
+    regional_block:
+      tier_mapping:
+        short_name: regional
+        atc_prefixes: [N01BB]
+        features: [max_level]
+
+    # ==================================================================
+    # INSULIN (2 features)
+    # ==================================================================
+
+    insulin:
+      tier_mapping:
+        mapping: insulin_escalation
+        short_name: insulin
+        features: [max_level]
+        atc_prefixes: [A10A]
+
+    # Chronic insulin (basal insulin = pre-existing diabetes marker)
+    chronic_insulin:
+      tier_mapping:
+        short_name: chronic_insulin
+        atc_prefixes: [A10AE, A10AC]
+        features: [max_level]
+
 
 Procedurer:
-  sub_code_level: 3                      # procedure code prefix length
-  categories: {}                         # clinician fills in
+  sub_code_level: 3
+  categories: {}
 
 ADTHaendelser:
-  sub_code_level: 0                      # no sub-code detail needed yet
+  sub_code_level: 0
   categories: {}
 
 Events:
-  sub_code_level: 0                      # no sub-code detail needed yet
+  sub_code_level: 0
   categories: {}

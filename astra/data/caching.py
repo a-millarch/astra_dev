@@ -19,7 +19,7 @@ from astra.utils import cfg
 logger = logging.getLogger(__name__)
 
 # Bump this when cached data format changes to auto-invalidate old caches
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 
 
 def _get_cache_key(cfg):
@@ -44,6 +44,7 @@ def _get_cache_key(cfg):
         "bin_freq_include": cfg.get("bin_freq_include", []),
         "ebm_enabled": cfg.get("ebm_feature", {}).get("enabled", False),
         "temporal_features": cfg.get("temporal_features", {}).get("enabled", False),
+        "categorical_profiles": cfg.get("categorical_profiles", {}),
         "agg_func": cfg.get("agg_func", {}),
         "normalization": cfg.get("normalization", {}),
         "drop_features": cfg.get("drop_features", {}),
