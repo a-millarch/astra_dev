@@ -52,6 +52,7 @@ def timed_stage(timing_dict: dict, stage_name: str):
 from astra.data.mappings import (
     VITALS_MAP, VITALS_BOUNDS, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP, EWS_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
+    INVASIVE_BP_TYPES, INVASIVE_VITALS_MAP,
     PROCEDURE_MAP, PROCEDURE_PREFIXES, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
 )
@@ -1250,6 +1251,22 @@ def _standardize_vitals(raw_vitals: List[dict]) -> List[dict]:
     return result
 
 
+def _extract_invasive_events(raw_vitals: List[dict]) -> List[dict]:
+    """Extract invasive monitoring events from raw vitals for categorical TS.
+
+    Returns list of {'timestamp': ..., 'value': 'arterial_bp'|'arterial_hr'|'invasive_temp'}.
+    """
+    result = []
+    for v in raw_vitals:
+        param = v.get('parameter', v.get('feature', ''))
+        ts = v['timestamp']
+        if param in INVASIVE_VITALS_MAP:
+            result.append({'timestamp': ts, 'value': INVASIVE_VITALS_MAP[param]})
+        elif param in INVASIVE_BP_TYPES:
+            result.append({'timestamp': ts, 'value': 'arterial_bp'})
+    return result
+
+
 def _standardize_labs(raw_labs: List[dict]) -> List[dict]:
     """Convert raw lab results to standardized format.
 
@@ -1456,6 +1473,7 @@ def prepare_from_raw_ehr(
             'ASMT_ELIX': raw_ehr.get('elixhauser_score'),
         },
         'VitaleVaerdier': _standardize_vitals(raw_ehr.get('vitals', [])),
+        'InvasiveMonitoring': _extract_invasive_events(raw_ehr.get('vitals', [])),
         'Labsvar': _standardize_labs(raw_ehr.get('labs', [])),
         'ITAOversigtsrapport': _standardize_icu(raw_ehr.get('icu_scores', [])),
         'Medicin': _standardize_medications(
@@ -1953,6 +1971,25 @@ def _filter_concepts_for_patient(
                                 logger.info(f"ISS_computed: {iss_val}")
                 except Exception as e:
                     logger.warning(f"Failed to load R-computed ISS: {e}")
+            continue
+
+        if concept == 'InvasiveMonitoring':
+            # Derived from VitaleVaerdier — saved by filter_vitals() above
+            inv_pkl = "data/interim/concepts/InvasiveMonitoring.pkl"
+            if os.path.exists(inv_pkl):
+                concept_filtered = pd.read_pickle(inv_pkl)
+                patient_pid = base_df['PID'].iloc[0]
+                if 'PID' in concept_filtered.columns:
+                    concept_filtered = concept_filtered[
+                        concept_filtered['PID'] == patient_pid
+                    ]
+                if not concept_filtered.empty:
+                    filtered[concept] = concept_filtered
+                    logger.info(
+                        f"InvasiveMonitoring: {len(concept_filtered)} events"
+                    )
+            else:
+                logger.debug("InvasiveMonitoring pkl not found — skipping")
             continue
 
         if concept == 'Events':

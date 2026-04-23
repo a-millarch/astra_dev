@@ -19,6 +19,8 @@ VITALS_MAP = {
     'ART mean inv BT': 'MAP',
     'Temperatur': 'TEMP',
     'Temp.': 'TEMP',
+    'Blæretemperatur': 'TEMP',
+    'Esophagustemperatur': 'TEMP',
     'DBP': 'DBP',
     'SBP': 'SBP',
 }
@@ -32,6 +34,21 @@ BP_TYPES = [
     'ABP inv BT',
     'Invasivt BT - ART (sys/dia)',
 ]
+
+# Invasive blood pressure parameter names (subset of BP_TYPES)
+INVASIVE_BP_TYPES = frozenset({
+    'ART inv BT',
+    'Invasivt BT - ABP (sys/dia)',
+    'ABP inv BT',
+    'Invasivt BT - ART (sys/dia)',
+})
+
+# Raw vital parameter names that indicate invasive measurement → category label
+INVASIVE_VITALS_MAP = {
+    'ABP Puls (fra A-kanyle)': 'arterial_hr',
+    'Blæretemperatur': 'invasive_temp',
+    'Esophagustemperatur': 'invasive_temp',
+}
 
 # Height/weight parameter names → standardized
 HEIGHT_WEIGHT_MAP = {
