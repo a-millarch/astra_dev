@@ -194,7 +194,12 @@ PROCEDURE_PREFIXES: List[str] = sorted(PROCEDURE_MAP.keys(), key=len, reverse=Tr
 # ============================================================================
 
 ADT_PATTERNS: List[Tuple[str, list]] = [
-    ('TC', ['traumecenter']),
+    ('TB', ['traumecenter']),
+    ('ED', [
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\bakutmodtagelse\b',
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\bakutklinik\b',
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\b[\w.]+\s+modtagelse\b',  # [\w.] allows "F."
+    ]),
     ('OR', [
         'operationsgang',
         'operationsklinik',
@@ -210,8 +215,8 @@ ADT_PATTERNS: List[Tuple[str, list]] = [
         'kirurgisk endo',
     ]),
     ('ICU', [r'\bintensiv\b', r'\bita\s', r'\bita,']),
-    ('BED', ['seng']),
-    ('AMB', ['amb']),
+    ('WARD', ['seng']),
+    ('OPD', ['amb']),
 ]
 
 
