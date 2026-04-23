@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Dict, Optional, Union
 
 import numpy as np
@@ -116,9 +117,10 @@ def merge_and_aggregate(
     if is_categorical:
         if is_multi_label:
             # Keep all values as separate rows
-            aggregated_df = filtered_df[
-                ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
-            ].drop_duplicates()
+            keep_cols = ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
+            if "SUB_CODE" in filtered_df.columns:
+                keep_cols.append("SUB_CODE")
+            aggregated_df = filtered_df[keep_cols].drop_duplicates()
 
         else:
             # Single-label: Take mode (most common) or last value
@@ -202,7 +204,7 @@ def map_concept(
 
     
     # Notater-derived concepts must use map_concept_optimized
-    _NOTATER_DERIVED = {"ISS", "Events"}
+    _NOTATER_DERIVED = {"ISS_notes", "ISS_computed", "Events"}
     if concept in _NOTATER_DERIVED:
         raise ValueError(
             f"'{concept}' is derived from Notater.pkl. Use map_concept_optimized() instead."
@@ -740,9 +742,10 @@ def merge_and_aggregate_optimized(
     
     if is_categorical:
         if is_multi_label:
-            aggregated_df = filtered_df[
-                ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
-            ].drop_duplicates()
+            keep_cols = ["PID", "bin_counter", "bin_start", "bin_end", "FEATURE", "VALUE"]
+            if "SUB_CODE" in filtered_df.columns:
+                keep_cols.append("SUB_CODE")
+            aggregated_df = filtered_df[keep_cols].drop_duplicates()
         else:
             if agg_func == "mode":
                 aggregated_df = (
@@ -891,7 +894,7 @@ def map_concept_optimized(
     filter_function = collect_filter(concept)
 
     # Load Notater.pkl once for concepts that need it
-    notes_concepts = ("ITAOversigtsrapport", "ISS", "Events")
+    notes_concepts = ("ITAOversigtsrapport", "ISS_notes", "ISS_computed", "Events")
     notater_df = pd.read_pickle("data/interim/concepts/Notater.pkl") if concept in notes_concepts else None
 
     # Cross-concept augmentation
@@ -906,9 +909,10 @@ def map_concept_optimized(
         gcs_df = build_gcs_from_notes(notater_df)
         concept_df = pd.concat([concept_df, gcs_df], ignore_index=True)
         logger.info(f"Augmented ITAOversigtsrapport with {len(gcs_df)} GCS values from notes")
-    elif concept == "ISS":
-        from astra.data.notes_features import build_iss_from_notes
-        concept_df = build_iss_from_notes(notater_df)
+    elif concept in ("ISS_notes", "ISS_computed"):
+        iss_pkl = f"data/interim/concepts/{concept}.pkl"
+        concept_df = pd.read_pickle(iss_pkl)
+        logger.info(f"Loaded {concept}: {len(concept_df)} rows")
         concept_df = filter_function(concept_df)
     elif concept == "Events":
         from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes

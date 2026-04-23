@@ -17,6 +17,7 @@ Usage:
     session.predict(**result)
 """
 
+import os
 import time
 from contextlib import contextmanager, nullcontext as _nullcontext
 
@@ -584,6 +585,100 @@ def _build_categorical_ts(
     return x_ts_cat
 
 
+def _build_profile_ts(
+    raw_data: dict,
+    bin_df: pd.DataFrame,
+    bundle: dict,
+) -> Optional[np.ndarray]:
+    """Build profile-encoded categorical TS tensor for inference.
+
+    Groups medication/procedure events by bin and category, counts distinct
+    sub-codes per group, and applies profile rules to determine ordinal levels.
+
+    Returns:
+        np.ndarray of shape ``[n_profiled_categories, seq_len]`` (int8),
+        or None if profiles are disabled.
+    """
+    profile_dims = bundle.get('ts_cat_profile_dims')
+    category_order = bundle.get('profile_category_order')
+    profile_cfg = bundle.get('data_config', {}).get('categorical_profiles', {})
+
+    if not profile_dims or not category_order or not profile_cfg.get('enabled'):
+        return None
+
+    from astra.data.profiles import load_profiles_config, evaluate_profile_rules
+
+    # Build a temporary cfg dict for load_profiles_config
+    profiles_config = load_profiles_config({'categorical_profiles': profile_cfg})
+
+    seq_len = bundle['model_params']['seq_len']
+    n_profiled = len(category_order)
+    x_profiles = np.zeros((n_profiled, seq_len), dtype=np.int8)
+
+    cat_encoder_names = bundle['data_config'].get('cat_encoder_names', {})
+
+    # For each concept that has profiles defined, collect sub-codes per bin per category
+    for concept_name in cat_encoder_names:
+        concept_profiles = profiles_config.get(concept_name, {})
+        profiled_cats = concept_profiles.get('categories', {})
+        sub_code_level = concept_profiles.get('sub_code_level', 0)
+
+        if not profiled_cats or sub_code_level == 0:
+            continue
+
+        events = raw_data.get(concept_name, [])
+        if not events:
+            continue
+
+        # Assign events to bins (reuse existing logic)
+        is_interval = 'start' in events[0]
+        events_df = pd.DataFrame(events)
+        if events_df.empty:
+            continue
+
+        if is_interval:
+            events_df['start'] = pd.to_datetime(events_df['start'])
+            events_df['end'] = pd.to_datetime(events_df['end'])
+            assigned = _expand_intervals_to_bins(events_df, bin_df)
+        else:
+            events_df['timestamp'] = pd.to_datetime(events_df['timestamp'])
+            events_df['feature'] = 'tmp'
+            assigned = _assign_to_bins(events_df, bin_df)
+
+        if assigned.empty:
+            continue
+
+        # Group by bin position and category, collect sub-codes
+        # Events should have 'value' (category name) and 'sub_code' (ATC detail)
+        bin_cat_subcodes: dict = {}  # {(pos, category): set(sub_codes)}
+        for _, row in assigned.iterrows():
+            pos = int(row['position'])
+            if pos >= seq_len:
+                continue
+            category = row.get('value', '')
+            sub_code = row.get('sub_code', '')
+            if not category or not sub_code or category not in profiled_cats:
+                continue
+            key = (pos, category)
+            if key not in bin_cat_subcodes:
+                bin_cat_subcodes[key] = set()
+            bin_cat_subcodes[key].add(sub_code)
+
+        # Evaluate profile rules and fill tensor
+        for (pos, category), sub_codes in bin_cat_subcodes.items():
+            if category not in profiled_cats:
+                continue
+            rules = profiled_cats[category].get('rules', [])
+            level = evaluate_profile_rules(rules, sub_codes)
+            if category in category_order:
+                cat_idx = category_order.index(category)
+                x_profiles[cat_idx, pos] = level
+
+    nonzero = int(np.count_nonzero(x_profiles))
+    logger.info(f"_build_profile_ts: shape={x_profiles.shape} nonzero={nonzero}")
+    return x_profiles
+
+
 # ============================================================================
 # BinCache & incremental tensor builders
 # ============================================================================
@@ -1078,11 +1173,16 @@ def prepare_single_patient(
     # 3. Build categorical TS
     x_ts_cat = _build_categorical_ts(raw_data, bin_df, bundle)
 
+    # 3b. Build profile TS (if profiles enabled)
+    x_ts_cat_profiles = _build_profile_ts(raw_data, bin_df, bundle)
+
     # Zero out bins beyond the visible horizon (guards against future data
     # leaking in when simulating with historic patients).
     seq_len = bundle['model_params']['seq_len']
     if trajectory_length < seq_len:
         x_ts_cat[:, trajectory_length:] = 0.0
+        if x_ts_cat_profiles is not None:
+            x_ts_cat_profiles[:, trajectory_length:] = 0
 
     # 4. Build tabular features
     tab_df = _build_tab_df(raw_data, bundle)
@@ -1093,13 +1193,16 @@ def prepare_single_patient(
         f"trajectory_length={trajectory_length}"
     )
 
-    return {
+    result = {
         'x_ts': x_ts,
         'x_ts_cat': x_ts_cat,
         'tab_df': tab_df,
         'trajectory_length': trajectory_length,
         'bin_df': bin_df,
     }
+    if x_ts_cat_profiles is not None:
+        result['x_ts_cat_profiles'] = x_ts_cat_profiles
+    return result
 
 
 # ============================================================================
@@ -1199,11 +1302,26 @@ def _standardize_ews(raw_ews: List[dict]) -> List[dict]:
     return result
 
 
-def _standardize_medications(raw_meds: List[dict]) -> List[dict]:
+def _get_inference_sub_code_level(bundle: Optional[dict], concept: str) -> int:
+    """Get sub_code_level for a concept from the deployment bundle."""
+    if bundle is None:
+        return 0
+    profile_cfg = bundle.get('data_config', {}).get('categorical_profiles', {})
+    if not profile_cfg.get('enabled'):
+        return 0
+    from astra.data.profiles import load_profiles_config
+    profiles = load_profiles_config({'categorical_profiles': profile_cfg})
+    return profiles.get(concept, {}).get('sub_code_level', 0)
+
+
+def _standardize_medications(raw_meds: List[dict], sub_code_level: int = 0) -> List[dict]:
     """Convert raw ATC codes to medication category names.
 
     Input:  [{'timestamp': ..., 'atc_code': 'N02AB02'}, ...]
     Output: [{'timestamp': ..., 'value': 'opiods'}, ...]
+
+    When *sub_code_level* > 0 (profiles enabled), also preserves a truncated
+    ATC sub-code in each event dict for profile determination.
     """
     result = []
     for med in raw_meds:
@@ -1211,15 +1329,20 @@ def _standardize_medications(raw_meds: List[dict]) -> List[dict]:
         atc = str(med.get('atc_code', med.get('value', '')))
         category = classify_atc(atc)
         if category is not None:
-            result.append({'timestamp': ts, 'value': category})
+            entry = {'timestamp': ts, 'value': category}
+            if sub_code_level > 0:
+                entry['sub_code'] = atc[:sub_code_level]
+            result.append(entry)
     return result
 
 
-def _standardize_procedures(raw_procs: List[dict]) -> List[dict]:
+def _standardize_procedures(raw_procs: List[dict], sub_code_level: int = 0) -> List[dict]:
     """Convert raw procedure codes to category names via prefix matching.
 
     Input:  [{'timestamp': ..., 'code': 'KNGJ22'}, ...]
     Output: [{'timestamp': ..., 'value': 'orto'}, ...]
+
+    When *sub_code_level* > 0, also preserves a truncated procedure code.
     """
     result = []
     for p in raw_procs:
@@ -1227,7 +1350,10 @@ def _standardize_procedures(raw_procs: List[dict]) -> List[dict]:
         code = str(p.get('code', p.get('value', '')))
         for prefix in PROCEDURE_PREFIXES:
             if code.startswith(prefix):
-                result.append({'timestamp': ts, 'value': PROCEDURE_MAP[prefix]})
+                entry = {'timestamp': ts, 'value': PROCEDURE_MAP[prefix]}
+                if sub_code_level > 0:
+                    entry['sub_code'] = code[:sub_code_level]
+                result.append(entry)
                 break
     return result
 
@@ -1332,8 +1458,14 @@ def prepare_from_raw_ehr(
         'VitaleVaerdier': _standardize_vitals(raw_ehr.get('vitals', [])),
         'Labsvar': _standardize_labs(raw_ehr.get('labs', [])),
         'ITAOversigtsrapport': _standardize_icu(raw_ehr.get('icu_scores', [])),
-        'Medicin': _standardize_medications(raw_ehr.get('medications', [])),
-        'Procedurer': _standardize_procedures(raw_ehr.get('procedures', [])),
+        'Medicin': _standardize_medications(
+            raw_ehr.get('medications', []),
+            sub_code_level=_get_inference_sub_code_level(bundle, 'Medicin'),
+        ),
+        'Procedurer': _standardize_procedures(
+            raw_ehr.get('procedures', []),
+            sub_code_level=_get_inference_sub_code_level(bundle, 'Procedurer'),
+        ),
         'ADTHaendelser': _standardize_adt(raw_ehr.get('adt', [])),
         'EWS': _standardize_ews(raw_ehr.get('ews', [])),
     }
@@ -1707,9 +1839,9 @@ def _try_add_elixhauser(
                                               patient_dir=patient_dir)
     except Exception as e:
         logger.warning(
-            f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=NaN."
+            f"Elixhauser computation failed ({e}). Setting ASMT_ELIX=0.0."
         )
-        base_df["ASMT_ELIX"] = np.nan
+        base_df["ASMT_ELIX"] = 0.0
         return base_df
 
 
@@ -1744,7 +1876,7 @@ def _filter_concepts_for_patient(
     concept_timing = {}  # per-concept load+filter timing
 
     # Concepts that are derived from Notater (clinical notes), not raw CSVs
-    _NOTES_DERIVED_CONCEPTS = {'ISS', 'Events'}
+    _NOTES_DERIVED_CONCEPTS = {'ISS_notes', 'ISS_computed', 'Events'}
     _NOTES_AUGMENTED_CONCEPTS = {'ITAOversigtsrapport'}
     _ALL_NOTES_CONCEPTS = _NOTES_DERIVED_CONCEPTS | _NOTES_AUGMENTED_CONCEPTS
 
@@ -1782,18 +1914,45 @@ def _filter_concepts_for_patient(
 
     for concept in cfg['concepts']:
         # --- Notes-derived concepts: built entirely from Notater, no CSV ---
-        if concept == 'ISS':
-            # ISS from notes (mirrors mapper.py)
+        if concept == 'ISS_notes':
+            from astra.data.notes_features import build_iss_from_notes
+            filter_fn = collect_filter(concept)
             if notater_inhospital is not None and not notater_inhospital.empty:
-                from astra.data.notes_features import build_iss_from_notes
-                filter_fn = collect_filter(concept)
-                concept_filtered = build_iss_from_notes(notater_inhospital)
-                concept_filtered = filter_fn(concept_filtered)
-                if not concept_filtered.empty:
-                    filtered[concept] = concept_filtered
-                    logger.info(f"ISS from notes: {len(concept_filtered)} rows")
-            else:
-                logger.info("No Notater data — skipping ISS")
+                iss_notes = build_iss_from_notes(notater_inhospital)
+                if not iss_notes.empty:
+                    concept_filtered = filter_fn(iss_notes)
+                    if not concept_filtered.empty:
+                        filtered[concept] = concept_filtered
+                        logger.info(f"ISS_notes: {len(concept_filtered)} row(s)")
+            continue
+
+        if concept == 'ISS_computed':
+            filter_fn = collect_filter(concept)
+            iss_r_csv = "data/interim/computed_iss_df.csv"
+            if os.path.exists(iss_r_csv):
+                try:
+                    iss_r_full = pd.read_csv(iss_r_csv, low_memory=False)
+                    patient_pid = base_df['PID'].iloc[0]
+                    iss_r_patient = iss_r_full[iss_r_full['PID'] == patient_pid]
+                    if not iss_r_patient.empty:
+                        riss = pd.to_numeric(iss_r_patient.get('riss'), errors='coerce').iloc[0]
+                        niss = pd.to_numeric(iss_r_patient.get('niss'), errors='coerce').iloc[0]
+                        iss_val = riss if pd.notna(riss) else niss
+                        if pd.notna(iss_val):
+                            # Use admission time as timestamp for inference
+                            # (batch pipeline uses latest diagnosis date)
+                            iss_r = pd.DataFrame({
+                                'PID': [patient_pid],
+                                'TIMESTAMP': [base_df['start'].iloc[0]],
+                                'FEATURE': ['ISS_computed'],
+                                'VALUE': [float(iss_val)],
+                            })
+                            concept_filtered = filter_fn(iss_r)
+                            if not concept_filtered.empty:
+                                filtered[concept] = concept_filtered
+                                logger.info(f"ISS_computed: {iss_val}")
+                except Exception as e:
+                    logger.warning(f"Failed to load R-computed ISS: {e}")
             continue
 
         if concept == 'Events':

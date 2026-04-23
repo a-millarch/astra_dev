@@ -28,7 +28,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from astra.utils import cfg, setup_logging
+from astra.utils import cfg, get_cfg, setup_logging
 
 logger = logging.getLogger(__name__)
 from astra.data.caching import prepare_data_and_dls_cached
@@ -44,6 +44,10 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="ASTRA Training Pipeline v2 (transfer learning + HP search)"
     )
+
+    # Config
+    parser.add_argument("--config", type=str, default="defaults.yaml",
+                        help="Config YAML filename in configs/ dir (default: defaults.yaml)")
 
     # Pipeline stages
     parser.add_argument("--pretrain", action="store_true", default=False,
@@ -66,6 +70,8 @@ def parse_args():
                         help="Load pretrained weights before finetuning")
     parser.add_argument("--skip-valid", action=argparse.BooleanOptionalAction, default=True,
                         help="Train on full trainval without validation split (use --no-skip-valid for 80/20 split with early stopping)")
+    parser.add_argument("--valid-size", type=float, default=None,
+                        help="Validation split fraction (e.g. 0.1). Implies --no-skip-valid.")
     parser.add_argument("--early-prediction", action="store_true", default=False,
                         help="Enable Phase 4: progressive time masking + weighted loss")
 
@@ -76,10 +82,20 @@ def parse_args():
                         help="Also run active-only evaluation (patients still in hospital) and generate comparison plots")
     parser.add_argument("--trauma-scores", action="store_true", default=False,
                         help="Compute traditional trauma risk scores (RTS, ISS, TRISS) and add as baselines (Azure-only)")
+    parser.add_argument("--delong", action="store_true", default=False,
+                        help="Run paired DeLong tests between HNN and trauma scores with FDR correction (requires --trauma-scores)")
 
     # Calibration
     parser.add_argument("--calibrate", action="store_true", default=False,
                         help="Run posthoc calibration analysis (isotonic/Platt at each timepoint)")
+
+    # SHAP
+    parser.add_argument("--shap", action="store_true", default=False,
+                        help="Run cohort temporal SHAP analysis with visualizations")
+    parser.add_argument("--shap-max-patients", type=int, default=20,
+                        help="Max holdout patients for temporal SHAP (default: 20)")
+    parser.add_argument("--shap-representative", action="store_true", default=False,
+                        help="Use stratified representative sampling for temporal SHAP")
 
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
@@ -124,6 +140,12 @@ def _get_pretrain_cfg() -> MLMConfig:
 def main():
     args = parse_args()
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
+
+    # Load config from configs/ dir (always applied, defaults to defaults.yaml)
+    import astra.utils as _utils
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / args.config)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
 
     # ========================================================================
     # Load data (shared across all stages)
@@ -183,7 +205,10 @@ def main():
         finetune_cfg.model_name = model_name
         finetune_cfg.pretrain_checkpoint_dir = pretrain_cfg.checkpoint_dir
 
-        if args.skip_valid:
+        if args.valid_size is not None:
+            finetune_cfg.valid_size = args.valid_size
+            logger.info(f"--valid-size={args.valid_size}: using {args.valid_size:.0%} validation split")
+        elif args.skip_valid:
             finetune_cfg.valid_size = 0.0
             logger.info("--skip-valid: training on full trainval data (valid_size=0.0)")
 
@@ -211,6 +236,7 @@ def main():
             data, cfg, args.multicurve, args.comprehensive_eval,
             active_only=args.active_only,
             trauma_scores=args.trauma_scores,
+            delong=args.delong,
         )
 
     # ========================================================================
@@ -219,9 +245,62 @@ def main():
     if args.calibrate:
         from astra.evaluation.posthoc_calibration import run_posthoc_calibration
         logger.info("=== Running Posthoc Calibration ===")
-        cal_summary = run_posthoc_calibration(data, cfg)
+        cal_summary = run_posthoc_calibration(
+            data, cfg, save_dir=f'reports/eval/{model_name}/calibration',
+        )
         if len(cal_summary) > 0:
             logger.info(f"Calibration summary: {len(cal_summary)} results saved")
+
+    # ========================================================================
+    # SHAP analysis
+    # ========================================================================
+    if args.shap:
+        from astra.evaluation.behavior import (
+            shap_analysis, visualize_shap_summary,
+            run_cohort_temporal_shap_analysis,
+        )
+        from astra.evaluation.utils import prepare_model
+        logger.info("=== Running SHAP Analysis ===")
+        model, device = prepare_model(data, cfg)
+        model_name = cfg["model_name"]
+
+        # Aggregate SHAP (auto-uses 'mean' for temporal head)
+        shap_results = shap_analysis(
+            data, model, model_name=model_name,
+            visualize=False, max_test_samples=500,
+            max_background_samples=1000, density_normalize=True,
+        )
+        visualize_shap_summary(
+            shap_results["shap_results"],
+            channel2feature=shap_results["channel2feature"],
+            feature_names_cat=shap_results["static_cat_names"],
+            feature_names_cont=cfg["dataset"]["num_cols"],
+            class_idx=1, max_display=20,
+            save_path=f'reports/eval/{model_name}/shap_class1.png',
+            density_normalize=True,
+        )
+
+        # Per-timeframe cohort temporal SHAP (active-only background)
+        run_cohort_temporal_shap_analysis(
+            data, model,
+            max_patients=args.shap_max_patients,
+            max_background_samples=1000,
+            save_dir=f'reports/eval/{model_name}/temporal_shap',
+            density_normalize=True,
+            active_only=True,
+            representative=args.shap_representative,
+        )
+
+        # Paper-quality summary panel from saved CSV
+        from astra.evaluation.shap_paper_figures import figure_shap_summary_panel
+        shap_dir = f'reports/eval/{model_name}/temporal_shap'
+        csv_path = f'{shap_dir}/cohort_shap_all_features_active_dn.csv'
+        pkl_path = f'{shap_dir}/cohort_temporal_shap_results_active_dn.pkl'
+        if Path(csv_path).exists():
+            figure_shap_summary_panel(
+                csv_path=csv_path, save_dir=shap_dir, pickle_path=pkl_path,
+            )
+        logger.info("SHAP analysis complete")
 
     # ========================================================================
     # Temporal validation (cross-check eval methods)

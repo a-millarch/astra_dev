@@ -114,13 +114,81 @@ def process_prehospital(cfg, base, overwrite=False):
     return base
 
 
-def _save_notater_derived_concepts(cfg):
-    """Extract ISS/Events from Notater.pkl and save as concept pickles.
+def _build_r_iss(base: pd.DataFrame) -> pd.DataFrame:
+    """Compute ISS from ICD-10 diagnosis codes via R icdpicr and return as
+    standard [PID, TIMESTAMP, FEATURE, VALUE] DataFrame.
 
-    These concepts are derived from clinical notes rather than having their own
-    raw CSVs, so filter_subsets_inhospital() does not create them.  Saving them
-    as standard concept pickles makes all downstream consumers (AggregatedDS,
-    inference) work without special-casing.
+    TIMESTAMP is the latest Noteret_dato among the diagnoses used per patient,
+    i.e. the moment the ISS becomes fully known.
+    """
+    from astra.evaluation.trauma_scores import _prepare_long_df, compute_iss_from_r
+
+    diag_path = "data/raw/Diagnoser.csv"
+    if not os.path.exists(diag_path):
+        logger.info("Diagnoser.csv not found — skipping R-computed ISS")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
+
+    # Ensure diagnoses_long.csv exists
+    long_path = "data/interim/diagnoses_long.csv"
+    if not is_file_present(long_path):
+        logger.info("Creating long diagnosis DataFrame for R ISS computation...")
+        _prepare_long_df(base)
+
+    # Run R script to produce computed_iss_df.csv
+    iss_csv_path = "data/interim/computed_iss_df.csv"
+    if not is_file_present(iss_csv_path):
+        try:
+            compute_iss_from_r(base)
+        except Exception as e:
+            logger.warning(f"R ISS computation failed: {e}")
+            return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
+
+    if not is_file_present(iss_csv_path):
+        logger.warning("computed_iss_df.csv not produced — skipping R-computed ISS")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
+
+    # Load R-computed ISS values
+    iss_r = pd.read_csv(iss_csv_path, low_memory=False)
+    iss_r["riss"] = pd.to_numeric(iss_r.get("riss"), errors="coerce")
+    iss_r["niss"] = pd.to_numeric(iss_r.get("niss"), errors="coerce")
+    # Use riss preferentially, fall back to niss
+    iss_r["iss_value"] = iss_r["riss"].fillna(iss_r["niss"])
+    iss_r = iss_r.dropna(subset=["iss_value"])
+    if iss_r.empty:
+        logger.info("R ISS: no valid riss/niss values")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
+
+    # Compute latest diagnosis timestamp per patient from raw diagnoses
+    diag = pd.read_csv(diag_path)
+    diag["Noteret_dato"] = pd.to_datetime(diag["Noteret_dato"])
+    merged = base[["CPR_hash", "PID", "start", "end"]].merge(diag, on="CPR_hash", how="inner")
+    merged = merged[
+        (merged["Noteret_dato"] >= merged["start"] - pd.DateOffset(days=1))
+        & (merged["Noteret_dato"] <= merged["end"] + pd.DateOffset(days=1))
+    ]
+    max_diag_date = merged.groupby("PID")["Noteret_dato"].max().reset_index()
+    max_diag_date.columns = ["PID", "TIMESTAMP"]
+
+    # Join ISS values with timestamps
+    result = iss_r[["PID", "iss_value"]].merge(max_diag_date, on="PID", how="inner")
+    result["FEATURE"] = "ISS_computed"
+    result = result.rename(columns={"iss_value": "VALUE"})
+    result = result[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
+
+    # Filter to only patients in the cohort (base_df)
+    cohort_pids = set(base["PID"].unique())
+    result = result[result["PID"].isin(cohort_pids)]
+    logger.info(f"R-computed ISS: {len(result)} patients with valid scores (after cohort filter)")
+    return result
+
+
+def _save_notater_derived_concepts(cfg, base: pd.DataFrame):
+    """Extract ISS_notes/ISS_computed/Events and save as concept pickles.
+
+    These concepts are derived from clinical notes or computed from diagnosis
+    codes rather than having their own raw CSVs, so filter_subsets_inhospital()
+    does not create them.  Saving them as standard concept pickles makes all
+    downstream consumers (AggregatedDS, inference) work without special-casing.
     """
     notater_path = "data/interim/concepts/Notater.pkl"
     if not os.path.exists(notater_path):
@@ -130,12 +198,21 @@ def _save_notater_derived_concepts(cfg):
     notater_df = pd.read_pickle(notater_path)
     bin_df = pd.read_pickle(cfg["bin_df_path"])
 
-    if "ISS" in cfg["concepts"]:
+    if "ISS_notes" in cfg["concepts"]:
         from astra.data.notes_features import build_iss_from_notes
-        iss_df = build_iss_from_notes(notater_df)
-        ensure_parent_dir("data/interim/concepts/ISS.pkl")
-        iss_df.to_pickle("data/interim/concepts/ISS.pkl", protocol=4)
-        logger.info(f"Saved ISS concept: {len(iss_df)} rows, {iss_df['PID'].nunique() if len(iss_df) else 0} patients")
+
+        iss_notes = build_iss_from_notes(notater_df)
+        n_notes = iss_notes["PID"].nunique() if len(iss_notes) else 0
+        ensure_parent_dir("data/interim/concepts/ISS_notes.pkl")
+        iss_notes.to_pickle("data/interim/concepts/ISS_notes.pkl", protocol=4)
+        logger.info(f"Saved ISS_notes: {len(iss_notes)} rows, {n_notes} patients")
+
+    if "ISS_computed" in cfg["concepts"]:
+        iss_r = _build_r_iss(base)
+        n_r = iss_r["PID"].nunique() if len(iss_r) else 0
+        ensure_parent_dir("data/interim/concepts/ISS_computed.pkl")
+        iss_r.to_pickle("data/interim/concepts/ISS_computed.pkl", protocol=4)
+        logger.info(f"Saved ISS_computed: {len(iss_r)} rows, {n_r} patients")
 
     if "Events" in cfg["concepts"]:
         from astra.data.cardiac_arrest import build_cardiac_arrest_from_notes
@@ -217,11 +294,14 @@ if __name__ =='__main__':
         logger.info(f"Updated base_df with TRAUMATEXT columns at {cfg['base_df_path']}")
 
     # Extract Notater-derived concepts (ISS, Events) before mapping
-    _save_notater_derived_concepts(cfg)
+    _save_notater_derived_concepts(cfg, base)
 
     map_data_optimized(cfg, overwrite=overwrite)
 
-    # Forward-fill ISS (semi-static feature)
-    _forward_fill_concept(cfg, "ISS")
+    # Forward-fill ISS channels (semi-static features)
+    if "ISS_notes" in cfg["concepts"]:
+        _forward_fill_concept(cfg, "ISS_notes")
+    if "ISS_computed" in cfg["concepts"]:
+        _forward_fill_concept(cfg, "ISS_computed")
   
     data = prepare_data_and_dls_cached(cfg)

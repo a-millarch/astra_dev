@@ -171,6 +171,7 @@ def _get_or_create_runner(cfg, cpr, sd, actual_start, hours_offset):
         # Invalidate stale SHAP when patient changes
         st.session_state.pop("shap_data", None)
         st.session_state.pop("shap_hours", None)
+        st.session_state.pop("diff_shap_data", None)
 
     # Only advance if target is beyond what we've already simulated
     runner.advance_to(hours=hours_offset)
@@ -253,11 +254,44 @@ def run_shap_explanation(session, runner, progress_bar=None):
     }
 
 
+def run_differential_shap(session, runner, t1_hours, t2_hours, progress_bar=None):
+    """
+    Compute differential SHAP between T1 and T2. Expensive (2× SHAP).
+    """
+    # Ensure runner is advanced to at least T2
+    runner.advance_to(hours=t2_hours)
+    ctx = runner.context
+
+    if progress_bar:
+        progress_bar.progress(5, text=f"Computing SHAP at T1={t1_hours:.1f}h...")
+
+    diff_result = session.explain_differential(ctx, t1_hours, t2_hours)
+
+    if progress_bar:
+        progress_bar.progress(85, text="Building visualization dict...")
+
+    diff_dict, ch2feat, cat_names, cont_names = session.differential_shap_to_viz_dict(
+        diff_result, ctx.x_ts, ctx.x_ts_cat, ctx.tab_df
+    )
+
+    if progress_bar:
+        progress_bar.progress(100, text="Differential SHAP complete.")
+
+    return {
+        "diff_result": diff_result,
+        "shap_dict": diff_dict,
+        "channel2feature": ch2feat,
+        "feature_names_cat": cat_names,
+        "feature_names_cont": cont_names,
+    }
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # VISUALIZATION HELPERS
 # ═════════════════════════════════════════════════════════════════════════
 
-def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
+def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None,
+                                diff_data=None):
     """Build Plotly prediction trajectory from SimulationResult."""
     if sim_result is None or not sim_result.steps:
         return None
@@ -305,6 +339,29 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None):
             name=f"SHAP eval ({shap_hours:.1f}h)",
             showlegend=True,
         ))
+
+    # Mark differential SHAP interval [T1, T2]
+    if diff_data is not None:
+        dr = diff_data["diff_result"]
+        t1h, t2h = dr.t1_hours, dr.t2_hours
+        # Shaded region
+        fig.add_vrect(
+            x0=t1h, x1=t2h,
+            fillcolor="rgba(255, 165, 0, 0.12)", line_width=0,
+            annotation_text="ΔSHAP window",
+            annotation_position="top left",
+        )
+        # T1 and T2 markers
+        for th, prob, label, symbol in [
+            (t1h, dr.t1_probability, f"T1 ({t1h:.1f}h)", "triangle-left"),
+            (t2h, dr.t2_probability, f"T2 ({t2h:.1f}h)", "triangle-right"),
+        ]:
+            if viewed_hours is None or th <= viewed_hours + 0.01:
+                fig.add_trace(go.Scatter(
+                    x=[th], y=[prob], mode="markers",
+                    marker=dict(size=11, color="#FF8C00", symbol=symbol),
+                    name=label, showlegend=True,
+                ))
 
     n_visible = len(df)
     fig.update_layout(
@@ -503,12 +560,33 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
+    # ── Sidebar: Differential SHAP ──────────────────────────────────
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Differential SHAP")
+    diff_col1, diff_col2 = st.sidebar.columns(2)
+    with diff_col1:
+        diff_t1 = st.number_input(
+            "T1 (hours)", min_value=0.5, max_value=float(max_hours),
+            value=max(0.5, hours_offset - 2.0), step=0.5, key="diff_t1_input",
+        )
+    with diff_col2:
+        diff_t2 = st.number_input(
+            "T2 (hours)", min_value=0.5, max_value=float(max_hours),
+            value=float(hours_offset), step=0.5, key="diff_t2_input",
+        )
+    diff_clicked = st.sidebar.button(
+        "Compute Differential SHAP",
+        type="primary",
+        use_container_width=True,
+        help="Compute ΔSHAP = SHAP(T2) − SHAP(T1) to see what drives the change",
+    )
+
     # ═════════════════════════════════════════════════════════════════
     # PREDICT: run simulation on button click / playback; reuse on slider
     # ═════════════════════════════════════════════════════════════════
 
     is_playback_step = _playback_target is not None
-    should_run = run_clicked or shap_clicked or is_playback_step
+    should_run = run_clicked or shap_clicked or diff_clicked or is_playback_step
     patient_key = f"{cpr}_{sd}_{cfg.get('model_name')}"
 
     if should_run:
@@ -534,6 +612,7 @@ def main():
         st.session_state.pop("pred_data", None)
         st.session_state.pop("shap_data", None)
         st.session_state.pop("shap_hours", None)
+        st.session_state.pop("diff_shap_data", None)
         st.info("Patient changed. Click **Run Simulation** to load the new patient.")
         return
 
@@ -558,6 +637,23 @@ def main():
             st.session_state["shap_hours"] = hours_offset
         except Exception as e:
             st.error(f"Error computing SHAP: {e}")
+            st.exception(e)
+
+    # ═════════════════════════════════════════════════════════════════
+    # DIFFERENTIAL SHAP: only on button click
+    # ═════════════════════════════════════════════════════════════════
+
+    if diff_clicked:
+        try:
+            progress = st.progress(0, text="Computing Differential SHAP (2× SHAP)...")
+            diff_data = run_differential_shap(
+                pred_data["session"], pred_data["runner"],
+                diff_t1, diff_t2, progress_bar=progress,
+            )
+            progress.empty()
+            st.session_state["diff_shap_data"] = diff_data
+        except Exception as e:
+            st.error(f"Error computing differential SHAP: {e}")
             st.exception(e)
 
     # ═════════════════════════════════════════════════════════════════
@@ -635,7 +731,11 @@ def main():
 
     # ── Prediction Trajectory (from simulation) ──────────────────────
     shap_hours = st.session_state.get("shap_hours")
-    fig_traj = _plot_simulation_trajectory(sim_result, shap_hours=shap_hours, viewed_hours=hours_offset)
+    diff_shap_data = st.session_state.get("diff_shap_data")
+    fig_traj = _plot_simulation_trajectory(
+        sim_result, shap_hours=shap_hours, viewed_hours=hours_offset,
+        diff_data=diff_shap_data,
+    )
     if fig_traj:
         fig_traj.update_layout(width=None)
         st.plotly_chart(fig_traj, use_container_width=True)
@@ -689,9 +789,10 @@ def main():
         )
 
     # ── Tabs ──────────────────────────────────────────────────────────
-    tab_shap, tab_overview, tab_comp = st.tabs([
+    tab_shap, tab_overview, tab_diff, tab_comp = st.tabs([
         "SHAP Heatmaps",
         "SHAP Overview",
+        "Differential SHAP",
         "Data Completeness",
     ])
 
@@ -778,7 +879,94 @@ def main():
                 fig_static.update_layout(width=None)
                 st.plotly_chart(fig_static, use_container_width=True)
 
-    # ── Tab 3: Data Completeness ──────────────────────────────────────
+    # ── Tab: Differential SHAP ───────────────────────────────────────
+    with tab_diff:
+        if diff_shap_data is None:
+            st.info(
+                "Set **T1** and **T2** in the sidebar, then click "
+                "**Compute Differential SHAP** to see what drives the "
+                "prediction change between two timepoints."
+            )
+        else:
+            dr = diff_shap_data["diff_result"]
+            delta_p = dr.t2_probability - dr.t1_probability
+
+            # Summary metrics
+            mc1, mc2, mc3 = st.columns(3)
+            with mc1:
+                st.metric("P(T1)", f"{dr.t1_probability:.3f}",
+                          help=f"Prediction at T1 = {dr.t1_hours:.1f}h")
+            with mc2:
+                st.metric("P(T2)", f"{dr.t2_probability:.3f}",
+                          help=f"Prediction at T2 = {dr.t2_hours:.1f}h")
+            with mc3:
+                st.metric("ΔP", f"{delta_p:+.3f}",
+                          delta=f"{delta_p:+.3f}",
+                          delta_color="inverse",
+                          help="P(T2) − P(T1)")
+
+            st.caption(
+                f"ΔSHAP = SHAP({dr.t2_hours:.1f}h) − SHAP({dr.t1_hours:.1f}h). "
+                f"Red = increased risk attribution, Blue = decreased."
+            )
+
+            # Delta continuous TS heatmap
+            fig_delta_cont = mods["plot_continuous_ts_shap_plotly"](
+                diff_shap_data["shap_dict"],
+                sample_idx=0,
+                channel2feature=diff_shap_data["channel2feature"],
+                height=max(400, len(diff_shap_data["channel2feature"]) * 14),
+                title=f"ΔSHAP: Continuous TS ({dr.t1_hours:.1f}h → {dr.t2_hours:.1f}h)",
+            )
+            if fig_delta_cont:
+                fig_delta_cont.update_layout(width=None)
+                st.plotly_chart(fig_delta_cont, use_container_width=True)
+
+            st.markdown("---")
+
+            # Delta categorical TS heatmap
+            fig_delta_cat = mods["plot_categorical_ts_shap_plotly"](
+                diff_shap_data["shap_dict"],
+                sample_idx=0,
+                height=500,
+            )
+            if fig_delta_cat:
+                fig_delta_cat.update_layout(
+                    width=None,
+                    title=f"ΔSHAP: Categorical TS ({dr.t1_hours:.1f}h → {dr.t2_hours:.1f}h)",
+                )
+                st.plotly_chart(fig_delta_cat, use_container_width=True)
+
+            st.markdown("---")
+
+            # Top changed features
+            fig_delta_top = mods["plot_top_channels_plotly"](
+                diff_shap_data["shap_dict"], sample_idx=0,
+                channel2feature=diff_shap_data["channel2feature"],
+            )
+            if fig_delta_top:
+                fig_delta_top.update_layout(
+                    width=None,
+                    title="Top Changed Channels (by |ΔSHAP|)",
+                )
+                st.plotly_chart(fig_delta_top, use_container_width=True)
+
+            st.markdown("---")
+
+            # Delta static features
+            fig_delta_static = mods["plot_static_features_plotly"](
+                diff_shap_data["shap_dict"], sample_idx=0,
+                feature_names_cat=diff_shap_data["feature_names_cat"],
+                feature_names_cont=diff_shap_data["feature_names_cont"],
+            )
+            if fig_delta_static:
+                fig_delta_static.update_layout(
+                    width=None,
+                    title="ΔSHAP: Static Features",
+                )
+                st.plotly_chart(fig_delta_static, use_container_width=True)
+
+    # ── Tab: Data Completeness ───────────────────────────────────────
     with tab_comp:
         # Data completeness uses shap_dict but can also work from prediction data
         completeness_source = shap_data["shap_dict"] if shap_data else None

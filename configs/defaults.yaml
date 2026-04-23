@@ -6,19 +6,30 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '20032026_exp1_baseline'
+model_name: '14042026'
 
-target: deceased_90d
+target: deceased_30d
 
 # Pre-hospital (PPJ) data integration
 prehospital: true                     # Set true to enable pre-hospital data pipeline
 prehospital_only: false                # If true, only include patients WITH PPJ data to data collection pipeline
 
 prehospital_config:
-  ppj_mapping_path: data/raw/ppj_mapping.csv       # CPR_hash → JournalID mapping
-  ppj_data_paths:
-    - data/raw/ppj/                                 # Directory containing raw PPJ CSVs
-  max_hours_before_admission: 48                    # Max hours before admission to include
+  sources:
+    - name: RegH
+      ppj_mapping_path: data/raw/ppj_mapping.csv
+      ppj_data_paths:
+        - data/raw/ppj/
+      mapping_sep: ";"
+      mapping_timestamp_format: sas      # 22FEB2018:13:40:02.2750
+    - name: RegSJ
+      ppj_mapping_path: data/raw/ppjsj_mapping.csv
+      ppj_data_paths:
+        - data/interim/ppjsj.csv         # Pre-filtered from raw_data_path
+      raw_data_path: data/dl/PPJ_RegSJ.csv  # Large unfiltered file, chunked pre-filter
+      mapping_sep: ","
+      mapping_timestamp_format: iso      # standard datetime
+  max_hours_before_admission: 48
   event_descriptions_path: data/external/event_descriptions_modified.xlsx
   # Override event codes if event_descriptions not available:
   # gcs_event_codes: []
@@ -37,10 +48,14 @@ temporal_features:
   #   sinusoidal – elapsed_hours drives sinusoidal positional encoding; both temporal
   #                features are excluded from W_P (Option B). W_P operates on clinical
   #                channels only (~N(0,1)), raw hours used for sin/cos encoding.
-  mode: channel #sinusoidal
+  mode: sinusoidal
   features:
     - elapsed_hours
     - bin_width_hours
+
+categorical_profiles:
+  enabled: false
+  config_file: configs/profiles.yaml     # path to profile definitions
 
 ebm_feature:
   enabled: false
@@ -78,17 +93,18 @@ concepts:
   - VitaleVaerdier
   - Labsvar
   - Medicin
-  - Procedurer
+  #- Procedurer
   - ADTHaendelser
   - EWS
-  - ISS
-  - Events
+  - ISS_notes
+  - ISS_computed
+  #- Events
   #- IndUd
   #- ITARespirator
   
 
 dataset:
-  exclusion: traumatext  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
+  exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc. study3
   overwrite: True
   max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
@@ -139,6 +155,7 @@ exclusion_criteria:
     traumatext: true
     traumatext_12h: false
     max_duration_days: 365
+    min_bin_seq_len: 1
     first_hospital:
       - null
     custom_filters: []
@@ -175,122 +192,140 @@ pretrain:
     save_best: True
     checkpoint_dir: './pretrain_checkpoints'
 
+    # Sparse-aware masking (Fix 6): preferentially mask non-empty timesteps
+    sparse_aware_masking: true
+    mask_prob_ts_data: 0.30
+    mask_prob_ts_empty: 0.05
+    mask_prob_cat_ts_data: 0.40
+    mask_prob_cat_ts_empty: 0.03
+
 training:
     folds: 5
     epochs: 30
     bs: 32
     
+  
 model:
-    res_dropout: 0.22
-    fc_dropout: 0.75
-    fc_mults_1: 0.3
-    fc_mults_2: 0.1
-    n_layers: 8
-    n_heads: 8
-    d_model: 64
-    head_pool: mean_cat
-    d_ff: None
-    d_k: None
-    d_v: None
-    temporal_head: false
-    causal: false  # auto-enabled when temporal_head=true
-    temporal_head_dropout: 0.3
+  d_model: 192
+  n_layers: 4
+  n_heads: 16
+  fc_mults_1: 0.1
+  fc_mults_2: 0.05
+  fc_dropout: 0.4
+  res_dropout: 0.1
+  head_pool: mean_cat
+  temporal_head_dropout: 0.55
+    
+  temporal_head: true
+  causal: true  # required for temporal_head
+
+  survival_mode: false  # true = discrete-time survival, false = binary classification
 
 finetune:
-    # Phase 1: Head-only training (warm up randomly initialized head)
-    phase1_epochs: 5
-    phase1_lr: 1.0e-3
+  phase1_epochs: 3
+  phase1_lr: 0.002095169972417103
+  phase2_epochs: 17
+  phase2_lr: 0.0003896
+  phase2_unfreeze_from: transformer_2_3
+  phase3_epochs: 9
+  phase3_lr: 7.25e-05
+  phase4_epochs: 10
+  phase4_lr: 1.348e-05
+  enable_early_prediction: true
+  masking_prob: 0.6000000000000001
+  early_weight: 1.8
+  lr_decay_factor: 0.05623310957562682
+  weight_decay: 0.005374083850821259
+  label_smoothing: 0.09
+  pos_weight_factor: 0.6000000000000001
+  time_weighting: early
+  temporal_loss_averaging: per_sample
+  eval_timeframe_weighting: 'true'
+  eval_timeframe_weight: 1.5
+  ranking_loss_weight: 0.15000000000000002
+  temporal_crop_prob: 0.0
+  temporal_crop_all_phases: false
+  # ── End sweep results ──
 
-    # Phase 2: Partial unfreeze (upper transformer layers + head)
-    phase2_epochs: 12
-    phase2_lr: 3.0e-4
-    phase2_unfreeze_from: transformer_4_5
+  # Phase 4 settings
+  min_timesteps: 2
 
-    # Phase 3: Full finetune (all layers, discriminative LRs)
-    phase3_epochs: 16
-    phase3_lr: 1.0e-4
+  # Optimization
+  warmup_fraction: 0.1
+  grad_clip: 1.0
 
-    # Phase 4: Early prediction hardening (optional)
-    enable_early_prediction: true
-    phase4_epochs: 8
-    phase4_lr: 5.0e-5
-    masking_prob: 0.8
-    early_weight: 2.0
-    min_timesteps: 2
+  # Validation / early stopping
+  patience: 7
+  valid_size: 0.2
 
-    # Discriminative learning rates
-    lr_decay_factor: 0.1
+  # Pretrained weights
+  use_pretrained: true
 
-    # Optimization
-    weight_decay: 0.01
-    warmup_fraction: 0.1         # fraction of phase steps for LR warmup
-    grad_clip: 1.0
-    label_smoothing: 0.1
+  # Temporal head
+  early_weight_factor: 2.0
+  ranking_loss_n_timeframes: 5
+  ranking_loss_max_pairs: 10000
 
-    # Class imbalance
-    pos_weight_factor: 0.0
-
-    # Validation / early stopping
-    patience: 7
-    valid_size: 0.2              # fraction of trainval used for validation
-
-    # Pretrained weights
-    use_pretrained: true
-
-    # Time weighting for temporal head
-    time_weighting: uniform
-    early_weight_factor: 2.0
-
-    # Temporal cropping augmentation (all phases)
-    # Experiment 1: disabled. Experiment 2: set temporal_crop_prob: 0.4
-    temporal_crop_prob: 0.0
-    temporal_crop_all_phases: false
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
-    n_trials: 80
+    n_trials: 350
+    study_patience: 12
+    study_min_delta: 0.005   # minimum AUROC+AUPRC improvement to reset patience
     search_space:
         # Architecture
-        d_model: [32, 64, 128]
-        n_layers: [2, 4, 6, 8]
-        n_heads: [4, 8]
-        fc_mults_1: [0.1, 0.5]
+        d_model: [64, 128, 192, 256]
+        n_layers: [4, 6, 8, 10, 12]
+        n_heads: [4, 8, 16]
+        fc_mults_1: [0.05, 0.5]
         fc_mults_2: [0.05, 0.3]
         fc_dropout: [0.1, 0.9]
-        res_dropout: [0.0, 0.4]
-        head_pool: [mean_cat]
-        # Training HPs (per-phase LRs swept independently)
-        phase1_lr: [1.0e-4, 1.0e-2]          # log scale
-        phase2_lr: [5.0e-5, 3.0e-3]          # log scale
-        phase3_lr: [1.0e-5, 1.0e-3]          # log scale
-        phase4_lr: [5.0e-6, 5.0e-4]          # log scale
-        phase1_epochs: [2, 8]
-        phase2_epochs: [5, 20]
-        phase3_epochs: [3, 15]
+        res_dropout: [0.0, 0.7]
+        temporal_head_dropout: [0.0, 0.8]
+        head_pool: [flatten, mean_cat]
+        # Training HPs (LR parameterized as base_lr × decay^phase)
+        base_lr: [5.0e-4, 1.0e-2]            # log scale; phase 1 LR
+        lr_phase_decay: [0.05, 0.5]          # log scale; ratio between consecutive phases
+        phase1_epochs: [1, 10]
+        phase2_epochs: [1, 20]
+        phase3_epochs: [1, 20]
         phase4_epochs: [0, 10]               # 0 = skip early prediction
         weight_decay: [1.0e-4, 1.0e-1]       # log scale
         label_smoothing: [0.0, 0.2]
         lr_decay_factor: [0.01, 0.5]         # log scale
-        masking_prob: [0.3, 0.7]
+        masking_prob: [0.3, 0.9]
         early_weight: [1.0, 3.0]
-        pos_weight_factor: [0.3, 1.0]        # log scale
-        temporal_crop_prob: [0.2, 0.6]       # probability of cropping per batch
+        pos_weight_factor: [0.0, 1.0]        # linear (0 = no class weighting)
+        temporal_crop_prob: [0.0, 0.8]       # probability of cropping per batch
+        # Temporal loss improvements (only active when temporal_head=true)
+        temporal_loss_averaging: [per_sample, global]
+        eval_timeframe_weighting: [true, false]
+        eval_timeframe_weight: [1.5, 5.0]    # multiplier when eval_timeframe_weighting=true
+        ranking_loss_weight: [0.0, 0.3]      # 0=disabled; blended as (1-w)*bce + w*rank
+        early_weight_factor: [1.0, 5.0]      # time-weighting magnitude for early/late modes
+        # Validation objective balance (only active when temporal_head=true)
+        val_auroc_weight: [0.1, 0.9]         # val_auprc_weight = 1 - val_auroc_weight
 
 evaluation:
     max_f_beta: 10
     f_beta: 4
     threshold_mode: f1 #fbeta
+    mc_dropout_samples: 30  # MC Dropout forward passes for uncertainty (Fix 8)
+    shap_seed: 42           # RNG seed for reproducible SHAP values (null to disable)
+    shap_nsamples: 200      # Number of interpolation samples for GradientExplainer
 
 normalization:
   ts_method: adaptive       # standard | quantile | power | robust | adaptive
   tab_method: adaptive      # standard | quantile | power | robust | adaptive
   n_quantiles: 1000         # max quantiles for quantile method
   quantile_output: normal   # normal | uniform
+  clip_range: null           # null (disabled) or [min, max] e.g. [-3, 3] to clip normalized output
+  boundary_range_frac: 0.05  # fraction of value range defining boundary zone (adaptive only)
+  boundary_mass_thresh: 0.40 # mass fraction in boundary zone that overrides quantile → robust
 
 base_df_path: data/interim/base_df.pkl
 raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
 bin_df_path: data/interim/mapped/bin_df.pkl
-
 
 
 default_load_filenames:
@@ -354,7 +389,9 @@ agg_func: #also for datasets, split it up
       - max
   EWS:
       - max
-  ISS:
+  ISS_notes:
+      - max
+  ISS_computed:
       - max
   Events:
       - max
@@ -368,7 +405,8 @@ npartitions:
   Labsvar: 4
   Medicin: 4
   EWS: 1
-  ISS: 1
+  ISS_notes: 1
+  ISS_computed: 1
   Events: 1
 
 mapping:
@@ -396,10 +434,13 @@ drop_features:
   IndUd:
     - nan
   ADTHaendelser:
+    - AMB
     - nan
   EWS:
     - nan
-  ISS:
+  ISS_notes:
+    - nan
+  ISS_computed:
     - nan
   Events:
     - nan
@@ -407,7 +448,7 @@ drop_features:
 
 holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
-holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
+holdout_split_date: '2023-07-01'   # Temporal split cutoff: train <= date < test
 seed: 2024
 
 Medicin: 

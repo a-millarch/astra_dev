@@ -28,9 +28,54 @@ from astra.data.mappings import (
     PPJ_VITAL_EVENT_CODES,
     PPJ_ABCD_MAP,
     PPJ_VITAL_BOUNDS,
+    ABCD_SEVERITY,
 )
 
 logger = setup_logging()
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _normalize_journal_id(series: pd.Series) -> pd.Series:
+    """Normalize JournalID to consistent string representation.
+
+    Handles the float→string round-trip issue: pandas may read integer IDs
+    as float64 (e.g. 12345 → 12345.0), producing "12345.0" via astype(str)
+    instead of "12345". This strips trailing '.0' from numeric-looking IDs
+    while preserving UUID-style string IDs unchanged.
+    """
+    s = series.astype(str)
+    # Strip trailing .0 from float-like values (e.g. "12345.0" → "12345")
+    s = s.str.replace(r'\.0$', '', regex=True)
+    return s
+
+
+# ============================================================================
+# Config helpers
+# ============================================================================
+
+def _get_sources(cfg) -> list:
+    """Return the list of PPJ source definitions from config.
+
+    Supports new multi-source format (``prehospital_config.sources``) and
+    falls back to wrapping the old flat keys into a single-element list for
+    backward compatibility.
+    """
+    ph_cfg = cfg.get("prehospital_config", {})
+    sources = ph_cfg.get("sources")
+    if sources:
+        return sources
+
+    # Backward compat: wrap old flat keys into a single source
+    return [{
+        "name": "RegH",
+        "ppj_mapping_path": ph_cfg.get("ppj_mapping_path", "data/raw/ppj_mapping.csv"),
+        "ppj_data_paths": ph_cfg.get("ppj_data_paths", []),
+        "mapping_sep": ";",
+        "mapping_timestamp_format": "sas",
+    }]
 
 
 # ============================================================================
@@ -55,36 +100,90 @@ def parse_ppj_timestamps(series: pd.Series) -> pd.Series:
 # ============================================================================
 
 def load_ppj_mapping(cfg) -> pd.DataFrame:
-    """Load CPR_hash → JournalID mapping.
+    """Load CPR_hash → JournalID mapping from all configured PPJ sources.
 
-    The mapping file links hospital patient identifiers (CPR_hash) to
-    pre-hospital journal identifiers (JournalID).  It also contains the
-    CreationTime that is used to determine temporal overlap.
+    Iterates over ``prehospital_config.sources``, loading each mapping CSV
+    with its source-specific separator and timestamp format.  Adds a
+    ``PrehospitalRegion`` column to track data origin.
 
-    Returns DataFrame with columns [CPR_hash, JournalID, CreationTime_dt].
+    Returns DataFrame with columns
+    [CPR_hash, JournalID, CreationTime_dt, PrehospitalRegion].
     """
-    ph_cfg = cfg.get("prehospital_config", {})
-    mapping_path = ph_cfg.get("ppj_mapping_path", "data/raw/ppj_mapping.csv")
-    logger.info(f"Loading PPJ mapping from {mapping_path}")
+    sources = _get_sources(cfg)
+    dfs = []
 
-    ppj_map = pd.read_csv(mapping_path, sep=";")
+    for source in sources:
+        name = source.get("name", "Unknown")
+        mapping_path = source.get("ppj_mapping_path")
+        sep = source.get("mapping_sep", ";")
+        ts_format = source.get("mapping_timestamp_format", "sas")
 
-    # Drop unnamed index columns if present
-    ppj_map = ppj_map.loc[:, ~ppj_map.columns.str.startswith("Unnamed")]
-    ppj_map.drop_duplicates(inplace=True)
+        if not mapping_path or not os.path.exists(mapping_path):
+            logger.warning(f"PPJ mapping not found for source '{name}': {mapping_path}")
+            continue
 
-    logger.info(f"PPJ mapping columns: {ppj_map.columns.tolist()}")
-    logger.info(f"PPJ mapping: {len(ppj_map)} rows, {ppj_map['CPR_hash'].nunique()} unique CPR_hash")
+        logger.info(f"Loading PPJ mapping for '{name}' from {mapping_path} (sep='{sep}')")
+        df = pd.read_csv(mapping_path, sep=sep)
 
-    # Parse timestamps
-    if "CreationTime" in ppj_map.columns:
-        ppj_map["CreationTime_dt"] = parse_ppj_timestamps(ppj_map["CreationTime"])
+        # Drop unnamed index columns if present
+        df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+        df.drop_duplicates(inplace=True)
+
+        logger.info(f"  [{name}] columns: {df.columns.tolist()}, "
+                     f"{len(df)} rows, dtypes:\n{df.dtypes.to_string()}")
+
+        # Validate required columns
+        required = {"CPR_hash", "JournalID"}
+        missing = required - set(df.columns)
+        if missing:
+            logger.error(f"  [{name}] Missing required columns: {missing} — skipping source")
+            continue
+        # Check for CreationTime (required for temporal filtering)
+        if "CreationTime" not in df.columns and "CreationTime_dt" not in df.columns:
+            logger.warning(f"  [{name}] No CreationTime column — temporal filtering will be limited")
+
+        # Log sample values for debugging
+        logger.info(f"  [{name}] CPR_hash samples: {df['CPR_hash'].head(3).tolist()}")
+        logger.info(f"  [{name}] JournalID samples (raw): {df['JournalID'].head(3).tolist()} "
+                     f"(dtype={df['JournalID'].dtype})")
+
+        # Parse timestamps
+        if "CreationTime" in df.columns:
+            if ts_format == "sas":
+                df["CreationTime_dt"] = parse_ppj_timestamps(df["CreationTime"])
+            else:
+                df["CreationTime_dt"] = pd.to_datetime(df["CreationTime"], errors="coerce")
+            n_parsed = df["CreationTime_dt"].notna().sum()
+            logger.info(f"  [{name}] Parsed CreationTime: {n_parsed}/{len(df)} non-NaT")
+            if n_parsed == 0:
+                logger.error(f"  [{name}] All CreationTime values failed to parse!")
+
+        # Normalize JournalID to string to prevent type mismatches across sources
+        if "JournalID" in df.columns:
+            df["JournalID"] = _normalize_journal_id(df["JournalID"])
+            logger.info(f"  [{name}] JournalID samples (normalized): {df['JournalID'].head(3).tolist()}")
+
+        logger.info(f"  [{name}] {len(df)} rows, {df['CPR_hash'].nunique()} unique CPR_hash, "
+                     f"{df['JournalID'].nunique()} unique JournalID")
+
+        df["PrehospitalRegion"] = name
+        dfs.append(df)
+
+    if not dfs:
+        raise FileNotFoundError("No PPJ mapping files found for any configured source")
+
+    ppj_map = pd.concat(dfs, ignore_index=True)
+    ppj_map.drop_duplicates(subset=["CPR_hash", "JournalID"], inplace=True)
+
+    logger.info(f"PPJ mapping combined: {len(ppj_map)} rows, "
+                f"{ppj_map['CPR_hash'].nunique()} unique CPR_hash, "
+                f"sources: {ppj_map['PrehospitalRegion'].value_counts().to_dict()}")
 
     return ppj_map
 
 
 def load_ppj_data(cfg) -> pd.DataFrame:
-    """Load raw PPJ CSV file(s).
+    """Load raw PPJ CSV file(s) from all configured sources.
 
     Reads semicolon-delimited CSVs with columns:
     ``EventCodeName, CreationTime, ManualTime, ValueFloat, ValueString,
@@ -93,11 +192,21 @@ def load_ppj_data(cfg) -> pd.DataFrame:
     Parses timestamps, replaces empty quoted strings with NaN, and removes
     CPR identity entries (EventCodeName == 'PAT00013').
     """
-    ph_cfg = cfg.get("prehospital_config", {})
-    ppj_paths = ph_cfg.get("ppj_data_paths", [])
+    # Collect data paths from all sources
+    sources = _get_sources(cfg)
+    ppj_paths = []
+    for source in sources:
+        paths = source.get("ppj_data_paths", [])
+        if isinstance(paths, str):
+            paths = [paths]
+        ppj_paths.extend(paths)
 
-    if isinstance(ppj_paths, str):
-        ppj_paths = [ppj_paths]
+    if not ppj_paths:
+        # Backward compat: try old flat key
+        ph_cfg = cfg.get("prehospital_config", {})
+        ppj_paths = ph_cfg.get("ppj_data_paths", [])
+        if isinstance(ppj_paths, str):
+            ppj_paths = [ppj_paths]
 
     dfs = []
     for path in ppj_paths:
@@ -109,9 +218,37 @@ def load_ppj_data(cfg) -> pd.DataFrame:
 
         for csv_file in csv_files:
             logger.info(f"Loading PPJ data from {csv_file}")
-            df = pd.read_csv(csv_file, sep=";", encoding="utf-8", low_memory=False)
+            df = pd.read_csv(csv_file, sep=";", encoding="utf-8",
+                             low_memory=False, on_bad_lines="warn")
             # Drop unnamed index columns
             df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+            # Validate expected columns
+            expected_cols = {"EventCodeName", "CreationTime", "ValueFloat",
+                             "ValueString", "JournalID"}
+            actual_cols = set(df.columns)
+            missing = expected_cols - actual_cols
+            if missing:
+                logger.error(f"  {csv_file}: MISSING expected columns {missing}! "
+                             f"Got: {df.columns.tolist()}. "
+                             f"Possible column shift from bad delimiter handling.")
+            extra = actual_cols - expected_cols - {"ManualTime", "ValueDateTime", "ValueBool"}
+            if extra:
+                logger.warning(f"  {csv_file}: Unexpected extra columns: {extra}")
+
+            # Log per-file stats
+            n_journals = df["JournalID"].nunique() if "JournalID" in df.columns else "?"
+            logger.info(f"  → {len(df):,} rows, {n_journals} journals, "
+                         f"JournalID dtype={df['JournalID'].dtype if 'JournalID' in df.columns else 'N/A'}, "
+                         f"JournalID samples={df['JournalID'].head(3).tolist() if 'JournalID' in df.columns else []}")
+
+            # Check for signs of column shifting (e.g. JournalID contains timestamps)
+            if "JournalID" in df.columns:
+                jid_sample = df["JournalID"].dropna().head(10).astype(str)
+                if jid_sample.str.contains(r'\d{4}-\d{2}-\d{2}', regex=True).any():
+                    logger.error(f"  {csv_file}: JournalID contains date-like values — "
+                                  f"likely column shift! Samples: {jid_sample.tolist()}")
+
             dfs.append(df)
 
     if not dfs:
@@ -119,8 +256,21 @@ def load_ppj_data(cfg) -> pd.DataFrame:
             f"No PPJ data files found at configured paths: {ppj_paths}"
         )
 
+    n_before_concat = sum(len(d) for d in dfs)
     ppj = pd.concat(dfs, ignore_index=True)
+    n_after_concat = len(ppj)
     ppj.drop_duplicates(inplace=True)
+    n_after_dedup = len(ppj)
+    logger.info(f"PPJ data: {n_before_concat:,} rows from {len(dfs)} files → "
+                f"{n_after_concat:,} after concat → {n_after_dedup:,} after dedup "
+                f"(dropped {n_after_concat - n_after_dedup:,} duplicates)")
+
+    # Normalize JournalID to string (must match mapping dtype)
+    if "JournalID" in ppj.columns:
+        ppj["JournalID"] = _normalize_journal_id(ppj["JournalID"])
+        logger.info(f"JournalID normalized: dtype={ppj['JournalID'].dtype}, "
+                     f"nunique={ppj['JournalID'].nunique()}, "
+                     f"samples={ppj['JournalID'].head(3).tolist()}")
 
     # Parse timestamps — try standard datetime first, fall back to PPJ SAS format
     for col in ["CreationTime", "ManualTime"]:
@@ -154,6 +304,71 @@ def load_ppj_data(cfg) -> pd.DataFrame:
     return ppj
 
 
+def _prefilter_raw_sources(cfg, matched_jids) -> None:
+    """Pre-filter large raw PPJ files by chunked reading.
+
+    Some sources (e.g. RegSJ) provide a single large CSV containing all
+    patients, not just the study population.  When a source defines
+    ``raw_data_path``, this function reads it in chunks, filters to the
+    matched JournalIDs, and saves the result to the first entry in
+    ``ppj_data_paths`` so that ``load_ppj_data()`` can read it normally.
+
+    Skips sources without ``raw_data_path`` or where the output already exists.
+    """
+    sources = _get_sources(cfg)
+    # Normalize using the same logic as _normalize_journal_id
+    matched_jids_set = set(_normalize_journal_id(pd.Series(matched_jids)))
+
+    for source in sources:
+        raw_path = source.get("raw_data_path")
+        if not raw_path:
+            continue
+
+        # Output path = first entry in ppj_data_paths
+        out_paths = source.get("ppj_data_paths", [])
+        if isinstance(out_paths, str):
+            out_paths = [out_paths]
+        if not out_paths:
+            logger.warning(f"[{source['name']}] raw_data_path set but no ppj_data_paths — skipping")
+            continue
+        out_path = out_paths[0]
+
+        # Skip if already filtered
+        if os.path.exists(out_path):
+            logger.info(f"[{source['name']}] Pre-filtered file already exists: {out_path}")
+            continue
+
+        if not os.path.exists(raw_path):
+            logger.warning(f"[{source['name']}] Raw data file not found: {raw_path}")
+            continue
+
+        logger.info(f"[{source['name']}] Pre-filtering {raw_path} → {out_path} "
+                     f"({len(matched_jids_set)} matched JournalIDs)")
+
+        chunk_size = 1_000_000
+        all_chunks = []
+        n_total = 0
+        for chunk in pd.read_csv(
+            raw_path, chunksize=chunk_size, sep=";",
+            on_bad_lines="warn", low_memory=False
+        ):
+            n_total += len(chunk)
+            chunk["JournalID"] = _normalize_journal_id(chunk["JournalID"])
+            filtered = chunk[chunk["JournalID"].isin(matched_jids_set)]
+            if len(filtered) > 0:
+                all_chunks.append(filtered)
+            logger.info(f"  Processed {n_total:,} rows, kept {sum(len(c) for c in all_chunks):,} so far")
+
+        if not all_chunks:
+            logger.warning(f"[{source['name']}] No matching records found in {raw_path}")
+            continue
+
+        result = pd.concat(all_chunks, ignore_index=True)
+        ensure_parent_dir(out_path)
+        result.to_csv(out_path, sep=";", index=False)
+        logger.info(f"[{source['name']}] Saved {len(result):,} filtered records to {out_path}")
+
+
 # ============================================================================
 # Population filtering
 # ============================================================================
@@ -178,6 +393,22 @@ def filter_ppj_to_population(
     # Link PPJ mapping to base population
     ppj_pop = ppj_map[ppj_map["CPR_hash"].isin(base_df["CPR_hash"])].copy()
     logger.info(f"PPJ mapping: {ppj_pop['CPR_hash'].nunique()} patients matched to study population")
+    if "PrehospitalRegion" in ppj_pop.columns:
+        logger.info(f"  Per-source match: {ppj_pop.groupby('PrehospitalRegion')['CPR_hash'].nunique().to_dict()}")
+
+    # Log JournalID overlap between mapping and raw PPJ data
+    map_jids = set(ppj_pop["JournalID"].unique())
+    ppj_jids = set(ppj["JournalID"].unique())
+    overlap = map_jids & ppj_jids
+    logger.info(f"  JournalID overlap: {len(overlap)} of {len(map_jids)} mapping JIDs "
+                f"found in {len(ppj_jids)} data JIDs")
+    if len(overlap) < len(map_jids):
+        map_only = map_jids - ppj_jids
+        logger.info(f"  JIDs in mapping but NOT in data: {len(map_only)} "
+                     f"(samples: {list(map_only)[:5]})")
+        ppj_only_sample = list(ppj_jids - map_jids)[:5]
+        logger.info(f"  JIDs in data but NOT in mapping: {len(ppj_jids - map_jids)} "
+                     f"(samples: {ppj_only_sample})")
 
     # Merge mapping with base_df to get admission/discharge times + PID
     base_cols = ["CPR_hash", "PID", "start", "end"]
@@ -201,17 +432,34 @@ def filter_ppj_to_population(
         ].drop_duplicates()
 
     logger.info(f"PPJ population after time filtering: {ph['PID'].nunique()} patients")
+    if "PrehospitalRegion" in ph.columns:
+        logger.info(f"  Per-source after time filter: "
+                     f"{ph.groupby('PrehospitalRegion')['PID'].nunique().to_dict()}")
 
     # Filter raw PPJ to matched JournalIDs
-    valid_jids = ph["JournalID"].unique()
+    valid_jids = set(ph["JournalID"].unique())
+    n_before_jid_filter = len(ppj)
     ppj_filtered = ppj[ppj["JournalID"].isin(valid_jids)].copy()
+    logger.info(f"PPJ data filtered by JournalID: {n_before_jid_filter:,} → {len(ppj_filtered):,} rows "
+                f"({len(valid_jids)} valid JIDs)")
 
-    # Add PID via JournalID → CPR_hash → PID
-    jid_to_pid = ph[["JournalID", "PID"]].drop_duplicates()
+    # Add PID and PrehospitalRegion via JournalID
+    jid_cols = ["JournalID", "PID"]
+    if "PrehospitalRegion" in ph.columns:
+        jid_cols.append("PrehospitalRegion")
+    jid_to_pid = ph[jid_cols].drop_duplicates()
+    n_before_pid = len(ppj_filtered)
     ppj_filtered = ppj_filtered.merge(jid_to_pid, on="JournalID", how="left")
+    n_no_pid = ppj_filtered["PID"].isna().sum()
+    if n_no_pid > 0:
+        logger.warning(f"  {n_no_pid:,} PPJ rows have no PID after JournalID merge — dropping")
     ppj_filtered = ppj_filtered[ppj_filtered["PID"].notnull()].copy()
 
-    logger.info(f"ppj_filtered: {len(ppj_filtered)} rows, columns: {ppj_filtered.columns.tolist()}")
+    logger.info(f"ppj_filtered: {len(ppj_filtered):,} rows, columns: {ppj_filtered.columns.tolist()}")
+    if "PrehospitalRegion" in ppj_filtered.columns:
+        logger.info(f"  Per-source: {ppj_filtered.groupby('PrehospitalRegion').size().to_dict()}")
+        logger.info(f"  Per-source unique PIDs: "
+                     f"{ppj_filtered.groupby('PrehospitalRegion')['PID'].nunique().to_dict()}")
     if "EventCodeName" in ppj_filtered.columns and len(ppj_filtered) > 0:
         logger.info(
             f"ppj_filtered unique EventCodeNames ({ppj_filtered['EventCodeName'].nunique()}): "
@@ -236,7 +484,13 @@ def filter_ppj_to_population(
                 logger.debug(f"Could not look up event codes in event_descriptions: {e}")
 
     # Build per-PID population summary (ph_pop)
-    ph_pop = ph[["CPR_hash", "PID", "start", "end"]].drop_duplicates(subset=["PID"])
+    # Keep PrehospitalRegion for per-source tracking (ADT events, timing)
+    pop_cols = ["CPR_hash", "PID", "start", "end"]
+    dedup_cols = ["PID"]
+    if "PrehospitalRegion" in ph.columns:
+        pop_cols.append("PrehospitalRegion")
+        dedup_cols.append("PrehospitalRegion")
+    ph_pop = ph[pop_cols].drop_duplicates(subset=dedup_cols)
 
     return ppj_filtered, ph_pop
 
@@ -582,9 +836,33 @@ def extract_ppj_abcd(
         subset = subset[subset["value"].notna() & (subset["value"] != "nan")]
         logger.info(f"    After NaN filter: {len(subset)} rows")
 
-        # Take latest observation per PID
-        subset["ts"] = subset["ManualTime"].fillna(subset["CreationTime"])
-        subset = subset.sort_values("ts").groupby("PID").last().reset_index()
+        # Pick most severe observation per PID.
+        # ABCD values can be numeric (1.0, 2.0, 4.0, 8.0 — higher = more severe)
+        # or text (Fri, Truede, Blokerede). Try numeric first, fall back to
+        # text-based severity ordering, then to latest observation.
+        subset["_severity"] = pd.to_numeric(subset["value"], errors="coerce")
+        if subset["_severity"].notna().any():
+            # Numeric encoding: higher = more severe → take max per PID
+            logger.info(f"    Using numeric severity (max): range [{subset['_severity'].min()}, {subset['_severity'].max()}]")
+            subset = subset.sort_values("_severity").groupby("PID").last().reset_index()
+            subset = subset.drop(columns=["_severity"])
+        else:
+            # Text encoding: use ABCD_SEVERITY ordering
+            severity_order = ABCD_SEVERITY.get(short_name, [])
+            subset = subset.drop(columns=["_severity"])
+            if severity_order:
+                unknown_vals = set(subset["value"].unique()) - set(severity_order)
+                if unknown_vals:
+                    logger.warning(f"    Unknown {short_name} values not in severity list: {unknown_vals}")
+                subset["_sev"] = subset["value"].map(
+                    {v: i for i, v in enumerate(severity_order)}
+                ).fillna(-1).astype(int)
+                subset = subset.sort_values("_sev").groupby("PID").last().reset_index()
+                subset = subset.drop(columns=["_sev"])
+            else:
+                # Last resort: take latest observation
+                subset["ts"] = subset["ManualTime"].fillna(subset["CreationTime"])
+                subset = subset.sort_values("ts").groupby("PID").last().reset_index()
         subset = subset[["PID", "value"]].rename(columns={"value": short_name})
 
         result_dfs.append(subset)
@@ -648,29 +926,123 @@ def compute_prehospital_times(
 ) -> pd.DataFrame:
     """Compute per-PID prehospital_start and prehospital_end from PPJ records.
 
-    prehospital_start = earliest PPJ timestamp for the patient.
-    prehospital_end = latest PPJ timestamp for the patient.
+    Computes per-source times (grouped by PID + PrehospitalRegion) and merges
+    them into ph_pop.  Also computes global per-PID prehospital_start/end
+    (min/max across all sources) for the universal timeline.
 
-    These are merged into ph_pop and returned.
+    Returns ph_pop with columns:
+    - prehospital_start_source: per-(PID, PrehospitalRegion) earliest timestamp
+    - prehospital_end_source: per-(PID, PrehospitalRegion) latest timestamp
+    - prehospital_start: global earliest across all sources (per PID)
+    - prehospital_end: global latest across all sources (per PID)
     """
     ts_col = "CreationTime"
     if ts_col not in ppj_filtered.columns:
         ts_col = "TIMESTAMP"
 
-    times = ppj_filtered.groupby("PID").agg(
+    has_region = "PrehospitalRegion" in ppj_filtered.columns
+
+    # Per-source times (for ADT event generation)
+    if has_region:
+        source_times = ppj_filtered.groupby(["PID", "PrehospitalRegion"]).agg(
+            prehospital_start_source=(ts_col, "min"),
+            prehospital_end_source=(ts_col, "max"),
+        ).reset_index()
+        for col in ["prehospital_start_source", "prehospital_end_source"]:
+            source_times[col] = pd.to_datetime(source_times[col])
+        ph_pop = ph_pop.merge(source_times, on=["PID", "PrehospitalRegion"], how="left")
+
+    # Global per-PID times (for universal timeline)
+    global_times = ppj_filtered.groupby("PID").agg(
         prehospital_start=(ts_col, "min"),
         prehospital_end=(ts_col, "max"),
     ).reset_index()
-
     for col in ["prehospital_start", "prehospital_end"]:
-        times[col] = pd.to_datetime(times[col])
+        global_times[col] = pd.to_datetime(global_times[col])
 
-    ph_pop = ph_pop.merge(times, on="PID", how="left")
+    # Drop existing global columns to avoid _x/_y on re-merge
+    for col in ["prehospital_start", "prehospital_end"]:
+        if col in ph_pop.columns:
+            ph_pop = ph_pop.drop(columns=[col])
+    ph_pop = ph_pop.merge(global_times, on="PID", how="left")
 
     n_with_ph = ph_pop["prehospital_start"].notna().sum()
-    logger.info(f"Prehospital times computed: {n_with_ph}/{len(ph_pop)} patients have PPJ data")
+    n_unique_pid = ph_pop["PID"].nunique()
+    logger.info(f"Prehospital times computed: {n_with_ph}/{len(ph_pop)} rows have PPJ data "
+                f"({n_unique_pid} unique patients)")
+    if has_region:
+        logger.info(f"  Per-source breakdown: "
+                     f"{ph_pop.groupby('PrehospitalRegion')['prehospital_start_source'].count().to_dict()}")
 
     return ph_pop
+
+
+# ============================================================================
+# Prehospital ADT events
+# ============================================================================
+
+def generate_prehospital_adt(
+    base_df: pd.DataFrame,
+    ph_pop: pd.DataFrame,
+) -> pd.DataFrame:
+    """Create interval-based ADT events for prehospital transport per source.
+
+    For each (PID, PrehospitalRegion) with PPJ data, creates an ADT event:
+    - FEATURE = "ADT"
+    - VALUE = "PREHOSP_{region}" (e.g. PREHOSP_REGH, PREHOSP_REGSJ)
+    - TIMESTAMP = per-source prehospital_start
+    - END_TIMESTAMP = inhospital_start
+
+    Saves to data/interim/prehospital_ADT.pkl and returns the DataFrame.
+    """
+    if "PrehospitalRegion" not in ph_pop.columns:
+        logger.info("No PrehospitalRegion in ph_pop — skipping ADT generation")
+        return pd.DataFrame(columns=["PID", "FEATURE", "VALUE", "TIMESTAMP", "END_TIMESTAMP"])
+
+    # Use per-source start times; fall back to global prehospital_start
+    start_col = "prehospital_start_source" if "prehospital_start_source" in ph_pop.columns else "prehospital_start"
+
+    # Get inhospital_start from base_df
+    inhospital_start_map = base_df.set_index("PID")["inhospital_start"] if "inhospital_start" in base_df.columns else base_df.set_index("PID")["start"]
+
+    rows = []
+    for _, row in ph_pop.iterrows():
+        pid = row["PID"]
+        region = row["PrehospitalRegion"]
+        ph_start = row.get(start_col)
+
+        if pd.isna(ph_start):
+            continue
+
+        ih_start = inhospital_start_map.get(pid)
+        if pd.isna(ih_start):
+            continue
+
+        rows.append({
+            "PID": pid,
+            "FEATURE": "ADT",
+            "VALUE": f"PREHOSP_{region.upper().replace(' ', '_')}",
+            "TIMESTAMP": pd.to_datetime(ph_start),
+            "END_TIMESTAMP": pd.to_datetime(ih_start),
+        })
+
+    adt_df = pd.DataFrame(rows)
+
+    if adt_df.empty:
+        logger.warning("No prehospital ADT events generated")
+        return adt_df
+
+    # Drop events where prehospital_start >= inhospital_start (no prehospital interval)
+    adt_df = adt_df[adt_df["TIMESTAMP"] < adt_df["END_TIMESTAMP"]].copy()
+
+    logger.info(
+        f"Generated {len(adt_df)} prehospital ADT events "
+        f"({adt_df['VALUE'].value_counts().to_dict()})"
+    )
+
+    ensure_parent_dir("data/interim/prehospital_ADT.pkl")
+    adt_df.to_pickle("data/interim/prehospital_ADT.pkl", protocol=4)
+    return adt_df
 
 
 # ============================================================================
@@ -707,8 +1079,14 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
     ph_cfg = cfg.get("prehospital_config", {})
     max_hours = ph_cfg.get("max_hours_before_admission", 48)
 
-    # Step 1: Load PPJ mapping and data
+    # Step 1: Load PPJ mapping
     ppj_map = load_ppj_mapping(cfg)
+
+    # Step 1.5: Pre-filter large raw data files (e.g. RegSJ) using matched JournalIDs
+    matched_jids = ppj_map[ppj_map["CPR_hash"].isin(base["CPR_hash"])]["JournalID"].unique()
+    _prefilter_raw_sources(cfg, matched_jids)
+
+    # Step 1.6: Load PPJ data (now including pre-filtered files)
     ppj_data = load_ppj_data(cfg)
 
     # Step 2: Filter to study population
@@ -730,8 +1108,11 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
     extract_ppj_gcs(ppj_filtered, ph_pop)
     abcd = extract_ppj_abcd(ppj_filtered, ph_pop)
 
-    # Step 4: Compute prehospital times
+    # Step 4: Compute prehospital times (per-source and global)
     ph_pop = compute_prehospital_times(ppj_filtered, ph_pop)
+
+    # Step 4.5: Generate prehospital ADT events (uses per-source times)
+    generate_prehospital_adt(base, ph_pop)
 
     # Step 5: Merge into base_df
     # Drop existing prehospital columns to avoid _x/_y suffixing on re-runs
@@ -739,12 +1120,11 @@ def run_prehospital_pipeline(cfg, base: Optional[pd.DataFrame] = None) -> pd.Dat
         if col in base.columns:
             base = base.drop(columns=[col])
 
+    # Deduplicate ph_pop to global per-PID level (may have multiple rows per source)
+    global_ph = ph_pop[["PID", "prehospital_start", "prehospital_end"]].drop_duplicates(subset=["PID"])
+
     # Add prehospital_start (NaT for patients without PPJ data — intentionally nullable)
-    base = base.merge(
-        ph_pop[["PID", "prehospital_start", "prehospital_end"]],
-        on="PID",
-        how="left",
-    )
+    base = base.merge(global_ph, on="PID", how="left")
 
     # Rename hospital admission 'start' → 'inhospital_start',
     # then create universal 'start' = earliest of prehospital and inhospital

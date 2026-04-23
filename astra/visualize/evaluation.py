@@ -236,7 +236,7 @@ def plot_fold_evaluation(metrics, target):
     return fig
 
 
-def evaluate_detection_rate(y_preds, y_true, threshold=0.5):
+def evaluate_detection_rate(y_preds, y_true, threshold=0.5, label=""):
     """
     Evaluate the detection rate by calculating sensitivity and specificity.
 
@@ -244,52 +244,48 @@ def evaluate_detection_rate(y_preds, y_true, threshold=0.5):
     - y_preds: Predicted probabilities for the positive class.
     - y_true: True binary labels.
     - threshold: Probability threshold for classifying as positive (default: 0.5).
-    """
-    # Calculate the percentage of positive patients
-    positive_percentage = np.mean(y_true) * 100
-    print(f"Percentage of positive patients: {positive_percentage:.2f}%")
+    - label: Optional label shown in the figure title (e.g. "F1" or "F5").
 
-    # Generate predictions based on the threshold
+    Returns:
+        (fig, sensitivity, specificity)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    y_true = np.asarray(y_true)
+    y_preds = np.asarray(y_preds)
+
+    positive_percentage = np.mean(y_true) * 100
+    logger.info(f"Prevalence: {positive_percentage:.2f}%")
+
     y_pred_risk = (y_preds >= threshold).astype(int)
 
-    # Calculate confusion matrix using the entire dataset with normalization
-    cm = confusion_matrix(y_true, y_pred_risk, normalize="true")
-
-    # Extract true positives, true negatives, false positives, and false negatives
+    cm_norm = confusion_matrix(y_true, y_pred_risk, normalize="true")
     TN, FP, FN, TP = confusion_matrix(y_true, y_pred_risk).ravel()
 
-    # Calculate sensitivity and specificity from the confusion matrix
     sensitivity = TP / (TP + FN) * 100 if (TP + FN) > 0 else 0
     specificity = TN / (TN + FP) * 100 if (TN + FP) > 0 else 0
 
-    print(
-        f"Sensitivity (% of truly positive patients classified as positive): {sensitivity:.2f}%"
-    )
-    print(
-        f"Specificity (% of truly negative patients classified as negative): {specificity:.2f}%"
-    )
+    logger.info(f"Threshold={threshold:.4f} ({label}): "
+                f"Sensitivity={sensitivity:.1f}%, Specificity={specificity:.1f}%")
 
-    # Create subplots for confusion matrix
+    title_suffix = f" ({label}, t={threshold:.3f})" if label else f" (t={threshold:.3f})"
+
     fig, ax = plt.subplots(1, 2, figsize=(12, 5))
 
-    # Absolute confusion matrix
     cm_absolute = confusion_matrix(y_true, y_pred_risk)
     ConfusionMatrixDisplay(
         confusion_matrix=cm_absolute, display_labels=["Negative", "Positive"]
     ).plot(ax=ax[0], values_format="d")
-    ax[0].set_title("Confusion Matrix (Absolute)")
+    ax[0].set_title(f"Confusion Matrix (Absolute){title_suffix}")
 
-    # Normalized confusion matrix
     ConfusionMatrixDisplay(
-        confusion_matrix=cm, display_labels=["Negative", "Positive"]
+        confusion_matrix=cm_norm, display_labels=["Negative", "Positive"]
     ).plot(ax=ax[1], values_format=".2f")
-    ax[1].set_title("Confusion Matrix (Normalized)")
+    ax[1].set_title(f"Confusion Matrix (Normalized){title_suffix}")
 
     plt.tight_layout()
-    os.makedirs("reports/eval", exist_ok=True)
-    plt.savefig("reports/eval/cm.png")
-    plt.show()
-    return fig
+    return fig, sensitivity, specificity
 
 
 def create_calibration_plot(y_true, y_pred, n_bins=4):

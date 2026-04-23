@@ -1,0 +1,57 @@
+# Categorical TS profile definitions
+# Referenced from defaults.yaml via categorical_profiles.config_file
+#
+# Each concept (Medicin, Procedurer, etc.) can define profile rules for its categories.
+# Categories not listed under a concept keep binary (present/absent) encoding.
+#
+# Rule types:
+#   count  — profile matches if min <= distinct_sub_codes <= max (max is optional)
+#   codes  — profile matches if ALL listed sub-codes are present in the bin
+#
+# Rules are evaluated in descending level order; first match wins.
+# Level 0 (absent) is implicit and always applies when no sub-codes are present.
+version: 1
+
+Medicin:
+  sub_code_level: 4                      # ATC chars to preserve (4 = chemical subgroup)
+  categories:
+    antibiotics:
+      rules:
+        - level: 1
+          name: prophylactic
+          type: count
+          min: 1
+          max: 1
+        - level: 2
+          name: severe_injury
+          type: count
+          min: 2
+          max: 3
+        - level: 3
+          name: multiresistant
+          type: count
+          min: 4
+    # Example combo-based rule (commented out, clinician fills in):
+    # cardiovascular_drugs:
+    #   rules:
+    #     - level: 1
+    #       name: single_agent
+    #       type: count
+    #       min: 1
+    #       max: 1
+    #     - level: 2
+    #       name: combination_therapy
+    #       type: count
+    #       min: 2
+
+Procedurer:
+  sub_code_level: 3                      # procedure code prefix length
+  categories: {}                         # clinician fills in
+
+ADTHaendelser:
+  sub_code_level: 0                      # no sub-code detail needed yet
+  categories: {}
+
+Events:
+  sub_code_level: 0                      # no sub-code detail needed yet
+  categories: {}

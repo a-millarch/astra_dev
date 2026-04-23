@@ -1,4 +1,6 @@
 import os
+import io
+import base64
 import hashlib
 import pandas as pd
 import numpy as np
@@ -151,10 +153,142 @@ if not _bootstrap_logger.handlers:
 logger = logging.getLogger('astra')
 
 
-def save_figure(fig, filename, save_dir='reports/studyfigs'):
+def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=50, dpi_ceiling=1200,
+                     pad_inches=0.1):
+    """Compute the highest DPI that renders *fig* within ``fit_long_side_px``.
+
+    Calls ``fig.canvas.draw()`` first so ``constrained_layout`` (if enabled) has
+    settled artist positions. Then takes the max of tight bbox and raw figsize as
+    the long-side estimate (constrained_layout can expand beyond the tight bbox
+    at save time). Adds ``2 * pad_inches`` to account for the padding matplotlib's
+    ``bbox_inches='tight'`` applies on save. Result is clamped to [dpi_floor, dpi_ceiling].
+    """
+    width_in, height_in = fig.get_size_inches()
+    # Force a draw so constrained_layout finalizes all artist positions before
+    # we measure — without this, get_tightbbox returns stale/narrower values.
+    try:
+        fig.canvas.draw()
+    except Exception:
+        pass
+    try:
+        renderer = fig.canvas.get_renderer()
+        tight = fig.get_tightbbox(renderer)
+        tight_long_in = max(tight.width, tight.height)
+    except Exception:
+        tight_long_in = 0.0
+    # Use whichever is larger: the measured tight bbox or the configured figsize.
+    # constrained_layout can grow the figure beyond its initial figsize when
+    # accommodating legends / outside text.
+    long_in = max(tight_long_in, max(width_in, height_in))
+    if long_in <= 0:
+        return dpi_ceiling
+    # savefig with bbox_inches='tight' adds pad_inches on each side (default 0.1).
+    long_in_padded = long_in + 2 * pad_inches
+    target = int(fit_long_side_px // long_in_padded)
+    return max(dpi_floor, min(dpi_ceiling, target))
+
+
+def _check_figure_size_limits(png_path, max_long_side_px=None, max_bytes=None):
+    """Log a warning if saved PNG exceeds pixel/byte caps. Does not modify the file."""
+    if max_long_side_px is not None:
+        try:
+            from PIL import Image
+            with Image.open(png_path) as im:
+                w, h = im.size
+            long_side = max(w, h)
+            if long_side > max_long_side_px:
+                logger.warning(
+                    f"{os.path.basename(png_path)}: longest side {long_side}px > cap {max_long_side_px}px "
+                    f"(actual {w}x{h}). Consider lowering dpi or figsize."
+                )
+        except Exception as e:
+            logger.debug(f"Could not check pixel size for {png_path}: {e}")
+    if max_bytes is not None:
+        try:
+            size = os.path.getsize(png_path)
+            if size > max_bytes:
+                logger.warning(
+                    f"{os.path.basename(png_path)}: {size / 1e6:.2f} MB > cap {max_bytes / 1e6:.2f} MB."
+                )
+        except OSError:
+            pass
+
+
+def save_figure(fig, filename, save_dir='reports/studyfigs', dpi=1200,
+                max_long_side_px=None, max_bytes=None, fit_long_side_px=None):
+    """Save *fig* as PNG + base64 text sidecar.
+
+    Args:
+        fig: matplotlib Figure
+        filename: stem (no extension)
+        save_dir: output directory for the PNG; base64 goes to ``<save_dir>/base64/``
+        dpi: rasterization DPI (default 1200 for legacy callers).
+        max_long_side_px: warn when the saved PNG's longest side exceeds this.
+        max_bytes: warn when the saved PNG size exceeds this.
+        fit_long_side_px: if set, compute the largest DPI that keeps the tight-bbox
+            output within this pixel budget, overriding ``dpi``. Preferred for
+            journal submissions — picks the highest sharpness that still fits the cap.
+    """
+    import matplotlib.pyplot as plt
+
+    if fit_long_side_px is not None:
+        dpi = _resolve_fit_dpi(fig, fit_long_side_px)
+        logger.debug(f"{filename}: auto-dpi={dpi} to fit {fit_long_side_px}px cap")
+
     os.makedirs(save_dir, exist_ok=True)
     png_path = os.path.join(save_dir, f'{filename}.png')
-    fig.savefig(png_path, dpi=1200, bbox_inches='tight')
+    fig.savefig(png_path, dpi=dpi, bbox_inches='tight')
+
+    # If auto-fit still overshoots (constrained_layout expanded the figure
+    # more than we estimated), re-save with a corrected DPI. Hard guarantees
+    # the pixel cap regardless of layout engine behaviour.
+    if fit_long_side_px is not None:
+        try:
+            from PIL import Image
+            with Image.open(png_path) as im:
+                actual_long = max(im.size)
+            if actual_long > fit_long_side_px:
+                corrected_dpi = max(10, int(dpi * fit_long_side_px / actual_long))
+                logger.debug(
+                    f"{filename}: re-saving at dpi={corrected_dpi} "
+                    f"(initial {dpi} produced {actual_long}px, over {fit_long_side_px}px cap)"
+                )
+                fig.savefig(png_path, dpi=corrected_dpi, bbox_inches='tight')
+                dpi = corrected_dpi
+        except Exception as e:
+            logger.debug(f"Could not verify/correct size for {png_path}: {e}")
+
+    # Save base64 version (same bytes as the PNG on disk)
+    base64_dir = os.path.join(save_dir, 'base64')
+    os.makedirs(base64_dir, exist_ok=True)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', dpi=dpi, bbox_inches='tight')
+    buffer.seek(0)
+    base64_image = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    base64_path = os.path.join(base64_dir, f'{filename}_base64.txt')
+    with open(base64_path, 'w') as f:
+        f.write(base64_image)
+
+    _check_figure_size_limits(png_path, max_long_side_px, max_bytes)
+    plt.close(fig)
+
+def save_base64(fig, save_path, dpi=1200, max_long_side_px=None, max_bytes=None,
+                fit_long_side_px=None):
+    """Save a base64 version of *fig* alongside *save_path* in a ``base64/`` sibling dir."""
+    if fit_long_side_px is not None:
+        dpi = _resolve_fit_dpi(fig, fit_long_side_px)
+    parent = os.path.dirname(save_path)
+    stem = Path(save_path).stem
+    base64_dir = os.path.join(parent, 'base64')
+    os.makedirs(base64_dir, exist_ok=True)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', dpi=dpi, bbox_inches='tight')
+    buffer.seek(0)
+    b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
+    with open(os.path.join(base64_dir, f'{stem}_base64.txt'), 'w') as f:
+        f.write(b64)
+    if os.path.exists(save_path):
+        _check_figure_size_limits(save_path, max_long_side_px, max_bytes)
 
 def ensure_parent_dir(path):
     """Create parent directory of *path* if it does not exist."""

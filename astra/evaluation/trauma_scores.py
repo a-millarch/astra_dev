@@ -18,6 +18,8 @@ from scipy.special import expit
 from astra.evaluation.utils import (
     calculate_roc_auc_ci,
     calculate_average_precision_ci,
+    delong_test_paired,
+    benjamini_hochberg,
     step_to_time,
 )
 
@@ -104,10 +106,10 @@ def compute_triss(df: pd.DataFrame, iss_col: str = 'ISS', age_col: str = 'AGE',
 
 
 def compound_iss(df: pd.DataFrame) -> pd.DataFrame:
-    """Create unified ISS column: priority ISS_DTR > riss > niss > iss_notes."""
+    """Create unified ISS column: max across ISS_DTR, riss, and niss."""
     df = df.copy()
     candidates = []
-    for col in ['ISS', 'riss', 'niss', 'iss_notes']:
+    for col in ['ISS_DTR', 'riss', 'niss']:
         if col in df.columns:
             candidates.append(pd.to_numeric(df[col], errors='coerce'))
 
@@ -319,55 +321,50 @@ def _prepare_long_df(base: pd.DataFrame) -> None:
 
 
 def add_iss_to_df(base: pd.DataFrame) -> pd.DataFrame:
-    """Add ISS columns to base_df from R-computed ICD codes + notes-extracted ISS.
+    """Add ISS columns to base_df from ISS_notes and ISS_computed concept pickles
+    and R-computed auxiliary columns (maxais, niss, mechmaj).
 
-    Sources (in priority order): R-computed riss/niss, notes-extracted ISS.
+    For TRISS evaluation, take the max ISS per patient across both sources.
     """
     from astra.utils import is_file_present
 
-    # Try loading R-computed ISS
-    iss_path = "data/interim/computed_iss_df.csv"
-    if not is_file_present(iss_path):
+    # Load both ISS sources and take max per PID for TRISS evaluation
+    iss_frames = []
+    for pkl_name in ("ISS_notes.pkl", "ISS_computed.pkl"):
+        pkl_path = f"data/interim/concepts/{pkl_name}"
+        if os.path.exists(pkl_path):
+            iss_frames.append(pd.read_pickle(pkl_path))
+    if iss_frames:
+        iss_combined = pd.concat(iss_frames, ignore_index=True)
+        iss_seq = (
+            iss_combined.groupby("PID")["VALUE"]
+            .max()
+            .reset_index()
+            .rename(columns={"VALUE": "riss"})
+        )
+        base = base.merge(iss_seq, how="left", on="PID")
+        logger.info(f"Merged ISS (notes + R-computed): {len(iss_seq)} patients")
+    else:
+        base["riss"] = np.nan
+        logger.warning("ISS_notes.pkl and ISS_computed.pkl not found — no ISS data available")
+
+    # Auxiliary R-computed columns (maxais, niss, mechmaj) for TRISS mechanism
+    iss_r_path = "data/interim/computed_iss_df.csv"
+    if not is_file_present(iss_r_path):
         try:
             compute_iss_from_r(base)
         except Exception as e:
             logger.warning(f"ISS R computation failed: {e}")
 
-    keep_cols = ["riss", "maxais", "niss", "mechmaj1", "mechmaj2", "mechmaj3", "mechmaj4"]
-    if is_file_present(iss_path):
-        iss = pd.read_csv(iss_path, low_memory=False)
-        available_cols = [c for c in keep_cols if c in iss.columns]
+    aux_cols = ["maxais", "niss", "mechmaj1", "mechmaj2", "mechmaj3", "mechmaj4"]
+    if is_file_present(iss_r_path):
+        iss_r = pd.read_csv(iss_r_path, low_memory=False)
+        available_cols = [c for c in aux_cols if c in iss_r.columns]
         if available_cols:
-            base = base.merge(iss[["PID"] + available_cols], how="left", on="PID")
+            base = base.merge(iss_r[["PID"] + available_cols], how="left", on="PID")
             for col in available_cols:
                 base[col] = base[col].replace("None", np.nan)
-            logger.info(f"Merged R-computed ISS ({len(available_cols)} cols)")
-    else:
-        logger.warning("No R-computed ISS file found")
-
-    # Notes-extracted ISS
-    iss_notes_path = "data/interim/concepts/ISS.pkl"
-    if os.path.exists(iss_notes_path):
-        iss_notes = pd.read_pickle(iss_notes_path)
-        iss_seq = (
-            iss_notes.groupby("PID")["VALUE"]
-            .max()
-            .reset_index()
-            .rename(columns={"VALUE": "iss_notes"})
-        )
-        base = base.merge(iss_seq, how="left", on="PID")
-        logger.info(f"Merged notes ISS ({len(iss_seq)} patients)")
-    else:
-        base["iss_notes"] = np.nan
-
-    # Combine: max of riss and iss_notes
-    if "riss" in base.columns:
-        base["riss"] = base[["riss", "iss_notes"]].astype(float).max(axis=1)
-    elif "iss_notes" in base.columns:
-        base["riss"] = base["iss_notes"].astype(float)
-
-    if "iss_notes" in base.columns:
-        base.drop(columns=["iss_notes"], inplace=True)
+            logger.info(f"Merged R auxiliary columns: {available_cols}")
 
     return base
 
@@ -571,11 +568,13 @@ def evaluate_static_scores_over_time(
     holdout_y: np.ndarray,
     holdout_pids: np.ndarray,
     valid_pids: Optional[np.ndarray] = None,
-) -> Dict[str, "List[TimeMetricResult]"]:
-    """Compute static score AUROC/AUPRC at each censor step using active patients only.
+    delong: bool = False,
+) -> Dict[str, Dict[str, "List[TimeMetricResult]"]]:
+    """Compute score and model AUROC/AUPRC at each censor step on identical patients.
 
-    At each censor step, uses the same active patient set as the model evaluation
-    (determined by which PIDs appear in preds_df_active at that step).
+    At each censor step, for each score: identifies patients with that score available,
+    then computes BOTH the score's metric AND the HNN model's metric on that exact
+    same patient set. This ensures a fair apples-to-apples comparison.
 
     Args:
         scores_df: DataFrame with PID + score columns from build_trauma_score_df().
@@ -583,9 +582,16 @@ def evaluate_static_scores_over_time(
         holdout_y: Full holdout binary targets.
         holdout_pids: Full holdout PIDs (same order as holdout_y).
         valid_pids: Optional further filter (e.g., patients with RTS scores).
+        delong: If True, run paired DeLong test at each timestep (HNN vs score)
+                and apply Benjamini-Hochberg FDR correction.
 
     Returns:
-        Dict mapping score label to List[TimeMetricResult].
+        Dict mapping score label to {"score": List[TimeMetricResult],
+            "model": List[TimeMetricResult], "counts": List[TimeMetricResult]}.
+        When delong=True, also includes "delong_p": list of raw p-values,
+            "delong_p_adj": FDR-adjusted p-values, "delong_z": z-statistics,
+            "delong_hours": corresponding time in hours, and
+            "delong_significant": boolean mask of significance at alpha=0.05.
     """
     from astra.evaluation.predictive_performance import TimeMetricResult
 
@@ -605,12 +611,22 @@ def evaluate_static_scores_over_time(
     else:
         preds_filtered = preds_df_active
 
+    # Index model predictions by (PID, censor_step) for fast lookup
+    preds_indexed = preds_filtered.set_index(['PID', 'censor_step'])['pred']
+
     all_results = {}
     for col, label, negate in score_configs:
         if col not in scores_by_pid.columns:
             continue
 
-        results = []
+        score_results = []
+        model_results = []
+        count_results = []
+        delong_raw_p = []
+        delong_z_vals = []
+        delong_se_vals = []
+        delong_delta_vals = []
+        delong_hours = []
         for step, group in preds_filtered.groupby('censor_step'):
             # Active PIDs at this step (intersection with score availability)
             active_pids = group['PID'].values
@@ -618,46 +634,120 @@ def evaluate_static_scores_over_time(
             has_score = score_vals.notna()
 
             pids_with_score = active_pids[has_score.values]
-            if len(pids_with_score) < 10:
-                continue
-
-            y_true = np.array([pid_to_y[pid] for pid in pids_with_score])
-            y_score = score_vals[has_score].values.astype(float)
-
-            if negate:
-                y_score = -y_score
-
-            if len(np.unique(y_true)) < 2:
-                continue
 
             time_min = step_to_time(step)
             if time_min is None:
                 continue
+
+            y_true = np.array([pid_to_y[pid] for pid in pids_with_score])
+            n_samples = len(pids_with_score)
+            n_positive = int(y_true.sum())
+
+            time_kwargs = dict(
+                time_min=time_min,
+                time_hours=time_min / 60.0,
+                time_days=time_min / (60.0 * 24.0),
+                censor_step=int(step),
+                n_samples=n_samples,
+                n_positive=n_positive,
+            )
+
+            # Always record counts (no skipping — for bottom panels)
+            count_results.append(TimeMetricResult(
+                **time_kwargs,
+                auroc=float('nan'),
+                auroc_ci=(float('nan'), float('nan')),
+                auprc=float('nan'),
+                auprc_ci=(float('nan'), float('nan')),
+            ))
+
+            # Skip metric computation if insufficient data
+            if n_samples < 10 or len(np.unique(y_true)) < 2:
+                continue
+
+            y_score = score_vals[has_score].values.astype(float)
+            if negate:
+                y_score = -y_score
+
+            # Get model predictions for the SAME patients
+            model_preds = np.array([
+                preds_indexed.loc[(pid, step)]
+                for pid in pids_with_score
+            ])
 
             try:
                 auroc, auroc_lo, auroc_hi = calculate_roc_auc_ci(y_true, y_score)
                 auprc, auprc_lo, auprc_hi = calculate_average_precision_ci(
                     y_true, y_score, n_bootstraps=200
                 )
+                m_auroc, m_auroc_lo, m_auroc_hi = calculate_roc_auc_ci(
+                    y_true, model_preds
+                )
+                m_auprc, m_auprc_lo, m_auprc_hi = calculate_average_precision_ci(
+                    y_true, model_preds, n_bootstraps=200
+                )
             except Exception:
                 continue
 
-            results.append(TimeMetricResult(
-                time_min=time_min,
-                time_hours=time_min / 60.0,
-                time_days=time_min / (60.0 * 24.0),
-                censor_step=int(step),
+            score_results.append(TimeMetricResult(
+                **time_kwargs,
                 auroc=auroc,
                 auroc_ci=(auroc_lo, auroc_hi),
                 auprc=auprc,
                 auprc_ci=(auprc_lo, auprc_hi),
-                n_samples=len(pids_with_score),
-                n_positive=int(y_true.sum()),
             ))
 
-        if results:
-            all_results[label] = results
-            logger.info(f"  {label}: evaluated at {len(results)} time points")
+            model_results.append(TimeMetricResult(
+                **time_kwargs,
+                auroc=m_auroc,
+                auroc_ci=(m_auroc_lo, m_auroc_hi),
+                auprc=m_auprc,
+                auprc_ci=(m_auprc_lo, m_auprc_hi),
+            ))
+
+            # DeLong paired test (model vs score AUROC)
+            if delong:
+                try:
+                    z, p, se = delong_test_paired(y_true, model_preds, y_score)
+                    delong_z_vals.append(z)
+                    delong_raw_p.append(p)
+                    delong_se_vals.append(se)
+                    delong_delta_vals.append(m_auroc - auroc)
+                    delong_hours.append(time_min / 60.0)
+                except Exception:
+                    delong_z_vals.append(0.0)
+                    delong_raw_p.append(1.0)
+                    delong_se_vals.append(0.0)
+                    delong_delta_vals.append(0.0)
+                    delong_hours.append(time_min / 60.0)
+
+        if score_results:
+            result_entry = {
+                "score": score_results,
+                "model": model_results,
+                "counts": count_results,
+            }
+
+            # Apply FDR correction across all timesteps for this score
+            if delong and delong_raw_p:
+                p_arr = np.array(delong_raw_p)
+                rejected, p_adj = benjamini_hochberg(p_arr, alpha=0.05)
+                result_entry["delong_p"] = delong_raw_p
+                result_entry["delong_p_adj"] = p_adj.tolist()
+                result_entry["delong_z"] = delong_z_vals
+                result_entry["delong_se"] = delong_se_vals
+                result_entry["delong_delta"] = delong_delta_vals
+                result_entry["delong_hours"] = delong_hours
+                result_entry["delong_significant"] = rejected.tolist()
+
+                n_sig = int(rejected.sum())
+                logger.info(
+                    f"  {label}: DeLong test at {len(delong_raw_p)} time points, "
+                    f"{n_sig}/{len(delong_raw_p)} significant (FDR<0.05)"
+                )
+
+            all_results[label] = result_entry
+            logger.info(f"  {label}: evaluated at {len(score_results)} time points")
 
     return all_results
 
@@ -733,4 +823,49 @@ def recompute_metrics_for_subset(
 
     logger.info(f"Recomputed metrics for {len(results)} time points "
                 f"on {len(valid_pids)} patients")
+    return results
+
+
+def compute_counts_for_subset(
+    preds_df: pd.DataFrame,
+    holdout_y: np.ndarray,
+    holdout_pids: np.ndarray,
+    valid_pids: np.ndarray,
+) -> "List[TimeMetricResult]":
+    """Compute patient counts at each censor step for a filtered subset.
+
+    Unlike recompute_metrics_for_subset, this does NOT skip steps with
+    insufficient data — it returns entries for ALL censor steps with NaN
+    metrics but valid n_samples/n_positive. Used for the count panels.
+    """
+    from astra.evaluation.predictive_performance import TimeMetricResult
+
+    pid_to_y = dict(zip(holdout_pids, holdout_y))
+    valid_set = set(valid_pids)
+    preds_filtered = preds_df[preds_df['PID'].isin(valid_set)]
+
+    results = []
+    for step, group in preds_filtered.groupby('censor_step'):
+        pids = group['PID'].values
+        y_true = np.array([pid_to_y[pid] for pid in pids])
+        n_samples = len(y_true)
+        n_positive = int(y_true.sum())
+
+        time_min = step_to_time(step)
+        if time_min is None:
+            continue
+
+        results.append(TimeMetricResult(
+            time_min=time_min,
+            time_hours=time_min / 60.0,
+            time_days=time_min / (60.0 * 24.0),
+            censor_step=int(step),
+            auroc=float('nan'),
+            auroc_ci=(float('nan'), float('nan')),
+            auprc=float('nan'),
+            auprc_ci=(float('nan'), float('nan')),
+            n_samples=n_samples,
+            n_positive=n_positive,
+        ))
+
     return results

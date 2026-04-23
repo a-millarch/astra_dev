@@ -61,16 +61,18 @@ class TemporalPredictionHead(nn.Module):
     positions (temporal only), applies a shared MLP to each, outputs [batch, seq_len].
     """
 
-    def __init__(self, d_model: int, seq_len: int, dropout: float = 0.3):
+    def __init__(self, d_model: int, seq_len: int, dropout: float = 0.3,
+                 head_mult: float = 0.5):
         super().__init__()
         self.seq_len = seq_len
+        hidden = max(1, int(d_model * head_mult))
         self.mlp = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
+            nn.Linear(d_model, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 1),
+            nn.Linear(hidden, 1),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -451,9 +453,16 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         temporal_head: bool = False,            # Per-timestep prediction head
         causal: bool = False,                   # Causal attention masking
         temporal_head_dropout: float = 0.3,     # Dropout for temporal head MLP
+        temporal_head_mult: float = 0.5,        # Hidden dim = int(d_model * mult)
         temporal_channel_idx: Optional[int] = None,          # Index of elapsed_hours in x_ts
         exclude_channel_indices: Optional[List[int]] = None, # Aux channels to skip in W_P
         head_pool: str = 'flatten',             # 'flatten' (legacy) or 'mean_cat' (pooled)
+        per_feature_cont_proj: bool = False,    # Per-feature static continuous projection
+        cat_ts_gate: bool = False,              # Learned sigmoid gate per categorical group
+        local_temporal_kernel: int = 1,         # Depthwise conv kernel before W_P (1=disabled)
+        bin_width_channel_idx: Optional[int] = None,  # Index of bin_width_hours in x_ts
+        bin_width_modulation: bool = False,     # Modulate W_P output by bin width
+        ts_cat_profile_dims: Optional[Dict[str, int]] = None,  # {category: n_levels} for profiled categories
     ):
         """
         Args:
@@ -490,12 +499,34 @@ class TSTabFusionTransformerMultiHot(nn.Module):
                 continuous_dim = d_model
             
             self.ts_cat_dims = ts_cat_dims
+            # Fix 3: Learned gate per categorical group
+            if cat_ts_gate and cat_ts_combine == 'add':
+                self.cat_ts_gate_params = nn.Parameter(torch.zeros(self.n_ts_cat))
+            else:
+                self.cat_ts_gate_params = None
         else:
             self.n_ts_cat = 0
             self.ts_cat_embeds = None
             self.ts_cat_dims = {}
+            self.cat_ts_gate_params = None
             continuous_dim = d_model
-        
+
+        # === PROFILED CATEGORICAL TIME SERIES ===
+        # Per-category ordinal embeddings for categories with clinician-defined profiles.
+        # These are separate from multi-hot binary categories.
+        if ts_cat_profile_dims:
+            from astra.data.preprocessing import ProfileEmbedding
+            profile_emb_dim = d_model  # always 'add' mode for profiles
+            self.profile_embedding = ProfileEmbedding(
+                profile_dims=ts_cat_profile_dims,
+                embedding_dim=profile_emb_dim,
+                zero_absent=True,
+            )
+            self.ts_cat_profile_dims = ts_cat_profile_dims
+        else:
+            self.profile_embedding = None
+            self.ts_cat_profile_dims = {}
+
         # === AUXILIARY CHANNEL EXCLUSION ===
         # Channels listed in exclude_channel_indices (e.g. elapsed_hours, bin_width_hours)
         # remain in x_ts for extraction but are NOT projected through W_P.
@@ -506,21 +537,58 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         n_signal = len(self._signal_indices)
 
         # === CONTINUOUS TIME SERIES ===
+        # Fix 9: Optional depthwise conv for local temporal context before W_P
+        if local_temporal_kernel > 1:
+            if causal:
+                pad = nn.ConstantPad1d((local_temporal_kernel - 1, 0), 0.0)
+            else:
+                pad = nn.ConstantPad1d((local_temporal_kernel // 2, local_temporal_kernel // 2), 0.0)
+            self.local_temporal_conv = nn.Sequential(
+                pad,
+                nn.Conv1d(n_signal, n_signal, kernel_size=local_temporal_kernel,
+                          padding=0, groups=n_signal),
+                nn.GELU(),
+            )
+        else:
+            self.local_temporal_conv = None
+
         # Initialize W_P AFTER determining the correct output dimension
         self.W_P = nn.Conv1d(n_signal, continuous_dim, 1)
-        
+
+        # Fix 5: Bin-width modulation
+        self.bin_width_channel_idx = bin_width_channel_idx
+        if bin_width_modulation and bin_width_channel_idx is not None:
+            self.bin_width_mod = nn.Sequential(
+                nn.Linear(1, d_model),
+                nn.Sigmoid(),
+            )
+        else:
+            self.bin_width_mod = None
+
         # === STATIC CATEGORICAL FEATURES ===
         n_cat = len(classes)
         n_classes = [len(v) for v in classes.values()]
         self.n_emb = sum(n_classes)
         self.embeds = nn.ModuleList([nn.Embedding(ni, d_model) for ni in n_classes])
-        
+
         # === STATIC CONTINUOUS FEATURES ===
         n_cont = len(cont_names)
         self.n_cont = n_cont
-        self.conv = nn.Conv1d(1, d_model, 1)
-        if init:
-            nn.init.kaiming_normal_(self.conv.weight)
+        # Fix 1: Per-feature projections for static continuous features
+        self.per_feature_cont = per_feature_cont_proj
+        if per_feature_cont_proj and n_cont > 0:
+            self.cont_projections = nn.ModuleList([
+                nn.Linear(1, d_model) for _ in range(n_cont)
+            ])
+            if init:
+                for proj in self.cont_projections:
+                    nn.init.kaiming_normal_(proj.weight)
+            self.conv = None
+        else:
+            self.conv = nn.Conv1d(1, d_model, 1)
+            if init:
+                nn.init.kaiming_normal_(self.conv.weight)
+            self.cont_projections = None
         
         # === TRANSFORMER ===
         self.res_drop = nn.Dropout(res_dropout) if res_dropout else None
@@ -542,7 +610,8 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         if temporal_head:
             # Per-timestep prediction head (~2K params)
             self.temporal_pred_head = TemporalPredictionHead(
-                d_model, seq_len, dropout=temporal_head_dropout
+                d_model, seq_len, dropout=temporal_head_dropout,
+                head_mult=temporal_head_mult,
             )
             self.head = None  # Skip large flatten+MLP
             self.head_nf = d_model
@@ -620,7 +689,7 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         traj_lengths = None
         if isinstance(x_input, (tuple, list)):
             if len(x_input) >= 3:
-                # TSAI format: (x_ts, x_tab, x_ts_cat) or (x_ts, x_tab, x_ts_cat, traj_lengths)
+                # TSAI format: (x_ts, x_tab, x_ts_cat, traj_lengths[, profiles])
                 x_ts = x_input[0]                    # Continuous TS
                 x_tab = x_input[1]                   # Tabular (tuple)
                 x_ts_cat_multi_hot = x_input[2]      # Categorical TS
@@ -659,6 +728,11 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             x_cat = torch.tensor([], device=x_input.device)
             x_cont = torch.tensor([], device=x_input.device)
         
+        # === EXTRACT PROFILE TENSOR ===
+        x_ts_cat_profiles = None
+        if isinstance(x_input, (tuple, list)) and len(x_input) >= 5:
+            x_ts_cat_profiles = x_input[4]  # [bs, n_profiled, seq_len] or None
+
         # === HANDLE KEY PADDING MASK ===
         if traj_lengths is not None:
             # Proper padding mask from trajectory lengths (preferred)
@@ -675,10 +749,26 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation (Fix 5)
+        if self.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.bin_width_channel_idx, :]  # [bs, seq_len]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels (elapsed_hours, bin_width_hours) before W_P so that
         # only ~N(0,1) normalized clinical features are projected.
         x_ts_signal = x_ts[:, self._signal_indices, :] if self.exclude_channel_indices else x_ts
+
+        # Fix 9: Local temporal context before pointwise projection
+        if self.local_temporal_conv is not None:
+            x_ts_signal = self.local_temporal_conv(x_ts_signal)
+
         x = self.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
+
+        # Fix 5: Modulate by bin width (wider bins → different representation scaling)
+        if self.bin_width_mod is not None and bin_width_hours is not None:
+            bw_scale = self.bin_width_mod(bin_width_hours.unsqueeze(-1))  # [bs, T, d_model]
+            x = x * bw_scale
         
         # === PROCESS MULTI-HOT CATEGORICAL TIME SERIES ===
         if self.n_ts_cat > 0 and x_ts_cat_multi_hot is not None:
@@ -715,14 +805,24 @@ class TSTabFusionTransformerMultiHot(nn.Module):
             
             # Combine embeddings
             if self.cat_ts_combine == 'add':
-                # Sum all categorical embeddings
-                x_ts_cat_sum = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-                x = x + x_ts_cat_sum
+                stacked = torch.stack(x_ts_cat_embedded_list, dim=0)  # [n_groups, B, T, d]
+                if self.cat_ts_gate_params is not None:
+                    # Fix 3: Learned sigmoid gate per categorical group
+                    gates = torch.sigmoid(self.cat_ts_gate_params)  # [n_groups]
+                    stacked = stacked * gates[:, None, None, None]
+                x = x + stacked.sum(dim=0)
             else:  # 'concat'
                 # Concatenate all categorical embeddings
                 x_ts_cat_concat = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_concat], dim=-1)
         
+        # === PROCESS PROFILED CATEGORICAL TIME SERIES ===
+        if self.profile_embedding is not None and x_ts_cat_profiles is not None:
+            # x_ts_cat_profiles: [bs, n_profiled, seq_len] → [bs, seq_len, n_profiled]
+            x_profiles = x_ts_cat_profiles.transpose(1, 2)
+            profile_embedded = self.profile_embedding(x_profiles)  # [bs, seq_len, d_model]
+            x = x + profile_embedded
+
         # === PROCESS STATIC CATEGORICAL FEATURES ===
         if self.n_emb != 0 and x_cat.numel() > 0:
             x_cat_list = [e(x_cat[:, i]).unsqueeze(1) for i, e in enumerate(self.embeds)]
@@ -731,7 +831,13 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         
         # === PROCESS STATIC CONTINUOUS FEATURES ===
         if self.n_cont != 0 and x_cont.numel() > 0:
-            x_cont_proj = self.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.cont_projections is not None:
+                # Fix 1: Per-feature projection — each feature gets its own linear map
+                x_cont_proj = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.cont_projections)
+                ], dim=1)  # [batch, n_cont, d_model]
+            else:
+                x_cont_proj = self.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_proj], 1)
         
         # === TRANSFORMER ===

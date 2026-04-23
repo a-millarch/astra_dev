@@ -29,7 +29,7 @@ from sklearn.metrics import brier_score_loss, roc_auc_score, average_precision_s
 from astra.utils import cfg as global_cfg, save_figure, ensure_parent_dir
 from astra.data.mixed_dataloader import AstraMixedDataset, AstraMixedDataLoader
 from astra.evaluation.utils import (
-    prepare_model, time_to_step, step_to_time,
+    prepare_model, time_to_step, step_to_time, get_total_steps,
 )
 from astra.evaluation.predictive_performance import (
     _get_predictions, _to_device, compute_net_benefit, format_step_label,
@@ -37,6 +37,23 @@ from astra.evaluation.predictive_performance import (
 from astra.evaluation.calibration import calculate_ece
 
 logger = logging.getLogger(__name__)
+
+# ── Figure style constants for readability ───────────────────────────────
+_FIG_STYLE = dict(
+    title=16,
+    axis_label=14,
+    tick_label=12,
+    legend=12,
+    annotation=11,
+    suptitle=18,
+)
+
+# Journal submission output constraints — see predictive_performance._SUBMISSION_KW
+_SUBMISSION_KW = dict(
+    fit_long_side_px=1200,
+    max_long_side_px=1200,
+    max_bytes=5_000_000,
+)
 
 
 # ============================================================================
@@ -116,22 +133,41 @@ class _TrainvalEvaluator:
         return X_censored
 
     def get_predictions_at_step(self, censor_step: int) -> Optional[TimepointPredictions]:
-        """Get trainval predictions at a censoring step."""
+        """Get trainval predictions at a censoring step (active patients only)."""
         y = np.array(self.y)
+
+        # Active-only: exclude patients whose trajectory ended before this step
+        if self.trajectory_lengths is not None:
+            active_mask = self.trajectory_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y = y[active_mask]
+            X_norm = self.X_normalized[active_mask]
+            X_mh = self.X_multi_hot[active_mask]
+            x_cat = self.x_cat[active_mask]
+            x_cont = self.x_cont[active_mask]
+            traj = self.trajectory_lengths[active_mask]
+        else:
+            X_norm = self.X_normalized
+            X_mh = self.X_multi_hot
+            x_cat = self.x_cat
+            x_cont = self.x_cont
+            traj = None
+
         if len(set(y)) < 2:
             return None
 
-        X_censored = self._censor_data(self.X_normalized, censor_step)
-        X_mh_censored = self._censor_data(self.X_multi_hot, censor_step)
+        X_censored = self._censor_data(X_norm, censor_step)
+        X_mh_censored = self._censor_data(X_mh, censor_step)
 
         effective_traj = None
-        if self.trajectory_lengths is not None:
-            effective_traj = np.minimum(self.trajectory_lengths, censor_step + 1)
+        if traj is not None:
+            effective_traj = np.minimum(traj, censor_step + 1)
 
         dataset = AstraMixedDataset(
             X_ts=X_censored,
-            x_cat=self.x_cat,
-            x_cont=self.x_cont,
+            x_cat=x_cat,
+            x_cont=x_cont,
             X_ts_cat=X_mh_censored,
             y=y,
             trajectory_lengths=effective_traj,
@@ -199,13 +235,20 @@ class _TrainvalTemporalEvaluator:
         y_true = self._y
         traj_lengths = self._traj_lengths
 
+        # Active-only: exclude patients whose trajectory ended before this step
         if len(traj_lengths) > 0:
-            effective_steps = np.minimum(censor_step, traj_lengths - 1)
+            active_mask = traj_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y_true = y_true[active_mask]
+            preds_sub = preds_all[active_mask]
+            traj_sub = traj_lengths[active_mask]
+            effective_steps = np.minimum(censor_step, traj_sub - 1)
             effective_steps = np.maximum(effective_steps, 0).astype(int)
+            y_prob = preds_sub[np.arange(len(preds_sub)), effective_steps]
         else:
-            effective_steps = np.full(len(preds_all), min(censor_step, preds_all.shape[1] - 1), dtype=int)
-
-        y_prob = preds_all[np.arange(len(preds_all)), effective_steps]
+            step = min(censor_step, preds_all.shape[1] - 1)
+            y_prob = preds_all[:, step]
 
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
             return None
@@ -259,20 +302,39 @@ class _HoldoutEvaluator:
 
     def get_predictions_at_step(self, censor_step: int) -> Optional[TimepointPredictions]:
         y = np.array(self.y)
+
+        # Active-only: exclude patients whose trajectory ended before this step
+        if self.trajectory_lengths is not None:
+            active_mask = self.trajectory_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y = y[active_mask]
+            X_norm = self.X_normalized[active_mask]
+            X_mh = self.X_multi_hot[active_mask]
+            x_cat = self.x_cat[active_mask]
+            x_cont = self.x_cont[active_mask]
+            traj = self.trajectory_lengths[active_mask]
+        else:
+            X_norm = self.X_normalized
+            X_mh = self.X_multi_hot
+            x_cat = self.x_cat
+            x_cont = self.x_cont
+            traj = None
+
         if len(set(y)) < 2:
             return None
 
-        X_censored = self._censor_data(self.X_normalized, censor_step)
-        X_mh_censored = self._censor_data(self.X_multi_hot, censor_step)
+        X_censored = self._censor_data(X_norm, censor_step)
+        X_mh_censored = self._censor_data(X_mh, censor_step)
 
         effective_traj = None
-        if self.trajectory_lengths is not None:
-            effective_traj = np.minimum(self.trajectory_lengths, censor_step + 1)
+        if traj is not None:
+            effective_traj = np.minimum(traj, censor_step + 1)
 
         dataset = AstraMixedDataset(
             X_ts=X_censored,
-            x_cat=self.x_cat,
-            x_cont=self.x_cont,
+            x_cat=x_cat,
+            x_cont=x_cont,
             X_ts_cat=X_mh_censored,
             y=y,
             trajectory_lengths=effective_traj,
@@ -339,13 +401,20 @@ class _HoldoutTemporalEvaluator:
         y_true = self._y
         traj_lengths = self._traj_lengths
 
+        # Active-only: exclude patients whose trajectory ended before this step
         if len(traj_lengths) > 0:
-            effective_steps = np.minimum(censor_step, traj_lengths - 1)
+            active_mask = traj_lengths > censor_step
+            if active_mask.sum() < 2:
+                return None
+            y_true = y_true[active_mask]
+            preds_sub = preds_all[active_mask]
+            traj_sub = traj_lengths[active_mask]
+            effective_steps = np.minimum(censor_step, traj_sub - 1)
             effective_steps = np.maximum(effective_steps, 0).astype(int)
+            y_prob = preds_sub[np.arange(len(preds_sub)), effective_steps]
         else:
-            effective_steps = np.full(len(preds_all), min(censor_step, preds_all.shape[1] - 1), dtype=int)
-
-        y_prob = preds_all[np.arange(len(preds_all)), effective_steps]
+            step = min(censor_step, preds_all.shape[1] - 1)
+            y_prob = preds_all[:, step]
 
         if y_true.sum() == 0 or y_true.sum() == len(y_true):
             return None
@@ -455,7 +524,7 @@ def _evaluate_calibrated(
     time_hours: float,
     method: str,
     calibrator_type: str,
-    n_bins: int = 10,
+    n_bins: int = 4,
 ) -> CalibratorResult:
     """Compare raw vs calibrated predictions at one timepoint."""
     ece_raw, _ = calculate_ece(y_true, y_prob_raw, n_bins=n_bins)
@@ -509,7 +578,7 @@ def _plot_calibration_metrics_over_time(
     save_dir: str,
 ):
     """Plot ECE and Brier score over time: raw vs calibrated per method."""
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
 
     colors = {'isotonic': '#2E86AB', 'platt': '#A23B72'}
 
@@ -543,18 +612,20 @@ def _plot_calibration_metrics_over_time(
                      color=color, linewidth=2, marker='o', markersize=4,
                      label=f'{method.capitalize()} calibrated')
 
-    axes[0].set_ylabel('Expected Calibration Error (ECE)')
-    axes[0].set_title('Calibration Metrics Over Time: Raw vs Calibrated')
-    axes[0].legend()
+    axes[0].set_ylabel('Expected Calibration Error (ECE)', fontsize=_FIG_STYLE['axis_label'])
+    axes[0].set_title('Calibration Metrics Over Time: Raw vs Calibrated', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    axes[0].legend(fontsize=_FIG_STYLE['legend'])
+    axes[0].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].set_xlabel('Time (hours)')
-    axes[1].set_ylabel('Brier Score')
-    axes[1].legend()
+    axes[1].set_xlabel('Time (hours)', fontsize=_FIG_STYLE['axis_label'])
+    axes[1].set_ylabel('Brier Score', fontsize=_FIG_STYLE['axis_label'])
+    axes[1].legend(fontsize=_FIG_STYLE['legend'])
+    axes[1].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    save_figure(fig, f"calibration_analysis_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"calibration_analysis_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved calibration_analysis_{model_name}.png")
 
@@ -565,16 +636,17 @@ def _plot_reliability_diagrams(
     best_method: str,
     model_name: str,
     save_dir: str,
-    n_bins: int = 10,
+    n_bins: int = 4,
 ):
     """Grid of reliability diagrams at key timepoints (before/after)."""
     from sklearn.calibration import calibration_curve
 
     steps = sorted(holdout_preds.keys())
     n = len(steps)
-    ncols = min(4, n)
+    ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 6 * nrows))
+    # Smaller per-panel size (3.5 in) so a 3x3 grid lands within the 1200 px cap.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.5 * nrows))
     if nrows == 1 and ncols == 1:
         axes = np.array([axes])
     axes = np.atleast_2d(axes)
@@ -591,8 +663,9 @@ def _plot_reliability_diagrams(
             frac_raw, mean_raw = calibration_curve(
                 y_true, y_prob_raw, n_bins=n_bins, strategy='uniform'
             )
-            ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=2,
-                    markersize=7, alpha=0.7, label='Raw')
+            brier_raw = brier_score_loss(y_true, y_prob_raw)
+            ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=2.0,
+                    markersize=5, alpha=0.7, label=f'Raw (Brier={brier_raw:.3f})')
         except Exception:
             pass
 
@@ -603,24 +676,24 @@ def _plot_reliability_diagrams(
                 frac_cal, mean_cal = calibration_curve(
                     y_true, y_prob_cal, n_bins=n_bins, strategy='uniform'
                 )
+                brier_cal = brier_score_loss(y_true, y_prob_cal)
                 ax.plot(mean_cal, frac_cal, 'o-', color='#2E86AB', linewidth=2.5,
-                        markersize=7, label=f'{best_method.capitalize()}')
+                        markersize=7, label=f'{best_method.capitalize()} (Brier={brier_cal:.3f})')
             except Exception:
                 pass
 
         ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
-        ax.set_title(format_step_label(step), fontsize=16, fontweight='bold')
+        ax.set_title(format_step_label(step), fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.set_xlim([0, 1])
         ax.set_ylim([0, 1])
         ax.set_aspect('equal')
         ax.grid(True, alpha=0.2)
-        ax.tick_params(axis='both', labelsize=13)
-        if idx == 0:
-            ax.legend(fontsize=13)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+        ax.legend(fontsize=8, handlelength=1.5, labelspacing=0.3)
         if row == nrows - 1:
-            ax.set_xlabel('Predicted probability', fontsize=14)
+            ax.set_xlabel('Predicted probability', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
-            ax.set_ylabel('Observed frequency', fontsize=14)
+            ax.set_ylabel('Observed frequency', fontsize=_FIG_STYLE['axis_label'])
 
     # Hide unused axes
     for idx in range(n, nrows * ncols):
@@ -628,9 +701,9 @@ def _plot_reliability_diagrams(
         axes[row, col].set_visible(False)
 
     fig.suptitle(f'Reliability Diagrams: Raw vs {best_method.capitalize()} Calibrated',
-                 fontsize=18, fontweight='bold')
-    plt.tight_layout()
-    save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir)
+                 fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved reliability_diagrams_{model_name}.png")
 
@@ -647,9 +720,10 @@ def _plot_dca_comparison(
     """DCA at key timepoints: raw vs calibrated net benefit."""
     steps = sorted(holdout_preds.keys())
     n = len(steps)
-    ncols = min(4, n)
+    ncols = min(3, n)
     nrows = (n + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.5 * nrows))
+    # Smaller per-panel size so a 3x3 grid lands within the 1200 px cap.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.5 * ncols, 3.0 * nrows))
     if nrows == 1 and ncols == 1:
         axes = np.array([axes])
     axes = np.atleast_2d(axes)
@@ -683,23 +757,24 @@ def _plot_dca_comparison(
             ymax = max(ymax, nb_cal.max() * 1.15 + 0.005)
 
         ax.set_ylim(ymin, ymax)
-        ax.set_title(format_step_label(step), fontsize=11)
+        ax.set_title(format_step_label(step), fontsize=_FIG_STYLE['title'])
         ax.grid(True, alpha=0.2)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         if idx == 0:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=_FIG_STYLE['legend'])
         if row == nrows - 1:
-            ax.set_xlabel('Threshold')
+            ax.set_xlabel('Threshold', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
-            ax.set_ylabel('Net Benefit')
+            ax.set_ylabel('Net Benefit', fontsize=_FIG_STYLE['axis_label'])
 
     for idx in range(n, nrows * ncols):
         row, col = divmod(idx, ncols)
         axes[row, col].set_visible(False)
 
     fig.suptitle(f'Decision Curve Analysis: Raw vs {best_method.capitalize()} Calibrated',
-                 fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir)
+                 fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved dca_comparison_{model_name}.png")
 
@@ -765,21 +840,22 @@ def _plot_dca_calibrated(
 
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
     ax.set_title(
         f"Decision Curves (Calibrated — {best_method.capitalize()})",
-        fontsize=13, fontweight='bold',
+        fontsize=_FIG_STYLE['title'], fontweight='bold',
     )
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=9,
-              title="Time Available", title_fontsize=10)
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
 
     fig.subplots_adjust(right=0.78)
     plt.tight_layout()
-    save_figure(fig, f"dca_calibrated_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"dca_calibrated_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved dca_calibrated_{model_name}.png")
 
@@ -816,16 +892,18 @@ def _plot_per_timepoint_vs_global(
     ax.bar(x + width, [r.ece_cal for r in glob], width,
            label='Global', color='#A23B72')
 
-    ax.set_xlabel('Timepoint')
-    ax.set_ylabel('ECE')
-    ax.set_title(f'ECE: Raw vs Per-Timepoint vs Global ({best_method.capitalize()})')
+    ax.set_xlabel('Timepoint', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel('ECE', fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title(f'ECE: Raw vs Per-Timepoint vs Global ({best_method.capitalize()})',
+                 fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=45, ha='right')
-    ax.legend()
+    ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=_FIG_STYLE['tick_label'])
+    ax.tick_params(axis='y', labelsize=_FIG_STYLE['tick_label'])
+    ax.legend(fontsize=_FIG_STYLE['legend'])
     ax.grid(True, alpha=0.2, axis='y')
 
     plt.tight_layout()
-    save_figure(fig, f"per_timepoint_vs_global_{model_name}", save_dir=save_dir)
+    save_figure(fig, f"per_timepoint_vs_global_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
     plt.close(fig)
     logger.info(f"Saved per_timepoint_vs_global_{model_name}.png")
 
@@ -880,7 +958,7 @@ def run_posthoc_calibration(
     methods: List[str] = ['isotonic', 'platt'],
     key_timepoints: Optional[List[int]] = None,
     min_positive_samples: int = 20,
-    n_bins: int = 10,
+    n_bins: int = 4,
     save_dir: str = 'reports/calibration',
     calibrator_dir: Optional[str] = None,
 ) -> pd.DataFrame:
@@ -916,13 +994,16 @@ def run_posthoc_calibration(
 
     # Default key timepoints
     if key_timepoints is None:
-        key_timepoints = [
+        max_step = get_total_steps() - 2  # last step needs full-length traj; cap to N-2
+        raw = [
             time_to_step(1, 'h'), time_to_step(6, 'h'),
             time_to_step(12, 'h'), time_to_step(72, 'h'),
-            time_to_step(7, 'D'), time_to_step(13, 'D'),
+            time_to_step(7, 'D'), time_to_step(14, 'D'),
             time_to_step(30, 'D'), time_to_step(90, 'D'),
         ]
-        key_timepoints = sorted([t for t in key_timepoints if t is not None])
+        key_timepoints = sorted({
+            min(t, max_step) for t in raw if t is not None
+        })
 
     logger.info(f"Posthoc calibration: {len(key_timepoints)} timepoints, methods={methods}")
 
@@ -1083,14 +1164,32 @@ def run_posthoc_calibration(
     logger.info("Generating calibration plots...")
 
     _plot_calibration_metrics_over_time(all_results, methods, model_name, save_dir)
+
+    # Collect predictions at all timepoints with a lower threshold
+    # so that later timepoints (7D, 14D, 30D) are not dropped from plots
+    all_holdout_preds = _collect_predictions(
+        holdout_eval, key_timepoints, min_positive=5, label="holdout-plots"
+    )
+    # Calibrate the extra steps using global calibrator
+    all_calibrated = dict(calibrated_holdout)  # copy existing per-tp calibrated
+    for step in all_holdout_preds:
+        if step not in all_calibrated:
+            all_calibrated[step] = {}
+            ho = all_holdout_preds[step]
+            for method in methods:
+                g_cal = global_calibrators[method]
+                all_calibrated[step][method] = apply_calibrator(
+                    g_cal, ho.y_prob, method
+                )
+
     _plot_reliability_diagrams(
-        holdout_preds, calibrated_holdout, best_method, model_name, save_dir, n_bins
+        all_holdout_preds, all_calibrated, best_method, model_name, save_dir, n_bins
     )
     _plot_dca_calibrated(
-        holdout_preds, calibrated_holdout, best_method, model_name, save_dir
+        all_holdout_preds, all_calibrated, best_method, model_name, save_dir
     )
     _plot_dca_comparison(
-        holdout_preds, calibrated_holdout, best_method, model_name, save_dir
+        all_holdout_preds, all_calibrated, best_method, model_name, save_dir
     )
     _plot_per_timepoint_vs_global(all_results, best_method, model_name, save_dir)
 

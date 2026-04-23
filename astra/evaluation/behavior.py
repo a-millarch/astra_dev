@@ -1,6 +1,7 @@
 #behavior.py
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -8,7 +9,7 @@ from matplotlib.colors import TwoSlopeNorm, ListedColormap, BoundaryNorm
 from matplotlib.patches import Patch
 import seaborn as sns
 from typing import Dict, List, Optional, Union
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from scipy import stats
 import shap
 from collections import OrderedDict
@@ -18,14 +19,26 @@ import logging
 import pickle
 from pathlib import Path
 
-from astra.utils import cfg, setup_logging, ensure_parent_dir
+from astra.utils import cfg, setup_logging, ensure_parent_dir, save_base64
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours, get_total_steps
 from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
 logger = setup_logging()
- 
+
+
+def _seed_shap(seed):
+    """Reset RNG state for reproducible GradientExplainer results."""
+    if seed is not None:
+        import random
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
 def get_centered_norm(data, center=0.0):
     """
     Create a TwoSlopeNorm that centers the colormap at the specified value.
@@ -472,7 +485,7 @@ def visualize_ebm_importances(ebm_importances: Dict, n_steps: int = None,
         n_steps = get_total_steps()
 
     # Respect eval_timestep cropping
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
 
     time_labels = [step_to_time(i) for i in range(n_steps)]
@@ -839,6 +852,27 @@ def get_static_cat_names_from_classes(classes: Dict) -> List[str]:
 # Model Wrapper for SHAP
 # ============================================================================
 
+def _select_temporal_output(logits, eval_timestep, key_padding_mask, seq_len):
+    """Select output from temporal head logits based on eval_timestep mode.
+
+    Args:
+        logits: [batch, seq_len] per-timestep logits from temporal_pred_head
+        eval_timestep: int index, or 'mean' for padding-aware mean across
+                       valid (non-padded) timesteps. Distributes SHAP gradients
+                       evenly so aggregate importance isn't dominated by the
+                       last position.
+        key_padding_mask: [batch, seq_len + n_static] bool (True=padding)
+        seq_len: number of temporal positions (to slice mask)
+    """
+    if eval_timestep == 'mean':
+        ts_mask = ~key_padding_mask[:, :seq_len]  # [batch, seq_len] True=valid
+        ts_mask_f = ts_mask.float()
+        masked_logits = logits[:, :seq_len] * ts_mask_f
+        mean_logit = masked_logits.sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+        return mean_logit.unsqueeze(-1)  # [batch, 1]
+    return logits[:, eval_timestep].unsqueeze(-1)  # [batch, 1]
+
+
 def _build_padding_mask_for_shap(x_ts, traj_lengths, n_static_tokens=0):
     """Build key_padding_mask matching model._build_traj_padding_mask().
 
@@ -898,11 +932,22 @@ class ModelWrapperWithEmbeddings(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation (before stripping aux channels)
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P (same as model forward)
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
         x = self.model.W_P(x_ts_signal).transpose(1, 2)
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
         if self.has_cat_ts and x_ts_cat_embedded is not None:
+            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
             if self.model.cat_ts_combine == 'add':
                 x = x + x_ts_cat_embedded
             else:
@@ -912,7 +957,12 @@ class ModelWrapperWithEmbeddings(nn.Module):
             x = torch.cat([x, x_cat_embedded], 1)
 
         if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
         # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
@@ -938,7 +988,137 @@ class ModelWrapperWithEmbeddings(nn.Module):
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
+        return self._apply_head(x, key_padding_mask)
+
+    def _apply_head(self, x, key_padding_mask):
+        """Apply head with pooling logic matching model.py forward()."""
+        if self.model.head_pool == 'mean_cat':
+            x_temporal = x[:, :self.model.seq_len, :]
+            x_static = x[:, self.model.seq_len:, :]
+            if key_padding_mask is not None:
+                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
+                ts_mask_f = ts_mask.unsqueeze(-1).float()
+                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
+            else:
+                x_pooled = x_temporal.mean(dim=1)
+            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
+        return self.model.head(x)
+
+
+class ModelWrapperWithOneHotCategoricals(nn.Module):
+    """
+    Wrapper that takes ONE-HOT encoded static categorical features [batch, n_cat, max_classes].
+
+    Performs matmul(one_hot, embedding.weight) to embed static categoricals differentiably.
+    This allows GradientExplainer to compute meaningful gradients through the one-hot probability
+    differences rather than through the pre-computed embedding lookup.
+    """
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
+                 x_cat_onehot_ref=None):
+        super().__init__()
+        self.model = model
+        self.has_cat_ts = has_cat_ts
+        self.eval_timestep = eval_timestep
+        self.traj_lengths = traj_lengths
+        # Store reference one-hot shape to know which embedding weights to extract
+        self.x_cat_onehot_ref = x_cat_onehot_ref
+
+    def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_onehot=None, x_cont=None):
+        """
+        Args:
+            x_ts: [batch, c_in, seq_len]
+            x_ts_cat_embedded: [batch, seq_len, d_model] if has_cat_ts
+            x_cat_onehot: [batch, n_cat, max_classes] ONE-HOT encoded static cats
+            x_cont: [batch, n_cont] continuous statics
+        """
+        nan_mask = torch.isnan(x_ts)
+        if nan_mask.any():
+            x_ts = x_ts.clone()
+            x_ts[nan_mask] = 0
+
+        # Build padding mask from trajectory lengths
+        seq_len = x_ts.shape[2]
+        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
+        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)
+
+        # Extract elapsed_hours for positional encoding
+        if self.model.temporal_channel_idx is not None:
+            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
+        else:
+            elapsed_hours = None
+
+        # Extract bin_width_hours for modulation
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
+        # Strip auxiliary channels before W_P
+        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
+        x = self.model.W_P(x_ts_signal).transpose(1, 2)
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
+
+        if self.has_cat_ts and x_ts_cat_embedded is not None:
+            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
+            if self.model.cat_ts_combine == 'add':
+                x = x + x_ts_cat_embedded
+            else:
+                x = torch.cat([x, x_ts_cat_embedded], dim=-1)
+
+        # Embed one-hot static categoricals via matmul (differentiable)
+        if x_cat_onehot is not None and x_cat_onehot.shape[1] > 0:
+            # Matmul one-hot with embedding weights: [batch, n_cat, max_classes] x [max_classes, d_model]
+            # -> [batch, n_cat, d_model]
+            x_cat_embedded_list = []
+            for i, emb in enumerate(self.model.embeds):
+                # Extract relevant one-hot slice and embedding weight
+                oh_i = x_cat_onehot[:, i, :emb.num_embeddings]  # [batch, num_classes]
+                emb_w = emb.weight  # [num_classes, d_model]
+                x_cat_i = torch.matmul(oh_i, emb_w)  # [batch, d_model]
+                x_cat_embedded_list.append(x_cat_i.unsqueeze(1))  # [batch, 1, d_model]
+
+            x_cat_embedded = torch.cat(x_cat_embedded_list, dim=1)  # [batch, n_cat, d_model]
+            x = torch.cat([x, x_cat_embedded], 1)
+
+        if x_cont is not None and x_cont.shape[1] > 0:
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            x = torch.cat([x, x_cont_emb], 1)
+
+        # Positional encoding
+        ts_padding_mask = key_padding_mask[:, :seq_len]
+        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
+        if self.model.res_drop is not None:
+            x = self.model.res_drop(x)
+
+        # Extend padding mask for static tokens
+        n_static = x.shape[1] - key_padding_mask.shape[1]
+        if n_static > 0:
+            static_mask = torch.zeros(
+                key_padding_mask.shape[0], n_static,
+                dtype=torch.bool, device=key_padding_mask.device,
+            )
+            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
+
+        attn_mask = self.model.causal_mask if self.model.causal else None
+        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
+
+        # Zero out padding positions post-transformer
+        x = x * (~key_padding_mask).unsqueeze(-1).float()
+
+        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
+            logits = self.model.temporal_pred_head(x)
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
         return self._apply_head(x, key_padding_mask)
 
     def _apply_head(self, x, key_padding_mask):
@@ -961,12 +1141,14 @@ class ModelWrapperWithRawCatTS(nn.Module):
     Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
     This allows SHAP to compute per-category attributions.
     """
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None):
+    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
+                 survival_mode: bool = False):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
         self.eval_timestep = eval_timestep
         self.traj_lengths = traj_lengths  # [n_samples] or None
+        self.survival_mode = survival_mode
 
     def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
         """
@@ -992,9 +1174,19 @@ class ModelWrapperWithRawCatTS(nn.Module):
         else:
             elapsed_hours = None
 
+        # Extract bin_width_hours for modulation
+        if self.model.bin_width_channel_idx is not None:
+            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
+        else:
+            bin_width_hours = None
+
         # Strip auxiliary channels before W_P (same as model forward)
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
+        if self.model.local_temporal_conv is not None:
+            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
         x = self.model.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
+        if self.model.bin_width_mod is not None and bin_width_hours is not None:
+            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
         # Embed categorical TS from raw multi-hot (this is differentiable!)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
@@ -1011,8 +1203,11 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 dim_offset += n_classes
 
             if self.model.cat_ts_combine == 'add':
-                x_ts_cat_embedded = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
-                x = x + x_ts_cat_embedded
+                stacked = torch.stack(x_ts_cat_embedded_list, dim=0)
+                if self.model.cat_ts_gate_params is not None:
+                    gates = torch.sigmoid(self.model.cat_ts_gate_params)
+                    stacked = stacked * gates[:, None, None, None]
+                x = x + stacked.sum(dim=0)
             else:
                 x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_embedded], dim=-1)
@@ -1023,7 +1218,12 @@ class ModelWrapperWithRawCatTS(nn.Module):
 
         # Static continuous
         if x_cont is not None and x_cont.shape[1] > 0:
-            x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
+            if self.model.cont_projections is not None:
+                x_cont_emb = torch.stack([
+                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
+                ], dim=1)
+            else:
+                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
         # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
@@ -1049,7 +1249,15 @@ class ModelWrapperWithRawCatTS(nn.Module):
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
             logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            return logits[:, self.eval_timestep].unsqueeze(-1)  # [batch, 1]
+            if self.survival_mode:
+                # Return cumulative incidence 1 - S(t) at eval_timestep (differentiable)
+                eval_t = self.eval_timestep if isinstance(self.eval_timestep, int) and self.eval_timestep >= 0 else logits.shape[1] - 1
+                hazards = torch.sigmoid(logits[:, :eval_t + 1])
+                log_surv = torch.sum(torch.log1p(-hazards + 1e-7), dim=1)
+                surv = torch.exp(log_surv)
+                return (1.0 - surv).unsqueeze(-1)  # [batch, 1]
+            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
+                                           self.model.seq_len)
         return self._apply_head(x, key_padding_mask)
 
     def _apply_head(self, x, key_padding_mask):
@@ -1085,7 +1293,11 @@ def embed_categorical_ts(model, x_ts_cat, encoding_info):
             dim_offset += n_classes
         
         if model.cat_ts_combine == 'add':
-            x_ts_cat_embedded = torch.stack(x_ts_cat_embedded_list, dim=0).sum(dim=0)
+            stacked = torch.stack(x_ts_cat_embedded_list, dim=0)
+            if model.cat_ts_gate_params is not None:
+                gates = torch.sigmoid(model.cat_ts_gate_params)
+                stacked = stacked * gates[:, None, None, None]
+            x_ts_cat_embedded = stacked.sum(dim=0)
         else:
             x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
     
@@ -1094,13 +1306,38 @@ def embed_categorical_ts(model, x_ts_cat, encoding_info):
 
 
 def embed_categorical_features(model, x_cat):
+    """
+    Convert static categorical features to one-hot encodings for SHAP.
+
+    Returns one-hot tensors [batch, n_cat, max_classes] with requires_grad=True.
+    The model wrapper will perform matmul(one_hot, embedding.weight) for differentiable embedding.
+
+    This allows GradientExplainer to compute meaningful gradients through the one-hot probability
+    differences between foreground and background, rather than through the pre-computed embedding
+    lookup (which gave near-zero SHAP for low-cardinality static categories).
+    """
     if x_cat is None or x_cat.shape[1] == 0:
         return None
-    with torch.no_grad():
-        x_cat_emb = [model.embeds[i](x_cat[:, i]).unsqueeze(1) for i in range(x_cat.shape[1])]
-        x_cat_emb = torch.cat(x_cat_emb, 1)
-    x_cat_emb.requires_grad = True
-    return x_cat_emb
+
+    # Get max embedding class count for padding
+    max_classes = max(emb.num_embeddings for emb in model.embeds)
+
+    # Convert to one-hot: [batch, n_cat, max_classes]
+    onehot_list = []
+    for i, emb in enumerate(model.embeds):
+        # One-hot encode this categorical feature
+        oh = F.one_hot(x_cat[:, i].long(), num_classes=emb.num_embeddings).float()  # [batch, num_classes]
+
+        # Pad to max_classes if needed
+        if emb.num_embeddings < max_classes:
+            pad_size = max_classes - emb.num_embeddings
+            oh = F.pad(oh, (0, pad_size), value=0.0)  # [batch, max_classes]
+
+        onehot_list.append(oh.unsqueeze(1))  # [batch, 1, max_classes]
+
+    x_cat_onehot = torch.cat(onehot_list, dim=1)  # [batch, n_cat, max_classes]
+    x_cat_onehot.requires_grad = True
+    return x_cat_onehot
 
 
 # ============================================================================
@@ -1280,9 +1517,13 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         all_pids: List of all PIDs in the test loader (in order). Required if specific_pids
                   is provided, to map PIDs to sample indices.
         eval_timestep: For temporal head models, which sequence position to evaluate.
-                       Default -1 (last position) is wrong for causal models — SHAP gradients
-                       decay to near-zero for early steps through the long attention chain.
-                       Use a fixed clinical timepoint instead, e.g.:
+                       Default -1 auto-switches to 'mean' when temporal head is detected.
+                       Options:
+                         - 'mean': padding-aware mean across valid timesteps (recommended
+                           for aggregate SHAP — distributes gradients evenly)
+                         - int >= 0: specific timestep index
+                         - -1: last position (auto-converts to 'mean' for temporal head)
+                       For per-timeframe analysis, use a fixed clinical timepoint:
                            from astra.evaluation.utils import time_to_step
                            eval_timestep=time_to_step(24, 'h')  # prediction at 24 h
         inhospital_start_steps: Per-sample step index where inhospital data starts
@@ -1341,41 +1582,68 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     has_cat_ts = model.n_ts_cat > 0 and bg_ts_cat is not None and bg_ts_cat.numel() > 0
     n_static_cat = bg_cat.shape[1]
     
-    # Pre-embed static categorical (always)
-    bg_cat_emb = embed_categorical_features(model, bg_cat) if n_static_cat > 0 else None
-    test_cat_emb = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
+    # Convert static categorical to one-hot (always)
+    # Returns [batch, n_cat, max_classes] with requires_grad=True for SHAP
+    bg_cat_onehot = embed_categorical_features(model, bg_cat) if n_static_cat > 0 else None
+    test_cat_onehot = embed_categorical_features(model, test_cat) if n_static_cat > 0 else None
     
     if model.temporal_head_enabled:
-        print(f"  Temporal head: eval_timestep={eval_timestep} "
-              f"({'last position — consider a clinical timepoint' if eval_timestep == -1 else 'OK'})")
+        if eval_timestep == -1:
+            eval_timestep = 'mean'
+            print(f"  Temporal head detected: auto-switching eval_timestep to 'mean' "
+                  f"(padding-aware average across valid timesteps)")
+        else:
+            print(f"  Temporal head: eval_timestep={eval_timestep}")
 
-    if bg_cat_emb is not None:
-        print(f"  Static categorical embedded: {bg_cat_emb.shape}")
+    if bg_cat_onehot is not None:
+        print(f"  Static categorical one-hot: {bg_cat_onehot.shape}")
     
     print(f"\ncompute_per_category_shap: {compute_per_category_shap}")
     
-    if compute_per_category_shap and has_cat_ts:
-        # Use wrapper that takes RAW categorical TS for per-category SHAP
+    if compute_per_category_shap and has_cat_ts and bg_cat_onehot is None:
+        # Per-category temporal SHAP with raw temporal cats, no static cats
         print("  Using ModelWrapperWithRawCatTS for per-category SHAP values")
         wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts,
                                                  eval_timestep=eval_timestep,
                                                  traj_lengths=test_traj)
-
-        # Ensure categorical TS is float and requires grad
         bg_ts_cat_input = bg_ts_cat.float()
         test_ts_cat_input = test_ts_cat.float()
         bg_ts_cat_input.requires_grad = True
         test_ts_cat_input.requires_grad = True
-
         bg_inputs = [bg_ts, bg_ts_cat_input]
         test_inputs = [test_ts, test_ts_cat_input]
+    elif compute_per_category_shap and has_cat_ts and bg_cat_onehot is not None:
+        # Both raw temporal cats AND one-hot static cats needed.
+        # ModelWrapperWithRawCatTS expects pre-embedded static cats (shape mismatch
+        # with one-hot), so we use ModelWrapperWithOneHotCategoricals and fall back
+        # to pre-embedded temporal cats (losing per-category temporal SHAP granularity).
+        print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats + embedded temporal TS)")
+        print("  NOTE: Per-category temporal SHAP unavailable when one-hot static cats are present")
+        compute_per_category_shap = False  # disable for parsing below
+        wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
+                                                           eval_timestep=eval_timestep,
+                                                           traj_lengths=test_traj,
+                                                           x_cat_onehot_ref=bg_cat_onehot)
+        bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
+        test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
+        bg_inputs = [bg_ts, bg_ts_cat_emb]
+        test_inputs = [test_ts, test_ts_cat_emb]
+        bg_inputs.append(bg_cat_onehot)
+        test_inputs.append(test_cat_onehot)
     else:
-        # Use wrapper with pre-embedded categorical TS (faster, less granular)
-        print("  Using ModelWrapperWithEmbeddings (embedded categorical TS)")
-        wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
-                                                   eval_timestep=eval_timestep,
-                                                   traj_lengths=test_traj)
-        
+        # No per-category temporal SHAP: embed temporal cats
+        if bg_cat_onehot is not None:
+            print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats, embedded categorical TS)")
+            wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
+                                                               eval_timestep=eval_timestep,
+                                                               traj_lengths=test_traj,
+                                                               x_cat_onehot_ref=bg_cat_onehot)
+        else:
+            print("  Using ModelWrapperWithEmbeddings (embedded categorical TS, no static cats)")
+            wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
+                                                       eval_timestep=eval_timestep,
+                                                       traj_lengths=test_traj)
+
         if has_cat_ts:
             bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
             test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
@@ -1384,20 +1652,23 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         else:
             bg_inputs = [bg_ts]
             test_inputs = [test_ts]
-    
-    if bg_cat_emb is not None:
-        bg_inputs.append(bg_cat_emb)
-        test_inputs.append(test_cat_emb)
+
+        if bg_cat_onehot is not None:
+            bg_inputs.append(bg_cat_onehot)
+            test_inputs.append(test_cat_onehot)
     
     if bg_cont.shape[1] > 0:
         bg_inputs.append(bg_cont)
         test_inputs.append(test_cont)
     
+    shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
+    shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
     print("\nCreating SHAP GradientExplainer...")
     explainer = shap.GradientExplainer(wrapped_model, bg_inputs)
-    
+
     print("Calculating SHAP values...")
-    shap_values = explainer.shap_values(test_inputs)
+    _seed_shap(shap_seed)
+    shap_values = explainer.shap_values(test_inputs, nsamples=shap_nsamples)
     print("SHAP calculation complete!")
 
     # For multi-output models (e.g. 2-class), GradientExplainer returns
@@ -1435,12 +1706,15 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             cat_ts_shap = np.abs(cat_ts_shap_embedded).mean(axis=2)
         idx += 1
     
-    cat_shap, cat_shap_embedded = None, None
-    if bg_cat_emb is not None:
-        cat_shap_embedded = shap_values[idx]
-        print(f"  cat_shap_embedded shape: {cat_shap_embedded.shape}")
-        cat_shap = cat_shap_embedded.mean(axis=2)
-        print(f"  cat_shap after mean: {cat_shap.shape}")
+    cat_shap, cat_shap_onehot = None, None
+    if bg_cat_onehot is not None:
+        cat_shap_onehot = shap_values[idx]
+        print(f"  cat_shap_onehot shape (one-hot SHAP): {cat_shap_onehot.shape}")
+        # cat_shap_onehot is [n_samples, n_cat, max_classes]
+        # Aggregate over the one-hot class dimension: sum absolute value per feature
+        # This gives overall feature importance (sum of all class probabilities' contribution)
+        cat_shap = np.abs(cat_shap_onehot).sum(axis=2)  # [n_samples, n_cat]
+        print(f"  cat_shap after sum(|one_hot|): {cat_shap.shape}")
         idx += 1
     
     cont_shap = shap_values[idx] if bg_cont.shape[1] > 0 else None
@@ -1464,7 +1738,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         'cat_ts_shap_per_category': cat_ts_shap_per_category,  # NEW: per-category SHAP
         'cat_ts_shap_embedded': cat_ts_shap_embedded,
         'cat_shap': cat_shap,
-        'cat_shap_embedded': cat_shap_embedded,
+        'cat_shap_onehot': cat_shap_onehot,
         'cont_shap': cont_shap,
         'n_static_cat': n_static_cat,
         'eval_timestep': eval_timestep,  # stored for visualization cropping
@@ -1633,7 +1907,7 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
     # Crop time axis to eval_timestep — steps beyond have ~0 SHAP due to causal masking.
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[..., :n_steps]
 
@@ -1995,7 +2269,7 @@ def visualize_data_completeness(shap_results: Dict, sample_idx: int = None,
 
     # Crop to eval_timestep — same as visualize_shap_individual.
     eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_data = ts_data[..., :n_steps]
 
@@ -2302,8 +2576,17 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
                            feature_names_cat: List[str] = None,
                            feature_names_cont: List[str] = None,
                            max_display: int = 20, class_idx: int = 1, save_path: str = None,
-                           eval_timestep: Optional[int] = None):
-    """Summary visualizations across cohort."""
+                           eval_timestep: Optional[int] = None,
+                           density_normalize: bool = False):
+    """Summary visualizations across cohort.
+
+    Args:
+        density_normalize: If True, normalize SHAP aggregation by measurement
+            density per channel.  Channels with more non-zero (measured) cells
+            naturally accumulate more |SHAP| under simple averaging; density
+            normalization divides by the fraction of measured cells so the bar
+            chart and heatmap reflect per-measurement importance.
+    """
 
     ts_shap = shap_results['ts_shap']
     if ts_shap.ndim == 4:
@@ -2314,7 +2597,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # and showing them extends the x-axis with meaningless zeros.
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[..., :n_steps]
 
@@ -2356,6 +2639,19 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     else:
         valid_time = None  # fallback: treat all positions as valid
 
+    # Build measurement-density mask from input data (non-zero = measured)
+    # Used when density_normalize=True to avoid rewarding channels that are
+    # simply measured more often.
+    _measured_mask = None  # [n_samples, n_channels, n_steps] bool
+    if density_normalize:
+        test_ts = shap_results.get('test_data', {}).get('ts')
+        if test_ts is not None:
+            _measured_mask = test_ts[:n_samples, :, :n_steps] != 0.0
+            logger.info("Density normalization enabled for SHAP summary")
+        else:
+            logger.warning("density_normalize=True but test_data['ts'] not available; "
+                           "falling back to standard aggregation")
+
     def _masked_temporal_mean(arr_3d, ch_indices):
         """Mean |SHAP| over samples & channels -> [n_steps], padding-aware."""
         subset = np.abs(arr_3d[:, ch_indices, :])  # [n_samples, n_ch, n_steps]
@@ -2367,8 +2663,22 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         return subset.mean(axis=(0, 1))
 
     def _masked_channel_mean(arr_3d):
-        """Mean |SHAP| over samples & time -> [n_channels], padding-aware."""
+        """Mean |SHAP| over samples & time -> [n_channels], padding-aware.
+
+        When ``_measured_mask`` is set (density_normalize=True), the denominator
+        counts only positions where the channel had an actual measurement
+        (non-zero input), so channels are not rewarded for being measured more
+        frequently.
+        """
         subset = np.abs(arr_3d)  # [n_samples, n_channels, n_steps]
+        if _measured_mask is not None:
+            # Density-normalized: only count measured positions
+            mask = _measured_mask.copy()
+            if valid_time is not None:
+                # Also exclude padding
+                mask = mask & valid_time[:, None, :]
+            denom = mask.sum(axis=(0, 2)).clip(1)  # [n_channels]
+            return (subset * mask).sum(axis=(0, 2)) / denom
         if valid_time is not None:
             mask = valid_time[:, None, :]
             mask = np.broadcast_to(mask, subset.shape)
@@ -2433,8 +2743,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         bar_colors = ['#008bfb'] * len(sorted_idx)
     ax2.barh(range(len(sorted_idx)), ch_imp[sorted_idx], color=bar_colors, alpha=0.7)
     ax2.set_yticks(range(len(sorted_idx))); ax2.set_yticklabels(names, fontsize=10)
-    bar_title = f'Top {len(sorted_idx)} Clinical Channels' if has_ebm else f'Top {len(sorted_idx)} Channels'
-    ax2.set_xlabel('Mean |SHAP|'); ax2.set_title(bar_title, fontweight='bold')
+    _dn_suffix = ' (per-measurement)' if _measured_mask is not None else ''
+    bar_title = f'Top {len(sorted_idx)} Clinical Channels{_dn_suffix}' if has_ebm else f'Top {len(sorted_idx)} Channels{_dn_suffix}'
+    _shap_label = 'Mean |SHAP| / measured cell' if _measured_mask is not None else 'Mean |SHAP|'
+    ax2.set_xlabel(_shap_label); ax2.set_title(bar_title, fontweight='bold')
     ax2.grid(True, alpha=0.3, axis='x'); ax2.invert_yaxis()
     if channel2feature and not has_ebm:
         used_groups = set()
@@ -2500,7 +2812,16 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     
     # Plot 4: Continuous TS heatmap — clinical-only when EBM present
     ax4 = fig.add_subplot(gs[2 + row_offset, :])
-    ts_mean = np.abs(ts_shap).mean(axis=0)
+    if _measured_mask is not None:
+        # Density-normalized heatmap: per-channel, per-timestep mean over
+        # measured positions only.
+        _hm_mask = _measured_mask.copy()
+        if valid_time is not None:
+            _hm_mask = _hm_mask & valid_time[:, None, :]
+        _hm_denom = _hm_mask.sum(axis=0).clip(1)  # [n_channels, n_steps]
+        ts_mean = (np.abs(ts_shap) * _hm_mask).sum(axis=0) / _hm_denom
+    else:
+        ts_mean = np.abs(ts_shap).mean(axis=0)
     if channel2feature and has_ebm:
         ordered_idx, ordered_labels_4 = _get_clinical_only_channel_order(channel2feature)
         ts_mean_display = ts_mean[ordered_idx]
@@ -2515,7 +2836,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         n_display_4 = n_channels
     im = ax4.imshow(ts_mean_display, aspect='auto', cmap='YlOrRd', interpolation='nearest', vmin=0)
     ax4.set_xlabel('Time'); ax4.set_ylabel('Channel')
-    heatmap_title_4 = 'Clinical Continuous TS |SHAP| Heatmap (Mean)' if has_ebm else 'Continuous TS |SHAP| Heatmap (Mean, grouped)'
+    if _measured_mask is not None:
+        heatmap_title_4 = 'Clinical |SHAP| Heatmap (per-measurement)' if has_ebm else '|SHAP| Heatmap (per-measurement, grouped)'
+    else:
+        heatmap_title_4 = 'Clinical Continuous TS |SHAP| Heatmap (Mean)' if has_ebm else 'Continuous TS |SHAP| Heatmap (Mean, grouped)'
     ax4.set_title(heatmap_title_4, fontweight='bold')
     if n_display_4 <= 40:
         ax4.set_yticks(range(n_display_4))
@@ -2574,13 +2898,15 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     if save_path:
         ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        save_base64(fig, save_path, dpi=150)
     plt.show()
 
 
 
 
 def shap_analysis(data=None, model=None, model_name='13012025', compute_per_category_shap=True, max_background_samples=600,
-                  max_test_samples=90, visualize=True, specific_pids: List = None) -> Dict:
+                  max_test_samples=90, visualize=True, specific_pids: List = None,
+                  density_normalize: bool = False) -> Dict:
     """
     Run full SHAP analysis.
 
@@ -2665,6 +2991,7 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
             feature_names_cont=cfg["dataset"]["num_cols"],
             class_idx=1, max_display=20,
             save_path='reports/shap/shap_summary_cohort.png',
+            density_normalize=density_normalize,
         )
 
         # Use first PID for individual plot
@@ -2755,7 +3082,8 @@ class TimeframeSHAPResult:
     cont_data: Optional[np.ndarray]
     ts_channel_importance: np.ndarray
     ts_temporal_importance: np.ndarray
-    
+    n_active_background: Optional[int] = None
+
     @property
     def effective_steps(self) -> int:
         if self.censor_step is None:
@@ -2777,12 +3105,45 @@ class TemporalSHAPResults:
     encoding_info: Dict
     stability_metrics: Optional[Dict] = None
     inhospital_start_step: Optional[int] = None
-    
+    active_only: bool = False
+    density_normalize: bool = False
+
     def get_available_timeframes(self) -> List[str]:
         return list(self.timeframe_results.keys())
-    
+
     def get_result(self, timeframe: str) -> Optional[TimeframeSHAPResult]:
         return self.timeframe_results.get(timeframe)
+
+
+@dataclass
+class CohortTemporalSHAPResults:
+    """Aggregated temporal SHAP results across a cohort of patients."""
+    n_patients: int
+    pids: List
+    # Per-timeframe aggregated arrays
+    channel_importance: Dict[str, np.ndarray]       # tf -> [n_channels]
+    channel_importance_std: Dict[str, np.ndarray]   # tf -> [n_channels]
+    temporal_importance: Dict[str, np.ndarray]       # tf -> [seq_len]
+    temporal_importance_std: Dict[str, np.ndarray]   # tf -> [seq_len]
+    ts_shap_mean: Dict[str, np.ndarray]             # tf -> [n_channels, seq_len]
+    static_cat_importance: Dict[str, Optional[np.ndarray]]
+    static_cont_importance: Dict[str, Optional[np.ndarray]]
+    patient_counts: Dict[str, int]                  # tf -> n patients with this tf
+    # Metadata
+    channel2feature: Dict[int, str]
+    static_cat_names: List[str]
+    static_cont_names: List[str]
+    encoding_info: Dict
+    active_only: bool = False
+    density_normalize: bool = False
+    # Categorical TS per-category importance (optional)
+    cat_ts_per_category_importance: Dict[str, Optional[np.ndarray]] = field(default_factory=dict)  # tf -> [n_categories]
+    cat_ts_category_names: List[str] = field(default_factory=list)
+    # Individual patient results (optional, for deep-dive)
+    patient_results: Optional[List[TemporalSHAPResults]] = None
+
+    def get_available_timeframes(self) -> List[str]:
+        return list(self.channel_importance.keys())
 
 
 # ============================================================================
@@ -2791,18 +3152,7 @@ class TemporalSHAPResults:
 
 # NOTE: ModelWrapperWithRawCatTS is defined above (used by both
 # calculate_shap_from_dataloaders and TemporalSHAPAnalyzer).
-
-
-def embed_categorical_features(model, x_cat):
-    """Pre-embed static categorical features."""
-    if x_cat is None or x_cat.shape[1] == 0:
-        return None
-    with torch.no_grad():
-        x_cat_emb = [model.embeds[i](x_cat[:, i]).unsqueeze(1) for i in range(x_cat.shape[1])]
-        x_cat_emb = torch.cat(x_cat_emb, 1)
-    x_cat_emb.requires_grad = True
-    return x_cat_emb
-
+# NOTE: embed_categorical_features is defined above (converts to one-hot for SHAP).
 
 # ============================================================================
 # MAIN ANALYZER
@@ -2812,25 +3162,33 @@ class TemporalSHAPAnalyzer:
     """Analyzes SHAP values across timeframes using Option A (re-compute per timeframe)."""
     
     def __init__(self, model: nn.Module, data: Dict, background_loader,
-                 device: str = 'cuda', max_background_samples: int = 200, class_idx: int = 1):
+                 device: str = 'cuda', max_background_samples: int = 200,
+                 class_idx: int = 1, active_only: bool = False,
+                 density_normalize: bool = False):
         self.model = model
         self.data = data
         self.background_loader = background_loader
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.max_background_samples = max_background_samples
         self.class_idx = class_idx
-        
+        self.active_only = active_only
+        self.density_normalize = density_normalize
+
         self.encoding_info = data.get("encoding_info", {})
         self.channel2feature, self.feature2channel = self._create_channel_mapping()
         self.static_cat_names = list(data.get("classes", {}).keys())
         self.static_cont_names = data.get("num_cols", [])
-        
+
         self._bg_data = None
         self.model.eval()
         self.model = self.model.to(device)
         self.has_cat_ts = model.n_ts_cat > 0
-        
-        print(f"TemporalSHAPAnalyzer: {len(self.channel2feature)} channels, "
+
+        mode_parts = []
+        if active_only: mode_parts.append("active-only")
+        if density_normalize: mode_parts.append("density-norm")
+        mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
+        print(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
               f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
     
     def _create_channel_mapping(self):
@@ -2869,7 +3227,26 @@ class TemporalSHAPAnalyzer:
             'traj_lengths': torch.cat(all_traj)[:self.max_background_samples].to(self.device)
         }
         return self._bg_data
-    
+
+    def _get_active_background(self, censor_step):
+        """Filter background to patients with trajectory_length > censor_step.
+
+        Returns (filtered_bg_dict, n_active).  When active_only is False or
+        censor_step is None, returns the full background unchanged.
+        """
+        bg = self._extract_background_data()
+        if not self.active_only or censor_step is None:
+            return bg, bg['ts'].shape[0]
+
+        mask = bg['traj_lengths'] > censor_step
+        n_active = int(mask.sum())
+        if n_active < 2:
+            # Fall back to full background to avoid degenerate SHAP
+            print(f"  WARNING: only {n_active} active bg samples at step {censor_step}, using all")
+            return bg, bg['ts'].shape[0]
+
+        return {k: v[mask] for k, v in bg.items()}, n_active
+
     def _censor_data(self, ts, ts_cat, censor_step):
         if censor_step is None:
             return ts, ts_cat
@@ -2881,7 +3258,7 @@ class TemporalSHAPAnalyzer:
     
     def _compute_shap_for_sample(self, sample_ts, sample_ts_cat, sample_cat, sample_cont,
                                 censor_step=None, traj_length=None):
-        bg = self._extract_background_data()
+        bg, n_active = self._get_active_background(censor_step)
         bg_ts_c, bg_ts_cat_c = self._censor_data(bg['ts'], bg['ts_cat'], censor_step)
 
         if sample_ts.dim() == 2:
@@ -2892,8 +3269,9 @@ class TemporalSHAPAnalyzer:
 
         sample_ts_c, sample_ts_cat_c = self._censor_data(sample_ts, sample_ts_cat, censor_step)
 
-        bg_cat_emb = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
-        sample_cat_emb = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
+        # Convert static categorical to one-hot encoding for SHAP
+        bg_cat_onehot = embed_categorical_features(self.model, bg['cat']) if bg['cat'].shape[1] > 0 else None
+        sample_cat_onehot = embed_categorical_features(self.model, sample_cat) if sample_cat.shape[1] > 0 else None
 
         # Build traj_lengths tensor for wrapper (single sample -> [1])
         # Clamp to censor_step+1 so the padding mask excludes censored positions
@@ -2907,25 +3285,55 @@ class TemporalSHAPAnalyzer:
         else:
             wrapper_traj = None
 
-        eval_ts = censor_step if censor_step is not None else -1
-        wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
-                                           traj_lengths=wrapper_traj)
+        if censor_step is not None:
+            eval_ts = censor_step
+        elif self.model.temporal_head_enabled:
+            # No censoring (full timeframe): use mean across valid timesteps
+            # to distribute SHAP gradients evenly instead of only explaining
+            # the last position (where gradients decay through causal chain)
+            eval_ts = 'mean'
+        else:
+            eval_ts = -1
 
-        bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
-        sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
-
-        if bg_cat_emb is not None:
-            bg_inputs.append(bg_cat_emb)
-            sample_inputs.append(sample_cat_emb)
+        # Choose wrapper based on whether we have static categorical features.
+        # ModelWrapperWithOneHotCategoricals expects PRE-EMBEDDED temporal cats,
+        # so when static cats exist we must embed temporal cats first.
+        if bg_cat_onehot is not None:
+            wrapped = ModelWrapperWithOneHotCategoricals(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                                         traj_lengths=wrapper_traj,
+                                                         x_cat_onehot_ref=bg_cat_onehot)
+            # Pre-embed temporal cats for this wrapper
+            bg_ts_cat_emb = embed_categorical_ts(self.model, bg_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
+            sample_ts_cat_emb = embed_categorical_ts(self.model, sample_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
+            if bg_ts_cat_emb is not None:
+                bg_inputs = [bg_ts_c, bg_ts_cat_emb]
+                sample_inputs = [sample_ts_c, sample_ts_cat_emb]
+            else:
+                bg_inputs = [bg_ts_c]
+                sample_inputs = [sample_ts_c]
+            bg_inputs.append(bg_cat_onehot)
+            sample_inputs.append(sample_cat_onehot)
+        else:
+            # No static cats: use raw wrapper for per-category temporal SHAP
+            wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
+                                               traj_lengths=wrapper_traj)
+            bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
+            sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
         if bg['cont'].shape[1] > 0:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
 
+        shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
+        shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
         explainer = shap.GradientExplainer(wrapped, bg_inputs)
-        shap_values = explainer.shap_values(sample_inputs)
+        _seed_shap(shap_seed)
+        shap_values = explainer.shap_values(sample_inputs, nsamples=shap_nsamples)
 
+        # For multi-output models (e.g. 2-class): select class 1 (mortality)
         if isinstance(shap_values, list) and shap_values and isinstance(shap_values[0], list):
-            shap_values = shap_values[0]
+            n_classes = len(shap_values)
+            selected_class = min(1, n_classes - 1)  # class 1 if available
+            shap_values = shap_values[selected_class]
 
         idx = 0
         ts_shap = shap_values[idx][0]
@@ -2937,8 +3345,10 @@ class TemporalSHAPAnalyzer:
             cat_ts_shap = np.abs(cat_ts_shap_per_cat).mean(axis=0)
             idx += 1
 
-        cat_shap = shap_values[idx][0].mean(axis=1) if bg_cat_emb is not None else None
-        if bg_cat_emb is not None:
+        # Static categorical SHAP: one-hot encoding -> [n_cat, max_classes]
+        # Aggregate over class dimension (sum absolute values per feature)
+        cat_shap = np.abs(shap_values[idx][0]).sum(axis=1) if bg_cat_onehot is not None else None
+        if bg_cat_onehot is not None:
             idx += 1
 
         cont_shap = shap_values[idx][0] if bg['cont'].shape[1] > 0 else None
@@ -2956,7 +3366,8 @@ class TemporalSHAPAnalyzer:
 
         return {'ts_shap': ts_shap, 'cat_ts_shap': cat_ts_shap,
                 'cat_ts_shap_per_category': cat_ts_shap_per_cat,
-                'cat_shap': cat_shap, 'cont_shap': cont_shap}
+                'cat_shap': cat_shap, 'cont_shap': cont_shap,
+                'n_active_background': n_active}
     
     def get_holdout_pids(self, max_samples=None):
         pids = self.data["holdout"].tab_df['PID'].tolist()
@@ -3031,11 +3442,13 @@ class TemporalSHAPAnalyzer:
         
         # If we skipped some timeframes, add 'max' which uses actual data length
         # This replaces 'full' behavior with a named timeframe showing actual hours
+        # Use a local copy to avoid mutating the global DEFAULT_TIMEFRAMES
+        local_timeframes = OrderedDict(DEFAULT_TIMEFRAMES)
         if skipped_any and 'full' in valid_tfs:
             # Replace 'full' with 'max' to make it clearer this is the max available
-            valid_tfs = [tf if tf != 'full' else f'max({actual_hours:.1f}h)' for tf in valid_tfs]
-            # Add max to DEFAULT_TIMEFRAMES temporarily for this analysis
-            DEFAULT_TIMEFRAMES[f'max({actual_hours:.1f}h)'] = None  # None means full/no censoring
+            max_label = f'max({actual_hours:.1f}h)'
+            valid_tfs = [tf if tf != 'full' else max_label for tf in valid_tfs]
+            local_timeframes[max_label] = None  # None means full/no censoring
         
         if verbose: print(f"Analyzing: {valid_tfs}")
         
@@ -3043,7 +3456,7 @@ class TemporalSHAPAnalyzer:
         t0 = time.time()
         
         for i, tf in enumerate(valid_tfs):
-            tf_h = DEFAULT_TIMEFRAMES.get(tf)
+            tf_h = local_timeframes.get(tf)
             censor = None if tf_h is None else time_to_step(tf_h, 'h')
             if verbose: print(f"  [{i+1}/{len(valid_tfs)}] {tf}...", end=" ", flush=True)
             
@@ -3051,19 +3464,45 @@ class TemporalSHAPAnalyzer:
             shap_res = self._compute_shap_for_sample(
                 sample_ts, sample_ts_cat, sample_cat, sample_cont, censor,
                 traj_length=traj_length)
-            if verbose: print(f"done ({time.time()-t1:.1f}s)")
+            n_active_bg = shap_res['n_active_background']
+            if verbose:
+                active_str = f", bg={n_active_bg}" if self.active_only else ""
+                print(f"done ({time.time()-t1:.1f}s{active_str})")
 
             ts_shap = shap_res['ts_shap']
             if ts_shap.ndim == 3:
                 ts_shap = ts_shap[..., min(self.class_idx, ts_shap.shape[-1] - 1)]
 
-            # Compute importance with padding-aware averaging
-            tl = actual_steps  # already set from traj_length
-            ts_channel_importance = np.abs(ts_shap).mean(axis=1)  # [seq_len] — zeros beyond tl
-            ts_temporal_importance = (
-                np.abs(ts_shap[:, :tl]).mean(axis=1) if tl > 0
-                else np.zeros(ts_shap.shape[0])
-            )
+            # Compute importance using effective steps (respects both trajectory
+            # length AND censoring boundary — avoids dilution from zeroed positions)
+            eff = min(actual_steps, (censor + 1) if censor is not None else actual_steps)
+            if eff > 0 and self.density_normalize:
+                # Density-normalized: mean |SHAP| over measured cells only
+                shap_eff = np.abs(ts_shap[:, :eff])  # [n_channels, eff_steps]
+                measured = ts_np[:, :eff] != 0.0       # [n_channels, eff_steps]
+                denom = measured.sum(axis=1).clip(1)   # [n_channels]
+                ts_channel_importance = (shap_eff * measured).sum(axis=1) / denom
+                # Debug: log a sample of denominator values for verification
+                if verbose:
+                    logger.debug(f"    Density-normalized denominators (sample): {denom[:5]}")
+            elif eff > 0:
+                ts_channel_importance = np.abs(ts_shap[:, :eff]).mean(axis=1)
+            else:
+                ts_channel_importance = np.zeros(ts_shap.shape[0])
+            # Temporal importance: mean |SHAP| across channels at each timestep
+            full_steps = ts_shap.shape[1]
+            if eff > 0 and self.density_normalize:
+                # Density-normalized: per-timestep mean over measured channels only
+                shap_eff = np.abs(ts_shap[:, :eff])      # [n_channels, eff]
+                measured = ts_np[:, :eff] != 0.0           # [n_channels, eff]
+                denom_t = measured.sum(axis=0).clip(1)     # [eff]
+                ts_temporal_importance = np.zeros(full_steps)
+                ts_temporal_importance[:eff] = (shap_eff * measured).sum(axis=0) / denom_t
+            elif eff > 0:
+                ts_temporal_importance = np.zeros(full_steps)
+                ts_temporal_importance[:eff] = np.abs(ts_shap[:, :eff]).mean(axis=0)
+            else:
+                ts_temporal_importance = np.zeros(full_steps)
 
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
@@ -3074,7 +3513,8 @@ class TemporalSHAPAnalyzer:
                 ts_data=ts_np, cat_ts_data=sample_ts_cat.cpu().numpy(),
                 cat_data=sample_cat.cpu().numpy(), cont_data=sample_cont.cpu().numpy(),
                 ts_channel_importance=ts_channel_importance,
-                ts_temporal_importance=ts_temporal_importance
+                ts_temporal_importance=ts_temporal_importance,
+                n_active_background=n_active_bg,
             )
         
         if verbose: print(f"Total: {time.time()-t0:.1f}s")
@@ -3084,7 +3524,9 @@ class TemporalSHAPAnalyzer:
             actual_data_length_steps=actual_steps, actual_data_length_hours=actual_hours,
             timeframe_results=results, channel2feature=self.channel2feature,
             static_cat_names=self.static_cat_names, static_cont_names=self.static_cont_names,
-            encoding_info=self.encoding_info, inhospital_start_step=ihs_step
+            encoding_info=self.encoding_info, inhospital_start_step=ihs_step,
+            active_only=self.active_only,
+            density_normalize=self.density_normalize,
         )
         out.stability_metrics = self._compute_stability_metrics(out)
         return out
@@ -3389,9 +3831,7 @@ class TemporalSHAPAnalyzer:
         gs = fig.add_gridspec(4, n_tf, hspace=0.35, wspace=0.25, height_ratios=[1, 1.2, 1.5, 1])
         
         seq_len = results.timeframe_results[tfs[0]].ts_shap.shape[1]
-        tick_idx = np.linspace(0, seq_len-1, min(8, seq_len), dtype=int)
-        tick_labels = [time_to_hours_str(step_to_time(i)) for i in tick_idx]
-        
+
         all_temp = [results.timeframe_results[t].ts_temporal_importance for t in tfs]
         all_chan = [results.timeframe_results[t].ts_channel_importance for t in tfs]
         temp_max = max(np.max(x) for x in all_temp)
@@ -3427,16 +3867,28 @@ class TemporalSHAPAnalyzer:
                 if tf_budget is not None:
                     ebm_annotation = f"  [EBM: {tf_budget['ebm_pct']:.0f}%]"
 
+            # Active background count annotation
+            active_annotation = ''
+            if results.active_only and r.n_active_background is not None:
+                active_annotation = f"\nn_bg={r.n_active_background}"
+
+            # Per-column display range: zoom to effective timeframe
+            eff = r.effective_steps
+            margin = max(3, int(eff * 0.08))
+            display_limit = min(eff + margin, seq_len)
+            col_ticks = np.linspace(0, display_limit - 1, min(8, display_limit), dtype=int)
+            col_tick_labels = [time_to_hours_str(step_to_time(i)) for i in col_ticks]
+
             # Row 1: Temporal importance
             ax1 = fig.add_subplot(gs[0, col])
             ax1.plot(r.ts_temporal_importance, lw=2, color='#ff0051')
             ax1.fill_between(range(len(r.ts_temporal_importance)), r.ts_temporal_importance, alpha=0.3, color='#ff0051')
             if r.censor_step: ax1.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax1.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5, alpha=0.7)
-            _draw_inhospital_boundary(ax1, results.inhospital_start_step, seq_len, label=(col == 0))
-            ax1.set_xlim(0, seq_len); ax1.set_ylim(0, temp_max*1.1)
-            ax1.set_xticks(tick_idx); ax1.set_xticklabels(tick_labels, rotation=45, fontsize=8)
-            ax1.set_title(f'{tf} {suffix}{ebm_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
+            _draw_inhospital_boundary(ax1, results.inhospital_start_step, display_limit, label=(col == 0))
+            ax1.set_xlim(0, display_limit); ax1.set_ylim(0, temp_max*1.1)
+            ax1.set_xticks(col_ticks); ax1.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
+            ax1.set_title(f'{tf} {suffix}{ebm_annotation}{active_annotation}', fontweight='bold'); ax1.grid(True, alpha=0.3)
 
             # Row 2: Channel bars (clinical-only when EBM present)
             ax2 = fig.add_subplot(gs[1, col])
@@ -3444,7 +3896,7 @@ class TemporalSHAPAnalyzer:
             ax2.barh(range(len(top_idx)), r.ts_channel_importance[top_idx], color=plt.cm.Blues(np.linspace(0.4,0.9,len(top_idx))))
             ax2.set_yticks(range(len(top_idx))); ax2.set_yticklabels(names, fontsize=9)
             ax2.set_xlim(0, chan_max*1.1); ax2.invert_yaxis(); ax2.grid(True, alpha=0.3, axis='x')
-            
+
             # Row 3: Heatmap
             ax3 = fig.add_subplot(gs[2, col])
             ts_top = r.ts_shap[top_idx]
@@ -3456,9 +3908,10 @@ class TemporalSHAPAnalyzer:
                            norm=TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax))
             if r.censor_step: ax3.axvline(r.censor_step, color='black', ls='--', lw=2)
             ax3.axvline(results.actual_data_length_steps, color='gray', ls=':', lw=1.5)
-            _draw_inhospital_boundary(ax3, results.inhospital_start_step, seq_len, label=False)
+            _draw_inhospital_boundary(ax3, results.inhospital_start_step, display_limit, label=False)
+            ax3.set_xlim(-0.5, display_limit - 0.5)
             ax3.set_yticks(range(len(top_idx))); ax3.set_yticklabels(names, fontsize=8)
-            ax3.set_xticks(tick_idx); ax3.set_xticklabels(tick_labels, rotation=45, fontsize=8)
+            ax3.set_xticks(col_ticks); ax3.set_xticklabels(col_tick_labels, rotation=45, fontsize=8)
             plt.colorbar(im, ax=ax3, shrink=0.8)
             
             # Row 4: Static features
@@ -3484,12 +3937,14 @@ class TemporalSHAPAnalyzer:
             else:
                 ax4.text(0.5, 0.5, 'No static features', ha='center', va='center', transform=ax4.transAxes)
         
-        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data)',
+        active_label = " [active-only]" if results.active_only else ""
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data){active_label}{dn_label}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
         return fig
-    
+
     def plot_stability_heatmap(self, results: TemporalSHAPResults, figsize=(24, 20), save_path=None):
         """
         Comprehensive heatmaps of stability metrics for ALL feature types.
@@ -3643,7 +4098,8 @@ class TemporalSHAPAnalyzer:
             axes[row_idx, 2].set_title('Stability Summary', fontweight='bold')
             axes[row_idx, 2].axis('off')
         
-        fig.suptitle(f'Comprehensive SHAP Stability Analysis - PID: {results.pid}\n'
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(f'Comprehensive SHAP Stability Analysis - PID: {results.pid}{active_label}\n'
                     f'Data: {results.actual_data_length_hours:.1f}h | Timeframes: {", ".join(tfs)}',
                     fontsize=14, fontweight='bold', y=1.02)
         
@@ -3832,7 +4288,7 @@ class TemporalSHAPAnalyzer:
                 return names, np.array(values)
             
             ref_static_names, ref_static_imp = get_static_importance(ref_result)
-            
+                
             if len(ref_static_imp) > 1:
                 top_static_idx = np.argsort(ref_static_imp)[-min(max_features, len(ref_static_imp)):]
                 
@@ -3865,7 +4321,8 @@ class TemporalSHAPAnalyzer:
                     ax.legend(fontsize=8)
                     ax.grid(True, alpha=0.3)
         
-        fig.suptitle(f'Feature Importance Correlation Analysis - PID: {results.pid}\n'
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(f'Feature Importance Correlation Analysis - PID: {results.pid}{active_label}\n'
                     f'Reference: {reference}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
@@ -3908,7 +4365,9 @@ class TemporalSHAPAnalyzer:
         
         ax.set_xticks(range(len(tfs))); ax.set_xticklabels(tfs, rotation=45)
         ax.set_xlabel('Timeframe'); ax.set_ylabel('Mean |SHAP|')
-        ax.set_title(f'Feature Trajectory - PID: {results.pid}', fontweight='bold')
+        active_label = " [active-only]" if results.active_only else ""
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        ax.set_title(f'Feature Trajectory - PID: {results.pid}{active_label}{dn_label}', fontweight='bold')
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -3943,6 +4402,7 @@ class TemporalSHAPAnalyzer:
                 'hours': r.timeframe_hours,
                 'censor_step': r.censor_step,
                 'effective_steps': r.effective_steps,
+                'n_active_bg': r.n_active_background,
 
                 # EBM vs Clinical budget
                 'ebm_pct': tf_budget['ebm_pct'] if tf_budget else np.nan,
@@ -4015,7 +4475,445 @@ class TemporalSHAPAnalyzer:
                 record['static_cont_corr_with_ref'] = np.nan
             
             records.append(record)
-        
+
+        return pd.DataFrame(records)
+
+    # ====================================================================
+    # COHORT-LEVEL ANALYSIS
+    # ====================================================================
+
+    def analyze_cohort(self, test_loader, holdout_pids, max_patients=20,
+                       timeframes=None, verbose=True) -> CohortTemporalSHAPResults:
+        """Run temporal SHAP analysis for multiple patients and aggregate.
+
+        ``max_patients`` is the target count **per timeframe**, not a global
+        cap.  Patients with short trajectories only contribute to early
+        timeframes, so we keep analyzing until every timeframe has reached
+        the target (or we run out of holdout patients).
+
+        Trajectory lengths are read upfront from the dataset to decide
+        which timeframes each patient can contribute to, skipping patients
+        and timeframes that are already saturated — avoiding unnecessary
+        SHAP computation.
+
+        Args:
+            test_loader: DataLoader for holdout set
+            holdout_pids: List of all holdout PIDs (in dataloader order)
+            max_patients: Target number of patients per timeframe
+            timeframes: List of timeframe names (default: all standard)
+            verbose: Print progress
+
+        Returns:
+            CohortTemporalSHAPResults with per-timeframe aggregated SHAP
+        """
+        timeframes = timeframes or list(DEFAULT_TIMEFRAMES.keys())
+
+        # Pre-read trajectory lengths from dataset (cheap — no SHAP yet)
+        holdout_ds = self.data["holdout_mixed_dls"]._train_ds
+        if hasattr(holdout_ds, 'dataset'):
+            holdout_ds = holdout_ds.dataset  # unwrap Subset
+        all_traj = holdout_ds.traj_lengths.numpy()  # [n_holdout]
+
+        # Track per-timeframe saturation
+        tf_counts = {tf: 0 for tf in timeframes}
+        patient_results = []
+
+        for i, pid in enumerate(holdout_pids):
+            if all(c >= max_patients for c in tf_counts.values()):
+                break
+
+            # Determine which timeframes this patient can contribute to
+            # and that still need more patients
+            traj_steps = int(all_traj[i])
+            traj_hours = (step_to_time(traj_steps - 1) or 0) / 60 if traj_steps > 0 else 0
+            needed_tfs = []
+            for tf in timeframes:
+                if tf_counts[tf] >= max_patients:
+                    continue
+                tf_h = DEFAULT_TIMEFRAMES.get(tf)
+                if tf_h is None or tf_h <= traj_hours:
+                    needed_tfs.append(tf)
+
+            if not needed_tfs:
+                continue  # this patient can't help any unsaturated timeframe
+
+            if verbose:
+                logger.info(f"\n[Patient {len(patient_results)+1}, PID {pid}] "
+                            f"traj={traj_hours:.1f}h, computing {len(needed_tfs)} timeframes")
+            try:
+                result = self.analyze_patient(
+                    test_loader, pid=pid, holdout_pids=holdout_pids,
+                    timeframes=needed_tfs, verbose=verbose
+                )
+                patient_results.append(result)
+                for tf in result.timeframe_results:
+                    norm_tf = 'full' if tf.startswith('max(') else tf
+                    if norm_tf in tf_counts:
+                        tf_counts[norm_tf] += 1
+            except Exception as e:
+                logger.warning(f"  FAILED for PID {pid}: {e}")
+
+        if not patient_results:
+            raise RuntimeError("No patients were successfully analyzed")
+
+        if verbose:
+            logger.info(f"\nAnalyzed {len(patient_results)} patients. "
+                        f"Per-timeframe counts: {tf_counts}")
+
+        return self._aggregate_patient_results(patient_results)
+
+    def _aggregate_patient_results(self, patient_results: List[TemporalSHAPResults]
+                                    ) -> CohortTemporalSHAPResults:
+        """Aggregate per-patient temporal SHAP into cohort-level results."""
+
+        def _normalize_tf(tf):
+            """Map patient-specific 'max(...)' back to 'full' for aggregation."""
+            return 'full' if tf.startswith('max(') else tf
+
+        # Collect per-timeframe results across patients
+        tf_collections = OrderedDict()  # normalized_tf -> list of TimeframeSHAPResult
+        for pr in patient_results:
+            for tf, tfr in pr.timeframe_results.items():
+                norm_tf = _normalize_tf(tf)
+                tf_collections.setdefault(norm_tf, []).append(tfr)
+
+        # Order timeframes by DEFAULT_TIMEFRAMES order
+        ordered_tfs = [tf for tf in DEFAULT_TIMEFRAMES if tf in tf_collections]
+        # Add any extra timeframes not in defaults
+        for tf in tf_collections:
+            if tf not in ordered_tfs:
+                ordered_tfs.append(tf)
+
+        channel_importance = OrderedDict()
+        channel_importance_std = OrderedDict()
+        temporal_importance = OrderedDict()
+        temporal_importance_std = OrderedDict()
+        ts_shap_mean = OrderedDict()
+        static_cat_importance = OrderedDict()
+        static_cont_importance = OrderedDict()
+        patient_counts = OrderedDict()
+
+        for tf in ordered_tfs:
+            tf_results = tf_collections[tf]
+            patient_counts[tf] = len(tf_results)
+
+            # Channel importance: [n_patients, n_channels] -> mean/std
+            ch_imp = np.stack([r.ts_channel_importance for r in tf_results])
+            channel_importance[tf] = ch_imp.mean(axis=0)
+            channel_importance_std[tf] = ch_imp.std(axis=0)
+
+            # Temporal importance: [n_patients, seq_len] -> mean/std
+            temp_imp = np.stack([r.ts_temporal_importance for r in tf_results])
+            temporal_importance[tf] = temp_imp.mean(axis=0)
+            temporal_importance_std[tf] = temp_imp.std(axis=0)
+
+            # SHAP heatmap: [n_patients, n_channels, seq_len] -> mean |SHAP|
+            ts_shap_mean[tf] = np.mean(
+                [np.abs(r.ts_shap) for r in tf_results], axis=0)
+
+            # Static features (squeeze trailing singleton class dim if present)
+            cat_shaps = [np.abs(r.cat_shap).squeeze() for r in tf_results
+                         if r.cat_shap is not None]
+            cont_shaps = [np.abs(r.cont_shap).squeeze() for r in tf_results
+                          if r.cont_shap is not None]
+            static_cat_importance[tf] = (
+                np.mean(cat_shaps, axis=0) if cat_shaps else None)
+            static_cont_importance[tf] = (
+                np.mean(cont_shaps, axis=0) if cont_shaps else None)
+
+        # Categorical TS per-category importance
+        cat_ts_per_category_importance = OrderedDict()
+        cat_ts_category_names = get_category_names_from_encoding_info(self.encoding_info) if self.encoding_info else []
+        for tf in ordered_tfs:
+            tf_results = tf_collections[tf]
+            cat_ts_arrays = []
+            for r in tf_results:
+                if r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
+                    arr = r.cat_ts_shap_per_category
+                    if arr.ndim == 2:
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))  # [n_cats, seq_len] -> [n_cats]
+                    elif arr.ndim == 1:
+                        cat_ts_arrays.append(np.abs(arr))
+                    elif arr.ndim == 3:
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=(1, 2)))
+            cat_ts_per_category_importance[tf] = (
+                np.mean(cat_ts_arrays, axis=0) if cat_ts_arrays else None)
+
+        return CohortTemporalSHAPResults(
+            n_patients=len(patient_results),
+            pids=[pr.pid for pr in patient_results],
+            channel_importance=channel_importance,
+            channel_importance_std=channel_importance_std,
+            temporal_importance=temporal_importance,
+            temporal_importance_std=temporal_importance_std,
+            ts_shap_mean=ts_shap_mean,
+            static_cat_importance=static_cat_importance,
+            static_cont_importance=static_cont_importance,
+            patient_counts=patient_counts,
+            channel2feature=self.channel2feature,
+            static_cat_names=self.static_cat_names,
+            static_cont_names=self.static_cont_names,
+            encoding_info=self.encoding_info,
+            active_only=self.active_only,
+            density_normalize=self.density_normalize,
+            cat_ts_per_category_importance=cat_ts_per_category_importance,
+            cat_ts_category_names=cat_ts_category_names,
+            patient_results=patient_results,
+        )
+
+    def plot_cohort_temporal_comparison(self, results: CohortTemporalSHAPResults,
+                                        max_channels=15, figsize=(18, 10),
+                                        save_path=None):
+        """Cohort-averaged temporal SHAP comparison across timeframes.
+
+        2-panel layout:
+          A (left):  Channel × Timeframe importance heatmap (excludes 'full')
+          B (right): Static Feature × Timeframe importance heatmap
+        """
+        tfs = [tf for tf in results.get_available_timeframes() if tf != 'full']
+        if not tfs:
+            tfs = results.get_available_timeframes()
+        n_tf = len(tfs)
+
+        # ── Top channels by mean importance across timeframes ──
+        has_ebm = _has_ebm_channels(results.channel2feature)
+        all_chan = [results.channel_importance[t] for t in tfs]
+        if has_ebm:
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(all_chan[0]))
+            clinical_chan = [ch[clinical_mask] for ch in all_chan]
+            top_clinical = np.argsort(
+                np.mean(clinical_chan, axis=0))[-max_channels:][::-1]
+            top_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            top_idx = np.argsort(
+                np.mean(all_chan, axis=0))[-max_channels:][::-1]
+
+        ch_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                    for i in top_idx]
+
+        _dn = results.density_normalize
+        _shap_label = 'Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|'
+
+        # ── Figure layout ──
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(1, 2, width_ratios=[3, 1], wspace=0.3)
+
+        # ── Panel A: Channel × Timeframe importance heatmap ──
+        ax_a = fig.add_subplot(gs[0, 0])
+        chan_matrix = np.column_stack(
+            [results.channel_importance[tf][top_idx] for tf in tfs])  # [n_ch, n_tf]
+        vmax_a = max(np.abs(chan_matrix).max(), 1e-10)
+        im_a = ax_a.imshow(chan_matrix, aspect='auto', cmap='YlOrRd',
+                           interpolation='nearest', vmin=0, vmax=vmax_a)
+        ax_a.set_yticks(range(len(top_idx)))
+        ax_a.set_yticklabels(ch_names, fontsize=10)
+        tf_labels = [f'{tf}\nn={results.patient_counts[tf]}' for tf in tfs]
+        ax_a.set_xticks(range(n_tf))
+        ax_a.set_xticklabels(tf_labels, fontsize=9, ha='center')
+        ax_a.set_xlabel('Timeframe', fontsize=10)
+        ax_a.set_title('Channel Importance Across Timeframes', fontsize=12,
+                       fontweight='bold')
+        plt.colorbar(im_a, ax=ax_a, shrink=0.8, label=_shap_label)
+        # Annotate cells with values when few enough to read
+        if max_channels <= 20:
+            for r in range(chan_matrix.shape[0]):
+                for c in range(chan_matrix.shape[1]):
+                    v = chan_matrix[r, c]
+                    color = 'white' if v > vmax_a * 0.6 else 'black'
+                    ax_a.text(c, r, f'{v:.4f}', ha='center', va='center',
+                              fontsize=7, color=color)
+
+        # ── Panel B: Static Feature × Timeframe heatmap ──
+        ax_b = fig.add_subplot(gs[0, 1])
+        static_names_all, static_matrix = [], []
+        for tf in tfs:
+            col_vals = []
+            if tf == tfs[0]:  # build names once
+                if results.static_cat_importance[tf] is not None:
+                    for i, nm in enumerate(
+                            results.static_cat_names[:len(results.static_cat_importance[tf])]):
+                        static_names_all.append(nm)
+                if results.static_cont_importance[tf] is not None:
+                    for i, nm in enumerate(
+                            results.static_cont_names[:len(results.static_cont_importance[tf])]):
+                        static_names_all.append(nm)
+            # Collect values for this timeframe
+            if results.static_cat_importance[tf] is not None:
+                for i in range(len(results.static_cat_importance[tf])):
+                    val = results.static_cat_importance[tf][i]
+                    col_vals.append(float(val) if np.isscalar(val)
+                                   or getattr(val, 'ndim', 1) == 0
+                                   else float(val.mean()))
+            if results.static_cont_importance[tf] is not None:
+                for i in range(len(results.static_cont_importance[tf])):
+                    val = results.static_cont_importance[tf][i]
+                    col_vals.append(float(val) if np.isscalar(val)
+                                   or getattr(val, 'ndim', 1) == 0
+                                   else float(val.mean()))
+            static_matrix.append(col_vals)
+
+        if static_names_all and static_matrix and len(static_matrix[0]) > 0:
+            static_matrix = np.array(static_matrix).T  # [n_features, n_tf]
+            # Sort by mean importance, take top 15
+            mean_imp = static_matrix.mean(axis=1)
+            sorted_s = np.argsort(mean_imp)[::-1][:15]
+            static_matrix = static_matrix[sorted_s]
+            static_names_sorted = [static_names_all[i] for i in sorted_s]
+
+            vmax_b = max(np.abs(static_matrix).max(), 1e-10)
+            im_b = ax_b.imshow(static_matrix, aspect='auto', cmap='YlOrRd',
+                               interpolation='nearest', vmin=0, vmax=vmax_b)
+            ax_b.set_yticks(range(len(static_names_sorted)))
+            ax_b.set_yticklabels(static_names_sorted, fontsize=9)
+            ax_b.set_xticks(range(n_tf))
+            ax_b.set_xticklabels(tfs, fontsize=8, rotation=45, ha='right')
+            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+            plt.colorbar(im_b, ax=ax_b, shrink=0.8, label=_shap_label)
+        else:
+            ax_b.text(0.5, 0.5, 'No static features', ha='center',
+                      va='center', transform=ax_b.transAxes, fontsize=12)
+            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+
+        # ── Suptitle & save ──
+        dn_label = " [density-norm]" if results.density_normalize else ""
+        active_label = " [active-only]" if results.active_only else ""
+        fig.suptitle(
+            f'Cohort Temporal SHAP (n={results.n_patients}){active_label}{dn_label}',
+            fontsize=14, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        if save_path:
+            ensure_parent_dir(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            save_base64(fig, save_path, dpi=150)
+            logger.info(f"Saved: {save_path}")
+        return fig
+
+    def plot_cohort_feature_trajectory(self, results: CohortTemporalSHAPResults,
+                                        top_k=10, figsize=(14, 8),
+                                        save_path=None):
+        """Track top feature importance across timeframes (cohort average ± std)."""
+        tfs = results.get_available_timeframes()
+
+        # Select top channels from the last (broadest) timeframe
+        ref_imp = results.channel_importance[tfs[-1]]
+        has_ebm = _has_ebm_channels(results.channel2feature)
+        if has_ebm:
+            clinical_mask = _get_clinical_only_channel_mask(
+                results.channel2feature, len(ref_imp))
+            clinical_imp = ref_imp[clinical_mask]
+            top_clinical = np.argsort(clinical_imp)[-top_k:][::-1]
+            feat_idx = np.array([clinical_mask[i] for i in top_clinical])
+        else:
+            feat_idx = np.argsort(ref_imp)[-top_k:][::-1]
+
+        feature_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                         for i in feat_idx]
+
+        fig, ax = plt.subplots(figsize=figsize)
+        colors = plt.cm.tab10(np.linspace(0, 1, len(feature_names)))
+
+        for i, (name, idx) in enumerate(zip(feature_names, feat_idx)):
+            means = [results.channel_importance[tf][idx] for tf in tfs]
+            stds = [results.channel_importance_std[tf][idx] for tf in tfs]
+            x = range(len(tfs))
+            ax.plot(x, means, marker='o', lw=2, ms=8, label=name,
+                    color=colors[i])
+            ax.fill_between(x,
+                            np.array(means) - np.array(stds),
+                            np.array(means) + np.array(stds),
+                            alpha=0.1, color=colors[i])
+
+        # Annotate patient counts per timeframe
+        for j, tf in enumerate(tfs):
+            n = results.patient_counts[tf]
+            ax.annotate(f'n={n}', (j, 0), fontsize=7, ha='center',
+                        alpha=0.5, xytext=(0, -18),
+                        textcoords='offset points')
+
+        ax.set_xticks(range(len(tfs)))
+        ax.set_xticklabels(tfs, rotation=45)
+        ax.set_xlabel('Timeframe')
+        _dn = results.density_normalize
+        ax.set_ylabel('Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|')
+        active_label = " [active-only]" if results.active_only else ""
+        dn_label = " [density-norm]" if _dn else ""
+        ax.set_title(
+            f'Feature Trajectory — Cohort (n={results.n_patients}){active_label}{dn_label}',
+            fontweight='bold')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        if save_path:
+            ensure_parent_dir(save_path)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            save_base64(fig, save_path, dpi=150)
+            logger.info(f"Saved: {save_path}")
+        return fig
+
+    def generate_cohort_summary_report(self, results: CohortTemporalSHAPResults
+                                        ) -> pd.DataFrame:
+        """Summary DataFrame with per-timeframe cohort-averaged metrics."""
+        tfs = results.get_available_timeframes()
+        has_ebm = _has_ebm_channels(results.channel2feature)
+
+        records = []
+        for tf in tfs:
+            ch_imp = results.channel_importance[tf]
+            if has_ebm:
+                clinical_mask = _get_clinical_only_channel_mask(
+                    results.channel2feature, len(ch_imp))
+                display_imp = ch_imp[clinical_mask]
+                display_names = [results.channel2feature.get(
+                    int(clinical_mask[i]), f'Ch{i}')
+                    for i in range(len(clinical_mask))]
+            else:
+                display_imp = ch_imp
+                display_names = [results.channel2feature.get(int(i), f'Ch{i}')
+                                 for i in range(len(ch_imp))]
+
+            top5_idx = np.argsort(display_imp)[-5:][::-1]
+            top5 = [display_names[i] for i in top5_idx]
+
+            tf_hours = DEFAULT_TIMEFRAMES.get(tf)
+            record = {
+                'timeframe': tf,
+                'hours': tf_hours,
+                'n_patients': results.patient_counts[tf],
+                'top_5_channels': ', '.join(top5),
+                'mean_channel_shap': ch_imp.mean(),
+                'max_channel_shap': ch_imp.max(),
+            }
+
+            # Mean active background count when active_only is enabled
+            if results.active_only and results.patient_results:
+                bg_counts = []
+                for pr in results.patient_results:
+                    # Map patient-specific max(...) back to 'full'
+                    for ptf, tfr in pr.timeframe_results.items():
+                        norm = 'full' if ptf.startswith('max(') else ptf
+                        if norm == tf and tfr.n_active_background is not None:
+                            bg_counts.append(tfr.n_active_background)
+                if bg_counts:
+                    record['mean_n_active_bg'] = np.mean(bg_counts)
+
+            # EBM budget (from mean SHAP heatmap)
+            if has_ebm:
+                budget = compute_ebm_vs_clinical_budget(
+                    results.ts_shap_mean[tf], results.channel2feature)
+                if budget:
+                    record['ebm_pct'] = budget['ebm_pct']
+                    record['clinical_pct'] = budget['clinical_pct']
+
+            # Static features
+            if results.static_cat_importance[tf] is not None:
+                record['static_cat_mean'] = results.static_cat_importance[tf].mean()
+            if results.static_cont_importance[tf] is not None:
+                record['static_cont_mean'] = results.static_cont_importance[tf].mean()
+
+            records.append(record)
+
         return pd.DataFrame(records)
 
 
@@ -4024,9 +4922,10 @@ class TemporalSHAPAnalyzer:
 # ============================================================================
 
 def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframes=None,
-                               max_background_samples=200, save_dir='reports/shap', verbose=False):
-    """
-    Run complete temporal SHAP analysis with all visualizations.
+                               max_background_samples=200, save_dir='reports/shap',
+                               verbose=False, active_only=False,
+                               density_normalize: bool = False):
+    """Run complete temporal SHAP analysis with all visualizations.
 
     Args:
         data: Data dict from prepare_data_and_dls()
@@ -4036,6 +4935,10 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
         timeframes: List of timeframe names (default: all)
         save_dir: Output directory
         verbose: Print progress
+        active_only: If True, only use background patients with active
+                     trajectories at each evaluation timeframe
+        density_normalize: If True, normalize channel importance by measurement
+                          density (per-measured-cell mean instead of per-timestep).
 
     Returns:
         TemporalSHAPResults
@@ -4043,7 +4946,9 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
     os.makedirs(save_dir, exist_ok=True)
 
     analyzer = TemporalSHAPAnalyzer(
-        model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu', max_background_samples
+        model, data, data["mixed_dls"].train, 'cuda' if torch.cuda.is_available() else 'cpu',
+        max_background_samples, active_only=active_only,
+        density_normalize=density_normalize,
     )
     
     holdout_pids = analyzer.get_holdout_pids()
@@ -4075,6 +4980,159 @@ def run_temporal_shap_analysis(data, model, pid=None, sample_idx=None, timeframe
         logger.info(f"Data: {results.actual_data_length_hours:.1f}h, Timeframes: {results.get_available_timeframes()}")
         logger.info(summary.to_string(index=False))
     
+    return results
+
+
+def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
+                                      max_background_samples=200,
+                                      timeframes=None,
+                                      save_dir='reports/shap',
+                                      verbose=True, active_only=False,
+                                      density_normalize: bool = False,
+                                      representative: bool = False,
+                                      representative_seed: int = 42):
+    """Run temporal SHAP analysis across a cohort of holdout patients.
+
+    This is the cohort-level counterpart of ``run_temporal_shap_analysis``.
+    For each patient, SHAP values are re-computed per timeframe (with future
+    data censored), then results are aggregated across the cohort.
+
+    Args:
+        data: Data dict from prepare_data_and_dls()
+        model: Trained nn.Module
+        max_patients: Maximum number of holdout patients to analyze
+        max_background_samples: Background samples for SHAP explainer
+        timeframes: List of timeframe names (default: all from DEFAULT_TIMEFRAMES)
+        save_dir: Output directory for plots and CSV
+        verbose: Print progress
+        active_only: Only use background patients active at each timeframe
+        density_normalize: Normalize channel importance by measurement density
+        representative: Select patients via stratified representative sampling
+            (matching cohort on outcome, trajectory, age, sex)
+        representative_seed: Random seed for representative sampling
+
+    Returns:
+        CohortTemporalSHAPResults
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    analyzer = TemporalSHAPAnalyzer(
+        model, data, data["mixed_dls"].train,
+        'cuda' if torch.cuda.is_available() else 'cpu',
+        max_background_samples, active_only=active_only,
+        density_normalize=density_normalize,
+    )
+
+    holdout_pids = analyzer.get_holdout_pids()
+
+    if representative:
+        from astra.evaluation.shap_paper_figures import select_representative_sample
+        selected_pids, comparison_df = select_representative_sample(
+            data, n_target=max_patients, seed=representative_seed, verbose=verbose,
+        )
+        comparison_df.to_csv(f'{save_dir}/sample_representativeness.csv', index=False)
+        # Filter holdout_pids to selected, preserving dataloader order
+        selected_set = set(selected_pids)
+        holdout_pids = [p for p in holdout_pids if p in selected_set]
+        logger.info(f"Representative sampling: {len(holdout_pids)} patients selected")
+
+    logger.info(f"Cohort temporal SHAP: analyzing up to {max_patients} of "
+                f"{len(holdout_pids)} holdout patients")
+
+    results = analyzer.analyze_cohort(
+        data["holdout_mixed_dls"].train, holdout_pids,
+        max_patients=max_patients, timeframes=timeframes, verbose=verbose,
+    )
+
+    logger.info("\nGenerating cohort visualizations...")
+
+    # Build suffix for file names to distinguish different mode runs
+    suffix_parts = []
+    if active_only:
+        suffix_parts.append('active')
+    if density_normalize:
+        suffix_parts.append('dn')
+    suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
+
+    for name, method in [
+        ('cohort_temporal_comparison',
+         analyzer.plot_cohort_temporal_comparison),
+        ('cohort_feature_trajectory',
+         analyzer.plot_cohort_feature_trajectory),
+    ]:
+        fig = method(results, save_path=f'{save_dir}/{name}{suffix}.png')
+        if fig:
+            plt.close(fig)
+
+    summary = analyzer.generate_cohort_summary_report(results)
+    summary.to_csv(f'{save_dir}/cohort_temporal_shap_summary{suffix}.csv',
+                   index=False)
+
+    # Save full results: pickle + all-features CSV
+    import pickle
+    pickle_path = f'{save_dir}/cohort_temporal_shap_results{suffix}.pkl'
+    with open(pickle_path, 'wb') as f:
+        pickle.dump(results, f)
+    logger.info(f"Full results saved to {pickle_path}")
+
+    # Detailed CSV: all features x timeframes (mean |SHAP| ± std)
+    # Use float() casts to ensure numpy scalars serialize correctly in CSV.
+    detail_rows = []
+    for tf in results.get_available_timeframes():
+        ch_imp = results.channel_importance[tf]
+        ch_std = results.channel_importance_std[tf]
+        for i in range(len(ch_imp)):
+            detail_rows.append({
+                'timeframe': tf,
+                'channel_idx': i,
+                'feature': results.channel2feature.get(int(i), f'Ch{i}'),
+                'mean_abs_shap': float(ch_imp[i]),
+                'std_abs_shap': float(ch_std[i]),
+                'n_patients': results.patient_counts[tf],
+            })
+        # Static categorical features
+        cat_imp = results.static_cat_importance.get(tf)
+        if cat_imp is not None:
+            for j, name in enumerate(results.static_cat_names):
+                if j < len(cat_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cat:{name}',
+                        'mean_abs_shap': float(cat_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        # Static continuous features
+        cont_imp = results.static_cont_importance.get(tf)
+        if cont_imp is not None:
+            for j, name in enumerate(results.static_cont_names):
+                if j < len(cont_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cont:{name}',
+                        'mean_abs_shap': float(cont_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        # Categorical TS per-category features
+        cat_ts_imp = results.cat_ts_per_category_importance.get(tf)
+        if cat_ts_imp is not None:
+            for j, name in enumerate(results.cat_ts_category_names):
+                if j < len(cat_ts_imp):
+                    detail_rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'cat_ts:{name}',
+                        'mean_abs_shap': float(cat_ts_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+    detail_df = pd.DataFrame(detail_rows)
+    detail_path = f'{save_dir}/cohort_shap_all_features{suffix}.csv'
+    detail_df.to_csv(detail_path, index=False)
+    logger.info(f"All-features SHAP saved to {detail_path}")
+
+    if verbose:
+        logger.info(f"\n{'='*60}\nCOHORT TEMPORAL SHAP SUMMARY (n={results.n_patients})"
+                    f"\n{'='*60}")
+        logger.info(summary.to_string(index=False))
+
     return results
 
 
@@ -4138,7 +5196,7 @@ def plot_continuous_ts_shap_plotly(
 
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
 
@@ -4212,7 +5270,7 @@ def plot_categorical_ts_shap_plotly(
 
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         data = data[:, :n_steps]
 
@@ -4357,7 +5415,7 @@ def plot_shap_budget_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
     budget = compute_ebm_vs_clinical_budget(ts_shap, channel2feature)
@@ -4395,7 +5453,7 @@ def plot_shap_temporal_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
     time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
@@ -4450,7 +5508,7 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
     n_ch, n_steps = ts_shap.shape
     if eval_timestep is None:
         eval_timestep = shap_results.get('eval_timestep')
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
         ts_shap = ts_shap[:, :eval_timestep + 1]
     has_ebm = channel2feature and _has_ebm_channels(channel2feature)
     ch_imp = np.abs(ts_shap).mean(axis=1)
@@ -4623,7 +5681,7 @@ def plot_data_completeness_plotly(
     ts_data = shap_results["test_data"]["ts"][sample_idx]
     n_channels, n_steps_full = ts_data.shape
     eval_timestep = shap_results.get("eval_timestep")
-    if eval_timestep is not None and 0 <= eval_timestep < n_steps_full:
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps_full:
         n_steps = eval_timestep + 1
         ts_data = ts_data[:, :n_steps]
     else:

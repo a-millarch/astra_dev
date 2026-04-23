@@ -278,6 +278,12 @@ def filter_procedures(proc):
         inplace=True,
     )
 
+    # Preserve procedure sub-code for profile-based encoding (before VALUE is overwritten)
+    from astra.data.profiles import get_sub_code_level
+    sub_code_level = get_sub_code_level(cfg, "Procedurer")
+    if sub_code_level > 0:
+        proc["SUB_CODE"] = proc["VALUE"].str[:sub_code_level]
+
     def _map_prefix(code):
         for prefix in PROCEDURE_PREFIXES:
             if code.startswith(prefix):
@@ -380,12 +386,13 @@ def filter_ews(ews):
     return ews[["PID", "TIMESTAMP", "FEATURE", "VALUE"]]
 
 
-def filter_iss(df):
-    """Filter for ISS (Injury Severity Score from notes).
+def filter_iss_notes(df):
+    """Filter for ISS_notes (Injury Severity Score from clinical notes)."""
+    return df
 
-    Data is already in standard format [PID, TIMESTAMP, FEATURE, VALUE],
-    so no additional mapping needed.
-    """
+
+def filter_iss_computed(df):
+    """Filter for ISS_computed (R-computed ISS from ICD-10 diagnosis codes)."""
     return df
 
 
@@ -431,6 +438,12 @@ def filter_medicin(med):
     med = med[med["FEATURE"].notnull()].copy()
     med["VALUE"] = med["FEATURE"]
     med["FEATURE"] = "medication"
+
+    # Preserve ATC sub-code for profile-based encoding
+    from astra.data.profiles import get_sub_code_level
+    sub_code_level = get_sub_code_level(cfg, "Medicin")
+    if sub_code_level > 0:
+        med["SUB_CODE"] = med["ATC"].str[:sub_code_level]
 
     med.rename(
         columns={"Administrationstidspunkt": "start", "Seponeringstidspunkt": "end"},
@@ -493,6 +506,14 @@ def filter_adt(adt, base_df=None):
 
     adt["TIMESTAMP"] = adt["Flyt_ind"]
     adt["END_TIMESTAMP"] = adt["Flyt_ud"]
+
+    # Concat pre-hospital ADT events when enabled
+    if cfg.get("prehospital") and is_file_present("data/interim/prehospital_ADT.pkl"):
+        logger.info("> Adding prehospital ADT events")
+        ph_adt = pd.read_pickle("data/interim/prehospital_ADT.pkl")
+        adt = pd.concat([adt, ph_adt])
+        adt = adt.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
+        logger.info(f">> ADT after prehospital merge: {len(adt)} rows")
 
     logger.info(f"Using {len(adt)} ADT observations")
     return adt
@@ -568,7 +589,8 @@ def collect_filter(concept: str):
         "Procedurer": filter_procedures,
         "ADTHaendelser": filter_adt,
         "EWS": filter_ews,
-        "ISS": filter_iss,
+        "ISS_notes": filter_iss_notes,
+        "ISS_computed": filter_iss_computed,
         "Events": filter_events,
     }
 

@@ -56,6 +56,7 @@ class SimulationStep:
     trajectory_length: int
     probability: float
     predictions_over_time: Optional[np.ndarray] = None  # temporal head only
+    survival_curve: Optional[np.ndarray] = None         # survival mode: S(t) at each step
     step_timing: dict = field(default_factory=dict)
     n_new_measurements: int = 0
 
@@ -209,7 +210,9 @@ class SimulationResult:
                        linestyle=':', alpha=0.8,
                        label=f'Hospital arrival ({self.inhospital_start_hours:.1f}h)')
             ax.legend()
-        ax.set_ylabel('P(deceased 30d)')
+        has_survival = any(s.survival_curve is not None for s in self.steps)
+        ylabel = 'Cumulative risk (1 - S(t))' if has_survival else 'P(deceased 30d)'
+        ax.set_ylabel(ylabel)
         ax.set_title(f'Simulation: patient {self.pid} ({self.n_steps} steps, '
                       f'{self.wall_clock_seconds:.1f}s total)')
         ax.set_ylim(-0.05, 1.05)
@@ -390,6 +393,7 @@ class SimulationRunner:
                 trajectory_length=self.context.trajectory_length,
                 probability=result.probability,
                 predictions_over_time=result.predictions_over_time,
+                survival_curve=getattr(result, 'survival_curve', None),
                 step_timing=step_timing,
                 n_new_measurements=n_new,
             )
@@ -627,6 +631,7 @@ class SimulationRunner:
                 trajectory_length=ctx.trajectory_length,
                 probability=result.probability,
                 predictions_over_time=result.predictions_over_time,
+                survival_curve=getattr(result, 'survival_curve', None),
                 step_timing=step_timing,
                 n_new_measurements=n_new,
             ))
@@ -787,6 +792,7 @@ class SimulationRunner:
                 trajectory_length=context.trajectory_length,
                 probability=result.probability,
                 predictions_over_time=result.predictions_over_time,
+                survival_curve=getattr(result, 'survival_curve', None),
                 step_timing=step_timing,
                 n_new_measurements=n_new,
             ))

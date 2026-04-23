@@ -301,13 +301,13 @@ def compute_elixhauser_for_patient(
         cpr_hash = base_df['CPR_hash'].iloc[0]
         diag = load_patient_csv(cpr_hash, 'Diagnoser', data_dir, patient_dir)
     except FileNotFoundError:
-        logger.info("Diagnoser.csv not found — setting ASMT_ELIX=NaN")
-        base_df["ASMT_ELIX"] = np.nan
+        logger.info("Diagnoser.csv not found — setting ASMT_ELIX=0.0")
+        base_df["ASMT_ELIX"] = 0.0
         return base_df
 
     if len(diag) == 0:
-        logger.info("Empty Diagnoser.csv — setting ASMT_ELIX=NaN")
-        base_df["ASMT_ELIX"] = np.nan
+        logger.info("Empty Diagnoser.csv — setting ASMT_ELIX=0.0")
+        base_df["ASMT_ELIX"] = 0.0
         return base_df
 
     diag["Noteret_dato"] = pd.to_datetime(diag["Noteret_dato"], errors="coerce")
@@ -319,8 +319,8 @@ def compute_elixhauser_for_patient(
     )
 
     if merged["Diagnosekode"].isna().all():
-        logger.info("No diagnoses found for patient — setting ASMT_ELIX=NaN")
-        base_df["ASMT_ELIX"] = np.nan
+        logger.info("No diagnoses found for patient — setting ASMT_ELIX=0.0")
+        base_df["ASMT_ELIX"] = 0.0
         return base_df
 
     # Filter: noted before trauma AND not resolved before trauma

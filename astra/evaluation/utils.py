@@ -4,7 +4,7 @@ import math
 from astra.utils import cfg
 import numpy as np
 from scipy import stats
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_recall_curve
 
 logger = logging.getLogger(__name__)
 
@@ -291,8 +291,10 @@ def prepare_model(data, cfg):
         temporal_head=is_temporal,
         causal=model_cfg.get("causal", False),
         temporal_head_dropout=model_cfg.get("temporal_head_dropout", 0.3),
+        temporal_head_mult=model_cfg.get("temporal_head_mult", 0.5),
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
 
     state_dict = load_model_state(model_name)
@@ -303,6 +305,40 @@ def prepare_model(data, cfg):
     backbone.eval()
     logger.info(f"Model loaded (temporal_head={is_temporal})")
     return backbone, device
+
+
+def mc_dropout_predict(model, inputs, n_samples=30):
+    """
+    MC Dropout: run N forward passes with dropout active for uncertainty estimation.
+
+    Args:
+        model: trained backbone model
+        inputs: tuple of input tensors (same format as model.forward)
+        n_samples: number of stochastic forward passes
+
+    Returns:
+        mean_probs: [batch, ...] mean predicted probabilities
+        std_probs: [batch, ...] standard deviation of predicted probabilities
+    """
+    import torch.nn as nn
+
+    # Enable dropout but keep normalization layers in eval mode
+    model.train()
+    for m in model.modules():
+        if isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+            m.eval()
+
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            logits = model(inputs)
+            probs = torch.sigmoid(logits)
+            preds.append(probs)
+
+    model.eval()  # Restore
+    preds = torch.stack(preds)  # [n_samples, batch, ...]
+    return preds.mean(dim=0), preds.std(dim=0)
+
 
 def delong_roc_variance(ground_truth, predictions):
     order = np.argsort(predictions)
@@ -315,6 +351,130 @@ def delong_roc_variance(ground_truth, predictions):
     v01 = (auc / (2 - auc) - auc ** 2) / n_neg
     v10 = (2 * auc ** 2 / (1 + auc) - auc ** 2) / n_pos
     return v01 + v10
+
+
+def _compute_placement_values(y_true, y_score):
+    """Compute DeLong placement values (structural components) for one predictor.
+
+    For each positive sample, V_10 = fraction of negatives scored below it.
+    For each negative sample, V_01 = fraction of positives scored above it.
+    These are the building blocks of the DeLong covariance matrix.
+
+    Reference: Sun & Xu (2014), "Fast Implementation of DeLong's Algorithm".
+    """
+    order = np.argsort(-y_score)  # descending
+    y_sorted = y_true[order]
+    s_sorted = y_score[order]
+
+    pos_mask = y_true == 1
+    neg_mask = y_true == 0
+    m = int(pos_mask.sum())  # number of positives
+    n = int(neg_mask.sum())  # number of negatives
+
+    # For each positive: fraction of negatives with strictly lower score
+    # Handle ties via midranks
+    pos_scores = y_score[pos_mask]
+    neg_scores = y_score[neg_mask]
+
+    # V10[i] = P(X_neg < X_pos_i) + 0.5 * P(X_neg == X_pos_i)
+    v10 = np.zeros(m)
+    for i, ps in enumerate(pos_scores):
+        v10[i] = (np.sum(neg_scores < ps) + 0.5 * np.sum(neg_scores == ps)) / n
+
+    # V01[j] = P(X_pos > X_neg_j) + 0.5 * P(X_pos == X_neg_j)
+    v01 = np.zeros(n)
+    for j, ns in enumerate(neg_scores):
+        v01[j] = (np.sum(pos_scores > ns) + 0.5 * np.sum(pos_scores == ns)) / m
+
+    return v10, v01
+
+
+def delong_test_paired(y_true, y_pred_a, y_pred_b):
+    """Two-sided DeLong test for two correlated AUROCs on the same samples.
+
+    Tests H0: AUC_A == AUC_B for two models evaluated on the same ground truth.
+    Accounts for correlation between the two AUCs through shared samples.
+
+    Args:
+        y_true: Binary ground truth labels, shape (n,).
+        y_pred_a: Predicted scores from model A, shape (n,).
+        y_pred_b: Predicted scores from model B, shape (n,).
+
+    Returns:
+        (z_stat, p_value, se_diff): z-statistic, two-sided p-value, and
+            standard error of the AUC difference. se_diff can be used to
+            compute a 95% CI for delta AUC: delta +/- 1.96 * se_diff.
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred_a = np.asarray(y_pred_a, dtype=float)
+    y_pred_b = np.asarray(y_pred_b, dtype=float)
+
+    pos_mask = y_true == 1
+    neg_mask = y_true == 0
+    m = int(pos_mask.sum())
+    n = int(neg_mask.sum())
+
+    if m < 2 or n < 2:
+        return 0.0, 1.0, 0.0
+
+    v10_a, v01_a = _compute_placement_values(y_true, y_pred_a)
+    v10_b, v01_b = _compute_placement_values(y_true, y_pred_b)
+
+    # AUC = mean of placement values
+    auc_a = np.mean(v10_a)
+    auc_b = np.mean(v10_b)
+
+    # Covariance matrix of (AUC_A, AUC_B) via DeLong decomposition:
+    # S = S10/m + S01/n  where S10, S01 are 2x2 covariance matrices
+    # of the placement value vectors for positives and negatives
+    s10 = np.cov(np.column_stack([v10_a, v10_b]), rowvar=False, ddof=1)
+    s01 = np.cov(np.column_stack([v01_a, v01_b]), rowvar=False, ddof=1)
+    S = s10 / m + s01 / n
+
+    # Variance of the difference AUC_A - AUC_B
+    # Var(A-B) = Var(A) + Var(B) - 2*Cov(A,B) = S[0,0] + S[1,1] - 2*S[0,1]
+    var_diff = S[0, 0] + S[1, 1] - 2.0 * S[0, 1]
+
+    if var_diff <= 0:
+        return 0.0, 1.0, 0.0
+
+    se_diff = np.sqrt(var_diff)
+    z = (auc_a - auc_b) / se_diff
+    p = 2.0 * stats.norm.sf(abs(z))
+    return float(z), float(p), float(se_diff)
+
+
+def benjamini_hochberg(p_values, alpha=0.05):
+    """Benjamini-Hochberg FDR correction.
+
+    Args:
+        p_values: Array of raw p-values.
+        alpha: FDR level (default 0.05).
+
+    Returns:
+        (rejected, adjusted_p): Boolean mask of rejected hypotheses and
+            adjusted p-values.
+    """
+    p = np.asarray(p_values, dtype=float)
+    n = len(p)
+    if n == 0:
+        return np.array([], dtype=bool), np.array([], dtype=float)
+
+    order = np.argsort(p)
+    rank = np.arange(1, n + 1)
+
+    # Adjusted p-values: p_adj[i] = min(p[i] * n / rank[i], 1.0)
+    # enforced to be monotonically non-decreasing from the right
+    adjusted = np.minimum(p[order] * n / rank, 1.0)
+    for i in range(n - 2, -1, -1):
+        adjusted[i] = min(adjusted[i], adjusted[i + 1])
+
+    # Map back to original order
+    adjusted_out = np.empty(n)
+    adjusted_out[order] = adjusted
+
+    rejected = adjusted_out <= alpha
+    return rejected, adjusted_out
 
 def calculate_roc_auc_ci(y_true, y_pred, alpha=0.95):
     auc = roc_auc_score(y_true, y_pred)
@@ -341,3 +501,85 @@ def calculate_average_precision_ci(y_true, y_pred, alpha=0.95, n_bootstraps=1000
     ci_lower = sorted_scores[int((1.0-alpha)/2 * len(sorted_scores))]
     ci_upper = sorted_scores[int((1.0+alpha)/2 * len(sorted_scores))]
     return ap, float(ci_lower), float(ci_upper)
+
+
+def _recall_at_percentile(y_preds, y_true, percentile):
+    """Calculate recall when selecting the top-percentile highest-risk patients.
+
+    Args:
+        y_preds: Prediction probabilities.
+        y_true: Binary ground-truth labels.
+        percentile: Top percentage to select (e.g. 10 for top 10%).
+
+    Returns:
+        Recall (float) within the selected group.
+    """
+    n_total_positive = np.sum(y_true == 1)
+    if n_total_positive == 0 or len(y_preds) == 0:
+        return 0.0
+
+    n_select = max(1, int(np.ceil(len(y_preds) * percentile / 100)))
+    top_indices = np.argsort(y_preds)[-n_select:]
+    return float(np.sum(y_true[top_indices] == 1)) / n_total_positive
+
+
+def bootstrap_recall_ci(y_preds, y_true, percentile, n_bootstraps=1000, alpha=0.95):
+    """Bootstrap confidence interval for recall at a given top-percentile threshold.
+
+    Mirrors ``calculate_average_precision_ci`` in structure.
+
+    Args:
+        y_preds: Prediction probabilities (1-D array).
+        y_true: Binary labels (1-D array).
+        percentile: Top percentage to select (e.g. 10 for top 10%).
+        n_bootstraps: Number of bootstrap resamples.
+        alpha: Confidence level.
+
+    Returns:
+        (recall, ci_lower, ci_upper)
+    """
+    recall = _recall_at_percentile(y_preds, y_true, percentile)
+
+    bootstrapped_scores = []
+    rng = np.random.RandomState(42)
+    for _ in range(n_bootstraps):
+        indices = rng.randint(0, len(y_true), len(y_true))
+        if np.sum(y_true[indices]) == 0:
+            continue
+        score = _recall_at_percentile(y_preds[indices], y_true[indices], percentile)
+        bootstrapped_scores.append(score)
+
+    if len(bootstrapped_scores) == 0:
+        return recall, 0.0, 1.0
+
+    sorted_scores = np.sort(np.array(bootstrapped_scores))
+    ci_lower = sorted_scores[int((1.0 - alpha) / 2 * len(sorted_scores))]
+    ci_upper = sorted_scores[int((1.0 + alpha) / 2 * len(sorted_scores))]
+    return recall, float(ci_lower), float(ci_upper)
+
+
+def find_optimal_fbeta_threshold(y_true, y_pred, beta=1.0):
+    """Find the probability threshold that maximises F-beta score.
+
+    Uses the precision-recall curve to evaluate all unique thresholds
+    in a single vectorised pass (no grid search needed).
+
+    Args:
+        y_true: Binary labels (1-D array).
+        y_pred: Predicted probabilities (1-D array).
+        beta: Beta parameter (1 = F1, 5 = F5, etc.).
+
+    Returns:
+        (best_threshold, best_fbeta)
+    """
+    precision, recall, thresholds = precision_recall_curve(y_true, y_pred)
+    # precision_recall_curve returns len(thresholds) = len(precision) - 1
+    precision = precision[:-1]
+    recall = recall[:-1]
+
+    beta_sq = beta ** 2
+    denom = beta_sq * precision + recall
+    fbeta = np.where(denom > 0, (1 + beta_sq) * precision * recall / denom, 0.0)
+
+    best_idx = np.argmax(fbeta)
+    return float(thresholds[best_idx]), float(fbeta[best_idx])

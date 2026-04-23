@@ -18,14 +18,35 @@ from astra.data.mixed_dataloader import (
 
 from astra.evaluation.utils import (
     calculate_roc_auc_ci, calculate_average_precision_ci,
+    bootstrap_recall_ci, find_optimal_fbeta_threshold,
     _parse_timedelta_to_minutes, _get_intervals_from_cfg,
-    time_to_step, step_to_time, prepare_model, get_max_days
+    time_to_step, step_to_time, prepare_model, get_max_days, get_total_steps
 )
 from sklearn.metrics import roc_curve, roc_auc_score, precision_recall_curve, average_precision_score
 from astra.models.hybrid.training import get_backbone
-from astra.visualize.evaluation import plot_evaluation
+from astra.visualize.evaluation import plot_evaluation, evaluate_detection_rate
 
 logger = logging.getLogger(__name__)
+
+# ── Figure style constants for readability ───────────────────────────────
+_FIG_STYLE = dict(
+    title=16,
+    axis_label=14,
+    tick_label=12,
+    legend=12,
+    annotation=11,
+    suptitle=18,
+)
+
+# Journal submission output constraints.
+# fit_long_side_px=1200 computes the highest DPI that keeps the tight-bbox output
+# under 1200 px on the long side (≥300 DPI for the figsizes used here). Warnings
+# fire if the final file exceeds 1200 px or 5 MB.
+_SUBMISSION_KW = dict(
+    fit_long_side_px=1200,
+    max_long_side_px=1200,
+    max_bytes=5_000_000,
+)
 
 
 @dataclass
@@ -41,6 +62,51 @@ class TimeMetricResult:
     auprc_ci: Tuple[float, float]
     n_samples: int
     n_positive: int
+    # Survival-specific metrics (optional, None for classification mode)
+    cindex: Optional[float] = None
+    cindex_ci: Optional[Tuple[float, float]] = None
+    brier_score: Optional[float] = None
+
+
+@dataclass
+class PercentileRecallResult:
+    """Container for percentile-based recall at a single time point."""
+    time_min: float
+    time_hours: float
+    time_days: float
+    censor_step: int
+    recalls: Dict[int, float]                    # {percentile: recall}
+    recall_cis: Dict[int, Tuple[float, float]]   # {percentile: (lower, upper)}
+    n_samples: int
+    n_positive: int
+
+
+_TARGET_DISPLAY = {"deceased_30d": "30-day Mortality"}
+
+
+def _save_time_metrics_csv(results: List['TimeMetricResult'], path: str) -> None:
+    """Persist a list of TimeMetricResult to CSV for downstream reporting."""
+    rows = []
+    for r in results:
+        rows.append({
+            "censor_step": r.censor_step,
+            "time_min": r.time_min,
+            "time_hours": r.time_hours,
+            "time_days": r.time_days,
+            "auroc": r.auroc,
+            "auroc_ci_lower": r.auroc_ci[0],
+            "auroc_ci_upper": r.auroc_ci[1],
+            "auprc": r.auprc,
+            "auprc_ci_lower": r.auprc_ci[0],
+            "auprc_ci_upper": r.auprc_ci[1],
+            "n_samples": r.n_samples,
+            "n_positive": r.n_positive,
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+    logger.info(f"Time metrics saved to {path}")
+
+def _display_target(name: str) -> str:
+    return _TARGET_DISPLAY.get(name, name)
 
 
 def _get_predictions(model, dataloader, device, temporal_head=False):
@@ -147,7 +213,7 @@ def plot_decision_curve(
         y_true, y_prob, thresholds
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(9, 6))
 
     # Determine y-range from model curve, then clip Treat All to that range
     ymin = min(nb_model.min(), -0.01) - 0.005
@@ -159,10 +225,11 @@ def plot_decision_curve(
             label='Treat All')
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curve Analysis", fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curve Analysis", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -250,11 +317,12 @@ def plot_decision_curves_over_time(
     # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
-              title="Time Available", title_fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -350,11 +418,12 @@ def _plot_decision_curves_temporal(
     # "Treat None" baseline
     ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
 
-    ax.set_xlabel("Threshold Probability", fontsize=11)
-    ax.set_ylabel("Net Benefit", fontsize=11)
-    ax.set_title("Decision Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=10,
-              title="Time Available", title_fontsize=10)
+    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_title("Decision Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
     ax.set_ylim(ymin, ymax)
@@ -623,12 +692,66 @@ class TimeDependentEvaluator:
 
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
-            os.makedirs('reports/predictions', exist_ok=True)
-            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+            preds_df.to_pickle(f'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
         return results, None
+
+    def evaluate_percentile_recall_over_time(
+        self,
+        censor_steps: List[int],
+        percentiles: List[int] = (5, 10, 15, 20, 25),
+        n_bootstraps: int = 1000,
+    ) -> List[PercentileRecallResult]:
+        """Compute recall at top-K% risk thresholds across time points."""
+        import time as time_module
+
+        results = []
+        logger.info(f"Percentile recall evaluation at {len(censor_steps)} time points "
+                     f"(percentiles={list(percentiles)})...")
+        start_time = time_module.time()
+
+        for i, censor_step in enumerate(censor_steps):
+            if i % 10 == 0:
+                logger.debug(f"Percentile recall progress: {i+1}/{len(censor_steps)}")
+
+            dls = self.create_censored_dataloaders_fast(censor_step)
+            if dls is None:
+                continue
+
+            preds, targets = _get_predictions(self.model, dls.train, self.device)
+            y_preds = preds[:, 1].numpy()
+            ys = targets.numpy()
+
+            time_min = step_to_time(censor_step)
+            if time_min is None or ys.sum() == 0:
+                continue
+
+            recalls = {}
+            recall_cis = {}
+            for perc in percentiles:
+                r, ci_lo, ci_hi = bootstrap_recall_ci(
+                    y_preds, ys, perc, n_bootstraps=n_bootstraps
+                )
+                recalls[perc] = r
+                recall_cis[perc] = (ci_lo, ci_hi)
+
+            results.append(PercentileRecallResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                recalls=recalls,
+                recall_cis=recall_cis,
+                n_samples=len(ys),
+                n_positive=int(ys.sum()),
+            ))
+
+        total_time = time_module.time() - start_time
+        logger.info(f"Percentile recall complete: {len(results)} time points in {total_time:.1f}s")
+        return results
 
 
 # ============================================================================
@@ -650,9 +773,11 @@ class TemporalEvaluator:
         self.cfg = cfg
         self.device = device
         self.active_only = active_only
+        self.survival_mode = cfg.get("model", {}).get("survival_mode", False)
         self.model.eval()
 
         self._holdout_preds = None
+        self._holdout_survival = None  # [N, seq_len] survival probs S(t)
         self._holdout_traj_lengths = np.array(
             data.get("holdout_trajectory_lengths",
                       data.get("traj_lengths_holdout", []))
@@ -660,24 +785,38 @@ class TemporalEvaluator:
         self.holdout = data["holdout"]
 
         mode_str = " (active-only mode)" if active_only else ""
-        logger.info(f"TemporalEvaluator initialized{mode_str}")
+        surv_str = " [survival]" if self.survival_mode else ""
+        logger.info(f"TemporalEvaluator initialized{mode_str}{surv_str}")
 
     def _get_all_predictions(self) -> np.ndarray:
+        """Get per-timestep predictions.
+
+        For classification: sigmoid probabilities [N, seq_len].
+        For survival: cumulative incidence 1-S(t) [N, seq_len].
+        """
         if self._holdout_preds is not None:
             return self._holdout_preds
 
         holdout_dls = self.data["holdout_mixed_dls"]
-        all_preds = []
+        all_logits = []
 
         with torch.no_grad():
             for batch in holdout_dls.train:
                 inputs, targets = batch
                 inputs = _to_device(inputs, self.device)
                 logits = self.model(inputs)
-                probs = torch.sigmoid(logits)
-                all_preds.append(probs.cpu().numpy())
+                all_logits.append(logits.cpu())
 
-        self._holdout_preds = np.concatenate(all_preds, axis=0)
+        all_logits_cat = torch.cat(all_logits, dim=0)  # [N, seq_len]
+
+        if self.survival_mode:
+            from astra.training.utils import hazards_to_survival
+            survival_probs = hazards_to_survival(all_logits_cat).numpy()
+            self._holdout_survival = survival_probs
+            self._holdout_preds = 1.0 - survival_probs  # cumulative incidence
+        else:
+            self._holdout_preds = torch.sigmoid(all_logits_cat).numpy()
+
         return self._holdout_preds
 
     def evaluate_at_timestep(self, censor_step: int) -> Optional[TimeMetricResult]:
@@ -729,6 +868,28 @@ class TemporalEvaluator:
         auroc, auroc_lower, auroc_upper = calculate_roc_auc_ci(ys, y_preds)
         auprc, auprc_lower, auprc_upper = calculate_average_precision_ci(ys, y_preds)
 
+        # Survival-specific metrics (C-index, Brier)
+        cindex_val = None
+        cindex_ci_val = None
+        brier_val = None
+        if self.survival_mode:
+            ho_event_times = self.data.get("holdout_event_times")
+            ho_event_indicators = self.data.get("holdout_event_indicators")
+            if ho_event_times is not None and ho_event_indicators is not None:
+                from astra.evaluation.survival_metrics import concordance_index as _ci
+                # Use the same subset if active_only filtering was applied
+                if self.active_only and len(traj_lengths) > 0:
+                    mask = traj_lengths > censor_step
+                    et = ho_event_times[mask]
+                    ei = ho_event_indicators[mask]
+                else:
+                    et = ho_event_times
+                    ei = ho_event_indicators
+                try:
+                    cindex_val, cindex_ci_val = _ci(et, ei, y_preds, n_bootstrap=500)
+                except Exception as e:
+                    logger.debug(f"C-index failed at step {censor_step}: {e}")
+
         return TimeMetricResult(
             time_min=time_min,
             time_hours=time_min / 60,
@@ -740,6 +901,9 @@ class TemporalEvaluator:
             auprc_ci=(auprc_lower, auprc_upper),
             n_samples=len(ys),
             n_positive=int(ys.sum()),
+            cindex=cindex_val,
+            cindex_ci=cindex_ci_val,
+            brier_score=brier_val,
         )
 
     def evaluate_over_time(
@@ -808,12 +972,81 @@ class TemporalEvaluator:
 
         if save_predictions and preds_over_time and model_name:
             preds_df = pd.DataFrame(preds_over_time)
-            os.makedirs('reports/predictions', exist_ok=True)
-            preds_df.to_pickle(f'reports/predictions/preds_{model_name}.pkl')
-            logger.info(f"Saved predictions to reports/predictions/preds_{model_name}.pkl")
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+            preds_df.to_pickle(f'reports/eval/{model_name}/predictions/preds_{model_name}.pkl')
+            logger.info(f"Saved predictions to reports/eval/{model_name}/predictions/preds_{model_name}.pkl")
             return results, preds_df
 
         return results, pd.DataFrame(preds_over_time) if preds_over_time else (results, None)
+
+    def evaluate_percentile_recall_over_time(
+        self,
+        censor_steps: List[int],
+        percentiles: List[int] = (5, 10, 15, 20, 25),
+        n_bootstraps: int = 1000,
+    ) -> List[PercentileRecallResult]:
+        """Compute recall at top-K% risk thresholds across time points.
+
+        Reuses cached single-forward-pass predictions — no extra inference.
+        """
+        preds_all = self._get_all_predictions()
+        ys = np.array(self.data["ty"])
+        traj_lengths = self._holdout_traj_lengths
+
+        results = []
+        logger.info(f"Temporal percentile recall at {len(censor_steps)} time points "
+                     f"(percentiles={list(percentiles)})...")
+
+        for censor_step in censor_steps:
+            # Active-only filtering (same logic as evaluate_at_timestep)
+            if self.active_only and len(traj_lengths) > 0:
+                mask = traj_lengths > censor_step
+                if mask.sum() < 2:
+                    continue
+                preds_subset = preds_all[mask]
+                ys_subset = ys[mask]
+                traj_subset = traj_lengths[mask]
+            else:
+                preds_subset = preds_all
+                ys_subset = ys
+                traj_subset = traj_lengths
+
+            # Pick effective timestep per patient
+            if len(traj_subset) > 0:
+                effective_steps = np.minimum(censor_step, traj_subset - 1)
+                effective_steps = np.maximum(effective_steps, 0).astype(int)
+            else:
+                effective_steps = np.full(len(preds_subset), censor_step, dtype=int)
+                effective_steps = np.minimum(effective_steps, preds_subset.shape[1] - 1)
+
+            y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
+
+            time_min = step_to_time(censor_step)
+            if time_min is None or ys_subset.sum() == 0:
+                continue
+
+            recalls = {}
+            recall_cis = {}
+            for perc in percentiles:
+                r, ci_lo, ci_hi = bootstrap_recall_ci(
+                    y_preds, ys_subset, perc, n_bootstraps=n_bootstraps
+                )
+                recalls[perc] = r
+                recall_cis[perc] = (ci_lo, ci_hi)
+
+            results.append(PercentileRecallResult(
+                time_min=time_min,
+                time_hours=time_min / 60,
+                time_days=time_min / (24 * 60),
+                censor_step=censor_step,
+                recalls=recalls,
+                recall_cis=recall_cis,
+                n_samples=len(ys_subset),
+                n_positive=int(ys_subset.sum()),
+            ))
+
+        logger.info(f"Temporal percentile recall complete: {len(results)} time points")
+        return results
 
 
 # ============================================================================
@@ -886,7 +1119,7 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
     auprc_lower = np.array([r.auprc_ci[0] for r in results])
     auprc_upper = np.array([r.auprc_ci[1] for r in results])
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 4))
 
     mask_cut = times_h <= cut_hours
 
@@ -908,14 +1141,15 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
             ax1.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
             ax1.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
 
-    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_xlim(0, cut_hours)
     ax1.set_xticks(np.arange(0, cut_hours+1, 6))
     ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax1.set_ylabel("Score", fontsize=11)
-    ax1.set_title("A) Performance over Hours", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title("A) Performance over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax1.grid(True, alpha=0.3)
-    ax1.legend(fontsize=10)
+    ax1.legend(fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax1.set_ylim(0.0, 1.0)
 
     for metric, vals, lower, upper, marker, color, label in [
@@ -936,17 +1170,287 @@ def plot_time_metrics(results: List[TimeMetricResult], cut_hours=72, max_days=No
             ax2.plot(x_ext, vals_ext, color=color, marker=marker, label=label, markersize=4)
             ax2.fill_between(x_ext, lower_ext, upper_ext, color=color, alpha=0.2)
 
-    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_xlim(0, max_days)
     ax2.set_xticks(np.arange(0, max_days+1, 5))
     ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
-    ax2.set_ylabel("Score", fontsize=11)
-    ax2.set_title("B) Performance over Days", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_title("B) Performance over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax2.grid(True, alpha=0.3)
-    ax2.legend(loc='lower right', fontsize=10)
+    ax2.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax2.set_ylim(0.0, 1.0)
 
     plt.tight_layout()
+    return fig
+
+
+def plot_prediction_distribution(
+    preds_df: pd.DataFrame,
+    y_true: np.ndarray,
+    holdout_pids: np.ndarray,
+    cut_hours: int = 72,
+    max_days: float = None,
+    hour_timepoints: List[float] = None,
+    day_timepoints: List[float] = None,
+) -> plt.Figure:
+    """
+    Plot distribution of predicted probabilities per outcome category across timepoints.
+
+    Following Van Calster et al. (Lancet Digital Health 2025) recommendation for
+    risk distribution plots using split violin plots at selected timepoints.
+
+    Args:
+        preds_df: DataFrame with columns PID, censor_step, time_hours, time_days, pred
+        y_true: True binary labels for holdout patients
+        holdout_pids: Patient IDs corresponding to y_true
+        cut_hours: Hour cutoff for the hours panel
+        max_days: Max days for the days panel (from config if None)
+        hour_timepoints: Timepoints (hours) to show in panel A
+        day_timepoints: Timepoints (days) to show in panel B
+
+    Returns:
+        matplotlib Figure
+    """
+    if max_days is None:
+        max_days = get_max_days()
+
+    if hour_timepoints is None:
+        hour_timepoints = [1, 6, 12, 24, 48, 72]
+    if day_timepoints is None:
+        day_timepoints = [3, 7, 14, 30, 60, 90]
+    day_timepoints = [d for d in day_timepoints if d <= max_days]
+
+    # Map PID → true label
+    pid_to_label = dict(zip(holdout_pids, y_true))
+    df = preds_df.copy()
+    df['true_label'] = df['PID'].map(pid_to_label)
+    df = df.dropna(subset=['true_label'])
+
+    COLOR_NEG = '#2CA02C'  # survived (green)
+    COLOR_POS = '#D62728'  # deceased (red)
+    MIN_SAMPLES = 5
+
+    def _snap_timepoints(available, requested):
+        """Snap requested timepoints to nearest available, deduplicated."""
+        snapped = []
+        seen = set()
+        for t in requested:
+            closest = min(available, key=lambda x: abs(x - t))
+            if closest not in seen:
+                snapped.append((t, closest))
+                seen.add(closest)
+        return snapped
+
+    def _draw_split_violins(ax, df, time_col, timepoint_pairs, time_unit):
+        positions = list(range(len(timepoint_pairs)))
+
+        for i, (requested, actual) in enumerate(timepoint_pairs):
+            subset = df[df[time_col] == actual]
+            preds_neg = subset.loc[subset['true_label'] == 0, 'pred'].values
+            preds_pos = subset.loc[subset['true_label'] == 1, 'pred'].values
+
+            # Left half: survived (negative)
+            if len(preds_neg) >= MIN_SAMPLES:
+                parts = ax.violinplot(
+                    preds_neg, positions=[i], showmedians=False,
+                    showextrema=False, widths=0.8
+                )
+                for body in parts['bodies']:
+                    verts = body.get_paths()[0].vertices
+                    center = i
+                    verts[:, 0] = np.clip(verts[:, 0], -np.inf, center)
+                    body.set_facecolor(COLOR_NEG)
+                    body.set_edgecolor('black')
+                    body.set_linewidth(0.5)
+                    body.set_alpha(0.7)
+                med = np.median(preds_neg)
+                ax.hlines(med, i - 0.35, i, colors='black', linewidth=1.5)
+
+            # Right half: deceased (positive)
+            if len(preds_pos) >= MIN_SAMPLES:
+                parts = ax.violinplot(
+                    preds_pos, positions=[i], showmedians=False,
+                    showextrema=False, widths=0.8
+                )
+                for body in parts['bodies']:
+                    verts = body.get_paths()[0].vertices
+                    center = i
+                    verts[:, 0] = np.clip(verts[:, 0], center, np.inf)
+                    body.set_facecolor(COLOR_POS)
+                    body.set_edgecolor('black')
+                    body.set_linewidth(0.5)
+                    body.set_alpha(0.7)
+                med = np.median(preds_pos)
+                ax.hlines(med, i, i + 0.35, colors='black', linewidth=1.5)
+
+            # Sample count annotation below the x-axis label (outside the plot area
+            # so it can't cover data). constrained_layout reserves bottom margin.
+            n_neg = len(preds_neg)
+            n_pos = len(preds_pos)
+            ax.text(
+                i, -0.22, f"n={n_neg}/{n_pos}",
+                ha='center', va='top', fontsize=9, color='#555555',
+                transform=ax.get_xaxis_transform(), clip_on=False,
+            )
+
+        # Format x-axis with requested timepoint labels (combine time + n= on one tick)
+        ax.set_xticks(positions)
+        if time_unit == 'hours':
+            labels = [f"{int(t)}h" for t, _ in timepoint_pairs]
+        else:
+            labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
+        ax.set_xticklabels(labels, fontsize=_FIG_STYLE['tick_label'])
+
+    # 3-row layout: panel A, panel B, dedicated legend row below both.
+    # constrained_layout auto-reserves bottom margin for the n=X/Y annotations
+    # that live below each panel's x-axis label.
+    fig = plt.figure(figsize=(6, 7.5), constrained_layout=True)
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.0, 0.10])
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0])
+    ax_legend = fig.add_subplot(gs[2, 0])
+    ax_legend.axis('off')
+
+    # Panel A: Hours
+    avail_hours = sorted(df['time_hours'].unique())
+    hour_pairs = _snap_timepoints(avail_hours, hour_timepoints)
+    if hour_pairs:
+        _draw_split_violins(ax1, df, 'time_hours', hour_pairs, 'hours')
+
+    ax1.set_title("A) Prediction Distribution over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax1.set_ylabel("Predicted Mortality Risk", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_ylim(0, 1.05)
+    ax1.set_yticks(np.arange(0, 1.1, 0.1))
+    ax1.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    # Panel B: Days
+    avail_days = sorted(df['time_days'].unique())
+    day_pairs = _snap_timepoints(avail_days, day_timepoints)
+    if day_pairs:
+        _draw_split_violins(ax2, df, 'time_days', day_pairs, 'days')
+
+    ax2.set_title("B) Prediction Distribution over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax2.set_ylabel("Predicted Mortality Risk", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_ylim(0, 1.05)
+    ax2.set_yticks(np.arange(0, 1.1, 0.1))
+    ax2.axhline(0.5, color='gray', linestyle='--', alpha=0.4, linewidth=0.8)
+    ax2.grid(True, alpha=0.3, axis='y')
+
+    # Shared legend in the dedicated bottom row (below both panels)
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=COLOR_NEG, edgecolor='black', alpha=0.7, label='Survived'),
+        Patch(facecolor=COLOR_POS, edgecolor='black', alpha=0.7, label='Deceased'),
+    ]
+    ax_legend.legend(
+        handles=legend_elements, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+
+    return fig
+
+
+def plot_multi_percentile_recall(
+    results: List[PercentileRecallResult],
+    percentiles: List[int] = (5, 10, 15, 20, 25),
+    cut_hours: int = 72,
+    max_days: float = None,
+):
+    """Plot recall over time for multiple top-percentile risk thresholds.
+
+    1x2 layout: hours (left) | days (right), with one line per percentile.
+
+    Args:
+        results: Output from evaluate_percentile_recall_over_time().
+        percentiles: Percentiles to plot (must match keys in results).
+        cut_hours: Hour cutoff for the left subplot.
+        max_days: Day limit for right subplot (default: from config).
+
+    Returns:
+        matplotlib Figure.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+    if not results:
+        raise ValueError("No percentile recall results to plot")
+
+    times_h = np.array([r.time_hours for r in results])
+    times_d = np.array([r.time_days for r in results])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    mask_cut = times_h <= cut_hours
+
+    for i, perc in enumerate(percentiles):
+        color = f"C{i}"
+        recall_vals = np.array([r.recalls[perc] for r in results])
+        recall_lower = np.array([r.recall_cis[perc][0] for r in results])
+        recall_upper = np.array([r.recall_cis[perc][1] for r in results])
+        label = f"Top {perc}%"
+
+        # --- Left panel: hours ---
+        x_h = times_h[mask_cut]
+        v_h = recall_vals[mask_cut]
+        lo_h = recall_lower[mask_cut]
+        hi_h = recall_upper[mask_cut]
+
+        if len(x_h) > 0:
+            if x_h[-1] < cut_hours:
+                x_h = np.append(x_h, cut_hours)
+                v_h = np.append(v_h, v_h[-1])
+                lo_h = np.append(lo_h, lo_h[-1])
+                hi_h = np.append(hi_h, hi_h[-1])
+            ax1.plot(x_h, v_h, color=color, marker='.', label=label,
+                     markersize=4, linewidth=2, alpha=0.8)
+            ax1.fill_between(x_h, lo_h, hi_h, color=color, alpha=0.15)
+
+        # --- Right panel: days ---
+        x_d = times_d
+        v_d = recall_vals
+        lo_d = recall_lower
+        hi_d = recall_upper
+
+        if len(x_d) > 0:
+            if x_d[-1] < max_days:
+                x_d = np.append(x_d, max_days)
+                v_d = np.append(v_d, v_d[-1])
+                lo_d = np.append(lo_d, lo_d[-1])
+                hi_d = np.append(hi_d, hi_d[-1])
+            ax2.plot(x_d, v_d, color=color, marker='.', label=label,
+                     markersize=4, linewidth=2, alpha=0.8)
+            ax2.fill_between(x_d, lo_d, hi_d, color=color, alpha=0.15)
+
+    # Left panel formatting
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_xlim(0, cut_hours)
+    ax1.set_xticks(np.arange(0, cut_hours + 1, 6 if cut_hours <= 72 else 4))
+    ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax1.set_ylim(0.0, 1.0)
+    ax1.set_ylabel("Sensitivity", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_title(f"A) High-Risk Sensitivity until {cut_hours}h", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+
+    # Right panel formatting
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_xlim(0, max_days)
+    ax2.set_xticks(np.arange(0, max_days + 1, 5))
+    ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
+    ax2.set_ylim(0.0, 1.0)
+    ax2.set_ylabel("Sensitivity", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_title(f"B) High-Risk Sensitivity up to {int(max_days)} days", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='lower right', fontsize=_FIG_STYLE['legend'])
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+
+    plt.tight_layout(pad=3.0)
     return fig
 
 
@@ -973,9 +1477,19 @@ def plot_time_metrics_comparison(
     if not results_all or not results_active:
         raise ValueError("Both result sets required for comparison plot")
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 11))
-    ax_perf_h, ax_perf_d = axes[0]
-    ax_count_h, ax_count_d = axes[1]
+    # 4-row layout with dedicated legend rows. constrained_layout auto-sizes each
+    # row based on actual artist extents (panel titles, x-labels, legend heights)
+    # so legends never collide with adjacent panel content.
+    fig = plt.figure(figsize=(11, 8.25), constrained_layout=True)
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.18, 1.0, 0.18])
+    ax_perf_h = fig.add_subplot(gs[0, 0])
+    ax_perf_d = fig.add_subplot(gs[0, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_count_h = fig.add_subplot(gs[2, 0])
+    ax_count_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
 
     # ── Top row: performance curves ──────────────────────────────────────
     datasets = [
@@ -1050,13 +1564,14 @@ def plot_time_metrics_comparison(
         (ax_perf_d, "Time (days)", max_days,
          np.arange(0, max_days + 1, 5), "B) Performance over Days"),
     ]:
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
         ax.set_xticks(xticks)
         ax.set_yticks(np.arange(0.0, 1.1, 0.1))
-        ax.set_ylabel("Score", fontsize=11)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax.set_ylim(0.0, 1.0)
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
@@ -1084,69 +1599,89 @@ def plot_time_metrics_comparison(
     ]:
         ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
         ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
-                label=f"{target_name} = 1 (active)")
+                label=f"{_display_target(target_name)} (active)")
         ax.axhline(y=all_n, color=ALL_COLOR, linestyle=":", linewidth=1.2,
                     label=f"All patients (N={all_n})")
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel("Count", fontsize=11)
-        ax.set_title(title, fontsize=12, fontweight='bold')
+        ax.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_ylim(bottom=0)
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
         ax_prev = ax.twinx()
         ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
                      linestyle="--", linewidth=1.5, label="Prevalence (%)")
-        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
         ax_prev.set_ylim(0, 12)
-        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
-    # ── Legends ──────────────────────────────────────────────────────────
+    # ── Legends in dedicated gridspec rows (no overlap with panels) ──────
     perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    fig.legend(perf_handles, perf_labels, loc='lower center', ncol=4, fontsize=10,
-               bbox_to_anchor=(0.5, 0.47))
+    ax_legend_top.legend(
+        perf_handles, perf_labels, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
 
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
-    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='lower center', ncol=4, fontsize=10, bbox_to_anchor=(0.5, -0.02))
+    ax_legend_bot.legend(
+        count_handles + prev_handles, count_labels + prev_labels,
+        loc='center', ncol=4, fontsize=_FIG_STYLE['legend'],
+        frameon=True, framealpha=0.9,
+    )
 
-    fig.subplots_adjust(hspace=0.45, bottom=0.08)
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
     return fig
 
 
 def plot_trauma_score_comparison(
-    results_active: List[TimeMetricResult],
-    score_results: Dict[str, List[TimeMetricResult]],
+    score_name: str,
+    paired: Dict[str, List[TimeMetricResult]],
     cut_hours=72, max_days=None,
     target_name: str = "deceased_30d",
-    subset_n: Optional[int] = None,
+    results_counts: Optional[List[TimeMetricResult]] = None,
 ):
-    """Active-only AUROC/AUPRC with time-varying trauma score baselines.
+    """Single score vs HNN comparison on identical patients per timestep.
 
     2x2 layout:
-        Top row:    AUROC/AUPRC over time (ASTRA + each score as curves with CIs)
-        Bottom row: active patient counts, prevalence for the filtered subset
+        Top row:    AUROC/AUPRC over time (HNN + score as curves with CIs)
+        Bottom row: active patient counts, prevalence for this score's subset
 
     Args:
-        results_active: ASTRA model TimeMetricResults (active-only, filtered subset).
-        score_results: Dict mapping score name to List[TimeMetricResult],
-            from evaluate_static_scores_over_time().
+        score_name: Name of the score (e.g. "RTS", "TRISS").
+        paired: {"score": List[TimeMetricResult], "model": List[TimeMetricResult]}.
+            Model results are computed on the exact same patients as the score
+            at each timestep (fair comparison).
+        results_counts: Optional separate results for count panels (bottom row).
+
+    Convention: AUROC = solid line, AUPRC = dotted line, same color per model.
     """
     if max_days is None:
         max_days = get_max_days()
-    if not results_active:
-        raise ValueError("Active-only results required for trauma score comparison")
 
-    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-    ax_perf_h, ax_perf_d = axes[0]
-    ax_count_h, ax_count_d = axes[1]
+    score_n = paired["score"][0].n_samples if paired["score"] else 0
+    # 4-row layout with dedicated legend rows (mirrors plot_time_metrics_comparison).
+    # constrained_layout auto-sizes rows to avoid overlap with titles/x-labels.
+    fig = plt.figure(figsize=(11, 8.25), constrained_layout=True)
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.0, 0.18, 1.0, 0.18])
+    ax_perf_h = fig.add_subplot(gs[0, 0])
+    ax_perf_d = fig.add_subplot(gs[0, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_count_h = fig.add_subplot(gs[2, 0])
+    ax_count_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
 
-    # ── Helper to plot a result set as AUROC + AUPRC curves ──────────────
-    def _plot_results(results, label_suffix, color_auroc, color_auprc,
-                      linestyle="-", alpha_ci=0.1):
+    # ── Color assignments ────────────────────────────────────────────────
+    score_color = "C3"
+    hnn_color = "C0"
+
+    # ── Helper to plot AUROC (solid) + AUPRC (dotted) for one model ──────
+    def _plot_model(results, model_name, color, alpha_ci=0.12):
         times_h = np.array([r.time_hours for r in results])
         times_d = np.array([r.time_days for r in results])
         auroc_vals = np.array([r.auroc for r in results])
@@ -1157,9 +1692,9 @@ def plot_trauma_score_comparison(
         auprc_hi = np.array([r.auprc_ci[1] for r in results])
         mask_cut = times_h <= cut_hours
 
-        for vals, lo, hi, color, metric in [
-            (auroc_vals, auroc_lo, auroc_hi, color_auroc, "AUROC"),
-            (auprc_vals, auprc_lo, auprc_hi, color_auprc, "AUPRC"),
+        for vals, lo, hi, ls, metric in [
+            (auroc_vals, auroc_lo, auroc_hi, "-", "AUROC"),
+            (auprc_vals, auprc_lo, auprc_hi, ":", "AUPRC"),
         ]:
             # Hours panel
             valid_h = mask_cut & ~np.isnan(vals)
@@ -1171,11 +1706,11 @@ def plot_trauma_score_comparison(
                     v = np.append(v, v[-1])
                     vlo = np.append(vlo, vlo[-1])
                     vhi = np.append(vhi, vhi[-1])
-                ax_perf_h.plot(x, v, color=color, linestyle=linestyle,
-                               label=f"{metric} {label_suffix}", linewidth=1.5)
+                ax_perf_h.plot(x, v, color=color, linestyle=ls,
+                               label=f"{metric} ({model_name})", linewidth=1.8)
                 ax_perf_h.fill_between(x, vlo, vhi, color=color, alpha=alpha_ci)
 
-            # Days panel
+            # Days panel (no duplicate labels)
             valid_d = ~np.isnan(vals)
             x = times_d[valid_d]
             v, vlo, vhi = vals[valid_d], lo[valid_d], hi[valid_d]
@@ -1185,49 +1720,60 @@ def plot_trauma_score_comparison(
                     v = np.append(v, v[-1])
                     vlo = np.append(vlo, vlo[-1])
                     vhi = np.append(vhi, vhi[-1])
-                ax_perf_d.plot(x, v, color=color, linestyle=linestyle,
-                               linewidth=1.5)
+                ax_perf_d.plot(x, v, color=color, linestyle=ls, linewidth=1.8)
                 ax_perf_d.fill_between(x, vlo, vhi, color=color, alpha=alpha_ci)
 
-    # Plot ASTRA model
-    _plot_results(results_active, "(ASTRA)", "C0", "C1",
-                  linestyle="-", alpha_ci=0.15)
+    # Plot HNN (on this score's patient set) then the score itself
+    _plot_model(paired["model"], "HNN", hnn_color, alpha_ci=0.12)
+    _plot_model(paired["score"], score_name, score_color, alpha_ci=0.08)
 
-    # Plot each trauma score
-    score_color_map = {"ISS": "C2", "RTS": "C3", "TRISS": "C4"}
-    for score_name, score_res in score_results.items():
-        color = score_color_map.get(score_name, "C5")
-        _plot_results(score_res, f"({score_name})", color, color,
-                      linestyle="--", alpha_ci=0.08)
-
-    subset_label = f" (N={subset_n})" if subset_n else ""
+    subset_label = f" (N={score_n})"
     for ax, xlabel, xlim, xticks, title in [
         (ax_perf_h, "Time (hours)", cut_hours,
          np.arange(0, cut_hours + 1, 6),
-         f"A) Performance — Trauma Score Subset{subset_label}"),
+         f"A) HNN vs {score_name}{subset_label} — Hours"),
         (ax_perf_d, "Time (days)", max_days,
          np.arange(0, max_days + 1, 5),
-         f"B) Performance — Trauma Score Subset{subset_label}"),
+         f"B) HNN vs {score_name}{subset_label} — Days"),
     ]:
-        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
         ax.set_xticks(xticks)
         ax.set_yticks(np.arange(0.0, 1.1, 0.1))
-        ax.set_ylabel("Score", fontsize=11)
-        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.set_ylabel("Score", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
         ax.set_ylim(0.0, 1.0)
+
+    # Performance legend — dedicated gridspec row (no overlap risk)
+    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
+    ax_legend_top.legend(
+        perf_handles, perf_labels, loc='center', ncol=2,
+        fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+    )
 
     # ── Bottom row: patient counts & prevalence ──────────────────────────
     PREV_COLOR = "#1F77B4"
     ACTIVE_COLOR = "#2CA02C"
     POSITIVE_COLOR = "#D62728"
 
-    times_h = np.array([r.time_hours for r in results_active])
-    times_d = np.array([r.time_days for r in results_active])
-    act_n_samples = np.array([r.n_samples for r in results_active])
-    act_n_positive = np.array([r.n_positive for r in results_active])
+    # Use results_counts for bottom panels if provided (covers full time range)
+    count_source = results_counts if results_counts is not None else paired["model"]
+    times_h = np.array([r.time_hours for r in count_source])
+    times_d = np.array([r.time_days for r in count_source])
+    act_n_samples = np.array([r.n_samples for r in count_source])
+    act_n_positive = np.array([r.n_positive for r in count_source])
     act_prevalence = np.where(act_n_samples > 0, act_n_positive / act_n_samples, 0.0)
+
+    # Extend to end of time range with zeros so lines go to 0 instead of clipping
+    if len(times_d) > 0 and times_d[-1] < max_days:
+        times_h = np.append(times_h, max_days * 24.0)
+        times_d = np.append(times_d, max_days)
+        act_n_samples = np.append(act_n_samples, 0)
+        act_n_positive = np.append(act_n_positive, 0)
+        act_prevalence = np.append(act_prevalence, 0.0)
+
     mask_cut_act = times_h <= cut_hours
 
     prev_ax_ref = None
@@ -1240,34 +1786,190 @@ def plot_trauma_score_comparison(
     ]:
         ax.plot(times[mask], n_samp[mask], color=ACTIVE_COLOR, label="Active patients")
         ax.plot(times[mask], n_pos[mask], color=POSITIVE_COLOR,
-                label=f"{target_name} = 1 (active)")
-        ax.set_xlabel(xlabel, fontsize=11)
+                label=f"{_display_target(target_name)} (active)")
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
         ax.set_xlim(0, xlim)
-        ax.set_ylabel("Count", fontsize=11)
-        ax.set_title(title, fontsize=11, fontweight='bold')
+        ax.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_ylim(bottom=0)
+        ax.set_title(title, fontsize=_FIG_STYLE['title'], fontweight='bold')
         ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
         ax_prev = ax.twinx()
         ax_prev.plot(times[mask], prev[mask] * 100, color=PREV_COLOR,
                      linestyle="--", linewidth=1.5, label="Prevalence (%)")
-        ax_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+        ax_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
         ax_prev.set_ylim(0, 12)
-        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+        ax_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
         if prev_ax_ref is None:
             prev_ax_ref = ax_prev
 
-    # ── Legends ──────────────────────────────────────────────────────────
-    perf_handles, perf_labels = ax_perf_h.get_legend_handles_labels()
-    fig.legend(perf_handles, perf_labels, loc='upper center',
-               ncol=4, fontsize=8, bbox_to_anchor=(0.5, 0.50))
-
+    # Count legend — dedicated gridspec row
     count_handles, count_labels = ax_count_h.get_legend_handles_labels()
     prev_handles, prev_labels = prev_ax_ref.get_legend_handles_labels()
-    fig.legend(count_handles + prev_handles, count_labels + prev_labels,
-               loc='upper center', ncol=3, fontsize=9, bbox_to_anchor=(0.5, 0.02))
+    ax_legend_bot.legend(
+        count_handles + prev_handles, count_labels + prev_labels,
+        loc='center', ncol=3, fontsize=_FIG_STYLE['legend'],
+        frameon=True, framealpha=0.9,
+    )
 
-    fig.subplots_adjust(hspace=0.55)
-    plt.tight_layout(rect=[0, 0.06, 1, 1])
+    return fig
+
+
+def plot_delong_comparison(
+    score_name: str,
+    paired: Dict,
+    cut_hours=72, max_days=None,
+):
+    """Standalone DeLong statistical comparison: HNN vs a trauma score over time.
+
+    2x2 layout:
+        Top row:    Delta AUROC (HNN - score) with 95% CI from DeLong SE
+        Bottom row: -log10(FDR-adjusted p-value) trajectory
+
+    Left column = hours (0 to cut_hours), right column = days (0 to max_days).
+
+    Args:
+        score_name: Name of the baseline score (e.g. "RTS", "TRISS").
+        paired: Dict from evaluate_static_scores_over_time(delong=True).
+            Must contain keys: delong_hours, delong_delta, delong_se,
+            delong_p_adj, delong_significant.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+
+    hours = np.array(paired["delong_hours"])
+    days = hours / 24.0
+    delta = np.array(paired["delong_delta"])
+    se = np.array(paired["delong_se"])
+    p_adj = np.array(paired["delong_p_adj"])
+    sig = np.array(paired["delong_significant"])
+
+    ci_lo = delta - 1.96 * se
+    ci_hi = delta + 1.96 * se
+
+    # Clamp p_adj floor for log transform (avoid -log10(0) = inf)
+    p_adj_safe = np.clip(p_adj, 1e-20, 1.0)
+    neg_log_p = -np.log10(p_adj_safe)
+
+    SIG_COLOR = "#2CA02C"
+    NONSIG_COLOR = "#999999"
+    DELTA_COLOR = "C0"
+
+    # 4-row layout: suptitle at top, panels A/B, dedicated legend axis,
+    # panels C/D, dedicated legend axis. Matches plot_time_metrics_comparison.
+    fig = plt.figure(figsize=(10, 7))
+    gs = fig.add_gridspec(4, 2, hspace=0.55, wspace=0.32,
+                          height_ratios=[1.0, 0.10, 1.0, 0.12],
+                          top=0.86, bottom=0.05, left=0.08, right=0.97)
+    ax_d_h = fig.add_subplot(gs[0, 0])
+    ax_d_d = fig.add_subplot(gs[0, 1])
+    ax_legend_top = fig.add_subplot(gs[1, :])
+    ax_legend_top.axis('off')
+    ax_p_h = fig.add_subplot(gs[2, 0])
+    ax_p_d = fig.add_subplot(gs[2, 1])
+    ax_legend_bot = fig.add_subplot(gs[3, :])
+    ax_legend_bot.axis('off')
+
+    n_sig = int(sig.sum())
+    n_total = len(sig)
+
+    # ── Top row: Delta AUROC with CI ─────────────────────────────────────
+    for ax, times, xlim, xlabel, title_lbl in [
+        (ax_d_h, hours, cut_hours, "Time (hours)", "A"),
+        (ax_d_d, days, max_days, "Time (days)", "B"),
+    ]:
+        mask = times <= xlim
+        t = times[mask]
+        d, lo, hi = delta[mask], ci_lo[mask], ci_hi[mask]
+        s = sig[mask]
+
+        # CI band
+        ax.fill_between(t, lo, hi, color=DELTA_COLOR, alpha=0.12)
+        # Delta line
+        ax.plot(t, d, color=DELTA_COLOR, linewidth=1.5)
+        # Green fill where significant and HNN wins
+        sig_win = s & (d > 0)
+        if sig_win.any():
+            ax.fill_between(t, 0, d,
+                            where=sig_win, color=SIG_COLOR, alpha=0.18,
+                            label="Significant (FDR<0.05)")
+        # Reference line at 0
+        ax.axhline(0, color='black', linewidth=0.8, linestyle='--', alpha=0.5)
+
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel(r"$\Delta$ AUROC (HNN $-$ " + score_name + ")", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_title(
+            f"{title_lbl}) Delta AUROC: HNN vs {score_name}",
+            fontsize=_FIG_STYLE['title'], fontweight='bold',
+        )
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+
+    # Legend for top row (dedicated axis, no overlap with titles)
+    d_handles, d_labels = ax_d_h.get_legend_handles_labels()
+    if d_handles:
+        ax_legend_top.legend(
+            d_handles, d_labels, loc='center', ncol=2,
+            fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+        )
+
+    # ── Bottom row: -log10(p_adj) trajectory ─────────────────────────────
+    threshold = -np.log10(0.05)
+
+    for ax, times, xlim, xlabel, title_lbl in [
+        (ax_p_h, hours, cut_hours, "Time (hours)", "C"),
+        (ax_p_d, days, max_days, "Time (days)", "D"),
+    ]:
+        mask = times <= xlim
+        t = times[mask]
+        nlp = neg_log_p[mask]
+        s = sig[mask]
+
+        # Scatter: green = significant, gray = not
+        ax.scatter(t[s], nlp[s], c=SIG_COLOR, s=18, zorder=3,
+                   label="Significant (FDR<0.05)")
+        ax.scatter(t[~s], nlp[~s], c=NONSIG_COLOR, s=18, zorder=3,
+                   label="Not significant")
+        # Connect with a thin line
+        ax.plot(t, nlp, color='#666666', linewidth=0.6, alpha=0.5, zorder=2)
+        # Significance threshold
+        ax.axhline(threshold, color='red', linewidth=1.0, linestyle='--',
+                    alpha=0.6, label=r"$\alpha$ = 0.05")
+
+        ax.set_xlabel(xlabel, fontsize=_FIG_STYLE['axis_label'])
+        ax.set_xlim(0, xlim)
+        ax.set_ylabel(r"$-\log_{10}(p_{adj})$", fontsize=_FIG_STYLE['axis_label'])
+        ax.set_ylim(bottom=0)
+        ax.set_title(
+            f"{title_lbl}) DeLong p-value (FDR-corrected)",
+            fontsize=_FIG_STYLE['title'], fontweight='bold',
+        )
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
+
+    # Legend for bottom row (dedicated axis)
+    p_handles, p_labels = ax_p_h.get_legend_handles_labels()
+    if p_handles:
+        ax_legend_bot.legend(
+            p_handles, p_labels, loc='center', ncol=3,
+            fontsize=_FIG_STYLE['legend'], frameon=True, framealpha=0.9,
+        )
+
+    # Suptitle + summary inside figure coords (top=0.86 reserved by GridSpec)
+    mean_delta = float(np.mean(delta))
+    summary = (
+        f"DeLong paired test: {n_sig}/{n_total} time points significant "
+        f"(BH-FDR<0.05), mean {chr(916)}AUROC = {mean_delta:+.3f}"
+    )
+    fig.suptitle(
+        f"HNN vs {score_name} — Statistical Comparison",
+        fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=0.97,
+    )
+    fig.text(0.5, 0.91, summary, ha='center', va='center',
+             fontsize=_FIG_STYLE['annotation'], fontstyle='italic', color='#444444')
+
     return fig
 
 
@@ -1292,58 +1994,72 @@ def plot_n_active_over_time(
     ACTIVE_COLOR = "#2CA02C"  # green
     POSITIVE_COLOR = "#D62728"  # red
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 10))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
+    for ax in [ax1, ax2]:
+        ax.set_box_aspect(1)
 
     mask_cut = times_h <= cut_hours
 
     # Hours panel
     ax1.plot(times_h[mask_cut], n_samples[mask_cut], color=ACTIVE_COLOR, label="Active patients")
-    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
-    ax1.set_xlabel("Time (hours)", fontsize=11)
+    ax1.plot(times_h[mask_cut], n_positive[mask_cut], color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
+    ax1.set_xlabel("Time (hours)", fontsize=_FIG_STYLE['axis_label'])
     ax1.set_xlim(0, cut_hours)
-    ax1.set_ylabel("Count", fontsize=11)
-    ax1.set_title("A) Active Patients over Hours", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
+    ax1.set_ylim(bottom=0)
+    ax1.set_title("A) Active Patients over Hours", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax1.grid(True, alpha=0.3)
+    ax1.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     ax1_prev = ax1.twinx()
     ax1_prev.plot(times_h[mask_cut], prevalence[mask_cut] * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax1_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax1_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
     ax1_prev.set_ylim(0, 12)
-    ax1_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+    ax1_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
 
     # Days panel
     ax2.plot(times_d, n_samples, color=ACTIVE_COLOR, label="Active patients")
-    ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{target_name} = 1 (active)")
-    ax2.set_xlabel("Time (days)", fontsize=11)
+    ax2.plot(times_d, n_positive, color=POSITIVE_COLOR, label=f"{_display_target(target_name)} (active)")
+    ax2.set_xlabel("Time (days)", fontsize=_FIG_STYLE['axis_label'])
     ax2.set_xlim(0, max_days)
-    ax2.set_ylabel("Count", fontsize=11)
-    ax2.set_title("B) Active Patients over Days", fontsize=12, fontweight='bold')
+    ax2.set_ylabel("Count", fontsize=_FIG_STYLE['axis_label'])
+    ax2.set_ylim(bottom=0)
+    ax2.set_title("B) Active Patients over Days", fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax2.grid(True, alpha=0.3)
+    ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     ax2_prev = ax2.twinx()
     ax2_prev.plot(times_d, prevalence * 100, color=PREV_COLOR,
                   linestyle="--", linewidth=1.5, label="Prevalence (%)")
-    ax2_prev.set_ylabel("Prevalence (%)", fontsize=10, color=PREV_COLOR)
+    ax2_prev.set_ylabel("Prevalence (%)", fontsize=_FIG_STYLE['axis_label'], color=PREV_COLOR)
     ax2_prev.set_ylim(0, 12)
-    ax2_prev.tick_params(axis='y', labelcolor=PREV_COLOR)
+    ax2_prev.tick_params(axis='y', labelcolor=PREV_COLOR, labelsize=_FIG_STYLE['tick_label'])
 
     # Combined legend below
     h1, l1 = ax1.get_legend_handles_labels()
     h2, l2 = ax1_prev.get_legend_handles_labels()
-    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=10,
+    fig.legend(h1 + h2, l1 + l2, loc='lower center', ncol=3, fontsize=_FIG_STYLE['legend'],
                bbox_to_anchor=(0.5, -0.02))
-    fig.subplots_adjust(bottom=0.18)
-    plt.tight_layout(rect=[0, 0.08, 1, 1])
+    plt.tight_layout(rect=[0, 0.06, 1, 1])
     return fig
 
 
-def plot_multiple_roc_pr_curves(
-    evaluator: TimeDependentEvaluator,
+def _plot_roc_pr_curves_from_arrays(
     censor_steps: List[int],
-    labels: Optional[List[str]] = None
+    preds_per_step: List[np.ndarray],
+    targets_per_step: List[np.ndarray],
+    labels: Optional[List[str]] = None,
 ):
-    fig, (ax_roc, ax_pr) = plt.subplots(2, 1, figsize=(8, 14))
+    """Shared plotting logic for ROC/PR multi-curve plots.
+
+    Args:
+        censor_steps: List of censor step indices.
+        preds_per_step: List of 1-D prediction arrays, one per step.
+        targets_per_step: List of 1-D target arrays, one per step.
+        labels: Optional display labels per step.
+    """
+    fig, (ax_roc, ax_pr) = plt.subplots(1, 2, figsize=(14, 6))
 
     colors = ['#1F77B4', '#FF7F0E', '#2CA02C', '#D62728', '#9467BD',
               '#8C564B', '#E377C2', '#7F7F7F', '#BCBD22', '#17BECF']
@@ -1351,14 +2067,8 @@ def plot_multiple_roc_pr_curves(
     baseline = None
 
     for i, censor_step in enumerate(censor_steps):
-        dls = evaluator.create_censored_dataloaders_fast(censor_step)
-        if dls is None:
-            logger.warning(f"Skipping step {censor_step}: dataloader creation failed")
-            continue
-
-        preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
-        y_preds = preds[:, 1].numpy()
-        ys = targets.numpy()
+        y_preds = preds_per_step[i]
+        ys = targets_per_step[i]
 
         if len(set(ys)) < 2:
             logger.warning(f"Skipping step {censor_step}: only one class")
@@ -1379,35 +2089,116 @@ def plot_multiple_roc_pr_curves(
         ax_pr.plot(recall, precision, color=color, label=f"{label} (AUC={auprc:.3f})", linewidth=2)
 
     ax_roc.plot([0, 1], [0, 1], 'k--', lw=1.5, c="grey", alpha=0.7, label='Chance')
-    ax_roc.set_title("ROC Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_roc.set_xlabel("False Positive Rate", fontsize=11)
-    ax_roc.set_ylabel("True Positive Rate", fontsize=11)
+    ax_roc.set_title("ROC Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax_roc.set_xlabel("False Positive Rate", fontsize=_FIG_STYLE['axis_label'])
+    ax_roc.set_ylabel("True Positive Rate", fontsize=_FIG_STYLE['axis_label'])
     ax_roc.grid(alpha=0.3)
-    ax_roc.legend(fontsize=10, title="Time Available", title_fontsize=10)
+    ax_roc.legend(fontsize=_FIG_STYLE['legend'], title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax_roc.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax_roc.set_aspect('equal', adjustable='box')
 
     if baseline is not None:
         ax_pr.axhline(y=baseline, color='grey', linestyle='--', lw=1.5, alpha=0.7, label=f'Baseline ({baseline:.3f})')
-    ax_pr.set_title("Precision-Recall Curves at Different Time Points", fontsize=13, fontweight='bold')
-    ax_pr.set_xlabel("Recall", fontsize=11)
-    ax_pr.set_ylabel("Precision", fontsize=11)
+    ax_pr.set_title("Precision-Recall Curves at Different Time Points", fontsize=_FIG_STYLE['title'], fontweight='bold')
+    ax_pr.set_xlabel("Recall", fontsize=_FIG_STYLE['axis_label'])
+    ax_pr.set_ylabel("Precision", fontsize=_FIG_STYLE['axis_label'])
     ax_pr.grid(alpha=0.3)
-    ax_pr.legend(fontsize=10, title="Time Available", title_fontsize=10)
+    ax_pr.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
+                title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+    ax_pr.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax_pr.set_aspect('equal', adjustable='box')
+
+    fig.subplots_adjust(right=0.82, wspace=0.3)
     plt.tight_layout()
 
     return fig
 
 
+def plot_multiple_roc_pr_curves(
+    evaluator: TimeDependentEvaluator,
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None
+):
+    preds_list = []
+    targs_list = []
+    valid_steps = []
+    valid_labels = []
+
+    for i, censor_step in enumerate(censor_steps):
+        dls = evaluator.create_censored_dataloaders_fast(censor_step)
+        if dls is None:
+            logger.warning(f"Skipping step {censor_step}: dataloader creation failed")
+            continue
+
+        preds, targets = _get_predictions(evaluator.model, dls.train, evaluator.device)
+        preds_list.append(preds[:, 1].numpy())
+        targs_list.append(targets.numpy())
+        valid_steps.append(censor_step)
+        valid_labels.append(
+            labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        )
+
+    return _plot_roc_pr_curves_from_arrays(valid_steps, preds_list, targs_list, valid_labels)
+
+
+def plot_multiple_roc_pr_curves_temporal(
+    temporal_eval: 'TemporalEvaluator',
+    censor_steps: List[int],
+    labels: Optional[List[str]] = None,
+):
+    """Create multi-curve ROC/PR plot using temporal (single forward pass) predictions."""
+    preds_all = temporal_eval._get_all_predictions()  # [N, seq_len]
+    ys = np.array(temporal_eval.data["ty"])
+    traj_lengths = temporal_eval._holdout_traj_lengths
+
+    preds_list = []
+    targs_list = []
+    valid_steps = []
+    valid_labels = []
+
+    for i, censor_step in enumerate(censor_steps):
+        # Apply active-only filtering if configured
+        if temporal_eval.active_only and len(traj_lengths) > 0:
+            mask = traj_lengths > censor_step
+            if mask.sum() < 2:
+                logger.warning(f"Skipping step {censor_step}: too few active patients ({mask.sum()})")
+                continue
+            preds_subset = preds_all[mask]
+            ys_subset = ys[mask]
+            traj_subset = traj_lengths[mask]
+        else:
+            preds_subset = preds_all
+            ys_subset = ys
+            traj_subset = traj_lengths
+
+        # Pick effective timestep per patient (min of censor_step, traj_end)
+        if len(traj_subset) > 0:
+            effective_steps = np.minimum(censor_step, traj_subset - 1).astype(int)
+            effective_steps = np.maximum(effective_steps, 0)
+        else:
+            effective_steps = np.full(len(preds_subset), min(censor_step, preds_subset.shape[1] - 1), dtype=int)
+
+        y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
+
+        preds_list.append(y_preds)
+        targs_list.append(ys_subset)
+        valid_steps.append(censor_step)
+        valid_labels.append(
+            labels[i] if labels and i < len(labels) else format_step_label(censor_step)
+        )
+
+    return _plot_roc_pr_curves_from_arrays(valid_steps, preds_list, targs_list, valid_labels)
+
+
 def _run_trauma_score_comparison(data, cfg, results_all, results_active,
-                                 preds_df_active, model_name):
+                                 preds_df_active, model_name,
+                                 delong: bool = False):
     """Shared trauma score comparison logic for both temporal and non-temporal paths."""
     try:
         from astra.evaluation.trauma_scores import (
             build_trauma_score_df,
             evaluate_static_scores,
             evaluate_static_scores_over_time,
-            recompute_metrics_for_subset,
         )
 
         logger.info("=" * 80)
@@ -1432,7 +2223,8 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
             save_figure(
                 fig_cmp_ts,
                 f"time_metrics_comparison_trauma_{model_name}",
-                save_dir='reports/eval',
+                save_dir=f'reports/eval/{model_name}',
+                **_SUBMISSION_KW,
             )
             logger.info("Comparison plot with trauma score baselines saved")
 
@@ -1442,30 +2234,41 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
         logger.info(f"Filtered subset: {len(valid_pids)} patients with RTS scores")
 
         if len(valid_pids) >= 20 and preds_df_active is not None:
-            # ASTRA model metrics on filtered subset
-            results_filtered = recompute_metrics_for_subset(
-                preds_df_active, holdout_y, holdout_pids, valid_pids,
-            )
-
-            # Time-varying trauma score metrics on active patients
+            # Time-varying score + model metrics on identical patients per step
             score_results = evaluate_static_scores_over_time(
                 trauma_df, preds_df_active, holdout_y, holdout_pids,
                 valid_pids=valid_pids,
+                delong=delong,
             )
 
-            if results_filtered and score_results:
-                fig_trauma = plot_trauma_score_comparison(
-                    results_filtered,
-                    score_results,
-                    target_name=cfg["target"],
-                    subset_n=len(valid_pids),
-                )
-                save_figure(
-                    fig_trauma,
-                    f"trauma_score_comparison_{model_name}",
-                    save_dir='reports/eval',
-                )
-                logger.info("Trauma score filtered comparison plot saved")
+            if score_results:
+                # One plot per score (each has different patient population)
+                for sname, paired in score_results.items():
+                    if sname == "ISS":
+                        continue
+                    fig_trauma = plot_trauma_score_comparison(
+                        sname, paired,
+                        target_name=cfg["target"],
+                        results_counts=paired["counts"],
+                    )
+                    save_figure(
+                        fig_trauma,
+                        f"trauma_{sname.lower()}_comparison_{model_name}",
+                        save_dir=f'reports/eval/{model_name}',
+                        **_SUBMISSION_KW,
+                    )
+                    logger.info(f"HNN vs {sname} comparison plot saved")
+
+                    # Standalone DeLong significance plot
+                    if "delong_significant" in paired:
+                        fig_dl = plot_delong_comparison(sname, paired)
+                        save_figure(
+                            fig_dl,
+                            f"delong_{sname.lower()}_comparison_{model_name}",
+                            save_dir=f'reports/eval/{model_name}',
+                            **_SUBMISSION_KW,
+                        )
+                        logger.info(f"DeLong {sname} comparison plot saved")
         else:
             logger.warning(
                 f"Too few patients with RTS ({len(valid_pids)}) or "
@@ -1481,7 +2284,8 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
 # ============================================================================
 
 def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True,
-             active_only: bool = False, trauma_scores: bool = False):
+             active_only: bool = False, trauma_scores: bool = False,
+             delong: bool = False):
     """
     Enhanced evaluation with time-dependent metrics.
 
@@ -1492,6 +2296,9 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                      comparison plots (all patients vs active-only).
         trauma_scores: If True, compute traditional trauma risk scores (RTS, ISS,
                       TRISS) and add them as baselines to comparison plots.
+        delong: If True, run paired DeLong tests between HNN and trauma scores
+                at each timestep with Benjamini-Hochberg FDR correction.
+                Only effective when trauma_scores=True.
     """
     model_name = cfg["model_name"]
     holdout_mixed_dls = data["holdout_mixed_dls"]
@@ -1523,42 +2330,99 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
         evalplt = plot_evaluation(
             torch.tensor(baseline_preds), torch.tensor(targs), cfg["target"]
         )
-        save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+        save_figure(evalplt, f"baseline_eval_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Baseline temporal evaluation saved")
 
         # Decision Curve Analysis (baseline — full trajectory)
         fig_dca = plot_decision_curve(targs, baseline_preds, model_name=model_name)
-        save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
-        plt.close(fig_dca)
+        save_figure(fig_dca, f"dca_baseline_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Baseline decision curve saved")
+
+        # Confusion matrices at F-beta optimised thresholds (calibrated)
+        # 1. Get trainval baseline predictions
+        from astra.evaluation.posthoc_calibration import fit_calibrators, apply_calibrator
+        logger.info("Computing calibrated F-beta thresholds (temporal)...")
+        trainval_dls = data["mixed_dls"]
+        tv_preds_all = []
+        tv_targets_all = []
+        with torch.no_grad():
+            for batch in trainval_dls.train:
+                inputs, targets_batch = batch
+                inputs = _to_device(inputs, device)
+                logits = model(inputs)
+                tv_preds_all.append(torch.sigmoid(logits).cpu())
+                tv_targets_all.append(targets_batch)
+        tv_preds_cat = torch.cat(tv_preds_all, dim=0).numpy()  # [N, seq_len]
+        tv_targs = torch.cat(tv_targets_all, dim=0).numpy()
+        tv_traj = np.array(data.get("trajectory_lengths", []))
+        if len(tv_traj) > 0:
+            tv_last = np.minimum(tv_preds_cat.shape[1] - 1, tv_traj - 1).astype(int)
+            tv_last = np.maximum(tv_last, 0)
+        else:
+            tv_last = np.full(len(tv_preds_cat), tv_preds_cat.shape[1] - 1, dtype=int)
+        tv_baseline_preds = tv_preds_cat[np.arange(len(tv_preds_cat)), tv_last]
+
+        # 2. Fit isotonic calibrator on trainval, apply to both
+        calibrators = fit_calibrators(tv_targs, tv_baseline_preds, methods=['isotonic'])
+        iso_cal = calibrators['isotonic']
+        tv_cal = apply_calibrator(iso_cal, tv_baseline_preds, 'isotonic')
+        ho_cal = apply_calibrator(iso_cal, baseline_preds, 'isotonic')
+        logger.info("Isotonic calibrator fit on trainval, applied to holdout")
+
+        # 3. Find thresholds on calibrated trainval, evaluate on calibrated holdout
+        for beta, label in [(1, "F1"), (5, "F5")]:
+            thr, score = find_optimal_fbeta_threshold(tv_targs, tv_cal, beta=beta)
+            logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on calibrated trainval")
+            fig_cm, _, _ = evaluate_detection_rate(
+                ho_cal, targs, threshold=thr, label=label
+            )
+            save_figure(fig_cm, f"cm_{label}_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
 
         key_timepoints = None
         if multicurve:
-            key_timepoints = [
-                time_to_step(1, 'h'), time_to_step(6, 'h'),
-                time_to_step(12, 'h'), time_to_step(72, 'h'),
-                time_to_step(7, 'D'), time_to_step(13, 'D'),
-                time_to_step(30, 'D'), time_to_step(90, 'D'),
-            ]
-            key_timepoints = [t for t in key_timepoints if t is not None]
+            max_step = get_total_steps() - 1
+            key_timepoints = sorted({
+                min(t, max_step) for t in [
+                    time_to_step(1, 'h'), time_to_step(6, 'h'),
+                    time_to_step(12, 'h'), time_to_step(72, 'h'),
+                    time_to_step(7, 'D'), time_to_step(14, 'D'),
+                    time_to_step(30, 'D'), time_to_step(90, 'D'),
+                ] if t is not None
+            })
 
             logger.info("Performance at key time points (temporal model):")
             for step in key_timepoints:
                 result = temporal_eval.evaluate_at_timestep(step)
                 if result:
-                    logger.info(
+                    line = (
                         f"  {format_step_label(step):>12s}: "
                         f"AUROC={result.auroc:.3f} [{result.auroc_ci[0]:.3f}-{result.auroc_ci[1]:.3f}], "
                         f"AUPRC={result.auprc:.3f} [{result.auprc_ci[0]:.3f}-{result.auprc_ci[1]:.3f}]"
                     )
+                    if result.cindex is not None:
+                        line += f", C-index={result.cindex:.3f}"
+                        if result.cindex_ci:
+                            line += f" [{result.cindex_ci[0]:.3f}-{result.cindex_ci[1]:.3f}]"
+                    logger.info(line)
+
+            # ROC/PR curves at key timepoints (temporal)
+            labels = [format_step_label(step) for step in key_timepoints]
+            fig_curves = plot_multiple_roc_pr_curves_temporal(
+                temporal_eval, key_timepoints, labels=labels
+            )
+            save_figure(fig_curves, f"multi_curves_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+            logger.info("Multiple ROC/PR curves plot saved (temporal)")
 
             # Decision curves at key timepoints (temporal)
-            labels = [format_step_label(step) for step in key_timepoints]
             fig_dca_time = _plot_decision_curves_temporal(
                 preds_all, targs, traj_lens, key_timepoints, labels=labels
             )
-            save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
-            plt.close(fig_dca_time)
+            save_figure(fig_dca_time, f"dca_multicurve_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Time-dependent decision curves saved (temporal)")
 
         if comprehensive_eval:
@@ -1573,19 +2437,34 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 logger.error("No valid results from temporal evaluation!")
                 return None, None
 
-            os.makedirs('reports/predictions', exist_ok=True)
+            os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
             if preds_df is not None:
                 preds_df.to_csv(
-                    f'reports/predictions/preds_df_{model_name}.csv', index=False
+                    f'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False
                 )
+            _save_time_metrics_csv(
+                results, f'reports/eval/{model_name}/predictions/time_metrics_{model_name}.csv'
+            )
 
             fig_time = plot_time_metrics(results, cut_hours=72)
-            save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+            save_figure(fig_time, f"time_metrics_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+
+            # Percentile recall plot
+            percentiles = [5, 10, 15, 20, 25]
+            recall_results = temporal_eval.evaluate_percentile_recall_over_time(
+                censor_thresholds, percentiles=percentiles
+            )
+            if recall_results:
+                fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
+                save_figure(fig_recall, f"multi_percentile_recall_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+                logger.info("Percentile recall plot saved")
 
             # Active-only evaluation and comparison
             results_active = None
             preds_df_active = None
-            if active_only or trauma_scores:
+            if active_only or trauma_scores or comprehensive_eval:
                 logger.info("Running active-only temporal evaluation...")
                 temporal_eval_active = TemporalEvaluator(
                     data, model, cfg, device=device, active_only=True
@@ -1596,20 +2475,37 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                 if results_active:
                     if preds_df_active is not None:
                         preds_df_active.to_csv(
-                            f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                            f'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                         )
+                    _save_time_metrics_csv(
+                        results_active, f'reports/eval/{model_name}/predictions/time_metrics_{model_name}_active.csv'
+                    )
                     fig_cmp = plot_time_metrics_comparison(
                         results, results_active, target_name=cfg["target"]
                     )
-                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                    save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
+                                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                     fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                    save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                    save_figure(fig_n, f"n_active_{model_name}",
+                                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                     logger.info("Active-only comparison plots saved")
+
+            # Prediction distribution plot (prefer active-only predictions)
+            dist_preds = preds_df_active if preds_df_active is not None else preds_df
+            if dist_preds is not None:
+                fig_dist = plot_prediction_distribution(
+                    dist_preds, np.array(data["ty"]),
+                    data["holdout"].base.PID.values
+                )
+                save_figure(fig_dist, f"pred_distribution_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+                logger.info("Prediction distribution plot saved")
 
             # Trauma score comparison (temporal path)
             if trauma_scores:
                 _run_trauma_score_comparison(
-                    data, cfg, results, results_active, preds_df_active, model_name
+                    data, cfg, results, results_active, preds_df_active, model_name,
+                    delong=delong,
                 )
 
             logger.info("="*80)
@@ -1626,6 +2522,8 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                         r = matching[0]
                         line = (f"  {format_step_label(step):>12s}: "
                                 f"AUROC={r.auroc:.3f}, AUPRC={r.auprc:.3f}")
+                        if r.cindex is not None:
+                            line += f", C-index={r.cindex:.3f}"
                         if matching_active:
                             ra = matching_active[0]
                             line += (f"  |  Active: AUROC={ra.auroc:.3f}, "
@@ -1641,16 +2539,42 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     preds, targs = _get_predictions(model, holdout_mixed_dls.train, device)
 
     evalplt = plot_evaluation(preds[:, 1], targs, cfg["target"])
-    save_figure(evalplt, f"baseline_eval_{model_name}", save_dir='reports/eval')
+    save_figure(evalplt, f"baseline_eval_{model_name}",
+                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
     logger.info("Baseline ROC/PR plot saved")
 
     # Decision Curve Analysis (baseline — full trajectory)
     fig_dca = plot_decision_curve(
         targs.numpy(), preds[:, 1].numpy(), model_name=model_name
     )
-    save_figure(fig_dca, f"dca_baseline_{model_name}", save_dir='reports/eval')
-    plt.close(fig_dca)
+    save_figure(fig_dca, f"dca_baseline_{model_name}",
+                save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
     logger.info("Baseline decision curve saved")
+
+    # Confusion matrices at F-beta optimised thresholds (calibrated)
+    logger.info("Computing calibrated F-beta thresholds...")
+    tv_preds_raw, tv_targs_raw = _get_predictions(model, data["mixed_dls"].train, device)
+    tv_y_pred = tv_preds_raw[:, 1].numpy()
+    tv_y_true = tv_targs_raw.numpy()
+    holdout_y_pred = preds[:, 1].numpy()
+    holdout_y_true = targs.numpy()
+
+    # Fit isotonic calibrator on trainval, apply to both
+    from astra.evaluation.posthoc_calibration import fit_calibrators, apply_calibrator
+    calibrators = fit_calibrators(tv_y_true, tv_y_pred, methods=['isotonic'])
+    iso_cal = calibrators['isotonic']
+    tv_y_cal = apply_calibrator(iso_cal, tv_y_pred, 'isotonic')
+    ho_y_cal = apply_calibrator(iso_cal, holdout_y_pred, 'isotonic')
+    logger.info("Isotonic calibrator fit on trainval, applied to holdout")
+
+    for beta, label in [(1, "F1"), (5, "F5")]:
+        thr, score = find_optimal_fbeta_threshold(tv_y_true, tv_y_cal, beta=beta)
+        logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on calibrated trainval")
+        fig_cm, _, _ = evaluate_detection_rate(
+            ho_y_cal, holdout_y_true, threshold=thr, label=label
+        )
+        save_figure(fig_cm, f"cm_{label}_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
 
     # Initialize evaluator with pre-normalized data
     evaluator = TimeDependentEvaluator(data, model, cfg, device=device)
@@ -1659,19 +2583,15 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
     if multicurve:
         logger.info("Creating multiple ROC/PR curves at key timepoints...")
 
-        key_timepoints = [
-            time_to_step(1, 'h'),
-            time_to_step(6, 'h'),
-            time_to_step(12, 'h'),
-            time_to_step(72, 'h'),
-            time_to_step(7, 'D'),
-            time_to_step(13, 'D'),
-            time_to_step(30, 'D'),
-            time_to_step(90, 'D'),
-        ]
-
-        key_timepoints = [t for t in key_timepoints if t is not None]
-        key_timepoints.reverse()
+        max_step = get_total_steps() - 2
+        key_timepoints = sorted({
+            min(t, max_step) for t in [
+                time_to_step(1, 'h'), time_to_step(6, 'h'),
+                time_to_step(12, 'h'), time_to_step(72, 'h'),
+                time_to_step(7, 'D'), time_to_step(14, 'D'),
+                time_to_step(30, 'D'), time_to_step(90, 'D'),
+            ] if t is not None
+        }, reverse=True)
 
         labels = [format_step_label(step) for step in key_timepoints]
 
@@ -1680,15 +2600,19 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             key_timepoints,
             labels=labels
         )
-        save_figure(fig_curves, f"multi_curves_{model_name}", save_dir='reports/eval')
+        save_figure(fig_curves, f"multi_curves_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Multiple curves plot saved")
 
-        # Decision curves at key timepoints
-        fig_dca_time = plot_decision_curves_over_time(
-            evaluator, key_timepoints, labels=labels
+        # Decision curves at key timepoints (active-only for correct prevalence)
+        evaluator_dca = TimeDependentEvaluator(
+            data, model, cfg, device=device, active_only=True
         )
-        save_figure(fig_dca_time, f"dca_multicurve_{model_name}", save_dir='reports/eval')
-        plt.close(fig_dca_time)
+        fig_dca_time = plot_decision_curves_over_time(
+            evaluator_dca, key_timepoints, labels=labels
+        )
+        save_figure(fig_dca_time, f"dca_multicurve_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Time-dependent decision curves saved")
 
     # COMPREHENSIVE TIME-DEPENDENT EVALUATION
@@ -1717,14 +2641,26 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
 
         logger.info(f"Evaluated at {len(results)} time points")
 
-        os.makedirs('reports/predictions', exist_ok=True)
-        preds_df.to_csv(f'reports/predictions/preds_df_{model_name}.csv', index=False)
+        os.makedirs(f'reports/eval/{model_name}/predictions', exist_ok=True)
+        preds_df.to_csv(f'reports/eval/{model_name}/predictions/preds_df_{model_name}.csv', index=False)
         logger.info(f"Predictions saved to CSV")
 
         logger.info("Creating time-dependent metrics plot...")
         fig_time = plot_time_metrics(results, cut_hours=72)
-        save_figure(fig_time, f"time_metrics_{model_name}", save_dir='reports/eval')
+        save_figure(fig_time, f"time_metrics_{model_name}",
+                    save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Time metrics plot saved")
+
+        # Percentile recall plot
+        percentiles = [5, 10, 15, 20, 25]
+        recall_results = evaluator.evaluate_percentile_recall_over_time(
+            censor_thresholds, percentiles=percentiles
+        )
+        if recall_results:
+            fig_recall = plot_multi_percentile_recall(recall_results, percentiles)
+            save_figure(fig_recall, f"multi_percentile_recall_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+            logger.info("Percentile recall plot saved")
 
         # Active-only evaluation and comparison
         results_active = None
@@ -1740,22 +2676,44 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             if results_active:
                 if preds_df_active is not None:
                     preds_df_active.to_csv(
-                        f'reports/predictions/preds_df_{model_name}_active.csv', index=False
+                        f'reports/eval/{model_name}/predictions/preds_df_{model_name}_active.csv', index=False
                     )
                 fig_cmp = plot_time_metrics_comparison(
                     results, results_active, target_name=cfg["target"]
                 )
-                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}", save_dir='reports/eval')
+                save_figure(fig_cmp, f"time_metrics_comparison_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 fig_n = plot_n_active_over_time(results_active, target_name=cfg["target"])
-                save_figure(fig_n, f"n_active_{model_name}", save_dir='reports/eval')
+                save_figure(fig_n, f"n_active_{model_name}",
+                            save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 logger.info("Active-only comparison plots saved")
+
+        # Prediction distribution plot (active-only predictions)
+        if preds_df_active is None and preds_df is not None:
+            logger.info("Running active-only evaluation for distribution plot...")
+            evaluator_active = TimeDependentEvaluator(
+                data, model, cfg, device=device, active_only=True
+            )
+            _, preds_df_active = evaluator_active.evaluate_over_time_ultra_fast(
+                censor_thresholds, save_predictions=True, model_name=f"{model_name}_active"
+            )
+        dist_preds = preds_df_active if preds_df_active is not None else preds_df
+        if dist_preds is not None:
+            fig_dist = plot_prediction_distribution(
+                dist_preds, np.array(data["ty"]),
+                data["holdout"].base.PID.values
+            )
+            save_figure(fig_dist, f"pred_distribution_{model_name}",
+                        save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
+            logger.info("Prediction distribution plot saved")
 
         # ================================================================
         # TRAUMA SCORE COMPARISON (optional, Azure-only)
         # ================================================================
         if trauma_scores:
             _run_trauma_score_comparison(
-                data, cfg, results, results_active, preds_df_active, model_name
+                data, cfg, results, results_active, preds_df_active, model_name,
+                delong=delong,
             )
 
         logger.info("="*80)

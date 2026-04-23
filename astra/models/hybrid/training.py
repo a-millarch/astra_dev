@@ -22,9 +22,12 @@ def get_backbone(
     temporal_head=False,
     causal=False,
     temporal_head_dropout=0.3,
+    temporal_head_mult=0.5,
     temporal_channel_idx=None,
     exclude_channel_indices=None,
+    bin_width_channel_idx=None,
 ):
+    model_cfg = cfg["model"]
     backbone = TSTabFusionTransformerMultiHot(
         c_in=data["c_in"],
         c_out=2,
@@ -32,20 +35,27 @@ def get_backbone(
         classes=data["classes"],
         cont_names=data["num_cols"],
         ts_cat_dims=data["ts_cat_dims"],
-        d_model=cfg["model"]["d_model"],
-        n_layers=cfg["model"]["n_layers"],
-        n_heads=cfg["model"]["n_heads"],
-        fc_dropout=cfg["model"]["fc_dropout"],
-        res_dropout=cfg["model"]["res_dropout"],
-        fc_mults=(cfg["model"]["fc_mults_1"], cfg["model"]["fc_mults_2"]),
+        d_model=model_cfg["d_model"],
+        n_layers=model_cfg["n_layers"],
+        n_heads=model_cfg["n_heads"],
+        fc_dropout=model_cfg["fc_dropout"],
+        res_dropout=model_cfg["res_dropout"],
+        fc_mults=(model_cfg["fc_mults_1"], model_cfg["fc_mults_2"]),
         cat_ts_combine='add',
         use_count_normalization=False,
         temporal_head=temporal_head,
         causal=causal,
         temporal_head_dropout=temporal_head_dropout,
+        temporal_head_mult=temporal_head_mult,
         temporal_channel_idx=temporal_channel_idx,
         exclude_channel_indices=exclude_channel_indices or [],
-        head_pool=cfg["model"].get("head_pool", "flatten"),
+        head_pool=model_cfg.get("head_pool", "flatten"),
+        per_feature_cont_proj=model_cfg.get("per_feature_cont_proj", False),
+        cat_ts_gate=model_cfg.get("cat_ts_gate", False),
+        local_temporal_kernel=model_cfg.get("local_temporal_kernel", 1),
+        bin_width_channel_idx=bin_width_channel_idx,
+        bin_width_modulation=model_cfg.get("bin_width_modulation", False),
+        ts_cat_profile_dims=data.get("ts_cat_profile_dims"),
     )
     return backbone
 
@@ -80,6 +90,11 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
             patience=pc["patience"],
             save_best=pc["save_best"],
             checkpoint_dir=f'{pc["checkpoint_dir"]}/{cfg["model_name"]}',
+            sparse_aware_masking=pc.get("sparse_aware_masking", False),
+            mask_prob_ts_data=pc.get("mask_prob_ts_data", 0.30),
+            mask_prob_ts_empty=pc.get("mask_prob_ts_empty", 0.05),
+            mask_prob_cat_ts_data=pc.get("mask_prob_cat_ts_data", 0.40),
+            mask_prob_cat_ts_empty=pc.get("mask_prob_cat_ts_empty", 0.03),
         )
 
     # ============================================================================
@@ -156,6 +171,7 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         x_cont=x_cont,
         X_ts_cat=X_multi_hot,
         y=y,
+        X_ts_cat_profiles=data.get("X_ts_cat_profiles"),
     )
     mixed_dls_ul = AstraMixedDataLoader(
         pretrain_dataset,
@@ -193,6 +209,7 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
         data, cfg,
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
     logger.info(f"  Backbone: {type(backbone).__name__}")
 

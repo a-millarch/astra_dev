@@ -261,5 +261,64 @@ class MultiHotEmbeddingWithCount(nn.Module):
         
         # Weighted sum
         embedded = torch.matmul(weights, all_embeddings)
-        
+
         return embedded
+
+
+class ProfileEmbedding(nn.Module):
+    """Per-category ordinal embedding for profiled categorical TS.
+
+    Each category has its own ``nn.Embedding`` table so the model can learn
+    that levels within a category are related.  Level 0 = absent (maps to a
+    zero vector by default, contributing nothing when the category is inactive).
+
+    Args:
+        profile_dims: ``{category_name: n_levels}``
+            e.g. ``{'antibiotics': 3, 'opioids': 2}``.
+            ``n_levels`` is the max profile level (1-based); the absent level 0
+            is added automatically.
+        embedding_dim: Output embedding dimension per category.
+        zero_absent: If True, level-0 embedding is initialised to zeros so
+            absent categories contribute nothing (gradient still flows).
+    """
+
+    def __init__(
+        self,
+        profile_dims: dict,
+        embedding_dim: int,
+        zero_absent: bool = True,
+    ):
+        super().__init__()
+        self.category_order = list(profile_dims.keys())
+        self.n_categories = len(self.category_order)
+        self.embedding_dim = embedding_dim
+
+        self.embeddings = nn.ModuleDict()
+        for cat_name, n_levels in profile_dims.items():
+            # +1 for the absent level at index 0
+            emb = nn.Embedding(n_levels + 1, embedding_dim)
+            if zero_absent:
+                emb.weight.data[0].zero_()
+            self.embeddings[cat_name] = emb
+
+    def forward(self, x_profiles: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_profiles: ``[batch_size, seq_len, n_profiled_categories]``
+                Integer profile levels (0 = absent, 1..N = profile levels).
+
+        Returns:
+            embedded: ``[batch_size, seq_len, embedding_dim]``
+                Sum of per-category embeddings.
+        """
+        parts = []
+        for i, cat_name in enumerate(self.category_order):
+            level = x_profiles[:, :, i].long()                 # [bs, seq]
+            cat_embed = self.embeddings[cat_name](level)        # [bs, seq, emb_dim]
+            parts.append(cat_embed)
+
+        if not parts:
+            bs, seq = x_profiles.shape[:2]
+            return torch.zeros(bs, seq, self.embedding_dim, device=x_profiles.device)
+
+        return sum(parts)

@@ -53,11 +53,23 @@ class AstraScaler:
     _KURT_NORMAL = 3.0
     _KURT_MODERATE = 7.0
 
+    # Boundary concentration thresholds: override quantile → robust when
+    # >= _BOUNDARY_MASS_THRESH of values cluster within _BOUNDARY_RANGE_FRAC
+    # of the observed range at either boundary (e.g. SPO2 ceiling at 100).
+    _BOUNDARY_RANGE_FRAC = 0.05
+    _BOUNDARY_MASS_THRESH = 0.40
+
     def __init__(self, method='adaptive', n_quantiles=1000,
-                 quantile_output='normal'):
+                 quantile_output='normal', clip_range=None,
+                 boundary_range_frac=None, boundary_mass_thresh=None):
         self.method = method
         self.n_quantiles = n_quantiles
         self.quantile_output = quantile_output
+        self.clip_range = clip_range  # e.g. (-3.0, 3.0) to clip normalized output
+        if boundary_range_frac is not None:
+            self._BOUNDARY_RANGE_FRAC = boundary_range_frac
+        if boundary_mass_thresh is not None:
+            self._BOUNDARY_MASS_THRESH = boundary_mass_thresh
 
         # Populated during fit
         self.channel_scalers_ = {}   # ch_idx → fitted object / dict
@@ -74,7 +86,30 @@ class AstraScaler:
     # Adaptive method selection
     # ------------------------------------------------------------------
     @staticmethod
-    def _select_method(values):
+    def _is_boundary_concentrated(values, range_frac=None, mass_thresh=None):
+        """Detect ceiling/floor-bounded distributions.
+
+        Returns True if >= *mass_thresh* of values cluster within
+        *range_frac* of the observed range at either boundary.  This
+        guards against quantile normalisation amplifying tiny raw
+        changes (e.g. SPO2 95-100 → full N(0,1) spread).
+        """
+        if range_frac is None:
+            range_frac = AstraScaler._BOUNDARY_RANGE_FRAC
+        if mass_thresh is None:
+            mass_thresh = AstraScaler._BOUNDARY_MASS_THRESH
+
+        vmin, vmax = float(np.nanmin(values)), float(np.nanmax(values))
+        span = vmax - vmin
+        if span == 0:
+            return False
+        zone = span * range_frac
+        at_ceiling = np.nansum(values >= vmax - zone) / len(values)
+        at_floor = np.nansum(values <= vmin + zone) / len(values)
+        return float(max(at_ceiling, at_floor)) >= mass_thresh
+
+    @staticmethod
+    def _select_method(values, range_frac=None, mass_thresh=None):
         """Pick normalisation method from distribution shape."""
         s = abs(float(_skew(values, nan_policy='omit')))
         k = float(_kurtosis(values, nan_policy='omit'))  # excess
@@ -82,6 +117,11 @@ class AstraScaler:
             return 'standard'
         elif s < AstraScaler._SKEW_MODERATE and k < AstraScaler._KURT_MODERATE:
             return 'power'
+        # Check for boundary-concentrated distributions before defaulting
+        # to quantile — quantile amplifies small changes in dense boundary
+        # regions (e.g. SPO2 ceiling, GCS ceiling).
+        if AstraScaler._is_boundary_concentrated(values, range_frac, mass_thresh):
+            return 'robust'
         return 'quantile'
 
     # ------------------------------------------------------------------
@@ -94,7 +134,8 @@ class AstraScaler:
             self.channel_scalers_[ch_idx] = {'mean': 0.0, 'std': 1.0}
             return
 
-        method = (self._select_method(values)
+        method = (self._select_method(
+                      values, self._BOUNDARY_RANGE_FRAC, self._BOUNDARY_MASS_THRESH)
                   if self.method == 'adaptive' else self.method)
         self.channel_methods_[ch_idx] = method
 
@@ -143,13 +184,17 @@ class AstraScaler:
         method = self.channel_methods_[ch_idx]
 
         if method == 'standard':
-            return (values - sc['mean']) / sc['std']
+            out = (values - sc['mean']) / sc['std']
         elif method in ('quantile', 'power'):
-            return sc.transform(values.reshape(-1, 1)).ravel()
+            out = sc.transform(values.reshape(-1, 1)).ravel()
         elif method == 'robust':
-            return (values - sc['median']) / sc['iqr']
+            out = (values - sc['median']) / sc['iqr']
         else:
             raise ValueError(f"Unknown method for channel {ch_idx}: {method}")
+
+        if self.clip_range is not None:
+            out = np.clip(out, self.clip_range[0], self.clip_range[1])
+        return out
 
     # ------------------------------------------------------------------
     # Populate backward-compat attributes after all channels are fitted
@@ -474,6 +519,54 @@ def encode_categorical_ts(df_wide, y, cfg, encoder=None):
     return X_multi_hot, encoding_info, ts_cat_dims, encoder
 
 
+def _extract_profile_tensors(tsds, final_pids, cfg):
+    """Extract and re-index profile tensors from a TSDS to match final PID order.
+
+    Args:
+        tsds: TSDS instance with ``_profile_data`` populated by ``collect_concepts()``.
+        final_pids: Sorted list of PIDs matching the final X/y ordering.
+        cfg: Config dict.
+
+    Returns:
+        profiles: np.ndarray [n_samples, total_profiled_categories, seq_len] (int8)
+                  or None if profiles are disabled / no profiled categories.
+        profile_dims: Dict {category_name: n_levels} across all concepts, or None.
+        category_order: List of profiled category names (matches tensor dim 1 order), or None.
+    """
+    from astra.data.profiles import profiles_enabled
+
+    if not profiles_enabled(cfg) or not hasattr(tsds, '_profile_data') or not tsds._profile_data:
+        return None, None, None
+
+    all_profile_arrays = []
+    all_profile_dims = {}
+    all_category_order = []
+
+    for concept, (profile_array, profile_dims, category_order, original_pids) in tsds._profile_data.items():
+        # Re-index profile_array rows to match final_pids
+        pid_to_orig_idx = {pid: idx for idx, pid in enumerate(original_pids)}
+        reindexed = np.zeros(
+            (len(final_pids), profile_array.shape[1], profile_array.shape[2]),
+            dtype=np.int8,
+        )
+        for new_idx, pid in enumerate(final_pids):
+            if pid in pid_to_orig_idx:
+                reindexed[new_idx] = profile_array[pid_to_orig_idx[pid]]
+
+        all_profile_arrays.append(reindexed)
+        all_profile_dims.update(profile_dims)
+        all_category_order.extend(category_order)
+
+    if not all_profile_arrays:
+        return None, None, None
+
+    # Concatenate along category dimension (dim 1) across concepts
+    profiles = np.concatenate(all_profile_arrays, axis=1)
+    logger.info(f"Profile tensor shape: {profiles.shape} (dims: {all_profile_dims})")
+
+    return profiles, all_profile_dims, all_category_order
+
+
 # ============================================================================
 # Main data preparation function
 # ============================================================================
@@ -586,6 +679,21 @@ def prepare_data_and_dls(cfg):
     y = list(y[:, 0].flatten())
     logger.info(f'Train/val X shape (before normalization): {X.shape}')
 
+    # Extract survival labels (event_time_steps, event_indicator) aligned with PID order
+    # df2xy_pure sorts by [PID, FEATURE], so samples = sorted unique PIDs
+    survival_mode = cfg.get('model', {}).get('survival_mode', False)
+    trainval_event_times = None
+    trainval_event_indicators = None
+    if survival_mode:
+        _tv_sorted_pids = sorted(trainval.complete['PID'].unique())
+        _tv_surv = trainval.base.set_index('PID').loc[_tv_sorted_pids]
+        trainval_event_times = _tv_surv['event_time_steps'].values.astype(int)
+        trainval_event_indicators = _tv_surv['event_indicator'].values.astype(int)
+        logger.info(
+            f"Survival labels (trainval): {trainval_event_indicators.sum()} events, "
+            f"{len(trainval_event_indicators) - trainval_event_indicators.sum()} censored"
+        )
+
     # Channel names — df2xy_pure sorts by FEATURE ascending, so this IS the channel order.
     ts_channel_names = sorted(trainval.complete['FEATURE'].unique())
 
@@ -605,31 +713,81 @@ def prepare_data_and_dls(cfg):
     # 1. CONTINUOUS TIME SERIES SCALER
     norm_cfg = cfg.get('normalization', {})
     ts_method = norm_cfg.get('ts_method', 'standard')
+    clip_range_cfg = norm_cfg.get('clip_range', None)
+    clip_range = tuple(clip_range_cfg) if clip_range_cfg else None
     ts_scaler = AstraScaler(
         method=ts_method,
         n_quantiles=norm_cfg.get('n_quantiles', 1000),
         quantile_output=norm_cfg.get('quantile_output', 'normal'),
+        clip_range=clip_range,
+        boundary_range_frac=norm_cfg.get('boundary_range_frac'),
+        boundary_mass_thresh=norm_cfg.get('boundary_mass_thresh'),
     )
-    logger.info(f"Using {ts_method} normalization for time series")
+    logger.info(f"Using {ts_method} normalization for time series"
+                + (f" with clip_range={clip_range}" if clip_range else ""))
 
     # Get trajectory lengths (works with NaN for missing measurements).
-    # Exclude EBM channel so forward-filled predictions cannot extend
-    # the trajectory beyond where clinical measurements exist.
+    # Exclude non-clinical channels (EBM, temporal features) whose values
+    # are non-zero everywhere and would inflate trajectory length detection.
     ebm_enabled = cfg.get('ebm_feature', {}).get('enabled', False)
-    traj_exclude_chs = [ebm_channel_idx] if ebm_enabled else None
+    traj_exclude_chs = [ebm_channel_idx] if ebm_enabled else []
+    tf_cfg = cfg.get('temporal_features', {})
+    if tf_cfg.get('enabled', False):
+        _tf_names = set(tf_cfg.get('features', []))
+        for i, name in enumerate(ts_channel_names):
+            if name in _tf_names:
+                traj_exclude_chs.append(i)
+    traj_exclude_chs = traj_exclude_chs or None
     traj_lengths = get_trajectory_lengths(X, padding_value=0.0, exclude_channels=traj_exclude_chs)
     logger.info(f'Trajectory lengths - min: {traj_lengths.min()}, max: {traj_lengths.max()}, '
                f'mean: {traj_lengths.mean():.1f}')
+
+    # --- Filter samples with trajectory shorter than min_bin_seq_len ----------
+    from astra.data.datasets import resolve_exclusion_criteria
+    _excl = resolve_exclusion_criteria(cfg) or {}
+    min_seq_len = _excl.get('min_bin_seq_len',
+                            cfg.get('dataset', {}).get('min_bin_seq_len', 0))
+    if min_seq_len > 0:
+        keep_mask = traj_lengths >= min_seq_len
+        n_short = (~keep_mask).sum()
+        if n_short:
+            sorted_pids = sorted(trainval.complete['PID'].unique())
+            drop_pids = {sorted_pids[i] for i in range(len(sorted_pids))
+                         if not keep_mask[i]}
+            logger.info(f'Dropping {n_short} trainval samples with trajectory '
+                        f'< {min_seq_len} steps (PIDs: {len(drop_pids)})')
+            X = X[keep_mask]
+            X_raw = X_raw[keep_mask]
+            y = [y[i] for i in range(len(y)) if keep_mask[i]]
+            traj_lengths = traj_lengths[keep_mask]
+            if trainval_event_times is not None:
+                trainval_event_times = trainval_event_times[keep_mask]
+                trainval_event_indicators = trainval_event_indicators[keep_mask]
+            id_col = cfg['dataset']['id_col']
+            trainval.base = trainval.base[
+                ~trainval.base[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval._base_pids -= drop_pids
+            trainval.tab_df = trainval.tab_df[
+                ~trainval.tab_df[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval.complete = trainval.complete[
+                ~trainval.complete[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
+            trainval.complete_cat = trainval.complete_cat[
+                ~trainval.complete_cat[id_col].isin(drop_pids)
+            ].reset_index(drop=True)
 
     # Per-channel normalization using trajectory_lengths + NaN awareness
     X_normalized = normalize_with_padding_mask(X, ts_scaler, traj_lengths, fit=True)
 
     # === TEMPORAL FEATURES: mode-aware index computation + elapsed_hours restoration ===
-    tf_cfg = cfg.get('temporal_features', {})
+    # tf_cfg already assigned above for trajectory length exclusion
     tf_enabled = tf_cfg.get('enabled', False)
     tf_mode = tf_cfg.get('mode', 'channel')
 
     temporal_channel_idx = None
+    bin_width_channel_idx = None
     exclude_channel_indices = []
 
     if tf_enabled and tf_mode == 'sinusoidal':
@@ -646,12 +804,28 @@ def prepare_data_and_dls(cfg):
                 "temporal_features.mode=sinusoidal but 'elapsed_hours' not found in channels; "
                 "falling back to learned positional encoding."
             )
+        if 'bin_width_hours' in ts_channel_names:
+            bw_idx = ts_channel_names.index('bin_width_hours')
+            X_normalized[:, bw_idx, :] = X_raw[:, bw_idx, :]
+            bin_width_channel_idx = bw_idx
+            logger.info(
+                f'Temporal PE (sinusoidal): restored raw bin_width_hours at channel {bw_idx}'
+            )
         exclude_channel_indices = [i for i, n in enumerate(ts_channel_names) if n in _aux_names]
         if exclude_channel_indices:
             excluded_names = [ts_channel_names[i] for i in exclude_channel_indices]
             logger.info(
                 f'Temporal PE: excluding {excluded_names} (indices {exclude_channel_indices}) from W_P'
             )
+        # Re-zero padding positions in restored temporal channels.
+        # normalize_with_padding_mask already zeroed them, but restoring raw
+        # values above re-introduced non-zero time data in padding positions.
+        _s_len = X_normalized.shape[2]
+        _pos = np.arange(_s_len)[np.newaxis, :]
+        _beyond = _pos >= traj_lengths[:, np.newaxis]  # [n_samples, seq_len]
+        for ch_idx in exclude_channel_indices:
+            X_normalized[:, ch_idx, :][_beyond] = 0.0
+        logger.info(f'Zeroed temporal features in {_beyond.sum()} padding positions')
     elif tf_enabled and tf_mode == 'channel':
         logger.info('Temporal features mode=channel: elapsed_hours/bin_width_hours go through W_P normally')
 
@@ -723,6 +897,11 @@ def prepare_data_and_dls(cfg):
         trainval.complete_cat, y, cfg, encoder=None,
     )
 
+    # Extract and align profile tensors from TSDS (if profiles enabled)
+    trainval_profiles, ts_cat_profile_dims, profile_category_order = _extract_profile_tensors(
+        trainval, sorted(trainval.complete_cat['PID'].unique()), cfg
+    )
+
     trainval_dataset = AstraMixedDataset(
         X_ts=X_normalized,
         x_cat=trainval_x_cat,
@@ -730,6 +909,9 @@ def prepare_data_and_dls(cfg):
         X_ts_cat=X_multi_hot,
         y=y,
         trajectory_lengths=traj_lengths,
+        event_times=trainval_event_times,
+        event_indicators=trainval_event_indicators,
+        X_ts_cat_profiles=trainval_profiles,
     )
     mixed_dls = AstraMixedDataLoader(
         trainval_dataset,
@@ -752,6 +934,19 @@ def prepare_data_and_dls(cfg):
     ty = list(ty[:, 0].flatten())
     logger.info(f'Holdout X shape (before normalization): {tX.shape}')
 
+    # Holdout survival labels
+    holdout_event_times = None
+    holdout_event_indicators = None
+    if survival_mode:
+        _ho_sorted_pids = sorted(holdout.complete['PID'].unique())
+        _ho_surv = holdout.base.set_index('PID').loc[_ho_sorted_pids]
+        holdout_event_times = _ho_surv['event_time_steps'].values.astype(int)
+        holdout_event_indicators = _ho_surv['event_indicator'].values.astype(int)
+        logger.info(
+            f"Survival labels (holdout): {holdout_event_indicators.sum()} events, "
+            f"{len(holdout_event_indicators) - holdout_event_indicators.sum()} censored"
+        )
+
     tX_raw = tX.copy()
 
     # ============================================================================
@@ -763,10 +958,51 @@ def prepare_data_and_dls(cfg):
     logger.info(f'Holdout trajectory lengths - min: {holdout_traj_lengths.min()}, '
                f'max: {holdout_traj_lengths.max()}, mean: {holdout_traj_lengths.mean():.1f}')
 
+    # --- Filter holdout samples with trajectory shorter than min_bin_seq_len --
+    if min_seq_len > 0:
+        keep_mask_h = holdout_traj_lengths >= min_seq_len
+        n_short_h = (~keep_mask_h).sum()
+        if n_short_h:
+            sorted_pids_h = sorted(holdout.complete['PID'].unique())
+            drop_pids_h = {sorted_pids_h[i] for i in range(len(sorted_pids_h))
+                           if not keep_mask_h[i]}
+            logger.info(f'Dropping {n_short_h} holdout samples with trajectory '
+                        f'< {min_seq_len} steps (PIDs: {len(drop_pids_h)})')
+            tX = tX[keep_mask_h]
+            tX_raw = tX_raw[keep_mask_h]
+            ty = [ty[i] for i in range(len(ty)) if keep_mask_h[i]]
+            holdout_traj_lengths = holdout_traj_lengths[keep_mask_h]
+            if holdout_event_times is not None:
+                holdout_event_times = holdout_event_times[keep_mask_h]
+                holdout_event_indicators = holdout_event_indicators[keep_mask_h]
+            id_col = cfg['dataset']['id_col']
+            holdout.base = holdout.base[
+                ~holdout.base[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout._base_pids -= drop_pids_h
+            holdout.tab_df = holdout.tab_df[
+                ~holdout.tab_df[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout.complete = holdout.complete[
+                ~holdout.complete[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+            holdout.complete_cat = holdout.complete_cat[
+                ~holdout.complete_cat[id_col].isin(drop_pids_h)
+            ].reset_index(drop=True)
+
     tX_normalized = normalize_with_padding_mask(tX, ts_scaler, holdout_traj_lengths, fit=False)
 
-    if tf_enabled and tf_mode == 'sinusoidal' and temporal_channel_idx is not None:
-        tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
+    if tf_enabled and tf_mode == 'sinusoidal':
+        if temporal_channel_idx is not None:
+            tX_normalized[:, temporal_channel_idx, :] = tX_raw[:, temporal_channel_idx, :]
+        if bin_width_channel_idx is not None:
+            tX_normalized[:, bin_width_channel_idx, :] = tX_raw[:, bin_width_channel_idx, :]
+        # Re-zero padding in restored temporal channels
+        _h_slen = tX_normalized.shape[2]
+        _h_pos = np.arange(_h_slen)[np.newaxis, :]
+        _h_beyond = _h_pos >= holdout_traj_lengths[:, np.newaxis]
+        for ch_idx in exclude_channel_indices:
+            tX_normalized[:, ch_idx, :][_h_beyond] = 0.0
 
     if cfg.get('ebm_feature', {}).get('enabled', False):
         ebm_norm_h = tX_normalized[:, ebm_channel_idx, :]
@@ -797,6 +1033,10 @@ def prepare_data_and_dls(cfg):
         holdout.complete_cat, ty, cfg, encoder=cat_encoder,
     )
 
+    holdout_profiles, _, _ = _extract_profile_tensors(
+        holdout, sorted(holdout.complete_cat['PID'].unique()), cfg
+    )
+
     holdout_dataset = AstraMixedDataset(
         X_ts=tX_normalized,
         x_cat=holdout_x_cat,
@@ -804,6 +1044,9 @@ def prepare_data_and_dls(cfg):
         X_ts_cat=tX_multi_hot,
         y=ty,
         trajectory_lengths=holdout_traj_lengths,
+        event_times=holdout_event_times,
+        event_indicators=holdout_event_indicators,
+        X_ts_cat_profiles=holdout_profiles,
     )
     holdout_mixed_dls = AstraMixedDataLoader(
         holdout_dataset,
@@ -862,11 +1105,23 @@ def prepare_data_and_dls(cfg):
         "holdout_trajectory_lengths": holdout_traj_lengths,
         "ebm_channel_idx": ebm_channel_idx,
         "temporal_channel_idx": temporal_channel_idx,
+        "bin_width_channel_idx": bin_width_channel_idx,
         "exclude_channel_indices": exclude_channel_indices,
+        # Survival labels (None when survival_mode is disabled)
+        "event_times": trainval_event_times,
+        "event_indicators": trainval_event_indicators,
+        "holdout_event_times": holdout_event_times,
+        "holdout_event_indicators": holdout_event_indicators,
+        "survival_mode": survival_mode,
         # Explicit scalars (replace TSAI DL attributes)
         "c_in": c_in,
         "seq_len": seq_len,
         "ts_cat_dims": ts_cat_dims,
+        # Profile-based categorical TS (None when profiles disabled)
+        "ts_cat_profile_dims": ts_cat_profile_dims,
+        "profile_category_order": profile_category_order,
+        "X_ts_cat_profiles": trainval_profiles,
+        "tX_ts_cat_profiles": holdout_profiles,
     }
 
 
@@ -1051,9 +1306,17 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'temporal_head': cfg.get("model", {}).get("temporal_head", False),
             'causal': cfg.get("model", {}).get("causal", False),
             'temporal_head_dropout': cfg.get("model", {}).get("temporal_head_dropout", 0.3),
+            'temporal_head_mult': cfg.get("model", {}).get("temporal_head_mult", 0.5),
             'temporal_channel_idx': data.get('temporal_channel_idx', None),
+            'bin_width_channel_idx': data.get('bin_width_channel_idx', None),
             'exclude_channel_indices': data.get('exclude_channel_indices', []),
             'head_pool': cfg.get("model", {}).get("head_pool", "flatten"),
+            'per_feature_cont_proj': cfg.get("model", {}).get("per_feature_cont_proj", False),
+            'cat_ts_gate': cfg.get("model", {}).get("cat_ts_gate", False),
+            'local_temporal_kernel': cfg.get("model", {}).get("local_temporal_kernel", 1),
+            'bin_width_modulation': cfg.get("model", {}).get("bin_width_modulation", False),
+            'survival_mode': cfg.get("model", {}).get("survival_mode", False),
+            'ts_cat_profile_dims': data.get('ts_cat_profile_dims'),
         },
 
         # --- SHAP background data ---
@@ -1069,7 +1332,12 @@ def save_deployment_bundle(data, cfg, model_name, save_dir='models/deployment',
             'concepts': list(cfg.get('concepts', [])),
             'temporal_features': cfg.get('temporal_features', {}),
             'ebm_channel_idx': data.get('ebm_channel_idx'),
+            'categorical_profiles': cfg.get('categorical_profiles', {}),
         },
+
+        # --- Profile-based categorical TS ---
+        'ts_cat_profile_dims': data.get('ts_cat_profile_dims'),
+        'profile_category_order': data.get('profile_category_order'),
 
         # --- Metadata ---
         'model_name': model_name,

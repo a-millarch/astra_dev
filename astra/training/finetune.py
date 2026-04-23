@@ -108,9 +108,25 @@ class FinetuneConfig:
     pos_weight_factor: float = 0.7
 
     # Time weighting for temporal head (training-specific, not model arch)
-    time_weighting: str = "uniform"     # 'uniform' or 'early'
+    time_weighting: str = "uniform"     # 'uniform', 'early', or 'late'
     early_weight_factor: float = 2.0
 
+    # Temporal loss averaging: "per_sample" averages within each sample first
+    # (prevents long trajectories from dominating), "global" is legacy behavior
+    temporal_loss_averaging: str = "per_sample"
+
+    # Evaluation-timeframe weighting: upweight timesteps at eval-relevant timeframes
+    eval_timeframe_weighting: bool = False
+    eval_timeframe_weight: float = 3.0   # multiplier for eval-relevant timesteps
+
+    # Pairwise ranking loss: differentiable AUROC surrogate at sampled timeframes
+    ranking_loss_weight: float = 0.0     # 0 = disabled; blended as (1-w)*bce + w*rank
+    ranking_loss_n_timeframes: int = 5   # timeframes to sample per batch
+    ranking_loss_max_pairs: int = 10000  # cap on pairwise comparisons per timeframe
+
+    # Validation objective weights (must sum to 1.0)
+    val_auroc_weight: float = 0.3
+    val_auprc_weight: float = 0.7
     # Temporal cropping augmentation
     temporal_crop_prob: float = 0.0       # probability of cropping per batch (0 = disabled)
     temporal_crop_all_phases: bool = False # apply cropping in Phases 1-3 (not just Phase 4)
@@ -174,14 +190,17 @@ def load_pretrained_backbone(
     temporal_head = model_cfg.get("temporal_head", False)
     causal = model_cfg.get("causal", False)
     temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+    temporal_head_mult = model_cfg.get("temporal_head_mult", 0.5)
 
     backbone = get_backbone(
         data, cfg_dict,
         temporal_head=temporal_head,
         causal=causal,
         temporal_head_dropout=temporal_head_dropout,
+        temporal_head_mult=temporal_head_mult,
         temporal_channel_idx=data.get('temporal_channel_idx'),
         exclude_channel_indices=data.get('exclude_channel_indices', []),
+        bin_width_channel_idx=data.get('bin_width_channel_idx'),
     )
 
     if checkpoint_dir is None:
@@ -409,6 +428,8 @@ def compute_temporal_loss(
     pos_weight: Optional[torch.Tensor] = None,
     time_weighting: str = "uniform",
     early_weight_factor: float = 2.0,
+    loss_averaging: str = "per_sample",
+    eval_timeframe_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Per-timestep BCE loss with padding mask and optional time weighting.
@@ -418,8 +439,13 @@ def compute_temporal_loss(
         targets: [batch] -- binary labels (0/1)
         traj_lengths: [batch] -- number of valid timesteps per sample
         pos_weight: Scalar tensor for class imbalance (ratio of neg/pos)
-        time_weighting: 'uniform' or 'early' (weight earlier predictions more)
-        early_weight_factor: Maximum weight for earliest timesteps (early mode)
+        time_weighting: 'uniform', 'early', or 'late'
+        early_weight_factor: Maximum weight factor (early: applied to first steps,
+            late: applied to last steps)
+        loss_averaging: 'per_sample' (each patient contributes equally) or
+            'global' (legacy: average over all valid elements, long trajectories dominate)
+        eval_timeframe_weights: Optional [seq_len] tensor weighting eval-relevant
+            timesteps more heavily. Applied multiplicatively before averaging.
 
     Returns:
         Scalar loss
@@ -444,10 +470,200 @@ def compute_temporal_loss(
     # Apply padding mask
     loss_per_element = loss_per_element * valid_mask.float()
 
+    # Optional time weighting (early/late linear ramp)
+    if time_weighting == "early":
+        time_weights = torch.linspace(
+            early_weight_factor, 1.0, seq_len, device=device
+        )
+        loss_per_element = loss_per_element * time_weights.unsqueeze(0)
+    elif time_weighting == "late":
+        time_weights = torch.linspace(
+            1.0, early_weight_factor, seq_len, device=device
+        )
+        loss_per_element = loss_per_element * time_weights.unsqueeze(0)
+
+    # Evaluation-timeframe weighting (upweight steps that match eval timeframes)
+    if eval_timeframe_weights is not None:
+        loss_per_element = loss_per_element * eval_timeframe_weights.unsqueeze(0)
+
+    # Averaging strategy
+    if loss_averaging == "per_sample":
+        # Average within each sample first, then across samples.
+        # This ensures each patient contributes equally regardless of trajectory length.
+        per_sample_valid = valid_mask.float().sum(dim=1).clamp(min=1.0)  # [batch]
+        per_sample_loss = loss_per_element.sum(dim=1) / per_sample_valid  # [batch]
+        return per_sample_loss.mean()
+    else:
+        # Legacy: global averaging (long trajectories dominate)
+        n_valid = valid_mask.float().sum().clamp(min=1.0)
+        return loss_per_element.sum() / n_valid
+
+
+_eval_timeframe_weights_cache: Dict[tuple, torch.Tensor] = {}
+
+
+def _build_eval_timeframe_weights(
+    seq_len: int, weight: float, device: torch.device,
+) -> torch.Tensor:
+    """Build a [seq_len] weight tensor that upweights evaluation-relevant timesteps.
+
+    Eval timeframes are derived from the same logic as the evaluation pipeline
+    (hourly up to 72h, daily after). Cached per (seq_len, weight).
+    """
+    cache_key = (seq_len, weight)
+    if cache_key in _eval_timeframe_weights_cache:
+        return _eval_timeframe_weights_cache[cache_key].to(device)
+
+    from astra.evaluation.predictive_performance import generate_time_thresholds
+
+    thresholds = generate_time_thresholds()
+    weights = torch.ones(seq_len)
+    for step in thresholds:
+        if 0 <= step < seq_len:
+            weights[step] = weight
+
+    _eval_timeframe_weights_cache[cache_key] = weights
+    return weights.to(device)
+
+
+def compute_ranking_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    traj_lengths: torch.Tensor,
+    eval_steps: list,
+    n_timeframes: int = 5,
+    max_pairs: int = 10000,
+) -> torch.Tensor:
+    """Differentiable AUROC surrogate via pairwise ranking at sampled timeframes.
+
+    At each sampled timeframe, computes sigmoid pairwise loss between positive
+    and negative predictions (active patients only). Directly optimizes ranking.
+
+    Args:
+        logits: [batch, seq_len] raw logits from temporal head.
+        targets: [batch] binary labels (0/1).
+        traj_lengths: [batch] number of valid timesteps per sample.
+        eval_steps: List of evaluation step indices to sample from.
+        n_timeframes: Number of timeframes to sample per batch.
+        max_pairs: Cap on pairwise comparisons per timeframe.
+
+    Returns:
+        Scalar ranking loss (mean over sampled timeframes).
+    """
+    device = logits.device
+    targets_float = targets.float()
+
+    # Sample timeframes from eval steps
+    if len(eval_steps) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    k = min(n_timeframes, len(eval_steps))
+    indices = torch.randperm(len(eval_steps))[:k]
+    sampled_steps = [eval_steps[i] for i in indices]
+
+    losses = []
+    for step in sampled_steps:
+        # Active patients at this timeframe
+        active = traj_lengths > step
+        if active.sum() < 4:
+            continue
+
+        preds_at_step = logits[active, step]
+        labels_at_step = targets_float[active]
+
+        pos_mask = labels_at_step == 1
+        neg_mask = labels_at_step == 0
+        n_pos = pos_mask.sum().item()
+        n_neg = neg_mask.sum().item()
+        if n_pos < 2 or n_neg < 2:
+            continue
+
+        pos_preds = preds_at_step[pos_mask]  # [n_pos]
+        neg_preds = preds_at_step[neg_mask]  # [n_neg]
+
+        # Subsample if too many pairs
+        if n_pos * n_neg > max_pairs:
+            n_sub_pos = max(2, int((max_pairs / n_neg) ** 0.5))
+            n_sub_neg = max(2, max_pairs // n_sub_pos)
+            pos_idx = torch.randperm(n_pos, device=device)[:n_sub_pos]
+            neg_idx = torch.randperm(n_neg, device=device)[:n_sub_neg]
+            pos_preds = pos_preds[pos_idx]
+            neg_preds = neg_preds[neg_idx]
+
+        # Pairwise differences: positive should be > negative
+        diff = pos_preds.unsqueeze(1) - neg_preds.unsqueeze(0)  # [n_pos, n_neg]
+        pair_loss = F.binary_cross_entropy_with_logits(
+            diff, torch.ones_like(diff), reduction="mean",
+        )
+        losses.append(pair_loss)
+
+    if not losses:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    return torch.stack(losses).mean()
+
+
+def compute_survival_loss(
+    logits: torch.Tensor,
+    event_times: torch.Tensor,
+    event_indicators: torch.Tensor,
+    traj_lengths: torch.Tensor,
+    time_weighting: str = "uniform",
+    early_weight_factor: float = 2.0,
+) -> torch.Tensor:
+    """
+    Discrete-time survival negative log-likelihood (Nnet-survival).
+
+    Each timestep k contributes a binary cross-entropy term:
+      - k < event_time: target = 0 (survived this interval)
+      - k == event_time AND event_indicator == 1: target = 1 (event here)
+      - k > event_time OR k >= traj_length: masked out
+
+    Args:
+        logits: [batch, seq_len] hazard logits from temporal head.
+        event_times: [batch] discrete timestep of event or censoring.
+        event_indicators: [batch] 1 = event observed, 0 = censored.
+        traj_lengths: [batch] valid timesteps (padding boundary).
+        time_weighting: 'uniform', 'early', or 'late'.
+        early_weight_factor: max weight factor for time weighting.
+
+    Returns:
+        Scalar loss.
+    """
+    batch_size, seq_len = logits.shape
+    device = logits.device
+
+    positions = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+    event_times_col = event_times.unsqueeze(1)  # [batch, 1]
+    event_ind_col = event_indicators.unsqueeze(1).float()  # [batch, 1]
+
+    # Per-timestep targets: 1 only at event timestep for patients with events
+    targets = torch.zeros_like(logits)
+    is_event_step = (positions == event_times_col) & (event_ind_col == 1.0)
+    targets[is_event_step] = 1.0
+
+    # Valid mask: positions <= event_time for events, < event_time for censored
+    # Also respect padding boundary
+    max_valid_step = torch.where(
+        event_indicators.bool(),
+        event_times + 1,  # include event timestep
+        event_times,       # exclude censoring timestep (survived up to but not including)
+    ).unsqueeze(1)  # [batch, 1]
+    valid_mask = (positions < max_valid_step) & (positions < traj_lengths.unsqueeze(1))
+
+    # Per-element BCE
+    loss_per_element = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none",
+    )
+    loss_per_element = loss_per_element * valid_mask.float()
+
     # Optional time weighting
     if time_weighting == "early":
         time_weights = torch.linspace(
             early_weight_factor, 1.0, seq_len, device=device
+        )
+        loss_per_element = loss_per_element * time_weights.unsqueeze(0)
+    elif time_weighting == "late":
+        time_weights = torch.linspace(
+            1.0, early_weight_factor, seq_len, device=device
         )
         loss_per_element = loss_per_element * time_weights.unsqueeze(0)
 
@@ -477,6 +693,15 @@ def train_one_epoch(
     early_weight_factor: float = 2.0,
     # Class weighting for standard (non-temporal) head
     class_weights: Optional[torch.Tensor] = None,
+    # Survival mode
+    survival_mode: bool = False,
+    # Temporal loss improvements
+    temporal_loss_averaging: str = "per_sample",
+    eval_timeframe_weights: Optional[torch.Tensor] = None,
+    ranking_loss_weight: float = 0.0,
+    ranking_loss_n_timeframes: int = 5,
+    ranking_loss_max_pairs: int = 10000,
+    ranking_loss_eval_steps: Optional[list] = None,
     desc: str = "Training",
 ) -> float:
     """
@@ -514,6 +739,14 @@ def train_one_epoch(
         inputs = _to_device(inputs, device)
         targets = _to_device(targets, device)
 
+        # Unpack survival targets: (y_binary, event_times, event_indicators)
+        if survival_mode and isinstance(targets, (tuple, list)):
+            y_binary, event_times, event_indicators = targets
+        else:
+            y_binary = targets
+            event_times = None
+            event_indicators = None
+
         # Optionally apply progressive time masking (Phase 4)
         if enable_masking and torch.rand(1).item() < masking_prob:
             x_ts = inputs[0]
@@ -524,29 +757,47 @@ def train_one_epoch(
         logits = model(inputs)
 
         # Compute loss — use real trajectory lengths from dataloader when available
-        if temporal_head:
-            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
-            if len(inputs) >= 4:
-                traj_lengths = inputs[3]
-            else:
-                traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
-            loss = compute_temporal_loss(
-                logits, targets, traj_lengths,
-                pos_weight=pos_weight,
+        x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
+        if len(inputs) >= 4:
+            traj_lengths = inputs[3]
+        else:
+            traj_lengths = _infer_trajectory_lengths_from_batch(x_ts)
+
+        if survival_mode and temporal_head and event_times is not None:
+            loss = compute_survival_loss(
+                logits, event_times, event_indicators, traj_lengths,
                 time_weighting=time_weighting,
                 early_weight_factor=early_weight_factor,
             )
+        elif temporal_head:
+            bce_loss = compute_temporal_loss(
+                logits, y_binary, traj_lengths,
+                pos_weight=pos_weight,
+                time_weighting=time_weighting,
+                early_weight_factor=early_weight_factor,
+                loss_averaging=temporal_loss_averaging,
+                eval_timeframe_weights=eval_timeframe_weights,
+            )
+            if ranking_loss_weight > 0 and ranking_loss_eval_steps:
+                rank_loss = compute_ranking_loss(
+                    logits, y_binary, traj_lengths,
+                    eval_steps=ranking_loss_eval_steps,
+                    n_timeframes=ranking_loss_n_timeframes,
+                    max_pairs=ranking_loss_max_pairs,
+                )
+                loss = (1 - ranking_loss_weight) * bce_loss + ranking_loss_weight * rank_loss
+            else:
+                loss = bce_loss
         elif enable_weighting:
-            x_ts = inputs[0] if isinstance(inputs, (tuple, list)) else inputs
             loss = _compute_weighted_loss(
-                logits, targets, x_ts,
+                logits, y_binary, x_ts,
                 label_smoothing=label_smoothing,
                 early_weight=early_weight,
                 class_weights=class_weights,
             )
         else:
             loss = F.cross_entropy(
-                logits, targets, label_smoothing=label_smoothing,
+                logits, y_binary, label_smoothing=label_smoothing,
                 weight=class_weights,
             )
 
@@ -591,6 +842,15 @@ def _run_phase(
     early_weight_factor: float = 2.0,
     # Class weighting for standard (non-temporal) head
     class_weights: Optional[torch.Tensor] = None,
+    # Survival mode
+    survival_mode: bool = False,
+    # Temporal loss improvements
+    temporal_loss_averaging: str = "per_sample",
+    eval_timeframe_weights: Optional[torch.Tensor] = None,
+    ranking_loss_weight: float = 0.0,
+    ranking_loss_n_timeframes: int = 5,
+    ranking_loss_max_pairs: int = 10000,
+    ranking_loss_eval_steps: Optional[list] = None,
 ) -> int:
     """
     Run a single training phase.
@@ -636,23 +896,46 @@ def _run_phase(
             time_weighting=time_weighting,
             early_weight_factor=early_weight_factor,
             class_weights=class_weights,
+            survival_mode=survival_mode,
+            temporal_loss_averaging=temporal_loss_averaging,
+            eval_timeframe_weights=eval_timeframe_weights,
+            ranking_loss_weight=ranking_loss_weight,
+            ranking_loss_n_timeframes=ranking_loss_n_timeframes,
+            ranking_loss_max_pairs=ranking_loss_max_pairs,
+            ranking_loss_eval_steps=ranking_loss_eval_steps,
             desc=desc,
         )
 
         if valid_dl is not None:
             metrics = compute_val_metrics(model, valid_dl, device=device,
-                                          temporal_head=temporal_head)
+                                          temporal_head=temporal_head,
+                                          survival_mode=survival_mode)
             val_auroc = metrics["auroc"]
             val_auprc = metrics["auprc"]
-            # Combined metric for early stopping and sweep objective
-            val_score = 0.5 * val_auroc + 0.5 * val_auprc
-            tracker.update(phase_name, global_epoch,
-                           train_loss=train_loss, val_auroc=val_auroc,
-                           val_auprc=val_auprc, val_score=val_score)
-            logger.info(
-                f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, "
-                f"val_auroc={val_auroc:.4f}, val_auprc={val_auprc:.4f}"
-            )
+
+            if survival_mode and "cindex" in metrics:
+                val_cindex = metrics["cindex"]
+                # Survival mode: C-index is the primary metric
+                val_score = val_cindex
+                tracker.update(phase_name, global_epoch,
+                               train_loss=train_loss, val_auroc=val_auroc,
+                               val_auprc=val_auprc, val_cindex=val_cindex,
+                               val_score=val_score)
+                logger.info(
+                    f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, "
+                    f"val_cindex={val_cindex:.4f}, val_auroc={val_auroc:.4f}"
+                )
+            else:
+                # Classification mode: combined AUROC + AUPRC
+                val_score = (finetune_cfg.val_auroc_weight * val_auroc
+                             + finetune_cfg.val_auprc_weight * val_auprc)
+                tracker.update(phase_name, global_epoch,
+                               train_loss=train_loss, val_auroc=val_auroc,
+                               val_auprc=val_auprc, val_score=val_score)
+                logger.info(
+                    f"  Epoch {global_epoch + 1}: loss={train_loss:.4f}, "
+                    f"val_auroc={val_auroc:.4f}, val_auprc={val_auprc:.4f}"
+                )
 
             # Optuna reporting + pruning (report combined score)
             if trial is not None:
@@ -706,6 +989,8 @@ def run_finetune_v2(
     temporal_head = model_cfg.get("temporal_head", False)
     causal = model_cfg.get("causal", False)
     temporal_head_dropout = model_cfg.get("temporal_head_dropout", 0.3)
+    temporal_head_mult = model_cfg.get("temporal_head_mult", 0.5)
+    survival_mode = model_cfg.get("survival_mode", False)
 
     # Auto-enable causal masking when temporal head is on (prevents silent leakage)
     if temporal_head and not causal:
@@ -726,8 +1011,10 @@ def run_finetune_v2(
             temporal_head=temporal_head,
             causal=causal,
             temporal_head_dropout=temporal_head_dropout,
+            temporal_head_mult=temporal_head_mult,
             temporal_channel_idx=data.get('temporal_channel_idx'),
             exclude_channel_indices=data.get('exclude_channel_indices', []),
+            bin_width_channel_idx=data.get('bin_width_channel_idx'),
         )
         logger.info("Using randomly initialized backbone (no pretraining)")
 
@@ -793,14 +1080,44 @@ def run_finetune_v2(
     phase_kwargs = {}
     if temporal_head:
         pw = torch.tensor([imbalance_ratio], device=device)
+
+        # Build eval-timeframe weights and ranking eval steps (once, cached)
+        seq_len = data["seq_len"]
+        etf_weights = None
+        rank_eval_steps = None
+        if finetune_cfg.eval_timeframe_weighting:
+            etf_weights = _build_eval_timeframe_weights(
+                seq_len, finetune_cfg.eval_timeframe_weight, device,
+            )
+            logger.info(f"Eval-timeframe weighting: {(etf_weights > 1).sum().item()} "
+                         f"steps upweighted by {finetune_cfg.eval_timeframe_weight}x")
+        if finetune_cfg.ranking_loss_weight > 0:
+            from astra.evaluation.predictive_performance import generate_time_thresholds
+            rank_eval_steps = [s for s in generate_time_thresholds() if s < seq_len]
+            logger.info(f"Ranking loss: weight={finetune_cfg.ranking_loss_weight}, "
+                         f"{len(rank_eval_steps)} eval steps, "
+                         f"sampling {finetune_cfg.ranking_loss_n_timeframes}/batch")
+
         phase_kwargs = dict(
             temporal_head=True,
             pos_weight=pw,
             time_weighting=finetune_cfg.time_weighting,
             early_weight_factor=finetune_cfg.early_weight_factor,
+            survival_mode=survival_mode,
+            temporal_loss_averaging=finetune_cfg.temporal_loss_averaging,
+            eval_timeframe_weights=etf_weights,
+            ranking_loss_weight=finetune_cfg.ranking_loss_weight,
+            ranking_loss_n_timeframes=finetune_cfg.ranking_loss_n_timeframes,
+            ranking_loss_max_pairs=finetune_cfg.ranking_loss_max_pairs,
+            ranking_loss_eval_steps=rank_eval_steps,
         )
-        logger.info(f"Temporal head: pos_weight={pw.item():.2f}, "
-                     f"time_weighting={finetune_cfg.time_weighting}")
+        if survival_mode:
+            logger.info(f"Survival mode: discrete-time hazard with temporal head, "
+                         f"time_weighting={finetune_cfg.time_weighting}")
+        else:
+            logger.info(f"Temporal head: pos_weight={pw.item():.2f}, "
+                         f"time_weighting={finetune_cfg.time_weighting}, "
+                         f"averaging={finetune_cfg.temporal_loss_averaging}")
     else:
         # Standard head: weighted cross-entropy for class imbalance
         factor = finetune_cfg.pos_weight_factor

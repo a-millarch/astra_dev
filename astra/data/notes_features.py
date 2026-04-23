@@ -181,7 +181,7 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
                 {
                     "PID": row["PID"],
                     "TIMESTAMP": row["Redigeringstidspunkt"],
-                    "FEATURE": "ISS",
+                    "FEATURE": "ISS_notes",
                     "VALUE": float(score),
                 }
             )
