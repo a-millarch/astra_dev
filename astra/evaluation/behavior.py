@@ -2643,6 +2643,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # Used when density_normalize=True to avoid rewarding channels that are
     # simply measured more often.
     _measured_mask = None  # [n_samples, n_channels, n_steps] bool
+    _cat_measured_mask = None  # [n_samples, n_categories, n_steps] bool
     if density_normalize:
         test_ts = shap_results.get('test_data', {}).get('ts')
         if test_ts is not None:
@@ -2651,6 +2652,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         else:
             logger.warning("density_normalize=True but test_data['ts'] not available; "
                            "falling back to standard aggregation")
+        test_ts_cat = shap_results.get('test_data', {}).get('ts_cat')
+        if test_ts_cat is not None:
+            _cat_measured_mask = test_ts_cat[:n_samples, :, :n_steps] != 0.0
+            logger.info("Density normalization enabled for categorical TS SHAP summary")
 
     def _masked_temporal_mean(arr_3d, ch_indices):
         """Mean |SHAP| over samples & channels -> [n_steps], padding-aware."""
@@ -2713,7 +2718,15 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         if cat_ts.ndim == 3:
             cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
         cat_ts = cat_ts[..., :n_steps]  # crop to eval_timestep
-        cat_imp = np.abs(cat_ts).mean(axis=0)
+        if _cat_measured_mask is not None:
+            # Density-normalized: any category active at this timestep per sample
+            _cat_any_active = _cat_measured_mask[:cat_ts.shape[0]].any(axis=1)[:, :cat_ts.shape[1]]  # [n_samples, n_steps]
+            if valid_time is not None:
+                _cat_any_active = _cat_any_active & valid_time[:_cat_any_active.shape[0], :_cat_any_active.shape[1]]
+            _cat_denom_t = _cat_any_active.sum(axis=0).clip(1)  # [n_steps]
+            cat_imp = (np.abs(cat_ts) * _cat_any_active).sum(axis=0) / _cat_denom_t
+        else:
+            cat_imp = np.abs(cat_ts).mean(axis=0)
         ax1.plot(cat_imp, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_imp)), cat_imp, alpha=0.2, color='#00d4aa')
 
@@ -2765,17 +2778,25 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         if cat_ts_shap.ndim == 4:
             cat_ts_shap = cat_ts_shap[..., min(class_idx, cat_ts_shap.shape[-1] - 1)]
         cat_ts_shap = cat_ts_shap[..., :n_steps]  # crop to eval_timestep
-        cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
-        
+        if _cat_measured_mask is not None:
+            _cat_hm_mask = _cat_measured_mask[:cat_ts_shap.shape[0], :cat_ts_shap.shape[1], :cat_ts_shap.shape[2]]
+            if valid_time is not None:
+                _cat_hm_mask = _cat_hm_mask & valid_time[:_cat_hm_mask.shape[0], None, :_cat_hm_mask.shape[2]]
+            _cat_hm_denom = _cat_hm_mask.sum(axis=0).clip(1)  # [n_cats, n_steps]
+            cat_ts_mean = (np.abs(cat_ts_shap) * _cat_hm_mask).sum(axis=0) / _cat_hm_denom
+        else:
+            cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
+
         enc_info = shap_results['encoding_info']
         cat_names = get_category_names_from_encoding_info(enc_info)
         n_cats = cat_ts_mean.shape[0]
         while len(cat_names) < n_cats:
             cat_names.append(f"cat_{len(cat_names)}")
-        
+
+        _cat_dn_suffix = ' (per-event)' if _cat_measured_mask is not None else ' (Mean)'
         im3 = ax3.imshow(cat_ts_mean, aspect='auto', cmap='YlOrRd', interpolation='nearest')
         ax3.set_xlabel('Time'); ax3.set_ylabel('Category')
-        ax3.set_title('Categorical TS |SHAP| (Mean)', fontweight='bold')
+        ax3.set_title(f'Categorical TS |SHAP|{_cat_dn_suffix}', fontweight='bold')
         
         if n_cats <= 20:
             ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names, fontsize=8)
@@ -2784,8 +2805,9 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
             yticks = list(range(0, n_cats, step))
             ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
-        plt.colorbar(im3, ax=ax3, label='Mean |SHAP|')
-    
+        _cat_cbar_label = 'Mean |SHAP| / active event' if _cat_measured_mask is not None else 'Mean |SHAP|'
+        plt.colorbar(im3, ax=ax3, label=_cat_cbar_label)
+
     elif shap_results.get('encoding_info') is not None:
         # Fallback: show activity data
         ax3 = fig.add_subplot(gs[1 + row_offset, 1])
@@ -3082,6 +3104,7 @@ class TimeframeSHAPResult:
     cont_data: Optional[np.ndarray]
     ts_channel_importance: np.ndarray
     ts_temporal_importance: np.ndarray
+    cat_ts_category_importance: Optional[np.ndarray] = None
     n_active_background: Optional[int] = None
 
     @property
@@ -3139,6 +3162,7 @@ class CohortTemporalSHAPResults:
     # Categorical TS per-category importance (optional)
     cat_ts_per_category_importance: Dict[str, Optional[np.ndarray]] = field(default_factory=dict)  # tf -> [n_categories]
     cat_ts_category_names: List[str] = field(default_factory=list)
+    cat_ts_gate_values: Optional[np.ndarray] = None
     # Individual patient results (optional, for deep-dive)
     patient_results: Optional[List[TemporalSHAPResults]] = None
 
@@ -3184,12 +3208,21 @@ class TemporalSHAPAnalyzer:
         self.model = self.model.to(device)
         self.has_cat_ts = model.n_ts_cat > 0
 
+        self.cat_ts_gate_values = None
+        if hasattr(model, 'cat_ts_gate_params') and model.cat_ts_gate_params is not None:
+            with torch.no_grad():
+                self.cat_ts_gate_values = torch.sigmoid(model.cat_ts_gate_params).cpu().numpy()
+
         mode_parts = []
         if active_only: mode_parts.append("active-only")
         if density_normalize: mode_parts.append("density-norm")
         mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
         print(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
               f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
+        if self.cat_ts_gate_values is not None:
+            logger.info(f"Categorical TS gate values (sigmoid): {self.cat_ts_gate_values}")
+            logger.info(f"Gate suppression factor: mean={self.cat_ts_gate_values.mean():.3f} "
+                        f"(range {self.cat_ts_gate_values.min():.3f}-{self.cat_ts_gate_values.max():.3f})")
     
     def _create_channel_mapping(self):
         features = self.data["trainval"].complete.sort_values(['PID', 'FEATURE'])['FEATURE'].drop_duplicates().tolist()
@@ -3504,6 +3537,21 @@ class TemporalSHAPAnalyzer:
             else:
                 ts_temporal_importance = np.zeros(full_steps)
 
+            # Categorical TS per-category importance (density-normalized when enabled)
+            cat_ts_category_importance = None
+            if shap_res['cat_ts_shap_per_category'] is not None:
+                cat_ts_raw = shap_res['cat_ts_shap_per_category']  # [n_cats, seq_len]
+                cat_ts_data_np = sample_ts_cat.cpu().numpy()        # [n_cats, seq_len]
+                if eff > 0 and self.density_normalize:
+                    shap_cat_eff = np.abs(cat_ts_raw[:, :eff])
+                    cat_measured = cat_ts_data_np[:, :eff] != 0.0
+                    cat_denom = cat_measured.sum(axis=1).clip(1)    # [n_cats]
+                    cat_ts_category_importance = (shap_cat_eff * cat_measured).sum(axis=1) / cat_denom
+                elif eff > 0:
+                    cat_ts_category_importance = np.abs(cat_ts_raw[:, :eff]).mean(axis=1)
+                else:
+                    cat_ts_category_importance = np.zeros(cat_ts_raw.shape[0])
+
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
                 actual_data_steps=actual_steps, ts_shap=ts_shap,
@@ -3514,6 +3562,7 @@ class TemporalSHAPAnalyzer:
                 cat_data=sample_cat.cpu().numpy(), cont_data=sample_cont.cpu().numpy(),
                 ts_channel_importance=ts_channel_importance,
                 ts_temporal_importance=ts_temporal_importance,
+                cat_ts_category_importance=cat_ts_category_importance,
                 n_active_background=n_active_bg,
             )
         
@@ -4621,17 +4670,19 @@ class TemporalSHAPAnalyzer:
             static_cont_importance[tf] = (
                 np.mean(cont_shaps, axis=0) if cont_shaps else None)
 
-        # Categorical TS per-category importance
+        # Categorical TS per-category importance (density-normalized when available)
         cat_ts_per_category_importance = OrderedDict()
         cat_ts_category_names = get_category_names_from_encoding_info(self.encoding_info) if self.encoding_info else []
         for tf in ordered_tfs:
             tf_results = tf_collections[tf]
             cat_ts_arrays = []
             for r in tf_results:
-                if r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
+                if r.cat_ts_category_importance is not None:
+                    cat_ts_arrays.append(r.cat_ts_category_importance)
+                elif r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
                     arr = r.cat_ts_shap_per_category
                     if arr.ndim == 2:
-                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))  # [n_cats, seq_len] -> [n_cats]
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))
                     elif arr.ndim == 1:
                         cat_ts_arrays.append(np.abs(arr))
                     elif arr.ndim == 3:
@@ -4658,6 +4709,7 @@ class TemporalSHAPAnalyzer:
             density_normalize=self.density_normalize,
             cat_ts_per_category_importance=cat_ts_per_category_importance,
             cat_ts_category_names=cat_ts_category_names,
+            cat_ts_gate_values=self.cat_ts_gate_values,
             patient_results=patient_results,
         )
 
