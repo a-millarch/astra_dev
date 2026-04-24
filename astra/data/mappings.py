@@ -136,6 +136,8 @@ ATC_LVL3_MAP = {
     'anti_thrombotic': ['B01'],
     'diuretics': ['C03'],
     'hemostatics': ['B02'],
+    'hormone_drugs': ['H01'],
+    'antidotes': ['V03'],
 }
 
 ATC_LVL4_MAP = {

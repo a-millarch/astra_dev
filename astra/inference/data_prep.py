@@ -392,6 +392,17 @@ def _compute_tier_features_for_patient(
     from astra.data.profiles import load_profiles_config
     profiles = load_profiles_config({'categorical_profiles': profile_cfg})
 
+    # Check for composite mode in any concept
+    for concept_name, concept_cfg in profiles.items():
+        if not isinstance(concept_cfg, dict):
+            continue
+        if concept_cfg.get('composite_mode'):
+            from astra.data.composite_features import compute_composite_features_for_patient
+            med_events = raw_data.get(concept_name, [])
+            return compute_composite_features_for_patient(
+                med_events, bin_df, ts_channel_names,
+            )
+
     # Collect tier mapping configs and expected channel names
     tier_configs = []  # (cat_name, tm_cfg, concept_name)
     for concept_name, concept_cfg in profiles.items():
@@ -2415,10 +2426,21 @@ def _filtered_dfs_to_raw_data(
             ]
         elif is_categorical:
             # Categorical point events (e.g. Medicin, Procedurer)
-            raw_data[concept] = [
-                {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
-                for _, r in df.iterrows()
-            ]
+            # Preserve ATC/dose/unit for Medicin (needed by composite features)
+            has_atc = 'ATC' in df.columns
+            has_dose = 'Administrationsdosis' in df.columns
+            has_unit = 'Dosisenhed' in df.columns
+            events = []
+            for _, r in df.iterrows():
+                ev = {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
+                if has_atc:
+                    ev['atc_code'] = r.get('ATC', '')
+                if has_dose:
+                    ev['dose'] = r.get('Administrationsdosis')
+                if has_unit:
+                    ev['unit'] = r.get('Dosisenhed')
+                events.append(ev)
+            raw_data[concept] = events
         else:
             # Continuous concepts (e.g. VitaleVaerdier, Labsvar, EWS, etc.)
             raw_data[concept] = [

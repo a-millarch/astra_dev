@@ -26,10 +26,11 @@
 # strip_categories: List of parent category names (from ATC_LVL3_MAP/ATC_LVL4_MAP)
 #   to remove from the multi-hot encoding. Required when subcategory config keys
 #   don't match the multi-hot value names.
-version: 3
+version: 4
 
 Medicin:
   sub_code_level: 4
+  composite_mode: true
   strip_categories:
     - cardiovascular_drugs
     - antibiotics
@@ -43,6 +44,8 @@ Medicin:
     - local_anastethics
     - anastethics
     - insulin
+    - hormone_drugs
+    - antidotes
 
   categories:
     # ==================================================================

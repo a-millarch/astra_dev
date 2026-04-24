@@ -112,6 +112,9 @@ def get_tier_feature_names(cfg: dict) -> Set[str]:
 
     Used by dataloader.py to identify which channels should be excluded
     from trajectory length detection.
+
+    When ``composite_mode: true`` is set for a concept, returns the 12
+    composite feature names instead of per-category names.
     """
     names: Set[str] = set()
     if not profiles_enabled(cfg):
@@ -119,6 +122,10 @@ def get_tier_feature_names(cfg: dict) -> Set[str]:
     profiles = load_profiles_config(cfg)
     for concept_name, concept_cfg in profiles.items():
         if not isinstance(concept_cfg, dict):
+            continue
+        if concept_cfg.get("composite_mode"):
+            from astra.data.composite_features import COMPOSITE_FEATURE_NAMES
+            names.update(COMPOSITE_FEATURE_NAMES)
             continue
         for _cat_name, cat_cfg in concept_cfg.get("categories", {}).items():
             tm = cat_cfg.get("tier_mapping")
@@ -425,6 +432,14 @@ class CategoricalProfileEncoder:
             f"Bin assignment: {len(concept_df_binned)}/{len(concept_df)} "
             f"records matched bins"
         )
+
+        # Composite mode: delegate to composite_features module
+        if self.config.get("composite_mode"):
+            from astra.data.composite_features import compute_composite_features
+            logger.info("Composite mode enabled — computing 12 composite features")
+            return compute_composite_features(
+                concept_df_binned, base_df, cfg, ts_cols, base_pids,
+            )
 
         # Validate short_name uniqueness
         short_names = []
