@@ -1093,6 +1093,7 @@ def _build_continuous_ts_incremental(
     trajectory_length: int,
     admission_time: pd.Timestamp = None,
     profiling: Optional[dict] = None,
+    raw_data: Optional[dict] = None,
 ) -> Tuple[np.ndarray, int]:
     """Incrementally update the continuous time series tensor.
 
@@ -1164,6 +1165,19 @@ def _build_continuous_ts_incremental(
             ch_idx = channel_to_idx[feat_name]
             n = min(len(values), seq_len)
             x_ts[ch_idx, :n] = values[:n]
+
+    # Recompute tier features from accumulated raw_data
+    if raw_data is not None:
+        with timed_stage(profiling, 'cts_tier_features') if profiling is not None else _nullcontext():
+            tier_features = _compute_tier_features_for_patient(
+                raw_data, bin_df, ts_channel_names, bundle,
+            )
+            for feat_name, values in tier_features.items():
+                if feat_name not in channel_to_idx:
+                    continue
+                ch_idx = channel_to_idx[feat_name]
+                n = min(len(values), seq_len)
+                x_ts[ch_idx, :n] = values[:n]
 
     # Update _data_present
     with timed_stage(profiling, 'cts_data_present') if profiling is not None else _nullcontext():
