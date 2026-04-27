@@ -485,7 +485,7 @@ def _compute_tier_features_for_patient(
 
         assigned_rows = []
         for _, row in matched_df.iterrows():
-            ts = row['timestamp']
+            ts = np.datetime64(row['timestamp'])
             idx = np.searchsorted(bin_starts, ts, side='right') - 1
             if 0 <= idx < n_positions and ts < bin_ends[idx]:
                 assigned_rows.append({
