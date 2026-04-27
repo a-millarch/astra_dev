@@ -1392,7 +1392,14 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             selected_class = min(1, n_classes - 1)  # class 1 if available
             print(f"  Multi-output model: {n_classes} classes, selecting class {selected_class}")
             shap_values = shap_values[selected_class]
-    
+
+    # Strip trailing singleton class dim (GradientExplainer format b)
+    if isinstance(shap_values, list):
+        shap_values = [
+            sv.squeeze(-1) if isinstance(sv, np.ndarray) and sv.ndim > 1 and sv.shape[-1] == 1
+            else sv for sv in shap_values
+        ]
+
     print("\nSHAP value shapes:")
     for i, sv in enumerate(shap_values):
         print(f"  shap_values[{i}]: {sv.shape}")
@@ -3061,6 +3068,13 @@ class TemporalSHAPAnalyzer:
             n_classes = len(shap_values)
             selected_class = min(1, n_classes - 1)  # class 1 if available
             shap_values = shap_values[selected_class]
+
+        # Strip trailing singleton class dim (GradientExplainer format b)
+        if isinstance(shap_values, list):
+            shap_values = [
+                sv.squeeze(-1) if isinstance(sv, np.ndarray) and sv.ndim > 1 and sv.shape[-1] == 1
+                else sv for sv in shap_values
+            ]
 
         idx = 0
         ts_shap = shap_values[idx][0]
