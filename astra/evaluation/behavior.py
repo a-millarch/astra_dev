@@ -4943,6 +4943,7 @@ def plot_continuous_ts_shap_plotly(
     height: int = 700,
     width: int = 1100,
     title: str = "Continuous TS SHAP Heatmap (interactive)",
+    channel_subset: Optional[list] = None,
 ):
     """Interactive Plotly heatmap for continuous time-series SHAP values."""
     if not HAS_PLOTLY:
@@ -4962,14 +4963,22 @@ def plot_continuous_ts_shap_plotly(
 
     time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
 
-    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
-    if has_ebm:
-        ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
-    elif channel2feature:
-        ordered_idx, ordered_labels, _ = _get_grouped_channel_order(channel2feature)
+    if channel_subset is not None:
+        ordered_idx = [idx for idx, _ in channel_subset]
+        ordered_labels = [label for _, label in channel_subset]
     else:
-        ordered_idx = list(range(n_ch))
-        ordered_labels = [f'Ch{i}' for i in range(n_ch)]
+        has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+        if has_ebm:
+            ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
+        elif channel2feature:
+            ordered_idx, ordered_labels, _ = _get_grouped_channel_order(channel2feature)
+        else:
+            ordered_idx = list(range(n_ch))
+            ordered_labels = [f'Ch{i}' for i in range(n_ch)]
+
+    valid_idx = [i for i in ordered_idx if i < n_ch]
+    valid_labels = [ordered_labels[j] for j, i in enumerate(ordered_idx) if i < n_ch]
+    ordered_idx, ordered_labels = valid_idx, valid_labels
 
     ts_display = ts_shap[ordered_idx]
     vmax = max(abs(float(np.nanmin(ts_display))),
