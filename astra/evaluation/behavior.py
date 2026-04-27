@@ -4912,11 +4912,11 @@ except ImportError:
     HAS_PLOTLY = False
 
 
-def _build_time_axis_plotly(n_steps):
+def _build_time_axis_plotly(n_steps, start_step=0):
     """Build time axis with sparse tick labels for readability."""
     all_labels = []
     for i in range(n_steps):
-        t = step_to_time(i)
+        t = step_to_time(start_step + i)
         all_labels.append(time_to_hours(t))
     n_ticks = min(15, n_steps)
     tick_vals = np.linspace(0, n_steps - 1, n_ticks, dtype=int).tolist()
@@ -5013,40 +5013,71 @@ def plot_continuous_ts_shap_plotly(
     return fig
 
 
-# Known concept names for extraction from feature strings.
-# Order determines display order in the unified heatmap.
-_KNOWN_CONCEPTS = [
-    'VitaleVaerdier', 'InvasiveMonitoring', 'Labsvar',
-    'ITAOversigtsrapport', 'EWS', 'ISS_notes', 'ISS_computed',
+_CONCEPT_TO_DISPLAY_GROUP = {
+    'VitaleVaerdier': 'Vitals',
+    'InvasiveMonitoring': 'Vitals',
+    'Labsvar': 'Labs',
+    'ITAOversigtsrapport': 'ICU',
+    'EWS': 'Scores',
+    'ISS_notes': 'Scores',
+    'ISS_computed': 'Scores',
+    'Medicin': 'Medicine',
+    'ADTHaendelser': 'ADT',
+    'Procedurer': 'Procedures',
+    'Events': 'Events',
+    '_ebm': 'EBM',
+}
+
+_FEATURE_GROUP_OVERRIDES = {
+    'GCS': 'Scores',
+    'ISS': 'Scores',
+}
+
+_DISPLAY_GROUP_ORDER = [
+    'Vitals', 'Scores', 'Labs', 'ICU',
+    'Medicine', 'ADT', 'Procedures', 'Events',
+    'EBM', 'Other',
 ]
 
 
-def _extract_concept(feat_name: str) -> str:
-    """Extract clinical concept from a feature name like 'HR_VitaleVaerdier_mean'."""
-    for concept in _KNOWN_CONCEPTS:
-        if f'_{concept}_' in feat_name or feat_name.startswith(f'{concept}_'):
-            return concept
+def _resolve_display_group(
+    feat_name: str,
+    channel_map: Optional[Dict[str, Dict]] = None,
+) -> str:
+    """Resolve a channel/feature name to its display group for the heatmap."""
     if feat_name in _EBM_CHANNELS:
         return 'EBM'
+
+    if channel_map and feat_name in channel_map:
+        info = channel_map[feat_name]
+        raw_feature = info.get('feature', '')
+        concept = info.get('concept', '')
+        for prefix, group in _FEATURE_GROUP_OVERRIDES.items():
+            if raw_feature.startswith(prefix):
+                return group
+        return _CONCEPT_TO_DISPLAY_GROUP.get(concept, 'Other')
+
+    for concept, group in _CONCEPT_TO_DISPLAY_GROUP.items():
+        if f'_{concept}_' in feat_name or feat_name.startswith(f'{concept}_'):
+            return group
+
     return 'Other'
 
 
-def _strip_concept_from_label(feat_name: str, concept: str) -> str:
-    """Strip concept name from feature label for compact display.
-
-    'HR_VitaleVaerdier_mean' with concept='VitaleVaerdier' -> 'HR_mean'
-    'Medicin:Aspirin' -> 'Aspirin'
-    """
+def _strip_concept_from_label(feat_name: str, display_group: str) -> str:
+    """Create a compact display label from a feature name."""
     if ':' in feat_name:
         return feat_name.split(':', 1)[1]
-    return feat_name.replace(f'_{concept}_', '_').replace(f'{concept}_', '')
+    return feat_name
 
 
 def plot_unified_shap_heatmap_plotly(
     shap_results: Dict,
     sample_idx: int = 0,
     channel2feature: Optional[Dict[int, str]] = None,
+    channel_map: Optional[Dict[str, Dict]] = None,
     eval_timestep: Optional[int] = None,
+    start_timestep: Optional[int] = None,
     class_idx: int = 1,
     height: Optional[int] = None,
     width: int = 1100,
@@ -5068,6 +5099,12 @@ def plot_unified_shap_heatmap_plotly(
         n_steps = eval_timestep + 1
         ts_shap = ts_shap[:, :n_steps]
 
+    start_step = 0
+    if isinstance(start_timestep, int) and 0 < start_timestep < n_steps:
+        start_step = start_timestep
+        ts_shap = ts_shap[:, start_step:]
+        n_steps = ts_shap.shape[1]
+
     # Collect continuous channels with concept tags
     rows = []  # list of (concept, label, shap_row)
     if channel2feature:
@@ -5077,7 +5114,7 @@ def plot_unified_shap_heatmap_plotly(
                 continue
             if ch_idx >= ts_shap.shape[0]:
                 continue
-            concept = _extract_concept(feat)
+            concept = _resolve_display_group(feat, channel_map)
             rows.append((concept, feat, ts_shap[ch_idx]))
     else:
         for i in range(ts_shap.shape[0]):
@@ -5090,7 +5127,7 @@ def plot_unified_shap_heatmap_plotly(
         cat_data = cat_shap[sample_idx]
         if cat_data.ndim == 3:
             cat_data = cat_data[..., min(class_idx, cat_data.shape[-1] - 1)]
-        cat_data = cat_data[:, :n_steps]
+        cat_data = cat_data[:, start_step:start_step + n_steps]
         cat_names = get_category_names_from_encoding_info(enc_info)
         feature_ranges = enc_info.get('feature_ranges', {})
         idx_to_concept = {}
@@ -5098,7 +5135,8 @@ def plot_unified_shap_heatmap_plotly(
             for i in range(start, end):
                 idx_to_concept[i] = feat_name
         for cat_idx in range(cat_data.shape[0]):
-            concept = idx_to_concept.get(cat_idx, 'Other')
+            raw_concept = idx_to_concept.get(cat_idx, 'Other')
+            concept = _CONCEPT_TO_DISPLAY_GROUP.get(raw_concept, raw_concept)
             label = cat_names[cat_idx] if cat_idx < len(cat_names) else f'cat_{cat_idx}'
             rows.append((concept, label, cat_data[cat_idx]))
 
@@ -5106,7 +5144,7 @@ def plot_unified_shap_heatmap_plotly(
         return None
 
     # --- Group by concept, preserving order ---
-    concept_order = _KNOWN_CONCEPTS + ['EBM', 'Other']
+    concept_order = _DISPLAY_GROUP_ORDER
     seen = set()
     ordered_concepts = []
     for c in concept_order:
@@ -5135,7 +5173,7 @@ def plot_unified_shap_heatmap_plotly(
 
     z = np.array(ordered_shap)  # [n_rows, n_steps]
 
-    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps, start_step)
 
     vmax = max(abs(float(np.nanmin(z))), abs(float(np.nanmax(z))), 1e-10)
 

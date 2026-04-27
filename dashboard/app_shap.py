@@ -842,6 +842,7 @@ def main():
                 shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=shap_data["channel2feature"],
+                channel_map=session.bundle.get('data_config', {}).get('channel_map', {}),
                 eval_timestep=current_eval_step,
                 title="SHAP Heatmap (all channels, grouped by concept)",
             )
@@ -944,6 +945,8 @@ def main():
                 diff_shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=diff_shap_data["channel2feature"],
+                channel_map=session.bundle.get('data_config', {}).get('channel_map', {}),
+                start_timestep=dr.t1_step,
                 title=f"ΔSHAP Heatmap ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
             )
             if fig_delta_unified:
