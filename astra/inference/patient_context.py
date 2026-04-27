@@ -526,6 +526,7 @@ class PatientContext:
                     trajectory_length=visible_bins,
                     admission_time=self.admission_time,
                     profiling=profiling,
+                    raw_data=self._raw_data,
                 )
             with timed_stage(self._timing, 'categorical_build'):
                 self.x_ts_cat = _build_categorical_ts_incremental(

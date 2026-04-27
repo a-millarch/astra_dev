@@ -363,8 +363,7 @@ def compute_shap_per_timepoint(
 def _squeeze_shap_results(shap_results: Dict) -> None:
     """Squeeze trailing singleton dimensions from SHAP arrays in-place."""
     for key in ('ts_shap', 'cat_ts_shap', 'cat_ts_shap_per_category',
-                'cat_ts_shap_embedded', 'cat_shap', 'cat_shap_embedded',
-                'cont_shap'):
+                'cat_shap', 'cont_shap'):
         val = shap_results.get(key)
         if val is not None and isinstance(val, np.ndarray) and val.ndim > 1 and val.shape[-1] == 1:
             shap_results[key] = val.squeeze(-1)
@@ -923,7 +922,11 @@ def _load_cat_ts_from_pickle(pickle_path: str, timeframes: list) -> Optional[pd.
             for pr in results.patient_results:
                 norm_tf = 'full' if tf.startswith('max(') else tf
                 tfr = pr.timeframe_results.get(norm_tf) or pr.timeframe_results.get(tf)
-                if tfr and tfr.cat_ts_shap_per_category is not None and tfr.cat_ts_shap_per_category.size > 0:
+                if tfr is None:
+                    continue
+                if tfr.cat_ts_category_importance is not None:
+                    cat_arrays.append(tfr.cat_ts_category_importance)
+                elif tfr.cat_ts_shap_per_category is not None and tfr.cat_ts_shap_per_category.size > 0:
                     arr = tfr.cat_ts_shap_per_category
                     if arr.ndim == 2:
                         cat_arrays.append(np.abs(arr).mean(axis=1))
@@ -1023,7 +1026,7 @@ def _load_all_from_pickle(pickle_path: str, timeframes: list) -> Optional[dict]:
                         cat_ts_rows.append({
                             'timeframe': tf, 'feature': f'cat_ts:{name}',
                             'display_name': name,
-                            'mean_abs_shap': float(imp[j]),
+                            'mean_abs_shap': float(np.mean(imp[j])),
                         })
         if cat_ts_rows:
             cat_ts = pd.DataFrame(cat_ts_rows)
@@ -1045,6 +1048,7 @@ def _load_all_from_pickle(pickle_path: str, timeframes: list) -> Optional[dict]:
         'timeframes': timeframes,
         'density_normalize': density_normalize,
         'patient_counts': patient_counts,
+        'cat_ts_gate_values': getattr(results, 'cat_ts_gate_values', None),
     }
 
 
@@ -1220,9 +1224,15 @@ def figure_shap_summary_panel(
                     annot_kws={'fontsize': 10})
         ax_c.set_ylabel('')
         ax_c.set_xlabel('Timeframe')
-        ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
+        _cat_dn_suffix = ' (per-event)' if density_normalize else ''
+        ax_c.set_title(f'Categorical TS |SHAP|{_cat_dn_suffix}', fontweight='bold')
         ax_c.tick_params(axis='y', labelsize=12)
         ax_c.tick_params(axis='x', labelsize=12)
+        cat_ts_gate_values = data.get('cat_ts_gate_values')
+        if cat_ts_gate_values is not None:
+            gate_mean = float(np.mean(cat_ts_gate_values))
+            ax_c.text(0.02, 0.02, f'Gate factor: {gate_mean:.2f}',
+                      transform=ax_c.transAxes, fontsize=8, style='italic', alpha=0.7)
     else:
         ax_c.text(0.5, 0.5, 'No categorical TS data available',
                   ha='center', va='center', transform=ax_c.transAxes, fontsize=12)

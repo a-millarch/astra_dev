@@ -906,156 +906,62 @@ def _resolve_traj_lengths(x_ts, stored_traj_lengths):
     return _infer_trajectory_lengths_from_batch(x_ts)
 
 
-class ModelWrapperWithEmbeddings(nn.Module):
-    """Wrapper that takes pre-embedded categorical features."""
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None):
+class SHAPModelWrapper(nn.Module):
+    """
+    Unified SHAP wrapper that accepts both raw multi-hot categorical TS and
+    one-hot static categoricals as separate inputs. Gradients flow through
+    both embedding paths, enabling per-category SHAP attribution for cat TS
+    and meaningful static categorical SHAP simultaneously.
+
+    Input ordering (positional, conditional on flags):
+        [x_ts, x_ts_cat_raw?, x_cat_onehot?, x_cont?]
+    """
+    def __init__(self, model, has_cat_ts=False, has_static_cat=False, has_cont=False,
+                 eval_timestep=-1, traj_lengths=None, survival_mode: bool = False):
         super().__init__()
         self.model = model
         self.has_cat_ts = has_cat_ts
-        self.eval_timestep = eval_timestep
-        self.traj_lengths = traj_lengths  # [n_samples] or None
-
-    def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_embedded=None, x_cont=None):
-        nan_mask = torch.isnan(x_ts)
-        if nan_mask.any():
-            x_ts = x_ts.clone()
-            x_ts[nan_mask] = 0
-
-        # Build padding mask from trajectory lengths (matches model training behavior)
-        seq_len = x_ts.shape[2]
-        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
-        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)  # [batch, seq_len]
-
-        # Extract elapsed_hours for positional encoding (before stripping aux channels)
-        if self.model.temporal_channel_idx is not None:
-            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
-        else:
-            elapsed_hours = None
-
-        # Extract bin_width_hours for modulation (before stripping aux channels)
-        if self.model.bin_width_channel_idx is not None:
-            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
-        else:
-            bin_width_hours = None
-
-        # Strip auxiliary channels before W_P (same as model forward)
-        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
-        if self.model.local_temporal_conv is not None:
-            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
-        x = self.model.W_P(x_ts_signal).transpose(1, 2)
-        if self.model.bin_width_mod is not None and bin_width_hours is not None:
-            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
-
-        if self.has_cat_ts and x_ts_cat_embedded is not None:
-            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
-            if self.model.cat_ts_combine == 'add':
-                x = x + x_ts_cat_embedded
-            else:
-                x = torch.cat([x, x_ts_cat_embedded], dim=-1)
-
-        if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
-            x = torch.cat([x, x_cat_embedded], 1)
-
-        if x_cont is not None and x_cont.shape[1] > 0:
-            if self.model.cont_projections is not None:
-                x_cont_emb = torch.stack([
-                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
-                ], dim=1)
-            else:
-                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
-            x = torch.cat([x, x_cont_emb], 1)
-
-        # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
-        ts_padding_mask = key_padding_mask[:, :seq_len]
-        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
-        if self.model.res_drop is not None:
-            x = self.model.res_drop(x)
-
-        # Extend key_padding_mask for static tokens (never masked)
-        n_static = x.shape[1] - key_padding_mask.shape[1]
-        if n_static > 0:
-            static_mask = torch.zeros(
-                key_padding_mask.shape[0], n_static,
-                dtype=torch.bool, device=key_padding_mask.device,
-            )
-            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
-
-        attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-
-        # Zero out padding positions post-transformer (matches model.py L730-732)
-        x = x * (~key_padding_mask).unsqueeze(-1).float()
-
-        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
-            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
-            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
-                                           self.model.seq_len)
-        return self._apply_head(x, key_padding_mask)
-
-    def _apply_head(self, x, key_padding_mask):
-        """Apply head with pooling logic matching model.py forward()."""
-        if self.model.head_pool == 'mean_cat':
-            x_temporal = x[:, :self.model.seq_len, :]
-            x_static = x[:, self.model.seq_len:, :]
-            if key_padding_mask is not None:
-                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
-                ts_mask_f = ts_mask.unsqueeze(-1).float()
-                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
-            else:
-                x_pooled = x_temporal.mean(dim=1)
-            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
-        return self.model.head(x)
-
-
-class ModelWrapperWithOneHotCategoricals(nn.Module):
-    """
-    Wrapper that takes ONE-HOT encoded static categorical features [batch, n_cat, max_classes].
-
-    Performs matmul(one_hot, embedding.weight) to embed static categoricals differentiably.
-    This allows GradientExplainer to compute meaningful gradients through the one-hot probability
-    differences rather than through the pre-computed embedding lookup.
-    """
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
-                 x_cat_onehot_ref=None):
-        super().__init__()
-        self.model = model
-        self.has_cat_ts = has_cat_ts
+        self.has_static_cat = has_static_cat
+        self.has_cont = has_cont
         self.eval_timestep = eval_timestep
         self.traj_lengths = traj_lengths
-        # Store reference one-hot shape to know which embedding weights to extract
-        self.x_cat_onehot_ref = x_cat_onehot_ref
+        self.survival_mode = survival_mode
 
-    def forward(self, x_ts, x_ts_cat_embedded=None, x_cat_onehot=None, x_cont=None):
-        """
-        Args:
-            x_ts: [batch, c_in, seq_len]
-            x_ts_cat_embedded: [batch, seq_len, d_model] if has_cat_ts
-            x_cat_onehot: [batch, n_cat, max_classes] ONE-HOT encoded static cats
-            x_cont: [batch, n_cont] continuous statics
-        """
+    def forward(self, *args):
+        idx = 0
+        x_ts = args[idx]; idx += 1
+
+        x_ts_cat_raw = None
+        if self.has_cat_ts:
+            x_ts_cat_raw = args[idx]; idx += 1
+
+        x_cat_onehot = None
+        if self.has_static_cat:
+            x_cat_onehot = args[idx]; idx += 1
+
+        x_cont = None
+        if self.has_cont:
+            x_cont = args[idx]; idx += 1
+
         nan_mask = torch.isnan(x_ts)
         if nan_mask.any():
             x_ts = x_ts.clone()
             x_ts[nan_mask] = 0
 
-        # Build padding mask from trajectory lengths
         seq_len = x_ts.shape[2]
         traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
         key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)
 
-        # Extract elapsed_hours for positional encoding
         if self.model.temporal_channel_idx is not None:
             elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
         else:
             elapsed_hours = None
 
-        # Extract bin_width_hours for modulation
         if self.model.bin_width_channel_idx is not None:
             bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
         else:
             bin_width_hours = None
 
-        # Strip auxiliary channels before W_P
         x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
         if self.model.local_temporal_conv is not None:
             x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
@@ -1063,132 +969,7 @@ class ModelWrapperWithOneHotCategoricals(nn.Module):
         if self.model.bin_width_mod is not None and bin_width_hours is not None:
             x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
 
-        if self.has_cat_ts and x_ts_cat_embedded is not None:
-            # Gate already applied during pre-embedding (see _pre_embed_categorical_ts)
-            if self.model.cat_ts_combine == 'add':
-                x = x + x_ts_cat_embedded
-            else:
-                x = torch.cat([x, x_ts_cat_embedded], dim=-1)
-
-        # Embed one-hot static categoricals via matmul (differentiable)
-        if x_cat_onehot is not None and x_cat_onehot.shape[1] > 0:
-            # Matmul one-hot with embedding weights: [batch, n_cat, max_classes] x [max_classes, d_model]
-            # -> [batch, n_cat, d_model]
-            x_cat_embedded_list = []
-            for i, emb in enumerate(self.model.embeds):
-                # Extract relevant one-hot slice and embedding weight
-                oh_i = x_cat_onehot[:, i, :emb.num_embeddings]  # [batch, num_classes]
-                emb_w = emb.weight  # [num_classes, d_model]
-                x_cat_i = torch.matmul(oh_i, emb_w)  # [batch, d_model]
-                x_cat_embedded_list.append(x_cat_i.unsqueeze(1))  # [batch, 1, d_model]
-
-            x_cat_embedded = torch.cat(x_cat_embedded_list, dim=1)  # [batch, n_cat, d_model]
-            x = torch.cat([x, x_cat_embedded], 1)
-
-        if x_cont is not None and x_cont.shape[1] > 0:
-            if self.model.cont_projections is not None:
-                x_cont_emb = torch.stack([
-                    proj(x_cont[:, i:i+1]) for i, proj in enumerate(self.model.cont_projections)
-                ], dim=1)
-            else:
-                x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
-            x = torch.cat([x, x_cont_emb], 1)
-
-        # Positional encoding
-        ts_padding_mask = key_padding_mask[:, :seq_len]
-        x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
-        if self.model.res_drop is not None:
-            x = self.model.res_drop(x)
-
-        # Extend padding mask for static tokens
-        n_static = x.shape[1] - key_padding_mask.shape[1]
-        if n_static > 0:
-            static_mask = torch.zeros(
-                key_padding_mask.shape[0], n_static,
-                dtype=torch.bool, device=key_padding_mask.device,
-            )
-            key_padding_mask = torch.cat([key_padding_mask, static_mask], dim=1)
-
-        attn_mask = self.model.causal_mask if self.model.causal else None
-        x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
-
-        # Zero out padding positions post-transformer
-        x = x * (~key_padding_mask).unsqueeze(-1).float()
-
-        if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
-            logits = self.model.temporal_pred_head(x)
-            return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
-                                           self.model.seq_len)
-        return self._apply_head(x, key_padding_mask)
-
-    def _apply_head(self, x, key_padding_mask):
-        """Apply head with pooling logic matching model.py forward()."""
-        if self.model.head_pool == 'mean_cat':
-            x_temporal = x[:, :self.model.seq_len, :]
-            x_static = x[:, self.model.seq_len:, :]
-            if key_padding_mask is not None:
-                ts_mask = ~key_padding_mask[:, :self.model.seq_len]
-                ts_mask_f = ts_mask.unsqueeze(-1).float()
-                x_pooled = (x_temporal * ts_mask_f).sum(dim=1) / ts_mask_f.sum(dim=1).clamp(min=1)
-            else:
-                x_pooled = x_temporal.mean(dim=1)
-            x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
-        return self.model.head(x)
-
-
-class ModelWrapperWithRawCatTS(nn.Module):
-    """
-    Wrapper that takes RAW multi-hot categorical TS (not pre-embedded).
-    This allows SHAP to compute per-category attributions.
-    """
-    def __init__(self, model, has_cat_ts=False, eval_timestep=-1, traj_lengths=None,
-                 survival_mode: bool = False):
-        super().__init__()
-        self.model = model
-        self.has_cat_ts = has_cat_ts
-        self.eval_timestep = eval_timestep
-        self.traj_lengths = traj_lengths  # [n_samples] or None
-        self.survival_mode = survival_mode
-
-    def forward(self, x_ts, x_ts_cat_raw=None, x_cat_embedded=None, x_cont=None):
-        """
-        Args:
-            x_ts: [bs, c_in, seq_len] - continuous time series
-            x_ts_cat_raw: [bs, n_categories, seq_len] - raw multi-hot categorical TS
-            x_cat_embedded: [bs, n_cat, d_model] - pre-embedded static categorical
-            x_cont: [bs, n_cont] - static continuous
-        """
-        nan_mask = torch.isnan(x_ts)
-        if nan_mask.any():
-            x_ts = x_ts.clone()
-            x_ts[nan_mask] = 0
-
-        # Build padding mask from trajectory lengths (matches model training behavior)
-        seq_len = x_ts.shape[2]
-        traj_lengths = _resolve_traj_lengths(x_ts, self.traj_lengths)
-        key_padding_mask = _build_padding_mask_for_shap(x_ts, traj_lengths)  # [batch, seq_len]
-
-        # Extract elapsed_hours for positional encoding (before stripping aux channels)
-        if self.model.temporal_channel_idx is not None:
-            elapsed_hours = x_ts[:, self.model.temporal_channel_idx, :]
-        else:
-            elapsed_hours = None
-
-        # Extract bin_width_hours for modulation
-        if self.model.bin_width_channel_idx is not None:
-            bin_width_hours = x_ts[:, self.model.bin_width_channel_idx, :]
-        else:
-            bin_width_hours = None
-
-        # Strip auxiliary channels before W_P (same as model forward)
-        x_ts_signal = x_ts[:, self.model._signal_indices, :] if self.model.exclude_channel_indices else x_ts
-        if self.model.local_temporal_conv is not None:
-            x_ts_signal = self.model.local_temporal_conv(x_ts_signal)
-        x = self.model.W_P(x_ts_signal).transpose(1, 2)  # [bs, seq_len, d_model]
-        if self.model.bin_width_mod is not None and bin_width_hours is not None:
-            x = x * self.model.bin_width_mod(bin_width_hours.unsqueeze(-1))
-
-        # Embed categorical TS from raw multi-hot (this is differentiable!)
+        # Raw multi-hot cat TS → differentiable embedding (per-category SHAP)
         if self.has_cat_ts and x_ts_cat_raw is not None and self.model.n_ts_cat > 0:
             x_ts_cat = x_ts_cat_raw.float().transpose(1, 2)
 
@@ -1212,11 +993,18 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
                 x = torch.cat([x, x_ts_cat_embedded], dim=-1)
 
-        # Static categorical (pre-embedded)
-        if x_cat_embedded is not None and x_cat_embedded.shape[1] > 0:
+        # One-hot static categoricals → differentiable matmul embedding
+        if x_cat_onehot is not None and x_cat_onehot.shape[1] > 0:
+            x_cat_embedded_list = []
+            for i, emb in enumerate(self.model.embeds):
+                oh_i = x_cat_onehot[:, i, :emb.num_embeddings]
+                emb_w = emb.weight
+                x_cat_i = torch.matmul(oh_i, emb_w)
+                x_cat_embedded_list.append(x_cat_i.unsqueeze(1))
+
+            x_cat_embedded = torch.cat(x_cat_embedded_list, dim=1)
             x = torch.cat([x, x_cat_embedded], 1)
 
-        # Static continuous
         if x_cont is not None and x_cont.shape[1] > 0:
             if self.model.cont_projections is not None:
                 x_cont_emb = torch.stack([
@@ -1226,13 +1014,11 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 x_cont_emb = self.model.conv(x_cont.unsqueeze(1)).transpose(1, 2)
             x = torch.cat([x, x_cont_emb], 1)
 
-        # Pass ts_padding_mask to positional encoding (prevents cos(0)=1 contamination)
         ts_padding_mask = key_padding_mask[:, :seq_len]
         x = self.model.pos_enc(x, elapsed_hours=elapsed_hours, ts_padding_mask=ts_padding_mask)
         if self.model.res_drop is not None:
             x = self.model.res_drop(x)
 
-        # Extend key_padding_mask for static tokens (never masked)
         n_static = x.shape[1] - key_padding_mask.shape[1]
         if n_static > 0:
             static_mask = torch.zeros(
@@ -1244,24 +1030,21 @@ class ModelWrapperWithRawCatTS(nn.Module):
         attn_mask = self.model.causal_mask if self.model.causal else None
         x = self.model.transformer(x, attn_mask=attn_mask, key_padding_mask=key_padding_mask)
 
-        # Zero out padding positions post-transformer (matches model.py L730-732)
         x = x * (~key_padding_mask).unsqueeze(-1).float()
 
         if self.model.temporal_head_enabled and self.model.temporal_pred_head is not None:
-            logits = self.model.temporal_pred_head(x)  # [batch, seq_len]
+            logits = self.model.temporal_pred_head(x)
             if self.survival_mode:
-                # Return cumulative incidence 1 - S(t) at eval_timestep (differentiable)
                 eval_t = self.eval_timestep if isinstance(self.eval_timestep, int) and self.eval_timestep >= 0 else logits.shape[1] - 1
                 hazards = torch.sigmoid(logits[:, :eval_t + 1])
                 log_surv = torch.sum(torch.log1p(-hazards + 1e-7), dim=1)
                 surv = torch.exp(log_surv)
-                return (1.0 - surv).unsqueeze(-1)  # [batch, 1]
+                return (1.0 - surv).unsqueeze(-1)
             return _select_temporal_output(logits, self.eval_timestep, key_padding_mask,
                                            self.model.seq_len)
         return self._apply_head(x, key_padding_mask)
 
     def _apply_head(self, x, key_padding_mask):
-        """Apply head with pooling logic matching model.py forward()."""
         if self.model.head_pool == 'mean_cat':
             x_temporal = x[:, :self.model.seq_len, :]
             x_static = x[:, self.model.seq_len:, :]
@@ -1273,36 +1056,6 @@ class ModelWrapperWithRawCatTS(nn.Module):
                 x_pooled = x_temporal.mean(dim=1)
             x = torch.cat([x_pooled, x_static.reshape(x.shape[0], -1)], dim=1)
         return self.model.head(x)
-
-
-def embed_categorical_ts(model, x_ts_cat, encoding_info):
-    if x_ts_cat is None or model.n_ts_cat == 0:
-        return None
-    
-    if hasattr(x_ts_cat, 'data'):
-        x_ts_cat = x_ts_cat.data
-    x_ts_cat = x_ts_cat.float().transpose(1, 2)
-    
-    with torch.no_grad():
-        x_ts_cat_embedded_list = []
-        dim_offset = 0
-        for embed_layer, (feat_name, n_classes) in zip(model.ts_cat_embeds, model.ts_cat_dims.items()):
-            feat_multi_hot = x_ts_cat[:, :, dim_offset:dim_offset + n_classes]
-            feat_embedded = embed_layer(feat_multi_hot)
-            x_ts_cat_embedded_list.append(feat_embedded)
-            dim_offset += n_classes
-        
-        if model.cat_ts_combine == 'add':
-            stacked = torch.stack(x_ts_cat_embedded_list, dim=0)
-            if model.cat_ts_gate_params is not None:
-                gates = torch.sigmoid(model.cat_ts_gate_params)
-                stacked = stacked * gates[:, None, None, None]
-            x_ts_cat_embedded = stacked.sum(dim=0)
-        else:
-            x_ts_cat_embedded = torch.cat(x_ts_cat_embedded_list, dim=-1)
-    
-    x_ts_cat_embedded.requires_grad = True
-    return x_ts_cat_embedded
 
 
 def embed_categorical_features(model, x_cat):
@@ -1595,69 +1348,28 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         else:
             print(f"  Temporal head: eval_timestep={eval_timestep}")
 
-    if bg_cat_onehot is not None:
+    has_static_cat = bg_cat_onehot is not None
+    has_cont = bg_cont.shape[1] > 0
+
+    if has_static_cat:
         print(f"  Static categorical one-hot: {bg_cat_onehot.shape}")
-    
-    print(f"\ncompute_per_category_shap: {compute_per_category_shap}")
-    
-    if compute_per_category_shap and has_cat_ts and bg_cat_onehot is None:
-        # Per-category temporal SHAP with raw temporal cats, no static cats
-        print("  Using ModelWrapperWithRawCatTS for per-category SHAP values")
-        wrapped_model = ModelWrapperWithRawCatTS(model, has_cat_ts=has_cat_ts,
-                                                 eval_timestep=eval_timestep,
-                                                 traj_lengths=test_traj)
-        bg_ts_cat_input = bg_ts_cat.float()
-        test_ts_cat_input = test_ts_cat.float()
-        bg_ts_cat_input.requires_grad = True
-        test_ts_cat_input.requires_grad = True
-        bg_inputs = [bg_ts, bg_ts_cat_input]
-        test_inputs = [test_ts, test_ts_cat_input]
-    elif compute_per_category_shap and has_cat_ts and bg_cat_onehot is not None:
-        # Both raw temporal cats AND one-hot static cats needed.
-        # ModelWrapperWithRawCatTS expects pre-embedded static cats (shape mismatch
-        # with one-hot), so we use ModelWrapperWithOneHotCategoricals and fall back
-        # to pre-embedded temporal cats (losing per-category temporal SHAP granularity).
-        print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats + embedded temporal TS)")
-        print("  NOTE: Per-category temporal SHAP unavailable when one-hot static cats are present")
-        compute_per_category_shap = False  # disable for parsing below
-        wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
-                                                           eval_timestep=eval_timestep,
-                                                           traj_lengths=test_traj,
-                                                           x_cat_onehot_ref=bg_cat_onehot)
-        bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
-        test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
-        bg_inputs = [bg_ts, bg_ts_cat_emb]
-        test_inputs = [test_ts, test_ts_cat_emb]
+
+    print(f"\n  Using SHAPModelWrapper (raw cat TS + one-hot static cats)")
+    wrapped_model = SHAPModelWrapper(
+        model, has_cat_ts=has_cat_ts,
+        has_static_cat=has_static_cat, has_cont=has_cont,
+        eval_timestep=eval_timestep, traj_lengths=test_traj,
+    )
+
+    bg_inputs = [bg_ts]
+    test_inputs = [test_ts]
+    if has_cat_ts:
+        bg_inputs.append(bg_ts_cat.float().requires_grad_(True))
+        test_inputs.append(test_ts_cat.float().requires_grad_(True))
+    if has_static_cat:
         bg_inputs.append(bg_cat_onehot)
         test_inputs.append(test_cat_onehot)
-    else:
-        # No per-category temporal SHAP: embed temporal cats
-        if bg_cat_onehot is not None:
-            print("  Using ModelWrapperWithOneHotCategoricals (one-hot static cats, embedded categorical TS)")
-            wrapped_model = ModelWrapperWithOneHotCategoricals(model, has_cat_ts=has_cat_ts,
-                                                               eval_timestep=eval_timestep,
-                                                               traj_lengths=test_traj,
-                                                               x_cat_onehot_ref=bg_cat_onehot)
-        else:
-            print("  Using ModelWrapperWithEmbeddings (embedded categorical TS, no static cats)")
-            wrapped_model = ModelWrapperWithEmbeddings(model, has_cat_ts=has_cat_ts,
-                                                       eval_timestep=eval_timestep,
-                                                       traj_lengths=test_traj)
-
-        if has_cat_ts:
-            bg_ts_cat_emb = embed_categorical_ts(model, bg_ts_cat, encoding_info)
-            test_ts_cat_emb = embed_categorical_ts(model, test_ts_cat, encoding_info)
-            bg_inputs = [bg_ts, bg_ts_cat_emb]
-            test_inputs = [test_ts, test_ts_cat_emb]
-        else:
-            bg_inputs = [bg_ts]
-            test_inputs = [test_ts]
-
-        if bg_cat_onehot is not None:
-            bg_inputs.append(bg_cat_onehot)
-            test_inputs.append(test_cat_onehot)
-    
-    if bg_cont.shape[1] > 0:
+    if has_cont:
         bg_inputs.append(bg_cont)
         test_inputs.append(test_cont)
     
@@ -1680,7 +1392,14 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             selected_class = min(1, n_classes - 1)  # class 1 if available
             print(f"  Multi-output model: {n_classes} classes, selecting class {selected_class}")
             shap_values = shap_values[selected_class]
-    
+
+    # Strip trailing singleton class dim (GradientExplainer format b)
+    if isinstance(shap_values, list):
+        shap_values = [
+            sv.squeeze(-1) if isinstance(sv, np.ndarray) and sv.ndim > 1 and sv.shape[-1] == 1
+            else sv for sv in shap_values
+        ]
+
     print("\nSHAP value shapes:")
     for i, sv in enumerate(shap_values):
         print(f"  shap_values[{i}]: {sv.shape}")
@@ -1691,23 +1410,15 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     
     cat_ts_shap_per_category = None
     cat_ts_shap = None
-    cat_ts_shap_embedded = None
-    
+
     if has_cat_ts:
-        if compute_per_category_shap:
-            # Raw multi-hot SHAP: [n_samples, n_categories, seq_len, n_classes]
-            cat_ts_shap_per_category = shap_values[idx]
-            print(f"  cat_ts_shap_per_category: {cat_ts_shap_per_category.shape}")
-            # Also compute per-timestep importance (mean across categories)
-            cat_ts_shap = np.abs(cat_ts_shap_per_category).mean(axis=1)
-        else:
-            # Embedded SHAP: [n_samples, seq_len, d_model, n_classes]
-            cat_ts_shap_embedded = shap_values[idx]
-            cat_ts_shap = np.abs(cat_ts_shap_embedded).mean(axis=2)
+        cat_ts_shap_per_category = shap_values[idx]
+        print(f"  cat_ts_shap_per_category: {cat_ts_shap_per_category.shape}")
+        cat_ts_shap = np.abs(cat_ts_shap_per_category).mean(axis=1)
         idx += 1
-    
+
     cat_shap, cat_shap_onehot = None, None
-    if bg_cat_onehot is not None:
+    if has_static_cat:
         cat_shap_onehot = shap_values[idx]
         print(f"  cat_shap_onehot shape (one-hot SHAP): {cat_shap_onehot.shape}")
         # cat_shap_onehot is [n_samples, n_cat, max_classes]
@@ -1717,7 +1428,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         print(f"  cat_shap after sum(|one_hot|): {cat_shap.shape}")
         idx += 1
     
-    cont_shap = shap_values[idx] if bg_cont.shape[1] > 0 else None
+    cont_shap = shap_values[idx] if has_cont else None
 
     # Zero SHAP values at padding positions (safety net — model already zeros
     # padding output, but explicit zeroing ensures clean SHAP values)
@@ -1729,14 +1440,11 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             cat_ts_shap_per_category[i, :, tl:] = 0.0
         if cat_ts_shap is not None:
             cat_ts_shap[i, tl:] = 0.0
-        if cat_ts_shap_embedded is not None:
-            cat_ts_shap_embedded[i, tl:] = 0.0
 
     return {
         'ts_shap': ts_shap,
         'cat_ts_shap': cat_ts_shap,
-        'cat_ts_shap_per_category': cat_ts_shap_per_category,  # NEW: per-category SHAP
-        'cat_ts_shap_embedded': cat_ts_shap_embedded,
+        'cat_ts_shap_per_category': cat_ts_shap_per_category,
         'cat_shap': cat_shap,
         'cat_shap_onehot': cat_shap_onehot,
         'cont_shap': cont_shap,
@@ -2643,6 +2351,7 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
     # Used when density_normalize=True to avoid rewarding channels that are
     # simply measured more often.
     _measured_mask = None  # [n_samples, n_channels, n_steps] bool
+    _cat_measured_mask = None  # [n_samples, n_categories, n_steps] bool
     if density_normalize:
         test_ts = shap_results.get('test_data', {}).get('ts')
         if test_ts is not None:
@@ -2651,6 +2360,10 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         else:
             logger.warning("density_normalize=True but test_data['ts'] not available; "
                            "falling back to standard aggregation")
+        test_ts_cat = shap_results.get('test_data', {}).get('ts_cat')
+        if test_ts_cat is not None:
+            _cat_measured_mask = test_ts_cat[:n_samples, :, :n_steps] != 0.0
+            logger.info("Density normalization enabled for categorical TS SHAP summary")
 
     def _masked_temporal_mean(arr_3d, ch_indices):
         """Mean |SHAP| over samples & channels -> [n_steps], padding-aware."""
@@ -2713,7 +2426,15 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         if cat_ts.ndim == 3:
             cat_ts = cat_ts[..., min(class_idx, cat_ts.shape[-1] - 1)]
         cat_ts = cat_ts[..., :n_steps]  # crop to eval_timestep
-        cat_imp = np.abs(cat_ts).mean(axis=0)
+        if _cat_measured_mask is not None:
+            # Density-normalized: any category active at this timestep per sample
+            _cat_any_active = _cat_measured_mask[:cat_ts.shape[0]].any(axis=1)[:, :cat_ts.shape[1]]  # [n_samples, n_steps]
+            if valid_time is not None:
+                _cat_any_active = _cat_any_active & valid_time[:_cat_any_active.shape[0], :_cat_any_active.shape[1]]
+            _cat_denom_t = _cat_any_active.sum(axis=0).clip(1)  # [n_steps]
+            cat_imp = (np.abs(cat_ts) * _cat_any_active).sum(axis=0) / _cat_denom_t
+        else:
+            cat_imp = np.abs(cat_ts).mean(axis=0)
         ax1.plot(cat_imp, linewidth=2, color='#00d4aa', label='Categorical TS', linestyle='--')
         ax1.fill_between(range(len(cat_imp)), cat_imp, alpha=0.2, color='#00d4aa')
 
@@ -2765,17 +2486,25 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
         if cat_ts_shap.ndim == 4:
             cat_ts_shap = cat_ts_shap[..., min(class_idx, cat_ts_shap.shape[-1] - 1)]
         cat_ts_shap = cat_ts_shap[..., :n_steps]  # crop to eval_timestep
-        cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
-        
+        if _cat_measured_mask is not None:
+            _cat_hm_mask = _cat_measured_mask[:cat_ts_shap.shape[0], :cat_ts_shap.shape[1], :cat_ts_shap.shape[2]]
+            if valid_time is not None:
+                _cat_hm_mask = _cat_hm_mask & valid_time[:_cat_hm_mask.shape[0], None, :_cat_hm_mask.shape[2]]
+            _cat_hm_denom = _cat_hm_mask.sum(axis=0).clip(1)  # [n_cats, n_steps]
+            cat_ts_mean = (np.abs(cat_ts_shap) * _cat_hm_mask).sum(axis=0) / _cat_hm_denom
+        else:
+            cat_ts_mean = np.abs(cat_ts_shap).mean(axis=0)  # [n_cats, seq_len]
+
         enc_info = shap_results['encoding_info']
         cat_names = get_category_names_from_encoding_info(enc_info)
         n_cats = cat_ts_mean.shape[0]
         while len(cat_names) < n_cats:
             cat_names.append(f"cat_{len(cat_names)}")
-        
+
+        _cat_dn_suffix = ' (per-event)' if _cat_measured_mask is not None else ' (Mean)'
         im3 = ax3.imshow(cat_ts_mean, aspect='auto', cmap='YlOrRd', interpolation='nearest')
         ax3.set_xlabel('Time'); ax3.set_ylabel('Category')
-        ax3.set_title('Categorical TS |SHAP| (Mean)', fontweight='bold')
+        ax3.set_title(f'Categorical TS |SHAP|{_cat_dn_suffix}', fontweight='bold')
         
         if n_cats <= 20:
             ax3.set_yticks(range(n_cats)); ax3.set_yticklabels(cat_names, fontsize=8)
@@ -2784,8 +2513,9 @@ def visualize_shap_summary(shap_results: Dict, channel2feature: Dict[int, str] =
             yticks = list(range(0, n_cats, step))
             ax3.set_yticks(yticks); ax3.set_yticklabels([cat_names[i] for i in yticks], fontsize=8)
         ax3.set_xticks(tick_idx); ax3.set_xticklabels([time_fmt[i] for i in tick_idx], rotation=45)
-        plt.colorbar(im3, ax=ax3, label='Mean |SHAP|')
-    
+        _cat_cbar_label = 'Mean |SHAP| / active event' if _cat_measured_mask is not None else 'Mean |SHAP|'
+        plt.colorbar(im3, ax=ax3, label=_cat_cbar_label)
+
     elif shap_results.get('encoding_info') is not None:
         # Fallback: show activity data
         ax3 = fig.add_subplot(gs[1 + row_offset, 1])
@@ -3082,6 +2812,7 @@ class TimeframeSHAPResult:
     cont_data: Optional[np.ndarray]
     ts_channel_importance: np.ndarray
     ts_temporal_importance: np.ndarray
+    cat_ts_category_importance: Optional[np.ndarray] = None
     n_active_background: Optional[int] = None
 
     @property
@@ -3139,6 +2870,7 @@ class CohortTemporalSHAPResults:
     # Categorical TS per-category importance (optional)
     cat_ts_per_category_importance: Dict[str, Optional[np.ndarray]] = field(default_factory=dict)  # tf -> [n_categories]
     cat_ts_category_names: List[str] = field(default_factory=list)
+    cat_ts_gate_values: Optional[np.ndarray] = None
     # Individual patient results (optional, for deep-dive)
     patient_results: Optional[List[TemporalSHAPResults]] = None
 
@@ -3150,7 +2882,7 @@ class CohortTemporalSHAPResults:
 # MODEL WRAPPER
 # ============================================================================
 
-# NOTE: ModelWrapperWithRawCatTS is defined above (used by both
+# NOTE: SHAPModelWrapper is defined above (used by both
 # calculate_shap_from_dataloaders and TemporalSHAPAnalyzer).
 # NOTE: embed_categorical_features is defined above (converts to one-hot for SHAP).
 
@@ -3184,12 +2916,21 @@ class TemporalSHAPAnalyzer:
         self.model = self.model.to(device)
         self.has_cat_ts = model.n_ts_cat > 0
 
+        self.cat_ts_gate_values = None
+        if hasattr(model, 'cat_ts_gate_params') and model.cat_ts_gate_params is not None:
+            with torch.no_grad():
+                self.cat_ts_gate_values = torch.sigmoid(model.cat_ts_gate_params).cpu().numpy()
+
         mode_parts = []
         if active_only: mode_parts.append("active-only")
         if density_normalize: mode_parts.append("density-norm")
         mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
         print(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
               f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
+        if self.cat_ts_gate_values is not None:
+            logger.info(f"Categorical TS gate values (sigmoid): {self.cat_ts_gate_values}")
+            logger.info(f"Gate suppression factor: mean={self.cat_ts_gate_values.mean():.3f} "
+                        f"(range {self.cat_ts_gate_values.min():.3f}-{self.cat_ts_gate_values.max():.3f})")
     
     def _create_channel_mapping(self):
         features = self.data["trainval"].complete.sort_values(['PID', 'FEATURE'])['FEATURE'].drop_duplicates().tolist()
@@ -3295,31 +3036,24 @@ class TemporalSHAPAnalyzer:
         else:
             eval_ts = -1
 
-        # Choose wrapper based on whether we have static categorical features.
-        # ModelWrapperWithOneHotCategoricals expects PRE-EMBEDDED temporal cats,
-        # so when static cats exist we must embed temporal cats first.
-        if bg_cat_onehot is not None:
-            wrapped = ModelWrapperWithOneHotCategoricals(self.model, self.has_cat_ts, eval_timestep=eval_ts,
-                                                         traj_lengths=wrapper_traj,
-                                                         x_cat_onehot_ref=bg_cat_onehot)
-            # Pre-embed temporal cats for this wrapper
-            bg_ts_cat_emb = embed_categorical_ts(self.model, bg_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
-            sample_ts_cat_emb = embed_categorical_ts(self.model, sample_ts_cat_c, self.encoding_info) if self.has_cat_ts else None
-            if bg_ts_cat_emb is not None:
-                bg_inputs = [bg_ts_c, bg_ts_cat_emb]
-                sample_inputs = [sample_ts_c, sample_ts_cat_emb]
-            else:
-                bg_inputs = [bg_ts_c]
-                sample_inputs = [sample_ts_c]
+        has_static_cat = bg_cat_onehot is not None
+        has_cont = bg['cont'].shape[1] > 0
+
+        wrapped = SHAPModelWrapper(
+            self.model, has_cat_ts=self.has_cat_ts,
+            has_static_cat=has_static_cat, has_cont=has_cont,
+            eval_timestep=eval_ts, traj_lengths=wrapper_traj,
+        )
+
+        bg_inputs = [bg_ts_c]
+        sample_inputs = [sample_ts_c]
+        if self.has_cat_ts:
+            bg_inputs.append(bg_ts_cat_c.float().requires_grad_(True))
+            sample_inputs.append(sample_ts_cat_c.float().requires_grad_(True))
+        if has_static_cat:
             bg_inputs.append(bg_cat_onehot)
             sample_inputs.append(sample_cat_onehot)
-        else:
-            # No static cats: use raw wrapper for per-category temporal SHAP
-            wrapped = ModelWrapperWithRawCatTS(self.model, self.has_cat_ts, eval_timestep=eval_ts,
-                                               traj_lengths=wrapper_traj)
-            bg_inputs = [bg_ts_c, bg_ts_cat_c.float().requires_grad_(True)]
-            sample_inputs = [sample_ts_c, sample_ts_cat_c.float().requires_grad_(True)]
-        if bg['cont'].shape[1] > 0:
+        if has_cont:
             bg_inputs.append(bg['cont'])
             sample_inputs.append(sample_cont)
 
@@ -3335,6 +3069,13 @@ class TemporalSHAPAnalyzer:
             selected_class = min(1, n_classes - 1)  # class 1 if available
             shap_values = shap_values[selected_class]
 
+        # Strip trailing singleton class dim (GradientExplainer format b)
+        if isinstance(shap_values, list):
+            shap_values = [
+                sv.squeeze(-1) if isinstance(sv, np.ndarray) and sv.ndim > 1 and sv.shape[-1] == 1
+                else sv for sv in shap_values
+            ]
+
         idx = 0
         ts_shap = shap_values[idx][0]
         idx += 1
@@ -3347,11 +3088,11 @@ class TemporalSHAPAnalyzer:
 
         # Static categorical SHAP: one-hot encoding -> [n_cat, max_classes]
         # Aggregate over class dimension (sum absolute values per feature)
-        cat_shap = np.abs(shap_values[idx][0]).sum(axis=1) if bg_cat_onehot is not None else None
-        if bg_cat_onehot is not None:
+        cat_shap = np.abs(shap_values[idx][0]).sum(axis=1) if has_static_cat else None
+        if has_static_cat:
             idx += 1
 
-        cont_shap = shap_values[idx][0] if bg['cont'].shape[1] > 0 else None
+        cont_shap = shap_values[idx][0] if has_cont else None
 
         # Zero SHAP values beyond effective trajectory (padding + censored positions)
         if traj_length is not None:
@@ -3504,6 +3245,21 @@ class TemporalSHAPAnalyzer:
             else:
                 ts_temporal_importance = np.zeros(full_steps)
 
+            # Categorical TS per-category importance (density-normalized when enabled)
+            cat_ts_category_importance = None
+            if shap_res['cat_ts_shap_per_category'] is not None:
+                cat_ts_raw = shap_res['cat_ts_shap_per_category']
+                cat_ts_data_np = sample_ts_cat.cpu().numpy()
+                if eff > 0 and self.density_normalize:
+                    shap_cat_eff = np.abs(cat_ts_raw[:, :eff])
+                    cat_measured = cat_ts_data_np[:, :eff] != 0.0
+                    cat_denom = cat_measured.sum(axis=1).clip(1)
+                    cat_ts_category_importance = (shap_cat_eff * cat_measured).sum(axis=1) / cat_denom
+                elif eff > 0:
+                    cat_ts_category_importance = np.abs(cat_ts_raw[:, :eff]).mean(axis=1)
+                else:
+                    cat_ts_category_importance = np.zeros(cat_ts_raw.shape[0])
+
             results[tf] = TimeframeSHAPResult(
                 timeframe_name=tf, timeframe_hours=tf_h, censor_step=censor,
                 actual_data_steps=actual_steps, ts_shap=ts_shap,
@@ -3514,6 +3270,7 @@ class TemporalSHAPAnalyzer:
                 cat_data=sample_cat.cpu().numpy(), cont_data=sample_cont.cpu().numpy(),
                 ts_channel_importance=ts_channel_importance,
                 ts_temporal_importance=ts_temporal_importance,
+                cat_ts_category_importance=cat_ts_category_importance,
                 n_active_background=n_active_bg,
             )
         
@@ -4621,17 +4378,19 @@ class TemporalSHAPAnalyzer:
             static_cont_importance[tf] = (
                 np.mean(cont_shaps, axis=0) if cont_shaps else None)
 
-        # Categorical TS per-category importance
+        # Categorical TS per-category importance (density-normalized when available)
         cat_ts_per_category_importance = OrderedDict()
         cat_ts_category_names = get_category_names_from_encoding_info(self.encoding_info) if self.encoding_info else []
         for tf in ordered_tfs:
             tf_results = tf_collections[tf]
             cat_ts_arrays = []
             for r in tf_results:
-                if r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
+                if r.cat_ts_category_importance is not None:
+                    cat_ts_arrays.append(r.cat_ts_category_importance)
+                elif r.cat_ts_shap_per_category is not None and r.cat_ts_shap_per_category.size > 0:
                     arr = r.cat_ts_shap_per_category
                     if arr.ndim == 2:
-                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))  # [n_cats, seq_len] -> [n_cats]
+                        cat_ts_arrays.append(np.abs(arr).mean(axis=1))
                     elif arr.ndim == 1:
                         cat_ts_arrays.append(np.abs(arr))
                     elif arr.ndim == 3:
@@ -4658,6 +4417,7 @@ class TemporalSHAPAnalyzer:
             density_normalize=self.density_normalize,
             cat_ts_per_category_importance=cat_ts_per_category_importance,
             cat_ts_category_names=cat_ts_category_names,
+            cat_ts_gate_values=self.cat_ts_gate_values,
             patient_results=patient_results,
         )
 
@@ -5120,7 +4880,7 @@ def run_cohort_temporal_shap_analysis(data, model, max_patients=20,
                     detail_rows.append({
                         'timeframe': tf, 'channel_idx': None,
                         'feature': f'cat_ts:{name}',
-                        'mean_abs_shap': float(cat_ts_imp[j]), 'std_abs_shap': None,
+                        'mean_abs_shap': float(np.mean(cat_ts_imp[j])), 'std_abs_shap': None,
                         'n_patients': results.patient_counts[tf],
                     })
     detail_df = pd.DataFrame(detail_rows)
@@ -5152,11 +4912,11 @@ except ImportError:
     HAS_PLOTLY = False
 
 
-def _build_time_axis_plotly(n_steps):
+def _build_time_axis_plotly(n_steps, start_step=0):
     """Build time axis with sparse tick labels for readability."""
     all_labels = []
     for i in range(n_steps):
-        t = step_to_time(i)
+        t = step_to_time(start_step + i)
         all_labels.append(time_to_hours(t))
     n_ticks = min(15, n_steps)
     tick_vals = np.linspace(0, n_steps - 1, n_ticks, dtype=int).tolist()
@@ -5183,6 +4943,7 @@ def plot_continuous_ts_shap_plotly(
     height: int = 700,
     width: int = 1100,
     title: str = "Continuous TS SHAP Heatmap (interactive)",
+    channel_subset: Optional[list] = None,
 ):
     """Interactive Plotly heatmap for continuous time-series SHAP values."""
     if not HAS_PLOTLY:
@@ -5202,14 +4963,22 @@ def plot_continuous_ts_shap_plotly(
 
     time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
 
-    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
-    if has_ebm:
-        ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
-    elif channel2feature:
-        ordered_idx, ordered_labels, _ = _get_grouped_channel_order(channel2feature)
+    if channel_subset is not None:
+        ordered_idx = [idx for idx, _ in channel_subset]
+        ordered_labels = [label for _, label in channel_subset]
     else:
-        ordered_idx = list(range(n_ch))
-        ordered_labels = [f'Ch{i}' for i in range(n_ch)]
+        has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+        if has_ebm:
+            ordered_idx, ordered_labels = _get_clinical_only_channel_order(channel2feature)
+        elif channel2feature:
+            ordered_idx, ordered_labels, _ = _get_grouped_channel_order(channel2feature)
+        else:
+            ordered_idx = list(range(n_ch))
+            ordered_labels = [f'Ch{i}' for i in range(n_ch)]
+
+    valid_idx = [i for i in ordered_idx if i < n_ch]
+    valid_labels = [ordered_labels[j] for j, i in enumerate(ordered_idx) if i < n_ch]
+    ordered_idx, ordered_labels = valid_idx, valid_labels
 
     ts_display = ts_shap[ordered_idx]
     vmax = max(abs(float(np.nanmin(ts_display))),
@@ -5240,6 +5009,315 @@ def plot_continuous_ts_shap_plotly(
         yaxis=dict(autorange="reversed"),
         xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
         margin=dict(l=180),
+    )
+    return fig
+
+
+_CONCEPT_TO_DISPLAY_GROUP = {
+    'VitaleVaerdier': 'Vitals',
+    'InvasiveMonitoring': 'Vitals',
+    'Labsvar': 'Labs',
+    'ITAOversigtsrapport': 'ICU',
+    'EWS': 'Scores',
+    'ISS_notes': 'Scores',
+    'ISS_computed': 'Scores',
+    'Medicin': 'Medicine',
+    'ADTHaendelser': 'ADT',
+    'Procedurer': 'Procedures',
+    'Events': 'Events',
+    '_ebm': 'EBM',
+}
+
+_FEATURE_GROUP_OVERRIDES = {
+    'GCS': 'Scores',
+    'ISS': 'Scores',
+}
+
+_DISPLAY_GROUP_ORDER = [
+    'Vitals', 'Scores', 'Labs', 'ICU',
+    'Medicine', 'ADT', 'Procedures', 'Events',
+    'EBM', 'Other',
+]
+
+
+def _resolve_display_group(
+    feat_name: str,
+    channel_map: Optional[Dict[str, Dict]] = None,
+) -> str:
+    """Resolve a channel/feature name to its display group for the heatmap."""
+    if feat_name in _EBM_CHANNELS:
+        return 'EBM'
+
+    if channel_map and feat_name in channel_map:
+        info = channel_map[feat_name]
+        raw_feature = info.get('feature', '')
+        concept = info.get('concept', '')
+        for prefix, group in _FEATURE_GROUP_OVERRIDES.items():
+            if raw_feature.startswith(prefix):
+                return group
+        return _CONCEPT_TO_DISPLAY_GROUP.get(concept, 'Other')
+
+    for concept, group in _CONCEPT_TO_DISPLAY_GROUP.items():
+        if f'_{concept}_' in feat_name or feat_name.startswith(f'{concept}_'):
+            return group
+
+    return 'Other'
+
+
+def _strip_concept_from_label(feat_name: str, display_group: str) -> str:
+    """Create a compact display label from a feature name."""
+    if ':' in feat_name:
+        return feat_name.split(':', 1)[1]
+    return feat_name
+
+
+def plot_unified_shap_heatmap_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    channel_map: Optional[Dict[str, Dict]] = None,
+    eval_timestep: Optional[int] = None,
+    start_timestep: Optional[int] = None,
+    class_idx: int = 1,
+    height: Optional[int] = None,
+    width: int = 1100,
+    title: str = "SHAP Heatmap (all channels)",
+):
+    """Unified SHAP heatmap: continuous + categorical channels grouped by concept."""
+    if not HAS_PLOTLY:
+        return None
+
+    # --- Continuous TS SHAP ---
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+
+    start_step = 0
+    if isinstance(start_timestep, int) and 0 < start_timestep < n_steps:
+        start_step = start_timestep
+        ts_shap = ts_shap[:, start_step:]
+        n_steps = ts_shap.shape[1]
+
+    # Collect continuous channels with concept tags
+    rows = []  # list of (concept, label, shap_row)
+    if channel2feature:
+        for ch_idx in sorted(channel2feature.keys()):
+            feat = channel2feature[ch_idx]
+            if feat in _SHAP_EXCLUDED_CHANNELS:
+                continue
+            if ch_idx >= ts_shap.shape[0]:
+                continue
+            concept = _resolve_display_group(feat, channel_map)
+            rows.append((concept, feat, ts_shap[ch_idx]))
+    else:
+        for i in range(ts_shap.shape[0]):
+            rows.append(('Other', f'Ch{i}', ts_shap[i]))
+
+    # --- Categorical TS SHAP ---
+    cat_shap = shap_results.get('cat_ts_shap_per_category')
+    enc_info = shap_results.get('encoding_info')
+    if cat_shap is not None and enc_info is not None:
+        cat_data = cat_shap[sample_idx]
+        if cat_data.ndim == 3:
+            cat_data = cat_data[..., min(class_idx, cat_data.shape[-1] - 1)]
+        cat_data = cat_data[:, start_step:start_step + n_steps]
+        cat_names = get_category_names_from_encoding_info(enc_info)
+        feature_ranges = enc_info.get('feature_ranges', {})
+        idx_to_concept = {}
+        for feat_name, (start, end) in feature_ranges.items():
+            for i in range(start, end):
+                idx_to_concept[i] = feat_name
+        for cat_idx in range(cat_data.shape[0]):
+            raw_concept = idx_to_concept.get(cat_idx, 'Other')
+            concept = _CONCEPT_TO_DISPLAY_GROUP.get(raw_concept, raw_concept)
+            label = cat_names[cat_idx] if cat_idx < len(cat_names) else f'cat_{cat_idx}'
+            rows.append((concept, label, cat_data[cat_idx]))
+
+    if not rows:
+        return None
+
+    # --- Group by concept, preserving order ---
+    concept_order = _DISPLAY_GROUP_ORDER
+    seen = set()
+    ordered_concepts = []
+    for c in concept_order:
+        if any(r[0] == c for r in rows) and c not in seen:
+            ordered_concepts.append(c)
+            seen.add(c)
+    for r in rows:
+        if r[0] not in seen:
+            ordered_concepts.append(r[0])
+            seen.add(r[0])
+
+    ordered_labels = []  # short display labels
+    full_labels = []     # original names for hover
+    ordered_shap = []
+    group_boundaries = []
+    for concept in ordered_concepts:
+        group_rows = [(label, shap_row) for c, label, shap_row in rows if c == concept]
+        group_rows.sort(key=lambda x: x[0])
+        start = len(ordered_labels)
+        for label, shap_row in group_rows:
+            short = _strip_concept_from_label(label, concept)
+            ordered_labels.append(short)
+            full_labels.append(label)
+            ordered_shap.append(shap_row)
+        group_boundaries.append((concept, start, len(ordered_labels)))
+
+    z = np.array(ordered_shap)  # [n_rows, n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps, start_step)
+
+    vmax = max(abs(float(np.nanmin(z))), abs(float(np.nanmax(z))), 1e-10)
+
+    hover = np.empty(z.shape, dtype=object)
+    for r in range(z.shape[0]):
+        for c in range(z.shape[1]):
+            hover[r, c] = (
+                f"<b>{full_labels[r]}</b><br>"
+                f"Time: {time_labels[c]}<br>"
+                f"SHAP: {z[r, c]:.5f}"
+            )
+
+    n_rows = len(ordered_labels)
+    if height is None:
+        height = max(500, n_rows * 18)
+
+    y_indices = list(range(n_rows))
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=list(range(n_steps)),
+        y=y_indices,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        colorscale='RdBu_r',
+        zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="SHAP"),
+    ))
+
+    # Add concept group separators with label on the right
+    for concept, start, end in group_boundaries:
+        if start > 0:
+            fig.add_shape(
+                type="line",
+                x0=0, x1=1, xref="paper",
+                y0=start - 0.5, y1=start - 0.5, yref="y",
+                line=dict(color="rgba(0,0,0,0.5)", width=2),
+            )
+        mid_row = (start + end - 1) / 2.0
+        fig.add_annotation(
+            x=1.01, y=mid_row,
+            xref="paper", yref="y",
+            text=f"<b>{concept}</b>",
+            showarrow=False,
+            font=dict(size=9, color="rgba(80,80,80,1)"),
+            xanchor="left",
+        )
+
+    fig.update_layout(
+        title=title, xaxis_title="Time", yaxis_title="",
+        height=height, width=width,
+        yaxis=dict(
+            tickvals=y_indices,
+            ticktext=ordered_labels,
+            tickfont=dict(size=10),
+        ),
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        margin=dict(l=160, r=80),
+    )
+    return fig
+
+
+def plot_delta_shap_temporal_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    class_idx: int = 1,
+    height: int = 350,
+    width: int = 1100,
+    title: str = "ΔSHAP Over Time",
+):
+    """ΔSHAP over time: continuous + categorical mean delta per timestep."""
+    if not HAS_PLOTLY:
+        return None
+
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+
+    eval_timestep = shap_results.get('eval_timestep')
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    x = list(range(n_steps))
+
+    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+    fig = go.Figure()
+
+    if has_ebm:
+        clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_ch)
+        ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
+        clinical_avg = np.mean(ts_shap[clinical_ch], axis=0)
+        fig.add_trace(go.Scatter(
+            x=x, y=clinical_avg, fill='tozeroy',
+            fillcolor='rgba(0,139,251,0.15)',
+            line=dict(color='#008bfb', width=2),
+            name='Clinical channels',
+            hovertemplate='<b>%{customdata}</b><br>Clinical ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+        if ebm_ch:
+            ebm_avg = np.mean(ts_shap[ebm_ch], axis=0)
+            fig.add_trace(go.Scatter(
+                x=x, y=ebm_avg,
+                line=dict(color='#FF9800', width=2, dash='dash'),
+                name='EBM',
+                hovertemplate='<b>%{customdata}</b><br>EBM ΔSHAP: %{y:.5f}<extra></extra>',
+                customdata=[time_labels[i] for i in range(n_steps)],
+            ))
+    else:
+        ts_avg = np.mean(ts_shap, axis=0)
+        fig.add_trace(go.Scatter(
+            x=x, y=ts_avg, fill='tozeroy',
+            fillcolor='rgba(255,0,81,0.2)',
+            line=dict(color='#ff0051', width=2),
+            name='Continuous TS',
+            hovertemplate='<b>%{customdata}</b><br>ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+
+    cat_ts = shap_results.get('cat_ts_shap')
+    if cat_ts is not None:
+        cat_data = cat_ts[sample_idx]
+        if cat_data.ndim == 2:
+            cat_data = cat_data[..., min(class_idx, cat_data.shape[-1] - 1)]
+        cat_data = cat_data[:n_steps]
+        fig.add_trace(go.Scatter(
+            x=x, y=cat_data,
+            line=dict(color='#00d4aa', width=2, dash='dash'),
+            name='Categorical TS',
+            hovertemplate='<b>%{customdata}</b><br>Cat ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", line_width=1)
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        xaxis_title="Time", yaxis_title="Mean ΔSHAP",
+        height=height, width=width,
     )
     return fig
 
@@ -5522,6 +5600,7 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
     sorted_idx = [display_ch[i] for i in sorted_display[:n_show]]
     names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx] if channel2feature else [f'Ch {i}' for i in sorted_idx]
     values = ch_imp[sorted_idx]
+    # Reverse so largest is at top in the horizontal bar chart
     names, values = names[::-1], values[::-1]
     hover = [f"<b>{names[i]}</b><br>Mean |SHAP|: {values[i]:.5f}" for i in range(n_show)]
     fig = go.Figure(data=go.Bar(x=values, y=names, orientation='h',
@@ -5529,7 +5608,8 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
         hovertemplate="%{customdata}<extra></extra>"))
     title = f"Top {n_show} Clinical Channels" if has_ebm else f"Top {n_show} Channels"
     fig.update_layout(title=title, xaxis_title="Mean |SHAP|",
-        yaxis=dict(autorange="reversed"), height=height, width=width, margin=dict(l=180))
+        yaxis=dict(dtick=1),
+        height=max(height, n_show * 22), width=width, margin=dict(l=180))
     return fig
 
 

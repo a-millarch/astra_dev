@@ -10,14 +10,12 @@ Requires: pip install streamlit plotly
 import sys
 import os
 import logging
-import time as _time
 
 # ── Ensure repo root is on path ──────────────────────────────────────────
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -48,6 +46,8 @@ def _load_astra_modules():
         plot_shap_temporal_plotly,
         plot_top_channels_plotly,
         plot_static_features_plotly,
+        plot_unified_shap_heatmap_plotly,
+        plot_delta_shap_temporal_plotly,
         visualize_data_completeness,
     )
     from astra.visualize.inference import plot_prediction_trajectory
@@ -68,6 +68,8 @@ def _load_astra_modules():
         "plot_shap_temporal_plotly": plot_shap_temporal_plotly,
         "plot_top_channels_plotly": plot_top_channels_plotly,
         "plot_static_features_plotly": plot_static_features_plotly,
+        "plot_unified_shap_heatmap_plotly": plot_unified_shap_heatmap_plotly,
+        "plot_delta_shap_temporal_plotly": plot_delta_shap_temporal_plotly,
         "plot_prediction_trajectory": plot_prediction_trajectory,
         "visualize_data_completeness": visualize_data_completeness,
         "time_to_step": time_to_step,
@@ -147,9 +149,9 @@ def _get_or_create_runner(cfg, cpr, sd, actual_start, hours_offset):
     """
     Get cached SimulationRunner or create/re-create as needed.
 
-    - Patient/model change → fresh setup + advance
-    - Time increased → incremental advance_to (fast)
-    - Time already covered → no-op (lookup from stored steps)
+    - Patient/model change -> fresh setup + advance
+    - Time increased -> incremental advance_to (fast)
+    - Time already covered -> no-op (lookup from stored steps)
     """
     mods = _load_astra_modules()
     session = load_session(cfg["model_name"])
@@ -256,7 +258,7 @@ def run_shap_explanation(session, runner, progress_bar=None):
 
 def run_differential_shap(session, runner, t1_hours, t2_hours, progress_bar=None):
     """
-    Compute differential SHAP between T1 and T2. Expensive (2× SHAP).
+    Compute differential SHAP between T1 and T2. Expensive (2x SHAP).
     """
     # Ensure runner is advanced to at least T2
     runner.advance_to(hours=t2_hours)
@@ -289,6 +291,22 @@ def run_differential_shap(session, runner, t1_hours, t2_hours, progress_bar=None
 # ═════════════════════════════════════════════════════════════════════════
 # VISUALIZATION HELPERS
 # ═════════════════════════════════════════════════════════════════════════
+
+_TRAJECTORY_TICK_HOURS = [0, 1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 504, 672]
+
+TAB_NAMES = ["SHAP Heatmaps", "SHAP Overview", "Differential SHAP", "Data Completeness"]
+
+
+def _hours_to_label(hours):
+    """Format hours to human-readable string."""
+    if hours < 1:
+        return f"{hours * 60:.0f}min"
+    elif hours < 24:
+        return f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+    else:
+        d = hours / 24
+        return f"{int(d)}D" if d == int(d) else f"{d:.1f}D"
+
 
 def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None,
                                 diff_data=None):
@@ -363,12 +381,26 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None,
                     name=label, showlegend=True,
                 ))
 
+    # Build meaningful x-axis tick labels (Change D)
+    max_h = df["elapsed_hours"].iloc[-1]
+    tick_hours = [h for h in _TRAJECTORY_TICK_HOURS if h <= max_h]
+    if not tick_hours or (max_h - tick_hours[-1]) > max_h * 0.05:
+        tick_hours.append(max_h)
+    tick_labels = [_hours_to_label(h) for h in tick_hours]
+
+    # Clamp x-axis to start at the first data point (avoid phantom hover at 0.0)
+    min_h = df["elapsed_hours"].iloc[0]
     n_visible = len(df)
     fig.update_layout(
         title=f"Prediction Trajectory ({n_visible} steps up to {df['elapsed_hours'].iloc[-1]:.1f}h)",
-        xaxis_title="Elapsed hours",
+        xaxis_title="Time since admission",
         yaxis_title="P(deceased 30d)",
         yaxis=dict(range=[-0.05, 1.05]),
+        xaxis=dict(
+            tickvals=tick_hours, ticktext=tick_labels, tickangle=0,
+            range=[max(0, min_h - 0.1), max_h + max_h * 0.02],
+        ),
+        hovermode="x",
         height=350,
         margin=dict(l=50, r=20, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -437,20 +469,33 @@ def _plot_simulation_diagnostics(sim_result, viewed_hours=None):
 
 def main():
 
+    # ── Read URL query params for state persistence (Change F) ───────
+    qp = st.query_params
+    qp_config = qp.get("config", None)
+    qp_pid = qp.get("pid", None)
+    qp_hours = qp.get("hours", None)
+    qp_diff_t1 = qp.get("diff_t1", None)
+    qp_diff_t2 = qp.get("diff_t2", None)
+    qp_tab = qp.get("tab", None)
+
     # ── Sidebar: Config selection ─────────────────────────────────────
     st.sidebar.header("Configuration")
     config_files = list_config_files()
-    default_idx = next(
-        (i for i, f in enumerate(config_files) if f.endswith("defaults.yaml")), 0
-    )
+
+    if qp_config and qp_config in config_files:
+        default_config_idx = config_files.index(qp_config)
+    else:
+        default_config_idx = next(
+            (i for i, f in enumerate(config_files) if f.endswith("defaults.yaml")), 0
+        )
     config_path = st.sidebar.selectbox(
         "Config file",
         options=config_files,
-        index=default_idx,
+        index=default_config_idx,
         help="YAML config from configs/ folder",
     )
 
-    # ── Load resources ────────────────────────────────────────────────
+    # ── Load config & base data (fast, cached) ───────────────────────
     with st.spinner("Loading config & base data..."):
         cfg = load_config(config_path)
         base_df = load_base_df()
@@ -462,10 +507,19 @@ def main():
     # ── Sidebar: Patient selection ────────────────────────────────────
     st.sidebar.header("Patient Selection")
 
+    pid_default_idx = 0
+    if qp_pid is not None:
+        try:
+            pid_val = int(qp_pid)
+            if pid_val in pid_list:
+                pid_default_idx = pid_list.index(pid_val)
+        except (ValueError, TypeError):
+            pass
+
     cohort_pid = st.sidebar.selectbox(
         "Patient ID (PID)",
         options=pid_list,
-        index=0,
+        index=pid_default_idx,
     )
 
     cpr, sd, actual_start = get_patient_info(base_df, cohort_pid)
@@ -485,18 +539,18 @@ def main():
     st.sidebar.markdown("---")
     st.sidebar.subheader("Observation Time")
 
-    # Apply playback target to slider BEFORE widget renders (so slider updates visually)
-    _playback_target = st.session_state.pop("play_target_hours", None)
-    if _playback_target is not None:
-        snapped = round(_playback_target / 0.5) * 0.5
-        snapped = max(0.5, min(snapped, float(max_hours)))
-        st.session_state["slider_hours"] = snapped
+    initial_hours = float(max_hours)
+    if qp_hours is not None:
+        try:
+            initial_hours = max(0.5, min(float(qp_hours), float(max_hours)))
+        except (ValueError, TypeError):
+            pass
 
     hours_offset = st.sidebar.slider(
         "Hours after admission",
         min_value=0.5,
         max_value=float(max_hours),
-        value=float(max_hours),
+        value=initial_hours,
         step=0.5,
         key="slider_hours",
         help="How many hours of data to include from admission",
@@ -509,37 +563,8 @@ def main():
     - Observation: `{hours_offset}h` after admission
     """)
 
-    # ── Playback controls ─────────────────────────────────────────────
+    # ── Sidebar: Action buttons (no Run Simulation - Change A) ───────
     st.sidebar.markdown("---")
-    st.sidebar.subheader("Playback")
-
-    play_col1, play_col2 = st.sidebar.columns(2)
-    with play_col1:
-        play_clicked = st.button(
-            "Play" if not st.session_state.get("play_active", False) else "Pause",
-            use_container_width=True,
-        )
-    with play_col2:
-        play_speed = st.selectbox(
-            "Speed",
-            options=["1 step", "5 steps", "10 steps"],
-            index=0,
-            label_visibility="collapsed",
-        )
-
-    if play_clicked:
-        st.session_state["play_active"] = not st.session_state.get("play_active", False)
-
-    # ── Sidebar: Action buttons ──────────────────────────────────────
-    st.sidebar.markdown("---")
-    # Green "Run Simulation" button via CSS on a keyed container
-    with st.sidebar.container(key="run_sim_container"):
-        run_clicked = st.button(
-            "Run Simulation",
-            type="primary",
-            use_container_width=True,
-            help="Run simulation for the selected patient and time",
-        )
     with st.sidebar.container(key="shap_container"):
         shap_clicked = st.button(
             "Compute SHAP",
@@ -547,65 +572,71 @@ def main():
             use_container_width=True,
             help="Compute SHAP explanations at the current time point",
         )
-    st.sidebar.markdown("""
-    <style>
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"] {
-        background-color: #21a366;
-        border-color: #1a8a54;
-    }
-    div[data-testid="stVerticalBlockBorderWrapper"]:has(div.st-key-run_sim_container) button[kind="primary"]:hover {
-        background-color: #1a8a54;
-        border-color: #15724a;
-    }
-    </style>
-    """, unsafe_allow_html=True)
 
     # ── Sidebar: Differential SHAP ──────────────────────────────────
     st.sidebar.markdown("---")
     st.sidebar.subheader("Differential SHAP")
     diff_col1, diff_col2 = st.sidebar.columns(2)
+
+    diff_t1_default = max(0.0, hours_offset - 2.0)
+    if qp_diff_t1 is not None:
+        try:
+            diff_t1_default = max(0.0, min(float(qp_diff_t1), float(max_hours)))
+        except (ValueError, TypeError):
+            pass
+
+    diff_t2_default = float(hours_offset)
+    if qp_diff_t2 is not None:
+        try:
+            diff_t2_default = max(0.0, min(float(qp_diff_t2), float(max_hours)))
+        except (ValueError, TypeError):
+            pass
+
     with diff_col1:
         diff_t1 = st.number_input(
-            "T1 (hours)", min_value=0.5, max_value=float(max_hours),
-            value=max(0.5, hours_offset - 2.0), step=0.5, key="diff_t1_input",
+            "T1 (hours)", min_value=0.0, max_value=float(max_hours),
+            value=diff_t1_default, step=0.5, key="diff_t1_input",
         )
     with diff_col2:
         diff_t2 = st.number_input(
-            "T2 (hours)", min_value=0.5, max_value=float(max_hours),
-            value=float(hours_offset), step=0.5, key="diff_t2_input",
+            "T2 (hours)", min_value=0.0, max_value=float(max_hours),
+            value=diff_t2_default, step=0.5, key="diff_t2_input",
         )
     diff_clicked = st.sidebar.button(
         "Compute Differential SHAP",
         type="primary",
         use_container_width=True,
-        help="Compute ΔSHAP = SHAP(T2) − SHAP(T1) to see what drives the change",
+        help="Compute ΔSHAP = SHAP(T2) - SHAP(T1) to see what drives the change",
     )
 
+    # ── Update URL query params (Change F) ───────────────────────────
+    st.query_params["config"] = config_path
+    st.query_params["pid"] = str(cohort_pid)
+    st.query_params["hours"] = str(hours_offset)
+    st.query_params["diff_t1"] = str(diff_t1)
+    st.query_params["diff_t2"] = str(diff_t2)
+
     # ═════════════════════════════════════════════════════════════════
-    # PREDICT: run simulation on button click / playback; reuse on slider
+    # SESSION INITIALIZATION GATE (Change B)
     # ═════════════════════════════════════════════════════════════════
 
-    is_playback_step = _playback_target is not None
-    should_run = run_clicked or shap_clicked or diff_clicked or is_playback_step
+    session_initialized = st.session_state.get("session_initialized", False)
     patient_key = f"{cpr}_{sd}_{cfg.get('model_name')}"
 
-    if should_run:
-        try:
-            with st.spinner("Running simulation prediction..."):
-                pred_data = run_simulation_predict(
-                    cfg, cpr, sd, actual_start, hours_offset
-                )
-            st.session_state["pred_data"] = pred_data
-            st.session_state["pred_patient_key"] = patient_key
-            st.session_state["cfg_used"] = cfg
-        except Exception as e:
-            st.error(f"Error running simulation: {e}")
-            st.exception(e)
+    if not session_initialized:
+        if shap_clicked or diff_clicked:
+            st.session_state["session_initialized"] = True
+            session_initialized = True
+        else:
+            st.info(
+                "Select a **config**, **patient**, and **observation time** in the sidebar, "
+                "then click **Compute SHAP** or **Compute Differential SHAP** to begin."
+            )
             return
 
-    if "pred_data" not in st.session_state:
-        st.info("Select a patient and observation time, then click **Run Simulation**.")
-        return
+    # ═════════════════════════════════════════════════════════════════
+    # PREDICT: auto-run on every rerun (Change A — no Run Sim button)
+    # ═════════════════════════════════════════════════════════════════
 
     # Invalidate cached results if the patient changed
     if st.session_state.get("pred_patient_key") != patient_key:
@@ -613,10 +644,18 @@ def main():
         st.session_state.pop("shap_data", None)
         st.session_state.pop("shap_hours", None)
         st.session_state.pop("diff_shap_data", None)
-        st.info("Patient changed. Click **Run Simulation** to load the new patient.")
-        return
 
-    pred_data = st.session_state["pred_data"]
+    try:
+        pred_data = run_simulation_predict(
+            cfg, cpr, sd, actual_start, hours_offset
+        )
+        st.session_state["pred_data"] = pred_data
+        st.session_state["pred_patient_key"] = patient_key
+        st.session_state["cfg_used"] = cfg
+    except Exception as e:
+        st.error(f"Error running simulation: {e}")
+        st.exception(e)
+        return
 
     # Look up the step at the current slider position from stored results
     viewed_step = _lookup_step_at_hours(pred_data["sim_result"], hours_offset)
@@ -645,43 +684,18 @@ def main():
 
     if diff_clicked:
         try:
-            progress = st.progress(0, text="Computing Differential SHAP (2× SHAP)...")
+            progress = st.progress(0, text="Computing Differential SHAP (2x SHAP)...")
             diff_data = run_differential_shap(
                 pred_data["session"], pred_data["runner"],
                 diff_t1, diff_t2, progress_bar=progress,
             )
             progress.empty()
             st.session_state["diff_shap_data"] = diff_data
+            # Auto-switch to Differential SHAP tab (Change H)
+            st.session_state["active_tab"] = "Differential SHAP"
         except Exception as e:
             st.error(f"Error computing differential SHAP: {e}")
             st.exception(e)
-
-    # ═════════════════════════════════════════════════════════════════
-    # PLAYBACK: schedule next advance and trigger rerun
-    # ═════════════════════════════════════════════════════════════════
-
-    if st.session_state.get("play_active", False):
-        runner = pred_data["runner"]
-        if runner.remaining_steps > 0 and hasattr(runner, "_time_points") and hasattr(runner, "_step_idx"):
-            # Determine step size from speed setting
-            steps_map = {"1 step": 1, "5 steps": 5, "10 steps": 10}
-            n_advance = steps_map.get(play_speed, 1)
-
-            # Find the next bin-aligned time point(s) to advance to
-            next_idx = min(
-                runner._step_idx + n_advance,
-                len(runner._time_points)
-            )
-            if next_idx > runner._step_idx and next_idx <= len(runner._time_points):
-                next_tp = runner._time_points[next_idx - 1]
-                next_hours = (next_tp - runner.context.admission_time).total_seconds() / 3600
-                st.session_state["play_target_hours"] = next_hours
-                _time.sleep(0.3)
-                st.rerun()
-            else:
-                st.session_state["play_active"] = False
-        else:
-            st.session_state["play_active"] = False
 
     mods = _load_astra_modules()
 
@@ -695,9 +709,14 @@ def main():
         prob = pred_data["result"].probability
         traj_len = pred_data["result"].trajectory_length
 
+    session = pred_data["session"]
+    cal_label = ""
+    if getattr(session, '_calibration_method', None):
+        cal_label = f" ({session._calibration_method})"
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("P(deceased 30d)", f"{prob:.3f}")
+        st.metric(f"P(deceased 30d){cal_label}", f"{prob:.3f}")
     with col2:
         st.metric("Trajectory Length", f"{traj_len} steps")
     with col3:
@@ -712,7 +731,6 @@ def main():
 
     # ── Patient Context (expandable) ──────────────────────────────────
     ctx = pred_data["ctx"]
-    session = pred_data["session"]
     with st.expander("Patient Context"):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -779,92 +797,102 @@ def main():
 
     st.markdown("---")
 
-    # ── SHAP staleness warning ────────────────────────────────────────
+    # ── SHAP staleness / re-slicing logic (Change G) ─────────────────
     shap_data = st.session_state.get("shap_data")
     shap_hours_cached = st.session_state.get("shap_hours")
-    if shap_data and shap_hours_cached is not None and abs(shap_hours_cached - hours_offset) > 0.01:
-        st.warning(
-            f"SHAP was computed at **{shap_hours_cached:.1f}h** but current time is "
-            f"**{hours_offset:.1f}h**. Click **Compute SHAP** to update."
-        )
 
-    # ── Tabs ──────────────────────────────────────────────────────────
-    tab_shap, tab_overview, tab_diff, tab_comp = st.tabs([
-        "SHAP Heatmaps",
-        "SHAP Overview",
-        "Differential SHAP",
-        "Data Completeness",
-    ])
+    time_to_step = mods["time_to_step"]
+    current_eval_step = time_to_step(hours_offset, 'h')
 
-    # ── Tab 1: SHAP Heatmaps ─────────────────────────────────────────
-    with tab_shap:
+    if shap_data and shap_hours_cached is not None:
+        if hours_offset > shap_hours_cached + 0.01:
+            st.warning(
+                f"SHAP was computed at **{shap_hours_cached:.1f}h** but current time is "
+                f"**{hours_offset:.1f}h** (beyond SHAP range). Click **Compute SHAP** to update."
+            )
+        elif abs(hours_offset - shap_hours_cached) > 0.01:
+            st.info(
+                f"Showing SHAP truncated to **{hours_offset:.1f}h** "
+                f"(computed at {shap_hours_cached:.1f}h)."
+            )
+
+    # ── Tab selector via st.radio (Change H — supports programmatic switch) ──
+    if "active_tab" not in st.session_state:
+        if qp_tab and qp_tab in TAB_NAMES:
+            st.session_state["active_tab"] = qp_tab
+        else:
+            st.session_state["active_tab"] = TAB_NAMES[0]
+
+    active_tab = st.radio(
+        "View",
+        options=TAB_NAMES,
+        horizontal=True,
+        key="active_tab",
+        label_visibility="collapsed",
+    )
+
+    st.query_params["tab"] = active_tab
+
+    # ── Tab: SHAP Heatmaps (unified, grouped by concept) ───────────
+    if active_tab == "SHAP Heatmaps":
         if shap_data is None:
             st.info("Click **Compute SHAP** in the sidebar to generate explanations for the current time point.")
         else:
-            fig_cont = mods["plot_continuous_ts_shap_plotly"](
+            fig_unified = mods["plot_unified_shap_heatmap_plotly"](
                 shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=shap_data["channel2feature"],
-                height=max(400, len(shap_data["channel2feature"]) * 14),
+                channel_map=session.bundle.get('data_config', {}).get('channel_map', {}),
+                eval_timestep=current_eval_step,
+                title="SHAP Heatmap (all channels, grouped by concept)",
             )
-            if fig_cont:
-                fig_cont.update_layout(width=None)
-                st.plotly_chart(fig_cont, use_container_width=True)
+            if fig_unified:
+                fig_unified.update_layout(width=None)
+                st.plotly_chart(fig_unified, use_container_width=True)
             else:
-                st.warning("No continuous TS SHAP data available")
+                st.warning("No SHAP heatmap data available")
 
-            st.markdown("---")
-
-            fig_cat = mods["plot_categorical_ts_shap_plotly"](
-                shap_data["shap_dict"],
-                sample_idx=0,
-                height=500,
-            )
-            if fig_cat:
-                fig_cat.update_layout(width=None)
-                st.plotly_chart(fig_cat, use_container_width=True)
-            else:
-                st.info("No categorical TS SHAP data available")
-
-            st.markdown("---")
-
+            # EBM contributions (supplementary)
             if shap_data["ebm_explanations"]:
-                fig_ebm = mods["plot_ebm_contributions_plotly"](
-                    shap_data["ebm_explanations"],
-                    height=600,
-                )
-                if fig_ebm:
-                    fig_ebm.update_layout(width=None)
-                    st.plotly_chart(fig_ebm, use_container_width=True)
-                else:
-                    st.info("Could not generate EBM plot")
-            else:
-                st.info("No EBM explanations available for this patient/timepoint")
+                with st.expander("EBM Contributions"):
+                    fig_ebm = mods["plot_ebm_contributions_plotly"](
+                        shap_data["ebm_explanations"],
+                        height=600,
+                    )
+                    if fig_ebm:
+                        fig_ebm.update_layout(width=None)
+                        st.plotly_chart(fig_ebm, use_container_width=True)
 
             st.markdown("---")
 
             fig_channels = mods["plot_top_channels_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
-                channel2feature=shap_data["channel2feature"])
+                channel2feature=shap_data["channel2feature"],
+                eval_timestep=current_eval_step,
+            )
             if fig_channels:
                 fig_channels.update_layout(width=None)
                 st.plotly_chart(fig_channels, use_container_width=True)
 
     # ── Tab: SHAP Overview ────────────────────────────────────────────
-    with tab_overview:
+    elif active_tab == "SHAP Overview":
         if shap_data is None:
             st.info("Click **Compute SHAP** in the sidebar to generate explanations.")
         else:
             fig_budget = mods["plot_shap_budget_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
-                channel2feature=shap_data["channel2feature"])
+                channel2feature=shap_data["channel2feature"],
+                eval_timestep=current_eval_step,
+            )
             if fig_budget:
                 fig_budget.update_layout(width=None)
                 st.plotly_chart(fig_budget, use_container_width=True)
 
             fig_temporal = mods["plot_shap_temporal_plotly"](
                 shap_data["shap_dict"], sample_idx=0,
-                channel2feature=shap_data["channel2feature"])
+                channel2feature=shap_data["channel2feature"],
+                eval_timestep=current_eval_step,
+            )
             if fig_temporal:
                 fig_temporal.update_layout(width=None)
                 st.plotly_chart(fig_temporal, use_container_width=True)
@@ -880,7 +908,7 @@ def main():
                 st.plotly_chart(fig_static, use_container_width=True)
 
     # ── Tab: Differential SHAP ───────────────────────────────────────
-    with tab_diff:
+    elif active_tab == "Differential SHAP":
         if diff_shap_data is None:
             st.info(
                 "Set **T1** and **T2** in the sidebar, then click "
@@ -903,39 +931,40 @@ def main():
                 st.metric("ΔP", f"{delta_p:+.3f}",
                           delta=f"{delta_p:+.3f}",
                           delta_color="inverse",
-                          help="P(T2) − P(T1)")
+                          help="P(T2) - P(T1)")
 
             st.caption(
-                f"ΔSHAP = SHAP({dr.t2_hours:.1f}h) − SHAP({dr.t1_hours:.1f}h). "
-                f"Red = increased risk attribution, Blue = decreased."
+                f"ΔSHAP = SHAP({dr.t2_hours:.1f}h) - SHAP({dr.t1_hours:.1f}h). "
+                f"Red = increased risk attribution, Blue = decreased. "
+                f"Note: P(T1)/P(T2) are computed on the T2 context with censoring "
+                f"and may differ slightly from the trajectory (which builds context incrementally)."
             )
 
-            # Delta continuous TS heatmap
-            fig_delta_cont = mods["plot_continuous_ts_shap_plotly"](
+            # Delta unified heatmap (all channels grouped by concept)
+            fig_delta_unified = mods["plot_unified_shap_heatmap_plotly"](
                 diff_shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=diff_shap_data["channel2feature"],
-                height=max(400, len(diff_shap_data["channel2feature"]) * 14),
-                title=f"ΔSHAP: Continuous TS ({dr.t1_hours:.1f}h → {dr.t2_hours:.1f}h)",
+                channel_map=session.bundle.get('data_config', {}).get('channel_map', {}),
+                start_timestep=dr.t1_step,
+                title=f"ΔSHAP Heatmap ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
             )
-            if fig_delta_cont:
-                fig_delta_cont.update_layout(width=None)
-                st.plotly_chart(fig_delta_cont, use_container_width=True)
+            if fig_delta_unified:
+                fig_delta_unified.update_layout(width=None)
+                st.plotly_chart(fig_delta_unified, use_container_width=True)
 
             st.markdown("---")
 
-            # Delta categorical TS heatmap
-            fig_delta_cat = mods["plot_categorical_ts_shap_plotly"](
+            # Delta SHAP over time (continuous + categorical)
+            fig_delta_temporal = mods["plot_delta_shap_temporal_plotly"](
                 diff_shap_data["shap_dict"],
                 sample_idx=0,
-                height=500,
+                channel2feature=diff_shap_data["channel2feature"],
+                title=f"ΔSHAP Over Time ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
             )
-            if fig_delta_cat:
-                fig_delta_cat.update_layout(
-                    width=None,
-                    title=f"ΔSHAP: Categorical TS ({dr.t1_hours:.1f}h → {dr.t2_hours:.1f}h)",
-                )
-                st.plotly_chart(fig_delta_cat, use_container_width=True)
+            if fig_delta_temporal:
+                fig_delta_temporal.update_layout(width=None)
+                st.plotly_chart(fig_delta_temporal, use_container_width=True)
 
             st.markdown("---")
 
@@ -967,7 +996,7 @@ def main():
                 st.plotly_chart(fig_delta_static, use_container_width=True)
 
     # ── Tab: Data Completeness ───────────────────────────────────────
-    with tab_comp:
+    elif active_tab == "Data Completeness":
         # Data completeness uses shap_dict but can also work from prediction data
         completeness_source = shap_data["shap_dict"] if shap_data else None
         completeness_ch2feat = shap_data["channel2feature"] if shap_data else None
@@ -975,8 +1004,11 @@ def main():
         if completeness_source is None:
             st.info("Click **Compute SHAP** in the sidebar to generate data completeness analysis.")
         else:
+            # Override eval_timestep with current slider position (Change G)
+            view_dict = {**completeness_source, "eval_timestep": current_eval_step}
+
             comp_figs = mods["plot_data_completeness_plotly"](
-                completeness_source,
+                view_dict,
                 sample_idx=0,
                 channel2feature=completeness_ch2feat,
             )

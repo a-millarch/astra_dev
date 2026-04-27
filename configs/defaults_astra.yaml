@@ -6,7 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '17032026_astra'
+model_name: '23042026_astra'
 
 target: deceased_30d
 
@@ -53,6 +53,10 @@ temporal_features:
     - elapsed_hours
     - bin_width_hours
 
+categorical_profiles:
+  enabled: true
+  config_file: configs/profiles.yaml     # path to profile definitions
+
 ebm_feature:
   enabled: false
   save_dir: data/interim/ebm_features
@@ -87,6 +91,7 @@ mapped_dir: data/interim/mapped
 concepts:
   - ITAOversigtsrapport
   - VitaleVaerdier
+  - InvasiveMonitoring  # derived from VitaleVaerdier — must be listed after it
   - Labsvar
   - Medicin
   #- Procedurer
@@ -97,7 +102,7 @@ concepts:
   - Events
   #- IndUd
   #- ITARespirator
-  
+
 
 dataset:
   exclusion: traumatext  # null = no exclusion, or profile name: "study", "lvl1tc", etc.
@@ -111,16 +116,19 @@ dataset:
       - Procedurer
       - ADTHaendelser
       - Events
+      - InvasiveMonitoring
   ts_categorical_multi_label:
       - Medicin
       - Procedurer
       - ADTHaendelser
       - Events
+      - InvasiveMonitoring
   cat_encoder_names:
       Medicin: medication
       Procedurer: procedures
       ADTHaendelser: ADT
       Events: event
+      InvasiveMonitoring: invasive_monitoring
 
   cat_cols:
       - SEX
@@ -163,9 +171,12 @@ exclusion_criteria:
   lvl1tc:
     lvl1tc: true
     traumatext: true
-    
+
   traumatext:
     traumatext: true
+
+  study3:
+    pid_file: data/external/studypop.csv
 
 pretrain:
     mask_prob_ts: 0.15
@@ -185,11 +196,18 @@ pretrain:
     save_best: True
     checkpoint_dir: './pretrain_checkpoints'
 
+    # Sparse-aware masking: preferentially mask non-empty timesteps
+    sparse_aware_masking: true
+    mask_prob_ts_data: 0.30
+    mask_prob_ts_empty: 0.05
+    mask_prob_cat_ts_data: 0.40
+    mask_prob_cat_ts_empty: 0.03
+
 training:
     folds: 5
     epochs: 30
     bs: 32
-    
+
 model:
     res_dropout: 0.22
     fc_dropout: 0.75
@@ -205,6 +223,7 @@ model:
     temporal_head: false
     causal: false  # auto-enabled when temporal_head=true
     temporal_head_dropout: 0.3
+    survival_mode: false  # true = discrete-time survival, false = binary classification
 
 finetune:
     # Phase 1: Head-only training (warm up randomly initialized head)
@@ -251,46 +270,71 @@ finetune:
     time_weighting: uniform      # 'uniform' or 'early'
     early_weight_factor: 2.0
 
-sweep:
-    # Stage 1: Architecture search
-    arch:
-        n_trials: 30
-        search_space:
-            d_model: [32, 64, 128]
-            n_layers: [2, 4, 6, 8]
-            n_heads: [4, 8]
-            fc_mults_1: [0.1, 0.5]
-            fc_mults_2: [0.05, 0.3]
-            fc_dropout: [0.1, 0.9]
-            res_dropout: [0.0, 0.4]
-            head_pool: [flatten, mean_cat]
+    # Temporal loss settings
+    temporal_loss_averaging: per_sample
+    eval_timeframe_weighting: 'false'
+    eval_timeframe_weight: 1.5
+    ranking_loss_weight: 0.0
+    ranking_loss_n_timeframes: 5
+    ranking_loss_max_pairs: 10000
+    temporal_crop_prob: 0.0
+    temporal_crop_all_phases: false
 
-    # Stage 2: Training HP search
-    training:
-        n_trials: 50
-        search_space:
-            finetune_lr: [1.0e-5, 1.0e-3]   # log scale
-            weight_decay: [1.0e-4, 1.0e-1]   # log scale
-            label_smoothing: [0.0, 0.2]
-            lr_decay_factor: [0.01, 0.5]     # log scale
-            phase1_epochs: [2, 8]
-            phase2_epochs: [5, 20]
-            phase3_epochs: [3, 15]
-            phase4_epochs: [0, 10]           # 0 = skip early prediction
-            masking_prob: [0.3, 0.7]
-            early_weight: [1.0, 3.0]
-            pos_weight_factor: [0.3, 1.0]   # log scale
+sweep:
+    # Joint architecture + training HP search (no pretraining during sweep)
+    n_trials: 350
+    study_patience: 12
+    study_min_delta: 0.005   # minimum AUROC+AUPRC improvement to reset patience
+    search_space:
+        # Architecture
+        d_model: [32, 64, 128]
+        n_layers: [2, 4, 6, 8]
+        n_heads: [4, 8]
+        fc_mults_1: [0.1, 0.5]
+        fc_mults_2: [0.05, 0.3]
+        fc_dropout: [0.1, 0.9]
+        res_dropout: [0.0, 0.4]
+        temporal_head_dropout: [0.0, 0.8]
+        head_pool: [flatten, mean_cat]
+        # Training HPs (LR parameterized as base_lr x decay^phase)
+        base_lr: [5.0e-4, 1.0e-2]            # log scale; phase 1 LR
+        lr_phase_decay: [0.05, 0.5]          # log scale; ratio between consecutive phases
+        phase1_epochs: [2, 8]
+        phase2_epochs: [5, 20]
+        phase3_epochs: [3, 15]
+        phase4_epochs: [0, 10]               # 0 = skip early prediction
+        weight_decay: [1.0e-4, 1.0e-1]       # log scale
+        label_smoothing: [0.0, 0.2]
+        lr_decay_factor: [0.01, 0.5]         # log scale
+        masking_prob: [0.3, 0.7]
+        early_weight: [1.0, 3.0]
+        pos_weight_factor: [0.3, 1.0]        # log scale
+        temporal_crop_prob: [0.0, 0.8]       # probability of cropping per batch
+        # Temporal loss improvements (only active when temporal_head=true)
+        temporal_loss_averaging: [per_sample, global]
+        eval_timeframe_weighting: [true, false]
+        eval_timeframe_weight: [1.5, 5.0]
+        ranking_loss_weight: [0.0, 0.3]
+        early_weight_factor: [1.0, 5.0]
+        # Validation objective balance (only active when temporal_head=true)
+        val_auroc_weight: [0.1, 0.9]
 
 evaluation:
     max_f_beta: 10
     f_beta: 4
     threshold_mode: f1 #fbeta
+    mc_dropout_samples: 30  # MC Dropout forward passes for uncertainty
+    shap_seed: 42           # RNG seed for reproducible SHAP values (null to disable)
+    shap_nsamples: 200      # Number of interpolation samples for GradientExplainer
 
 normalization:
   ts_method: adaptive       # standard | quantile | power | robust | adaptive
   tab_method: adaptive      # standard | quantile | power | robust | adaptive
   n_quantiles: 1000         # max quantiles for quantile method
   quantile_output: normal   # normal | uniform
+  clip_range: null           # null (disabled) or [min, max] e.g. [-3, 3] to clip normalized output
+  boundary_range_frac: 0.05  # fraction of value range defining boundary zone (adaptive only)
+  boundary_mass_thresh: 0.40 # mass fraction in boundary zone that overrides quantile -> robust
 
 base_df_path: data/interim/base_df.pkl
 raw_file_path: https://forskerpln0ybkrdls01.blob.core.windows.net/sp-data/
@@ -309,12 +353,12 @@ default_load_filenames:
   - IndUd
   - ITARespirator
   - EWS
-  
+
 large_load_filenames:
   - Labsvar
   - Medicin
   - Notater
- 
+
 bin_intervals:
   6h: '10min'
   12h: '20min'
@@ -365,6 +409,8 @@ agg_func: #also for datasets, split it up
       - max
   Events:
       - max
+  InvasiveMonitoring:
+      - max
 
 # Mapping
 npartitions:
@@ -378,10 +424,11 @@ npartitions:
   ISS_notes: 1
   ISS_computed: 1
   Events: 1
+  InvasiveMonitoring: 1
 
 mapping:
  Diagnoser: cat
- 
+
 drop_features:
   VitaleVaerdier:
     - nan
@@ -414,6 +461,8 @@ drop_features:
     - nan
   Events:
     - nan
+  InvasiveMonitoring:
+    - nan
 
 
 holdout_fraction: 0.2
@@ -421,7 +470,5 @@ holdout_type: temporal  # temporal or random
 holdout_split_date: '2023-06-01'  # Temporal split cutoff: train <= date < test
 seed: 2024
 
-Medicin: 
+Medicin:
     ATC_keep_len: 3
- 
- 

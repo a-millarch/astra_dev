@@ -19,6 +19,8 @@ VITALS_MAP = {
     'ART mean inv BT': 'MAP',
     'Temperatur': 'TEMP',
     'Temp.': 'TEMP',
+    'Blæretemperatur': 'TEMP',
+    'Esophagustemperatur': 'TEMP',
     'DBP': 'DBP',
     'SBP': 'SBP',
 }
@@ -32,6 +34,21 @@ BP_TYPES = [
     'ABP inv BT',
     'Invasivt BT - ART (sys/dia)',
 ]
+
+# Invasive blood pressure parameter names (subset of BP_TYPES)
+INVASIVE_BP_TYPES = frozenset({
+    'ART inv BT',
+    'Invasivt BT - ABP (sys/dia)',
+    'ABP inv BT',
+    'Invasivt BT - ART (sys/dia)',
+})
+
+# Raw vital parameter names that indicate invasive measurement → category label
+INVASIVE_VITALS_MAP = {
+    'ABP Puls (fra A-kanyle)': 'arterial_hr',
+    'Blæretemperatur': 'invasive_temp',
+    'Esophagustemperatur': 'invasive_temp',
+}
 
 # Height/weight parameter names → standardized
 HEIGHT_WEIGHT_MAP = {
@@ -119,6 +136,8 @@ ATC_LVL3_MAP = {
     'anti_thrombotic': ['B01'],
     'diuretics': ['C03'],
     'hemostatics': ['B02'],
+    'hormone_drugs': ['H01'],
+    'antidotes': ['V03'],
 }
 
 ATC_LVL4_MAP = {
@@ -194,7 +213,12 @@ PROCEDURE_PREFIXES: List[str] = sorted(PROCEDURE_MAP.keys(), key=len, reverse=Tr
 # ============================================================================
 
 ADT_PATTERNS: List[Tuple[str, list]] = [
-    ('TC', ['traumecenter']),
+    ('TB', ['traumecenter']),
+    ('ED', [
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\bakutmodtagelse\b',
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\bakutklinik\b',
+        r'(?i)(?!.*traumecenter)(?!.*psyk)(?!.*børnemod).*\b[\w.]+\s+modtagelse\b',  # [\w.] allows "F."
+    ]),
     ('OR', [
         'operationsgang',
         'operationsklinik',
@@ -210,8 +234,8 @@ ADT_PATTERNS: List[Tuple[str, list]] = [
         'kirurgisk endo',
     ]),
     ('ICU', [r'\bintensiv\b', r'\bita\s', r'\bita,']),
-    ('BED', ['seng']),
-    ('AMB', ['amb']),
+    ('WARD', ['seng']),
+    ('OPD', ['amb']),
 ]
 
 
