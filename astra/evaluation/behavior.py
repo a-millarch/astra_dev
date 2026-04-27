@@ -5013,6 +5013,256 @@ def plot_continuous_ts_shap_plotly(
     return fig
 
 
+# Known concept names for extraction from feature strings.
+# Order determines display order in the unified heatmap.
+_KNOWN_CONCEPTS = [
+    'VitaleVaerdier', 'InvasiveMonitoring', 'Labsvar',
+    'ITAOversigtsrapport', 'EWS', 'ISS_notes', 'ISS_computed',
+]
+
+
+def _extract_concept(feat_name: str) -> str:
+    """Extract clinical concept from a feature name like 'HR_VitaleVaerdier_mean'."""
+    for concept in _KNOWN_CONCEPTS:
+        if f'_{concept}_' in feat_name or feat_name.startswith(f'{concept}_'):
+            return concept
+    if feat_name in _EBM_CHANNELS:
+        return 'EBM'
+    return 'Other'
+
+
+def plot_unified_shap_heatmap_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    eval_timestep: Optional[int] = None,
+    class_idx: int = 1,
+    height: Optional[int] = None,
+    width: int = 1100,
+    title: str = "SHAP Heatmap (all channels)",
+):
+    """Unified SHAP heatmap: continuous + categorical channels grouped by concept."""
+    if not HAS_PLOTLY:
+        return None
+
+    # --- Continuous TS SHAP ---
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+
+    if eval_timestep is None:
+        eval_timestep = shap_results.get('eval_timestep')
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+
+    # Collect continuous channels with concept tags
+    rows = []  # list of (concept, label, shap_row)
+    if channel2feature:
+        for ch_idx in sorted(channel2feature.keys()):
+            feat = channel2feature[ch_idx]
+            if feat in _SHAP_EXCLUDED_CHANNELS:
+                continue
+            if ch_idx >= ts_shap.shape[0]:
+                continue
+            concept = _extract_concept(feat)
+            rows.append((concept, feat, ts_shap[ch_idx]))
+    else:
+        for i in range(ts_shap.shape[0]):
+            rows.append(('Other', f'Ch{i}', ts_shap[i]))
+
+    # --- Categorical TS SHAP ---
+    cat_shap = shap_results.get('cat_ts_shap_per_category')
+    enc_info = shap_results.get('encoding_info')
+    if cat_shap is not None and enc_info is not None:
+        cat_data = cat_shap[sample_idx]
+        if cat_data.ndim == 3:
+            cat_data = cat_data[..., min(class_idx, cat_data.shape[-1] - 1)]
+        cat_data = cat_data[:, :n_steps]
+        cat_names = get_category_names_from_encoding_info(enc_info)
+        feature_ranges = enc_info.get('feature_ranges', {})
+        idx_to_concept = {}
+        for feat_name, (start, end) in feature_ranges.items():
+            for i in range(start, end):
+                idx_to_concept[i] = feat_name
+        for cat_idx in range(cat_data.shape[0]):
+            concept = idx_to_concept.get(cat_idx, 'Other')
+            label = cat_names[cat_idx] if cat_idx < len(cat_names) else f'cat_{cat_idx}'
+            rows.append((concept, label, cat_data[cat_idx]))
+
+    if not rows:
+        return None
+
+    # --- Group by concept, preserving order ---
+    concept_order = _KNOWN_CONCEPTS + ['EBM', 'Other']
+    seen = set()
+    ordered_concepts = []
+    for c in concept_order:
+        if any(r[0] == c for r in rows) and c not in seen:
+            ordered_concepts.append(c)
+            seen.add(c)
+    for r in rows:
+        if r[0] not in seen:
+            ordered_concepts.append(r[0])
+            seen.add(r[0])
+
+    ordered_labels = []
+    ordered_shap = []
+    group_boundaries = []
+    for concept in ordered_concepts:
+        group_rows = [(label, shap_row) for c, label, shap_row in rows if c == concept]
+        group_rows.sort(key=lambda x: x[0])
+        start = len(ordered_labels)
+        for label, shap_row in group_rows:
+            ordered_labels.append(label)
+            ordered_shap.append(shap_row)
+        group_boundaries.append((concept, start, len(ordered_labels)))
+
+    z = np.array(ordered_shap)  # [n_rows, n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+
+    vmax = max(abs(float(np.nanmin(z))), abs(float(np.nanmax(z))), 1e-10)
+
+    hover = np.empty(z.shape, dtype=object)
+    for r in range(z.shape[0]):
+        for c in range(z.shape[1]):
+            hover[r, c] = (
+                f"<b>{ordered_labels[r]}</b><br>"
+                f"Time: {time_labels[c]}<br>"
+                f"SHAP: {z[r, c]:.5f}"
+            )
+
+    if height is None:
+        height = max(500, len(ordered_labels) * 16)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=list(range(n_steps)),
+        y=ordered_labels,
+        customdata=hover,
+        hovertemplate="%{customdata}<extra></extra>",
+        colorscale='RdBu_r',
+        zmid=0, zmin=-vmax, zmax=vmax,
+        colorbar=dict(title="SHAP"),
+    ))
+
+    # Add concept group separator lines
+    for concept, start, end in group_boundaries:
+        if start > 0:
+            fig.add_hline(
+                y=start - 0.5,
+                line_dash="solid",
+                line_color="rgba(0,0,0,0.4)",
+                line_width=1.5,
+            )
+        mid_y = (start + end - 1) / 2
+        fig.add_annotation(
+            x=-0.02, y=mid_y,
+            xref="paper", yref="y",
+            text=f"<b>{concept}</b>",
+            showarrow=False,
+            font=dict(size=10, color="rgba(0,0,0,0.6)"),
+            xanchor="right",
+        )
+
+    fig.update_layout(
+        title=title, xaxis_title="Time", yaxis_title="",
+        height=height, width=width,
+        yaxis=dict(autorange="reversed"),
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        margin=dict(l=220),
+    )
+    return fig
+
+
+def plot_delta_shap_temporal_plotly(
+    shap_results: Dict,
+    sample_idx: int = 0,
+    channel2feature: Optional[Dict[int, str]] = None,
+    class_idx: int = 1,
+    height: int = 350,
+    width: int = 1100,
+    title: str = "ΔSHAP Over Time",
+):
+    """ΔSHAP over time: continuous + categorical mean delta per timestep."""
+    if not HAS_PLOTLY:
+        return None
+
+    ts_shap = shap_results['ts_shap'][sample_idx]
+    if ts_shap.ndim == 3:
+        ts_shap = ts_shap[..., min(class_idx, ts_shap.shape[-1] - 1)]
+    n_ch, n_steps = ts_shap.shape
+
+    eval_timestep = shap_results.get('eval_timestep')
+    if isinstance(eval_timestep, int) and 0 <= eval_timestep < n_steps:
+        n_steps = eval_timestep + 1
+        ts_shap = ts_shap[:, :n_steps]
+
+    time_labels, tick_vals, tick_text = _build_time_axis_plotly(n_steps)
+    x = list(range(n_steps))
+
+    has_ebm = channel2feature and _has_ebm_channels(channel2feature)
+    fig = go.Figure()
+
+    if has_ebm:
+        clinical_ch = _get_clinical_only_channel_mask(channel2feature, n_ch)
+        ebm_ch = [i for i, name in channel2feature.items() if name in _EBM_CHANNELS]
+        clinical_avg = np.mean(ts_shap[clinical_ch], axis=0)
+        fig.add_trace(go.Scatter(
+            x=x, y=clinical_avg, fill='tozeroy',
+            fillcolor='rgba(0,139,251,0.15)',
+            line=dict(color='#008bfb', width=2),
+            name='Clinical channels',
+            hovertemplate='<b>%{customdata}</b><br>Clinical ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+        if ebm_ch:
+            ebm_avg = np.mean(ts_shap[ebm_ch], axis=0)
+            fig.add_trace(go.Scatter(
+                x=x, y=ebm_avg,
+                line=dict(color='#FF9800', width=2, dash='dash'),
+                name='EBM',
+                hovertemplate='<b>%{customdata}</b><br>EBM ΔSHAP: %{y:.5f}<extra></extra>',
+                customdata=[time_labels[i] for i in range(n_steps)],
+            ))
+    else:
+        ts_avg = np.mean(ts_shap, axis=0)
+        fig.add_trace(go.Scatter(
+            x=x, y=ts_avg, fill='tozeroy',
+            fillcolor='rgba(255,0,81,0.2)',
+            line=dict(color='#ff0051', width=2),
+            name='Continuous TS',
+            hovertemplate='<b>%{customdata}</b><br>ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+
+    cat_ts = shap_results.get('cat_ts_shap')
+    if cat_ts is not None:
+        cat_data = cat_ts[sample_idx]
+        if cat_data.ndim == 2:
+            cat_data = cat_data[..., min(class_idx, cat_data.shape[-1] - 1)]
+        cat_data = cat_data[:n_steps]
+        fig.add_trace(go.Scatter(
+            x=x, y=cat_data,
+            line=dict(color='#00d4aa', width=2, dash='dash'),
+            name='Categorical TS',
+            hovertemplate='<b>%{customdata}</b><br>Cat ΔSHAP: %{y:.5f}<extra></extra>',
+            customdata=[time_labels[i] for i in range(n_steps)],
+        ))
+
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", line_width=1)
+
+    fig.update_layout(
+        title=title,
+        xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
+        xaxis_title="Time", yaxis_title="Mean ΔSHAP",
+        height=height, width=width,
+    )
+    return fig
+
+
 def plot_categorical_ts_shap_plotly(
     shap_results: Dict,
     sample_idx: int = 0,

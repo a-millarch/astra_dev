@@ -16,7 +16,6 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -47,6 +46,8 @@ def _load_astra_modules():
         plot_shap_temporal_plotly,
         plot_top_channels_plotly,
         plot_static_features_plotly,
+        plot_unified_shap_heatmap_plotly,
+        plot_delta_shap_temporal_plotly,
         visualize_data_completeness,
     )
     from astra.visualize.inference import plot_prediction_trajectory
@@ -67,6 +68,8 @@ def _load_astra_modules():
         "plot_shap_temporal_plotly": plot_shap_temporal_plotly,
         "plot_top_channels_plotly": plot_top_channels_plotly,
         "plot_static_features_plotly": plot_static_features_plotly,
+        "plot_unified_shap_heatmap_plotly": plot_unified_shap_heatmap_plotly,
+        "plot_delta_shap_temporal_plotly": plot_delta_shap_temporal_plotly,
         "plot_prediction_trajectory": plot_prediction_trajectory,
         "visualize_data_completeness": visualize_data_completeness,
         "time_to_step": time_to_step,
@@ -291,8 +294,6 @@ def run_differential_shap(session, runner, t1_hours, t2_hours, progress_bar=None
 
 _TRAJECTORY_TICK_HOURS = [0, 1, 2, 3, 6, 12, 24, 48, 72, 168, 336, 504, 672]
 
-_EXCLUDED_CHANNELS = {'elapsed_hours', 'bin_width_hours', '_data_present'}
-
 TAB_NAMES = ["SHAP Heatmaps", "SHAP Overview", "Differential SHAP", "Data Completeness"]
 
 
@@ -387,13 +388,19 @@ def _plot_simulation_trajectory(sim_result, shap_hours=None, viewed_hours=None,
         tick_hours.append(max_h)
     tick_labels = [_hours_to_label(h) for h in tick_hours]
 
+    # Clamp x-axis to start at the first data point (avoid phantom hover at 0.0)
+    min_h = df["elapsed_hours"].iloc[0]
     n_visible = len(df)
     fig.update_layout(
         title=f"Prediction Trajectory ({n_visible} steps up to {df['elapsed_hours'].iloc[-1]:.1f}h)",
         xaxis_title="Time since admission",
         yaxis_title="P(deceased 30d)",
         yaxis=dict(range=[-0.05, 1.05]),
-        xaxis=dict(tickvals=tick_hours, ticktext=tick_labels, tickangle=0),
+        xaxis=dict(
+            tickvals=tick_hours, ticktext=tick_labels, tickangle=0,
+            range=[max(0, min_h - 0.1), max_h + max_h * 0.02],
+        ),
+        hovermode="x",
         height=350,
         margin=dict(l=50, r=20, t=40, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -454,40 +461,6 @@ def _plot_simulation_diagnostics(sim_result, viewed_hours=None):
     )
 
     return fig_timing, fig_meas
-
-
-def _split_shap_by_sign(shap_data, top_n=15, eval_timestep=None):
-    """Split channels into top-N positive and top-N negative by mean SHAP.
-
-    Returns (top_positive, top_negative) as lists of (channel_idx, label).
-    """
-    ts_shap = shap_data["shap_dict"]["ts_shap"][0]  # [n_ch, n_steps]
-    ch2feat = shap_data["channel2feature"]
-
-    if isinstance(eval_timestep, int) and 0 <= eval_timestep < ts_shap.shape[1]:
-        ts_shap = ts_shap[:, :eval_timestep + 1]
-
-    n_ch = ts_shap.shape[0]
-    mean_shap = np.nanmean(ts_shap, axis=1)  # [n_ch]
-
-    display_ch = []
-    for i in range(n_ch):
-        name = ch2feat.get(i, '')
-        if name not in _EXCLUDED_CHANNELS:
-            display_ch.append(i)
-
-    positive = [(i, ch2feat.get(i, f'Ch{i}'), float(mean_shap[i]))
-                for i in display_ch if mean_shap[i] > 0]
-    negative = [(i, ch2feat.get(i, f'Ch{i}'), float(mean_shap[i]))
-                for i in display_ch if mean_shap[i] < 0]
-
-    positive.sort(key=lambda x: x[2], reverse=True)
-    negative.sort(key=lambda x: x[2])
-
-    top_pos = [(idx, label) for idx, label, _ in positive[:top_n]]
-    top_neg = [(idx, label) for idx, label, _ in negative[:top_n]]
-
-    return top_pos, top_neg
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -856,74 +829,25 @@ def main():
 
     st.query_params["tab"] = active_tab
 
-    # ── Tab: SHAP Heatmaps (Change E — positive/negative split) ─────
+    # ── Tab: SHAP Heatmaps (unified, grouped by concept) ───────────
     if active_tab == "SHAP Heatmaps":
         if shap_data is None:
             st.info("Click **Compute SHAP** in the sidebar to generate explanations for the current time point.")
         else:
-            top_n = st.number_input(
-                "Top N features per group",
-                min_value=5, max_value=50, value=15, step=5,
-                help="Number of features to show in each heatmap (positive & negative)",
+            fig_unified = mods["plot_unified_shap_heatmap_plotly"](
+                shap_data["shap_dict"],
+                sample_idx=0,
+                channel2feature=shap_data["channel2feature"],
+                eval_timestep=current_eval_step,
+                title="SHAP Heatmap (all channels, grouped by concept)",
             )
-
-            top_pos, top_neg = _split_shap_by_sign(
-                shap_data, top_n=top_n, eval_timestep=current_eval_step
-            )
-
-            if top_pos:
-                st.subheader(f"Top {len(top_pos)} Risk-Increasing Features (positive SHAP)")
-                fig_pos = mods["plot_continuous_ts_shap_plotly"](
-                    shap_data["shap_dict"],
-                    sample_idx=0,
-                    channel2feature=shap_data["channel2feature"],
-                    eval_timestep=current_eval_step,
-                    channel_subset=top_pos,
-                    height=max(300, len(top_pos) * 20),
-                    title=f"Top {len(top_pos)} Risk-Increasing Features",
-                )
-                if fig_pos:
-                    fig_pos.update_layout(width=None)
-                    st.plotly_chart(fig_pos, use_container_width=True)
+            if fig_unified:
+                fig_unified.update_layout(width=None)
+                st.plotly_chart(fig_unified, use_container_width=True)
             else:
-                st.info("No channels with positive mean SHAP values.")
+                st.warning("No SHAP heatmap data available")
 
-            st.markdown("---")
-
-            if top_neg:
-                st.subheader(f"Top {len(top_neg)} Risk-Reducing Features (negative SHAP)")
-                fig_neg = mods["plot_continuous_ts_shap_plotly"](
-                    shap_data["shap_dict"],
-                    sample_idx=0,
-                    channel2feature=shap_data["channel2feature"],
-                    eval_timestep=current_eval_step,
-                    channel_subset=top_neg,
-                    height=max(300, len(top_neg) * 20),
-                    title=f"Top {len(top_neg)} Risk-Reducing Features",
-                )
-                if fig_neg:
-                    fig_neg.update_layout(width=None)
-                    st.plotly_chart(fig_neg, use_container_width=True)
-            else:
-                st.info("No channels with negative mean SHAP values.")
-
-            st.markdown("---")
-
-            # Categorical TS SHAP (kept as supplementary)
-            with st.expander("Categorical TS SHAP"):
-                fig_cat = mods["plot_categorical_ts_shap_plotly"](
-                    shap_data["shap_dict"],
-                    sample_idx=0,
-                    eval_timestep=current_eval_step,
-                    height=500,
-                )
-                if fig_cat:
-                    fig_cat.update_layout(width=None)
-                    st.plotly_chart(fig_cat, use_container_width=True)
-                else:
-                    st.info("No categorical TS SHAP data available")
-
-            # EBM contributions (kept as supplementary)
+            # EBM contributions (supplementary)
             if shap_data["ebm_explanations"]:
                 with st.expander("EBM Contributions"):
                     fig_ebm = mods["plot_ebm_contributions_plotly"](
@@ -933,8 +857,6 @@ def main():
                     if fig_ebm:
                         fig_ebm.update_layout(width=None)
                         st.plotly_chart(fig_ebm, use_container_width=True)
-                    else:
-                        st.info("Could not generate EBM plot")
 
             st.markdown("---")
 
@@ -1011,32 +933,29 @@ def main():
                 f"Red = increased risk attribution, Blue = decreased."
             )
 
-            # Delta continuous TS heatmap
-            fig_delta_cont = mods["plot_continuous_ts_shap_plotly"](
+            # Delta unified heatmap (all channels grouped by concept)
+            fig_delta_unified = mods["plot_unified_shap_heatmap_plotly"](
                 diff_shap_data["shap_dict"],
                 sample_idx=0,
                 channel2feature=diff_shap_data["channel2feature"],
-                height=max(400, len(diff_shap_data["channel2feature"]) * 14),
-                title=f"ΔSHAP: Continuous TS ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
+                title=f"ΔSHAP Heatmap ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
             )
-            if fig_delta_cont:
-                fig_delta_cont.update_layout(width=None)
-                st.plotly_chart(fig_delta_cont, use_container_width=True)
+            if fig_delta_unified:
+                fig_delta_unified.update_layout(width=None)
+                st.plotly_chart(fig_delta_unified, use_container_width=True)
 
             st.markdown("---")
 
-            # Delta categorical TS heatmap
-            fig_delta_cat = mods["plot_categorical_ts_shap_plotly"](
+            # Delta SHAP over time (continuous + categorical)
+            fig_delta_temporal = mods["plot_delta_shap_temporal_plotly"](
                 diff_shap_data["shap_dict"],
                 sample_idx=0,
-                height=500,
+                channel2feature=diff_shap_data["channel2feature"],
+                title=f"ΔSHAP Over Time ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
             )
-            if fig_delta_cat:
-                fig_delta_cat.update_layout(
-                    width=None,
-                    title=f"ΔSHAP: Categorical TS ({dr.t1_hours:.1f}h -> {dr.t2_hours:.1f}h)",
-                )
-                st.plotly_chart(fig_delta_cat, use_container_width=True)
+            if fig_delta_temporal:
+                fig_delta_temporal.update_layout(width=None)
+                st.plotly_chart(fig_delta_temporal, use_container_width=True)
 
             st.markdown("---")
 
