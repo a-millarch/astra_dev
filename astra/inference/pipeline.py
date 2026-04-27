@@ -81,9 +81,9 @@ class DifferentialSHAPResult:
     shap_t2: Optional[SHAPResult] = None
 
 
-# _SHAPModelWrapper and _embed_categorical_features live in
-# astra.evaluation.behavior (ModelWrapperWithRawCatTS / embed_categorical_features).
-# Imported lazily inside explain() to keep pipeline.py dependency-light.
+# SHAPModelWrapper and embed_categorical_features live in
+# astra.evaluation.behavior. Imported lazily inside explain() to keep
+# pipeline.py dependency-light.
 
 
 # ============================================================================
@@ -418,7 +418,7 @@ class InferenceSession:
             SHAPResult
         """
         import shap
-        from astra.evaluation.behavior import ModelWrapperWithRawCatTS, embed_categorical_features
+        from astra.evaluation.behavior import SHAPModelWrapper, embed_categorical_features
 
         logger.info("Computing SHAP explanation for pid=%s (censor_step=%s)", pid, censor_step)
 
@@ -466,23 +466,29 @@ class InferenceSession:
         effective_traj = min(traj_len, censor_step + 1) if censor_step is not None else traj_len
         traj_lengths_t = torch.tensor([effective_traj], dtype=torch.long, device=self.device)
         survival_mode = self.bundle.get('model_params', {}).get('survival_mode', False)
-        wrapped = ModelWrapperWithRawCatTS(self.model, has_cat_ts=has_cat_ts,
-                                           eval_timestep=target_step if target_step is not None else -1,
-                                           traj_lengths=traj_lengths_t,
-                                           survival_mode=survival_mode)
 
-        # Pre-embed static categoricals (not differentiable — treated as context)
-        bg_cat_emb = embed_categorical_features(self.model, self._bg['cat'])
-        sample_cat_emb = embed_categorical_features(self.model, x_cat_t)
+        bg_cat_onehot = embed_categorical_features(self.model, self._bg['cat'])
+        sample_cat_onehot = embed_categorical_features(self.model, x_cat_t)
+        has_static_cat = bg_cat_onehot is not None
+        has_cont = self._bg['cont'].shape[1] > 0
 
-        # Build input lists for GradientExplainer
-        bg_inputs = [bg_ts, bg_ts_cat.float().requires_grad_(True)]
-        sample_inputs = [x_ts_t, x_ts_cat_t.float().requires_grad_(True)]
+        wrapped = SHAPModelWrapper(
+            self.model, has_cat_ts=has_cat_ts,
+            has_static_cat=has_static_cat, has_cont=has_cont,
+            eval_timestep=target_step if target_step is not None else -1,
+            traj_lengths=traj_lengths_t,
+            survival_mode=survival_mode,
+        )
 
-        if bg_cat_emb is not None:
-            bg_inputs.append(bg_cat_emb)
-            sample_inputs.append(sample_cat_emb)
-        if self._bg['cont'].shape[1] > 0:
+        bg_inputs = [bg_ts]
+        sample_inputs = [x_ts_t]
+        if has_cat_ts:
+            bg_inputs.append(bg_ts_cat.float().requires_grad_(True))
+            sample_inputs.append(x_ts_cat_t.float().requires_grad_(True))
+        if has_static_cat:
+            bg_inputs.append(bg_cat_onehot)
+            sample_inputs.append(sample_cat_onehot)
+        if has_cont:
             bg_inputs.append(self._bg['cont'])
             sample_inputs.append(x_cont_t)
 
@@ -523,13 +529,12 @@ class InferenceSession:
             idx += 1
 
         cat_shap_raw = None
-        if bg_cat_emb is not None:
-            # [n_cat_features, d_model] — average over embedding dim
-            cat_shap_raw = shap_values[idx][0].mean(axis=1)
+        if has_static_cat:
+            cat_shap_raw = np.abs(shap_values[idx][0]).sum(axis=1)
             idx += 1
 
         cont_shap_raw = None
-        if self._bg['cont'].shape[1] > 0:
+        if has_cont:
             cont_shap_raw = shap_values[idx][0]  # [n_cont_features]
             idx += 1
 
@@ -774,9 +779,7 @@ class InferenceSession:
             'ts_shap': ts_shap,
             'cat_ts_shap': cat_ts_shap,
             'cat_ts_shap_per_category': cat_ts_shap_per_category,
-            'cat_ts_shap_embedded': None,
             'cat_shap': cat_shap,
-            'cat_shap_embedded': None,
             'cont_shap': cont_shap,
             'n_static_cat': len(classes),
             'eval_timestep': shap_result.eval_timestep,

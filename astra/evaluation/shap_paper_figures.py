@@ -363,8 +363,7 @@ def compute_shap_per_timepoint(
 def _squeeze_shap_results(shap_results: Dict) -> None:
     """Squeeze trailing singleton dimensions from SHAP arrays in-place."""
     for key in ('ts_shap', 'cat_ts_shap', 'cat_ts_shap_per_category',
-                'cat_ts_shap_embedded', 'cat_shap', 'cat_shap_embedded',
-                'cont_shap'):
+                'cat_shap', 'cont_shap'):
         val = shap_results.get(key)
         if val is not None and isinstance(val, np.ndarray) and val.ndim > 1 and val.shape[-1] == 1:
             shap_results[key] = val.squeeze(-1)
@@ -1027,7 +1026,7 @@ def _load_all_from_pickle(pickle_path: str, timeframes: list) -> Optional[dict]:
                         cat_ts_rows.append({
                             'timeframe': tf, 'feature': f'cat_ts:{name}',
                             'display_name': name,
-                            'mean_abs_shap': float(imp[j]),
+                            'mean_abs_shap': float(np.mean(imp[j])),
                         })
         if cat_ts_rows:
             cat_ts = pd.DataFrame(cat_ts_rows)
