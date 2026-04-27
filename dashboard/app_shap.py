@@ -709,9 +709,14 @@ def main():
         prob = pred_data["result"].probability
         traj_len = pred_data["result"].trajectory_length
 
+    session = pred_data["session"]
+    cal_label = ""
+    if getattr(session, '_calibration_method', None):
+        cal_label = f" ({session._calibration_method})"
+
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("P(deceased 30d)", f"{prob:.3f}")
+        st.metric(f"P(deceased 30d){cal_label}", f"{prob:.3f}")
     with col2:
         st.metric("Trajectory Length", f"{traj_len} steps")
     with col3:
@@ -726,7 +731,6 @@ def main():
 
     # ── Patient Context (expandable) ──────────────────────────────────
     ctx = pred_data["ctx"]
-    session = pred_data["session"]
     with st.expander("Patient Context"):
         col_a, col_b = st.columns(2)
         with col_a:
@@ -930,7 +934,9 @@ def main():
 
             st.caption(
                 f"ΔSHAP = SHAP({dr.t2_hours:.1f}h) - SHAP({dr.t1_hours:.1f}h). "
-                f"Red = increased risk attribution, Blue = decreased."
+                f"Red = increased risk attribution, Blue = decreased. "
+                f"Note: P(T1)/P(T2) are computed on the T2 context with censoring "
+                f"and may differ slightly from the trajectory (which builds context incrementally)."
             )
 
             # Delta unified heatmap (all channels grouped by concept)

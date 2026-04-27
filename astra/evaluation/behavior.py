@@ -5031,6 +5031,17 @@ def _extract_concept(feat_name: str) -> str:
     return 'Other'
 
 
+def _strip_concept_from_label(feat_name: str, concept: str) -> str:
+    """Strip concept name from feature label for compact display.
+
+    'HR_VitaleVaerdier_mean' with concept='VitaleVaerdier' -> 'HR_mean'
+    'Medicin:Aspirin' -> 'Aspirin'
+    """
+    if ':' in feat_name:
+        return feat_name.split(':', 1)[1]
+    return feat_name.replace(f'_{concept}_', '_').replace(f'{concept}_', '')
+
+
 def plot_unified_shap_heatmap_plotly(
     shap_results: Dict,
     sample_idx: int = 0,
@@ -5107,7 +5118,8 @@ def plot_unified_shap_heatmap_plotly(
             ordered_concepts.append(r[0])
             seen.add(r[0])
 
-    ordered_labels = []
+    ordered_labels = []  # short display labels
+    full_labels = []     # original names for hover
     ordered_shap = []
     group_boundaries = []
     for concept in ordered_concepts:
@@ -5115,7 +5127,9 @@ def plot_unified_shap_heatmap_plotly(
         group_rows.sort(key=lambda x: x[0])
         start = len(ordered_labels)
         for label, shap_row in group_rows:
-            ordered_labels.append(label)
+            short = _strip_concept_from_label(label, concept)
+            ordered_labels.append(short)
+            full_labels.append(label)
             ordered_shap.append(shap_row)
         group_boundaries.append((concept, start, len(ordered_labels)))
 
@@ -5129,18 +5143,21 @@ def plot_unified_shap_heatmap_plotly(
     for r in range(z.shape[0]):
         for c in range(z.shape[1]):
             hover[r, c] = (
-                f"<b>{ordered_labels[r]}</b><br>"
+                f"<b>{full_labels[r]}</b><br>"
                 f"Time: {time_labels[c]}<br>"
                 f"SHAP: {z[r, c]:.5f}"
             )
 
+    n_rows = len(ordered_labels)
     if height is None:
-        height = max(500, len(ordered_labels) * 16)
+        height = max(500, n_rows * 18)
+
+    y_indices = list(range(n_rows))
 
     fig = go.Figure(data=go.Heatmap(
         z=z,
         x=list(range(n_steps)),
-        y=ordered_labels,
+        y=y_indices,
         customdata=hover,
         hovertemplate="%{customdata}<extra></extra>",
         colorscale='RdBu_r',
@@ -5148,31 +5165,35 @@ def plot_unified_shap_heatmap_plotly(
         colorbar=dict(title="SHAP"),
     ))
 
-    # Add concept group separator lines
+    # Add concept group separators with label on the right
     for concept, start, end in group_boundaries:
         if start > 0:
-            fig.add_hline(
-                y=start - 0.5,
-                line_dash="solid",
-                line_color="rgba(0,0,0,0.4)",
-                line_width=1.5,
+            fig.add_shape(
+                type="line",
+                x0=0, x1=1, xref="paper",
+                y0=start - 0.5, y1=start - 0.5, yref="y",
+                line=dict(color="rgba(0,0,0,0.5)", width=2),
             )
-        mid_y = (start + end - 1) / 2
+        mid_row = (start + end - 1) / 2.0
         fig.add_annotation(
-            x=-0.02, y=mid_y,
+            x=1.01, y=mid_row,
             xref="paper", yref="y",
             text=f"<b>{concept}</b>",
             showarrow=False,
-            font=dict(size=10, color="rgba(0,0,0,0.6)"),
-            xanchor="right",
+            font=dict(size=9, color="rgba(80,80,80,1)"),
+            xanchor="left",
         )
 
     fig.update_layout(
         title=title, xaxis_title="Time", yaxis_title="",
         height=height, width=width,
-        yaxis=dict(autorange="reversed"),
+        yaxis=dict(
+            tickvals=y_indices,
+            ticktext=ordered_labels,
+            tickfont=dict(size=10),
+        ),
         xaxis=dict(tickvals=tick_vals, ticktext=tick_text, tickangle=45),
-        margin=dict(l=220),
+        margin=dict(l=160, r=80),
     )
     return fig
 
@@ -5541,6 +5562,7 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
     sorted_idx = [display_ch[i] for i in sorted_display[:n_show]]
     names = [channel2feature.get(i, f'Ch{i}') for i in sorted_idx] if channel2feature else [f'Ch {i}' for i in sorted_idx]
     values = ch_imp[sorted_idx]
+    # Reverse so largest is at top in the horizontal bar chart
     names, values = names[::-1], values[::-1]
     hover = [f"<b>{names[i]}</b><br>Mean |SHAP|: {values[i]:.5f}" for i in range(n_show)]
     fig = go.Figure(data=go.Bar(x=values, y=names, orientation='h',
@@ -5548,7 +5570,8 @@ def plot_top_channels_plotly(shap_results, sample_idx=0, channel2feature=None,
         hovertemplate="%{customdata}<extra></extra>"))
     title = f"Top {n_show} Clinical Channels" if has_ebm else f"Top {n_show} Channels"
     fig.update_layout(title=title, xaxis_title="Mean |SHAP|",
-        yaxis=dict(autorange="reversed"), height=height, width=width, margin=dict(l=180))
+        yaxis=dict(dtick=1),
+        height=max(height, n_show * 22), width=width, margin=dict(l=180))
     return fig
 
 

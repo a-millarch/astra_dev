@@ -11,8 +11,10 @@ Usage:
     shap_result = session.explain(x_ts, x_ts_cat, tab_df)
 """
 
+import json
 import logging
 import os
+import pickle
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -96,11 +98,18 @@ class InferenceSession:
     Supports repeated single-patient inference and SHAP explanation.
     """
 
-    def __init__(self, model, bundle, device='cpu'):
+    def __init__(self, model, bundle, device='cpu',
+                 calibrators=None, calibration_method=None):
         self.model = model
         self.bundle = bundle
         self.device = device
         self.is_temporal = bundle['model_params']['temporal_head']
+
+        self._calibrators = calibrators
+        self._global_calibrator = None
+        self._calibration_method = calibration_method
+        if calibrators is not None:
+            self._global_calibrator = calibrators.pop('global', None)
 
         # Pre-load SHAP background on device
         bg = bundle['shap_background']
@@ -181,7 +190,33 @@ class InferenceSession:
                       params['c_in'], params['seq_len'],
                       params['d_model'], params['n_layers'])
 
-        return cls(model, bundle, device)
+        # Load posthoc calibrators if available
+        calibrators = None
+        calibration_method = None
+        calibrator_dir = os.path.join(weights_dir, 'calibrators', model_name)
+        if os.path.isdir(calibrator_dir):
+            meta_path = os.path.join(calibrator_dir, 'metadata.json')
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                calibration_method = meta.get('best_method', 'isotonic')
+                calibrators = {}
+                for step in meta.get('timepoints', []):
+                    pkl = os.path.join(calibrator_dir, f"{calibration_method}_step{step}.pkl")
+                    if os.path.exists(pkl):
+                        with open(pkl, 'rb') as fh:
+                            calibrators[step] = pickle.load(fh)
+                global_pkl = os.path.join(calibrator_dir, f"{calibration_method}_global.pkl")
+                if os.path.exists(global_pkl):
+                    with open(global_pkl, 'rb') as fh:
+                        calibrators['global'] = pickle.load(fh)
+                n_tp = sum(1 for k in calibrators if k != 'global')
+                logger.info("Loaded %s calibrators (%d per-timepoint, global=%s)",
+                            calibration_method, n_tp, 'global' in calibrators)
+
+        return cls(model, bundle, device,
+                   calibrators=calibrators,
+                   calibration_method=calibration_method)
 
     # ------------------------------------------------------------------
     # Data preparation
@@ -306,6 +341,31 @@ class InferenceSession:
         return x_ts_t, x_cat_t, x_cont_t, x_ts_cat_t, traj_len
 
     # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+
+    def _calibrate(self, prob, step=None):
+        """Apply posthoc calibration to a probability or array of probabilities."""
+        if self._calibrators is None and self._global_calibrator is None:
+            return prob
+        from astra.evaluation.posthoc_calibration import apply_calibrator
+
+        is_scalar = isinstance(prob, (float, np.floating))
+        arr = np.atleast_1d(np.asarray(prob, dtype=np.float64))
+
+        cal = None
+        if step is not None and self._calibrators and step in self._calibrators:
+            cal = self._calibrators[step]
+        elif self._global_calibrator is not None:
+            cal = self._global_calibrator
+
+        if cal is None:
+            return prob
+
+        calibrated = apply_calibrator(cal, arr, self._calibration_method)
+        return float(calibrated[0]) if is_scalar else calibrated
+
+    # ------------------------------------------------------------------
     # Prediction
     # ------------------------------------------------------------------
 
@@ -375,6 +435,7 @@ class InferenceSession:
                 )
             else:
                 probs_all = torch.sigmoid(logits).cpu().numpy()[0]  # [seq_len]
+                probs_all = self._calibrate(probs_all)
                 probability = float(probs_all[step])
                 logger.info("Prediction: pid=%s P(deceased)=%.4f step=%d traj_len=%d",
                             pid, probability, step, traj_len)
@@ -388,7 +449,7 @@ class InferenceSession:
         else:
             # logits: [1, 2]
             probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
-            probability = float(probs[1])  # class 1 = deceased
+            probability = self._calibrate(float(probs[1]))
             logger.info("Prediction: pid=%s P(deceased)=%.4f traj_len=%d",
                         pid, probability, traj_len)
             return InferenceResult(
@@ -826,13 +887,14 @@ class InferenceSession:
             :class:`InferenceResult`
         """
         step = censor_step if censor_step is not None else context.trajectory_length - 1
+        traj_len = min(step + 1, context.trajectory_length) if censor_step is not None else context.trajectory_length
         return self.predict(
             context.x_ts,
             context.x_ts_cat,
             context.tab_df,
             censor_step=step,
             pid=context.pid,
-            trajectory_length=context.trajectory_length,
+            trajectory_length=traj_len,
             profiling=profiling,
         )
 
@@ -861,13 +923,14 @@ class InferenceSession:
             :class:`SHAPResult`
         """
         step = censor_step if censor_step is not None else context.trajectory_length - 1
+        traj_len = min(step + 1, context.trajectory_length) if censor_step is not None else context.trajectory_length
         return self.explain(
             context.x_ts,
             context.x_ts_cat,
             context.tab_df,
             censor_step=step,
             pid=context.pid,
-            trajectory_length=context.trajectory_length,
+            trajectory_length=traj_len,
         )
 
     def explain_differential(self, context, t1_hours, t2_hours):
