@@ -2765,6 +2765,92 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
 
 
 # ============================================================================
+# CLUSTER-STRATIFIED SHAP
+# ============================================================================
+
+def run_shap_by_cluster(
+    data,
+    model,
+    model_name: str,
+    cluster_csv: str = 'data/interim/holdout_cluster.csv',
+    max_test_samples: int = 90,
+    max_background_samples: int = 600,
+    density_normalize: bool = True,
+    save_dir: str = None,
+):
+    """Run SHAP analysis separately for each cluster and save per-cluster summary plots.
+
+    Uses the same background (full trainval) and the same method as the
+    whole-cohort ``shap_analysis()``, but restricts test samples to the
+    PIDs belonging to each cluster.
+
+    Args:
+        data:                  Data dict from prepare_data_and_dls().
+        model:                 Trained nn.Module.
+        model_name:            Model name (for output paths).
+        cluster_csv:           Path to cluster CSV (PID, dec_cluster, deceased_30d).
+        max_test_samples:      Max SHAP test samples per cluster.
+        max_background_samples: Background samples for SHAP explainer.
+        density_normalize:     Normalize channel importance by measurement density.
+        save_dir:              Output directory. Defaults to
+                               ``reports/eval/{model_name}/shap_clusters/``.
+    """
+    import pandas as pd
+    import os
+
+    if save_dir is None:
+        save_dir = f'reports/eval/{model_name}/shap_clusters'
+    os.makedirs(save_dir, exist_ok=True)
+
+    cluster_df = pd.read_csv(cluster_csv)
+    clusters = sorted(cluster_df['dec_cluster'].unique())
+    logger.info(
+        f"Cluster SHAP: {len(clusters)} clusters from {cluster_csv}"
+    )
+
+    channel2feature, _ = create_channel_mapping(data)
+    static_cat_names = get_static_cat_names_from_classes(data["classes"])
+
+    for c in clusters:
+        pids = cluster_df[cluster_df['dec_cluster'] == c]['PID'].tolist()
+        n_pos = int(cluster_df[cluster_df['dec_cluster'] == c]['deceased_30d'].sum())
+        logger.info(
+            f"  Cluster {c}: {len(pids)} patients, {n_pos} positive — running SHAP..."
+        )
+
+        try:
+            results = shap_analysis(
+                data=data,
+                model=model,
+                model_name=model_name,
+                compute_per_category_shap=True,
+                max_background_samples=max_background_samples,
+                max_test_samples=max_test_samples,
+                visualize=False,
+                specific_pids=pids,
+                density_normalize=density_normalize,
+            )
+        except Exception as e:
+            logger.warning(f"  Cluster {c}: SHAP failed — {e}")
+            continue
+
+        save_path = os.path.join(save_dir, f'shap_cluster{c}_{model_name}.png')
+        visualize_shap_summary(
+            results['shap_results'],
+            channel2feature=channel2feature,
+            feature_names_cat=static_cat_names,
+            feature_names_cont=cfg["dataset"]["num_cols"],
+            class_idx=1,
+            max_display=20,
+            save_path=save_path,
+            density_normalize=density_normalize,
+        )
+        logger.info(f"  Cluster {c}: saved → {save_path}")
+
+    logger.info(f"Cluster SHAP complete. All plots in {save_dir}/")
+
+
+# ============================================================================
 # TIMEFRAMES
 # ============================================================================
 

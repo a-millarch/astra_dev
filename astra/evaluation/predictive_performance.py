@@ -1048,6 +1048,99 @@ class TemporalEvaluator:
         logger.info(f"Temporal percentile recall complete: {len(results)} time points")
         return results
 
+    def generate_trainval_preds_csv(
+        self,
+        censor_steps: List[int],
+        model_name: str,
+        active_only: bool = True,
+    ) -> pd.DataFrame:
+        """Run inference on the trainval set and save a predictions CSV.
+
+        The output format is identical to the holdout predictions CSV so it
+        can be passed to ``stratified.py`` via ``--preds-extra``.
+
+        NOTE: These predictions are in-sample (the model was trained on these
+        patients).  Discrimination metrics (AUROC/AUPRC) will be optimistic.
+        Calibration and distribution metrics are less affected.
+        """
+        import time as time_module
+
+        logger.info("Running inference on trainval set for predictions CSV...")
+        trainval_dls = self.data["mixed_dls"]
+        trainval_pids = self.data["trainval"].base.PID.values
+        traj_lengths = np.array(self.data.get("trajectory_lengths", []))
+
+        all_logits = []
+        with torch.no_grad():
+            for batch in trainval_dls.train:
+                inputs, targets = batch
+                inputs = _to_device(inputs, self.device)
+                logits = self.model(inputs)
+                all_logits.append(logits.cpu())
+
+        preds_all = torch.sigmoid(torch.cat(all_logits, dim=0)).numpy()
+        logger.info(
+            f"Trainval inference complete: {preds_all.shape[0]} patients, "
+            f"{preds_all.shape[1]} timesteps"
+        )
+
+        preds_over_time = []
+        start = time_module.time()
+
+        for censor_step in censor_steps:
+            time_min = step_to_time(censor_step)
+            if time_min is None:
+                continue
+
+            if active_only and len(traj_lengths) > 0:
+                mask = traj_lengths > censor_step
+                preds_subset = preds_all[mask]
+                traj_subset = traj_lengths[mask]
+                active_pids = trainval_pids[mask]
+            else:
+                preds_subset = preds_all
+                traj_subset = traj_lengths
+                active_pids = trainval_pids
+
+            if len(traj_subset) > 0:
+                effective_steps = np.minimum(censor_step, traj_subset - 1)
+                effective_steps = np.maximum(effective_steps, 0).astype(int)
+            else:
+                effective_steps = np.full(
+                    len(preds_subset),
+                    min(censor_step, preds_subset.shape[1] - 1),
+                    dtype=int,
+                )
+
+            y_preds = preds_subset[np.arange(len(preds_subset)), effective_steps]
+
+            for pid, pred in zip(active_pids, y_preds):
+                preds_over_time.append({
+                    "PID": pid,
+                    "censor_step": censor_step,
+                    "time_min": time_min,
+                    "time_hours": time_min / 60,
+                    "time_days": time_min / (24 * 60),
+                    "pred": float(pred),
+                })
+
+        elapsed = time_module.time() - start
+        logger.info(f"Trainval prediction loop complete in {elapsed:.1f}s")
+
+        preds_df = pd.DataFrame(preds_over_time)
+        suffix = "_trainval_active" if active_only else "_trainval"
+        out_path = (
+            f"reports/eval/{model_name}/predictions/"
+            f"preds_df_{model_name}{suffix}.csv"
+        )
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        preds_df.to_csv(out_path, index=False)
+        logger.info(
+            f"Trainval predictions saved → {out_path} "
+            f"({preds_df['PID'].nunique()} patients)"
+        )
+        return preds_df
+
 
 # ============================================================================
 # TIME THRESHOLD GENERATION
@@ -1302,14 +1395,13 @@ def plot_prediction_distribution(
             labels = [f"{int(t)}d" for t, _ in timepoint_pairs]
         ax.set_xticklabels(labels, fontsize=_FIG_STYLE['tick_label'])
 
-    # 3-row layout: panel A, panel B, dedicated legend row below both.
-    # constrained_layout auto-reserves bottom margin for the n=X/Y annotations
-    # that live below each panel's x-axis label.
-    fig = plt.figure(figsize=(6, 7.5), constrained_layout=True)
-    gs = fig.add_gridspec(3, 1, height_ratios=[1.0, 1.0, 0.10])
+    # 2-row layout: panels A and B side by side, shared legend row below.
+    # constrained_layout auto-reserves bottom margin for the n=X/Y annotations.
+    fig = plt.figure(figsize=(12, 6), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 0.10])
     ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[1, 0])
-    ax_legend = fig.add_subplot(gs[2, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax_legend = fig.add_subplot(gs[1, :])
     ax_legend.axis('off')
 
     # Panel A: Hours
@@ -1354,6 +1446,70 @@ def plot_prediction_distribution(
     ax2.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
 
     return fig
+
+
+def plot_prediction_distribution_by_cluster(
+    preds_df: pd.DataFrame,
+    holdout_cluster_path: str = 'data/interim/holdout_cluster.csv',
+    cut_hours: int = 72,
+    max_days: float = None,
+    hour_timepoints: List[float] = None,
+    day_timepoints: List[float] = None,
+) -> Dict[int, plt.Figure]:
+    """
+    Plot prediction distribution violin plots separately for each patient cluster.
+
+    Reads cluster assignments from holdout_cluster.csv and generates one figure
+    per cluster (0–4), each identical in structure to plot_prediction_distribution.
+
+    Args:
+        preds_df: DataFrame with columns PID, censor_step, time_hours, time_days, pred
+        holdout_cluster_path: Path to CSV with columns PID, dec_cluster, deceased_30d
+        cut_hours: Hour cutoff for the hours panel
+        max_days: Max days for the days panel (from config if None)
+        hour_timepoints: Timepoints (hours) to show in panel A
+        day_timepoints: Timepoints (days) to show in panel B
+
+    Returns:
+        Dict mapping cluster_id (int) → matplotlib Figure
+    """
+    cluster_info = pd.read_csv(holdout_cluster_path)
+    pid_to_cluster = dict(zip(cluster_info['PID'], cluster_info['dec_cluster']))
+    pid_to_label = dict(zip(cluster_info['PID'], cluster_info['deceased_30d']))
+
+    df = preds_df.copy()
+    df['_cluster'] = df['PID'].map(pid_to_cluster)
+    df = df.dropna(subset=['_cluster'])
+    df['_cluster'] = df['_cluster'].astype(int)
+
+    figures = {}
+    for cid in sorted(df['_cluster'].unique()):
+        cluster_pids = df[df['_cluster'] == cid]['PID'].unique()
+        cluster_pids_labeled = [p for p in cluster_pids if p in pid_to_label]
+        if not cluster_pids_labeled:
+            continue
+
+        y_true = np.array([pid_to_label[p] for p in cluster_pids_labeled])
+        cluster_preds = preds_df[preds_df['PID'].isin(cluster_pids_labeled)].copy()
+        n_pos = int(y_true.sum())
+        n_total = len(cluster_pids_labeled)
+
+        fig = plot_prediction_distribution(
+            cluster_preds,
+            y_true,
+            np.array(cluster_pids_labeled),
+            cut_hours=cut_hours,
+            max_days=max_days,
+            hour_timepoints=hour_timepoints,
+            day_timepoints=day_timepoints,
+        )
+        fig.suptitle(
+            f"Cluster {cid}  (N={n_total}, {n_pos} deceased)",
+            fontsize=16, fontweight='bold',
+        )
+        figures[cid] = fig
+
+    return figures
 
 
 def plot_multi_percentile_recall(
@@ -1635,6 +1791,141 @@ def plot_time_metrics_comparison(
     )
 
     return fig
+
+
+def compute_cluster_time_metrics(
+    preds_df: pd.DataFrame,
+    holdout_cluster_path: str = 'data/interim/holdout_cluster.csv',
+    n_bootstraps: int = 1000,
+) -> Dict[int, List[TimeMetricResult]]:
+    """Compute time-dependent AUROC/AUPRC metrics per cluster from a predictions DataFrame.
+
+    Args:
+        preds_df: DataFrame with PID, censor_step, time_min, time_hours, time_days, pred.
+            Typically the all-patients predictions DataFrame from evaluate_over_time().
+        holdout_cluster_path: Path to CSV with columns PID, dec_cluster, deceased_30d.
+        n_bootstraps: Bootstrap iterations for CI estimation.
+
+    Returns:
+        Dict mapping cluster_id → List[TimeMetricResult] sorted by censor_step.
+    """
+    cluster_info = pd.read_csv(holdout_cluster_path)
+    pid_to_cluster = dict(zip(cluster_info['PID'], cluster_info['dec_cluster']))
+    pid_to_label = dict(zip(cluster_info['PID'], cluster_info['deceased_30d']))
+
+    df = preds_df.copy()
+    df['_cluster'] = df['PID'].map(pid_to_cluster)
+    df['_label'] = df['PID'].map(pid_to_label)
+    df = df.dropna(subset=['_cluster', '_label'])
+    df['_cluster'] = df['_cluster'].astype(int)
+
+    results_by_cluster: Dict[int, List[TimeMetricResult]] = {}
+
+    for cid in sorted(df['_cluster'].unique()):
+        cluster_sub = df[df['_cluster'] == cid]
+        results = []
+
+        for censor_step, grp in cluster_sub.groupby('censor_step'):
+            y_pred = grp['pred'].values
+            y_true = grp['_label'].values.astype(int)
+            n_pos = int(y_true.sum())
+            n_neg = len(y_true) - n_pos
+            if n_pos < 2 or n_neg < 2:
+                continue
+
+            time_min = float(grp['time_min'].iloc[0])
+            time_hours = float(grp['time_hours'].iloc[0])
+            time_days = float(grp['time_days'].iloc[0])
+
+            try:
+                auroc, au_lo, au_hi = calculate_roc_auc_ci(y_true, y_pred)
+                auprc, ap_lo, ap_hi = calculate_average_precision_ci(
+                    y_true, y_pred, n_bootstraps=n_bootstraps
+                )
+            except Exception as e:
+                logger.debug(f"Cluster {cid} step {censor_step}: CI failed ({e})")
+                continue
+
+            results.append(TimeMetricResult(
+                time_min=time_min,
+                time_hours=time_hours,
+                time_days=time_days,
+                censor_step=int(censor_step),
+                auroc=auroc,
+                auroc_ci=(au_lo, au_hi),
+                auprc=auprc,
+                auprc_ci=(ap_lo, ap_hi),
+                n_samples=len(y_true),
+                n_positive=n_pos,
+            ))
+
+        results_by_cluster[cid] = sorted(results, key=lambda r: r.censor_step)
+        logger.info(
+            f"Cluster {cid}: {len(results)} time points "
+            f"({cluster_sub['PID'].nunique()} patients)"
+        )
+
+    return results_by_cluster
+
+
+def plot_time_metrics_comparison_by_cluster(
+    results_all_by_cluster: Dict[int, List[TimeMetricResult]],
+    results_active_by_cluster: Dict[int, List[TimeMetricResult]],
+    cut_hours=72,
+    max_days=None,
+    target_name: str = "deceased_30d",
+) -> Dict[int, plt.Figure]:
+    """Generate one performance figure per cluster identical in layout to
+    plot_time_metrics_comparison:
+        A) AUROC/AUPRC (all-patients solid, active-only dashed) over hours
+        B) same over days
+        C) Active patient count + prevalence over hours
+        D) same over days
+
+    Args:
+        results_all_by_cluster:    cluster_id → results from non-active preds_df
+        results_active_by_cluster: cluster_id → results from active-only preds_df
+
+    Returns:
+        Dict mapping cluster_id → plt.Figure.
+    """
+    if max_days is None:
+        max_days = get_max_days()
+    if not results_all_by_cluster:
+        raise ValueError("results_all_by_cluster must not be empty")
+
+    figures: Dict[int, plt.Figure] = {}
+    all_cids = sorted(set(results_all_by_cluster) | set(results_active_by_cluster))
+
+    for cid in all_cids:
+        results_all = results_all_by_cluster.get(cid, [])
+        results_active = results_active_by_cluster.get(cid, [])
+
+        # Need at least all-patient results to draw performance curves
+        if not results_all:
+            continue
+
+        # Fall back to all-patients for active if cluster too small to produce any
+        if not results_active:
+            results_active = results_all
+
+        # Cluster size and deceased count come from the all-patients results
+        # (n_samples constant = cluster size; n_positive = total deceased in cluster)
+        n_total = results_all[0].n_samples if results_all else 0
+        n_deceased = max(r.n_positive for r in results_all) if results_all else 0
+
+        fig = plot_time_metrics_comparison(
+            results_all, results_active,
+            cut_hours=cut_hours, max_days=max_days,
+            target_name=target_name,
+        )
+        fig.suptitle(
+            f"Cluster {cid}  —  N={n_total}  ({n_deceased} deceased)",
+            fontsize=_FIG_STYLE['suptitle'], fontweight='bold',
+        )
+        figures[cid] = fig
+
+    return figures
 
 
 def plot_trauma_score_comparison(
@@ -2285,7 +2576,7 @@ def _run_trauma_score_comparison(data, cfg, results_all, results_active,
 
 def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool = True,
              active_only: bool = False, trauma_scores: bool = False,
-             delong: bool = False):
+             delong: bool = False, save_trainval_preds: bool = False):
     """
     Enhanced evaluation with time-dependent metrics.
 
@@ -2501,6 +2792,48 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                             save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
                 logger.info("Prediction distribution plot saved")
 
+                # Per-cluster violin plots and time metrics
+                _cluster_path = 'data/interim/holdout_cluster.csv'
+                if os.path.exists(_cluster_path):
+                    _cluster_dir = f'reports/eval/{model_name}/cluster_holdout'
+                    os.makedirs(_cluster_dir, exist_ok=True)
+                    logger.info("Generating per-cluster prediction distribution plots...")
+                    cluster_dist_figs = plot_prediction_distribution_by_cluster(
+                        dist_preds, holdout_cluster_path=_cluster_path,
+                    )
+                    for cid, fig in cluster_dist_figs.items():
+                        save_figure(
+                            fig, f"pred_distribution_cluster{cid}_{model_name}",
+                            save_dir=_cluster_dir, **_SUBMISSION_KW,
+                        )
+                    logger.info(f"Per-cluster prediction distribution plots saved ({len(cluster_dist_figs)} clusters)")
+
+                    logger.info("Computing per-cluster time metrics...")
+                    results_by_cluster_all = compute_cluster_time_metrics(preds_df, _cluster_path)
+                    results_by_cluster_active = compute_cluster_time_metrics(dist_preds, _cluster_path)
+                    if results_by_cluster_all:
+                        cluster_time_figs = plot_time_metrics_comparison_by_cluster(
+                            results_by_cluster_all, results_by_cluster_active,
+                            target_name=cfg["target"],
+                        )
+                        for cid, fig in cluster_time_figs.items():
+                            save_figure(
+                                fig, f"time_metrics_cluster{cid}_{model_name}",
+                                save_dir=_cluster_dir, **_SUBMISSION_KW,
+                            )
+                        # Save per-cluster metrics CSVs (all-patients + active)
+                        for cid, cresults in results_by_cluster_all.items():
+                            _save_time_metrics_csv(
+                                cresults,
+                                f'{_cluster_dir}/time_metrics_cluster{cid}_{model_name}.csv',
+                            )
+                        for cid, cresults in results_by_cluster_active.items():
+                            _save_time_metrics_csv(
+                                cresults,
+                                f'{_cluster_dir}/time_metrics_cluster{cid}_{model_name}_active.csv',
+                            )
+                        logger.info(f"Per-cluster time metrics plots and CSVs saved ({len(cluster_time_figs)} clusters)")
+
             # Trauma score comparison (temporal path)
             if trauma_scores:
                 _run_trauma_score_comparison(
@@ -2529,6 +2862,14 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                             line += (f"  |  Active: AUROC={ra.auroc:.3f}, "
                                      f"AUPRC={ra.auprc:.3f} (n={ra.n_samples})")
                         logger.info(line)
+
+            # ── Trainval predictions CSV (for full-population cluster eval) ──
+            if save_trainval_preds:
+                logger.info("Generating trainval predictions CSV...")
+                temporal_eval.generate_trainval_preds_csv(
+                    censor_thresholds, model_name=model_name, active_only=True
+                )
+
             return results, preds_df
         return None, None
 
@@ -2706,6 +3047,48 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
             save_figure(fig_dist, f"pred_distribution_{model_name}",
                         save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
             logger.info("Prediction distribution plot saved")
+
+            # Per-cluster violin plots and time metrics
+            _cluster_path = 'data/interim/holdout_cluster.csv'
+            if os.path.exists(_cluster_path):
+                _cluster_dir = f'reports/eval/{model_name}/cluster_holdout'
+                os.makedirs(_cluster_dir, exist_ok=True)
+                logger.info("Generating per-cluster prediction distribution plots...")
+                cluster_dist_figs = plot_prediction_distribution_by_cluster(
+                    dist_preds, holdout_cluster_path=_cluster_path,
+                )
+                for cid, fig in cluster_dist_figs.items():
+                    save_figure(
+                        fig, f"pred_distribution_cluster{cid}_{model_name}",
+                        save_dir=_cluster_dir, **_SUBMISSION_KW,
+                    )
+                logger.info(f"Per-cluster prediction distribution plots saved ({len(cluster_dist_figs)} clusters)")
+
+                logger.info("Computing per-cluster time metrics...")
+                results_by_cluster_all = compute_cluster_time_metrics(preds_df, _cluster_path)
+                results_by_cluster_active = compute_cluster_time_metrics(dist_preds, _cluster_path)
+                if results_by_cluster_all:
+                    cluster_time_figs = plot_time_metrics_comparison_by_cluster(
+                        results_by_cluster_all, results_by_cluster_active,
+                        target_name=cfg["target"],
+                    )
+                    for cid, fig in cluster_time_figs.items():
+                        save_figure(
+                            fig, f"time_metrics_cluster{cid}_{model_name}",
+                            save_dir=_cluster_dir, **_SUBMISSION_KW,
+                        )
+                    # Save per-cluster metrics CSVs (all-patients + active)
+                    for cid, cresults in results_by_cluster_all.items():
+                        _save_time_metrics_csv(
+                            cresults,
+                            f'{_cluster_dir}/time_metrics_cluster{cid}_{model_name}.csv',
+                        )
+                    for cid, cresults in results_by_cluster_active.items():
+                        _save_time_metrics_csv(
+                            cresults,
+                            f'{_cluster_dir}/time_metrics_cluster{cid}_{model_name}_active.csv',
+                        )
+                    logger.info(f"Per-cluster time metrics plots and CSVs saved ({len(cluster_time_figs)} clusters)")
 
         # ================================================================
         # TRAUMA SCORE COMPARISON (optional, Azure-only)

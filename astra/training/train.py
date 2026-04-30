@@ -46,8 +46,8 @@ def parse_args():
     )
 
     # Config
-    parser.add_argument("--config", type=str, default="defaults.yaml",
-                        help="Config YAML filename in configs/ dir (default: defaults.yaml)")
+    parser.add_argument("--config", type=str, default="defaults_astra_20260424.yaml",
+                        help="Config YAML filename in configs/ dir (default: defaults_astra_20260424.yaml)")
 
     # Pipeline stages
     parser.add_argument("--pretrain", action="store_true", default=False,
@@ -84,6 +84,10 @@ def parse_args():
                         help="Compute traditional trauma risk scores (RTS, ISS, TRISS) and add as baselines (Azure-only)")
     parser.add_argument("--delong", action="store_true", default=False,
                         help="Run paired DeLong tests between HNN and trauma scores with FDR correction (requires --trauma-scores)")
+    parser.add_argument("--save-trainval-preds", action="store_true", default=False,
+                        help="Also run inference on trainval set and save preds_df_{model}_trainval_active.csv. "
+                             "Used with --preds-extra in stratified.py for full-population cluster evaluation. "
+                             "Requires --comprehensive-eval. NOTE: trainval predictions are in-sample.")
 
     # Calibration
     parser.add_argument("--calibrate", action="store_true", default=False,
@@ -96,6 +100,12 @@ def parse_args():
                         help="Max holdout patients for temporal SHAP (default: 20)")
     parser.add_argument("--shap-representative", action="store_true", default=False,
                         help="Use stratified representative sampling for temporal SHAP")
+    parser.add_argument("--shap-clusters", action="store_true", default=False,
+                        help="Run SHAP analysis separately per cluster and save one summary "
+                             "plot per cluster to reports/eval/{model}/shap_clusters/")
+    parser.add_argument("--shap-cluster-csv", type=str,
+                        default="data/interim/holdout_cluster.csv",
+                        help="Cluster CSV for --shap-clusters (default: data/interim/holdout_cluster.csv)")
 
     # Temporal validation
     parser.add_argument("--validate-temporal", action="store_true", default=False,
@@ -237,6 +247,7 @@ def main():
             active_only=args.active_only,
             trauma_scores=args.trauma_scores,
             delong=args.delong,
+            save_trainval_preds=args.save_trainval_preds,
         )
 
     # ========================================================================
@@ -301,6 +312,23 @@ def main():
                 csv_path=csv_path, save_dir=shap_dir, pickle_path=pkl_path,
             )
         logger.info("SHAP analysis complete")
+
+    # ========================================================================
+    # Cluster-stratified SHAP
+    # ========================================================================
+    if args.shap_clusters:
+        from astra.evaluation.behavior import run_shap_by_cluster
+        from astra.evaluation.utils import prepare_model
+        logger.info("=== Running Cluster-Stratified SHAP ===")
+        model, device = prepare_model(data, cfg)
+        run_shap_by_cluster(
+            data, model,
+            model_name=cfg["model_name"],
+            cluster_csv=args.shap_cluster_csv,
+            max_test_samples=500,
+            max_background_samples=1000,
+            density_normalize=True,
+        )
 
     # ========================================================================
     # Temporal validation (cross-check eval methods)
