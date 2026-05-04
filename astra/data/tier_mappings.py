@@ -212,53 +212,69 @@ register_mapping(
 )
 
 # ---------------------------------------------------------------------------
-# Sedation escalation (agent-type, no dose)
-# Tier 1 = ward-level sleep aids
-# Tier 2 = moderate ICU (dexmedetomidine, clonidine, propofol)
-# Tier 3 = deep sedation (midazolam, lorazepam infusion)
+# Sedation escalation (co-occurrence-based unified design)
+# Tier 1 = anxiolysis / mild CNS effect
+# Tier 2 = moderate sedation (dexmedetomidine, antipsychotics, esketamine alone)
+# Tier 3 = deep sedation (propofol alone, midazolam, lorazepam)
+# Tier 4 = general anesthesia (volatile, thiopental, etomidate)
+# Tier 5 = GA + NMB (composite mode only; flat mapping cannot represent
+#          co-occurrence, so Tier 5 is not reachable via this mapping)
 # ---------------------------------------------------------------------------
 
 _SEDATION_EXACT: Dict[str, int] = {
-    # Tier 1 — Ward-level
+    # Tier 1 — Anxiolysis
     "N05CH01": 1,  # Melatonin
     "N05CF01": 1,  # Zopiclone
     "N05BA04": 1,  # Oxazepam
     "N05BA01": 1,  # Diazepam
     "N05BA02": 1,  # Chlordiazepoxide
-    # Tier 2 — Moderate ICU
-    "C02AC01": 2,  # Clonidine (sedation adjunct in DK ICU practice)
-    "N05CM18": 2,  # Dexmedetomidine
-    "N01AX10": 2,  # Propofol (default moderate; dose-based upgrade in Phase 2)
+    "C02AC01": 1,  # Clonidine
+    # Tier 2 — Moderate sedation
+    "N05CM18": 2,  # Dexmedetomidine (capped)
+    "N05AD01": 2,  # Haloperidol
+    "N05AH03": 2,  # Olanzapine
+    "N05AH04": 2,  # Quetiapine
+    "N01AX14": 2,  # Esketamine (alone; co-occurrence elevates in composite mode)
+    "N01AX03": 2,  # Ketamine (alone)
     # Tier 3 — Deep sedation
+    "N01AX10": 3,  # Propofol (alone; co-occurrence elevates in composite mode)
     "N05CD08": 3,  # Midazolam
     "N05BA06": 3,  # Lorazepam
+    # Tier 4 — General anesthesia (fixed agents)
+    "N01AF03": 4,  # Thiopental
+    "N01AX07": 4,  # Etomidate
 }
+
+_SEDATION_PREFIX: List[Tuple[str, int]] = [
+    ("N01AB", 4),  # Volatile anesthetics
+]
 
 register_mapping(
     TierMapping(
         name="sedation_escalation",
-        n_levels=3,
+        n_levels=5,
         exact=_SEDATION_EXACT,
-        prefix=[],
+        prefix=_SEDATION_PREFIX,
     )
 )
 
 # ---------------------------------------------------------------------------
-# NMBA escalation
-# Tier 1 = bolus (intubation): suxamethonium, rocuronium
-# Tier 2 = continuous infusion: cisatracurium
+# NMBA escalation (unified — no bolus/infusion distinction)
+# All peripheral NMBAs → tier 1.  Context inferred via co-occurrence
+# with sedation agents in the composite feature pipeline.
 # ---------------------------------------------------------------------------
 
 _NMBA_EXACT: Dict[str, int] = {
-    "M03AB01": 1,  # Suxamethonium — always bolus
-    "M03AC09": 1,  # Rocuronium — default bolus (v1 simplification)
-    "M03AC11": 2,  # Cisatracurium — always ICU infusion
+    "M03AB01": 1,  # Suxamethonium
+    "M03AC09": 1,  # Rocuronium
+    "M03AC11": 1,  # Cisatracurium
+    "M03AC03": 1,  # Vecuronium
 }
 
 register_mapping(
     TierMapping(
         name="nmba_escalation",
-        n_levels=2,
+        n_levels=1,
         exact=_NMBA_EXACT,
         prefix=[],
     )
@@ -382,15 +398,19 @@ _SPOT_CHECKS = {
         "H01BA01": 1,  # Vasopressin
     },
     "sedation_escalation": {
-        "N05CH01": 1,  # Melatonin (ward)
-        "N01AX10": 2,  # Propofol (moderate)
+        "N05CH01": 1,  # Melatonin (anxiolysis)
+        "C02AC01": 1,  # Clonidine (anxiolysis)
+        "N05CM18": 2,  # Dexmedetomidine (moderate)
+        "N01AX10": 3,  # Propofol (deep, alone)
         "N05CD08": 3,  # Midazolam (deep)
-        "C02AC01": 2,  # Clonidine (moderate, cross-category)
+        "N01AF03": 4,  # Thiopental (GA)
+        "N01AX07": 4,  # Etomidate (GA)
     },
     "nmba_escalation": {
-        "M03AB01": 1,  # Suxamethonium (bolus)
-        "M03AC09": 1,  # Rocuronium (bolus)
-        "M03AC11": 2,  # Cisatracurium (infusion)
+        "M03AB01": 1,  # Suxamethonium
+        "M03AC09": 1,  # Rocuronium
+        "M03AC11": 1,  # Cisatracurium
+        "M03AC03": 1,  # Vecuronium
     },
     "anticoag_escalation": {
         "B01AB10": 1,  # Tinzaparin (heparin)

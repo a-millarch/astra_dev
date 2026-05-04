@@ -50,16 +50,15 @@ AMIODARONE = frozenset({"C01BD01"})
 
 # -- Sedation --
 WARD_SEDATION = frozenset({
-    "N05CH01", "N05CF01", "N05BA04", "N05BA01", "N05BA02",
+    "N05CH01", "N05CF01", "N05BA04", "N05BA01", "N05BA02", "C02AC01",
 })
 ICU_LIGHT_SEDATION = frozenset({
-    "N05CM18", "C02AC01", "N05AD01", "N05AH03", "N05AH04",
+    "N05CM18", "N05AD01", "N05AH03", "N05AH04",
 })
 PROPOFOL = frozenset({"N01AX10"})
 DEEP_BENZO = frozenset({"N05CD08", "N05BA06"})
-NMBA_CISATRACURIUM = frozenset({"M03AC11"})
-NMBA_BOLUS_AGENTS = frozenset({"M03AB01", "M03AC09"})
-ROCURONIUM = frozenset({"M03AC09"})
+ETOMIDATE = frozenset({"N01AX07"})
+NMBA_ALL = frozenset({"M03AC09", "M03AC11", "M03AB01", "M03AC03"})
 
 # -- Coagulation --
 LMWH_TINZAPARIN = frozenset({"B01AB10"})
@@ -204,19 +203,10 @@ def _tag_records(df: pd.DataFrame) -> pd.DataFrame:
     # --- Sedation ---
     df["_ward_sed"] = atc.isin(WARD_SEDATION)
     df["_icu_light_sed"] = atc.isin(ICU_LIGHT_SEDATION)
-    # Propofol: infusion → sedation, bolus (mg only) → surgical, unknown → sedation
-    is_propofol = atc.isin(PROPOFOL)
-    df["_propofol_sedation"] = is_propofol & ~is_bolus_mg
-    df["_propofol_surgical"] = is_propofol & is_bolus_mg
+    df["_propofol"] = atc.isin(PROPOFOL)
     df["_deep_benzo"] = atc.isin(DEEP_BENZO)
-    # NMBA: cisatracurium always infusion; rocuronium depends on unit
-    df["_nmba_infusion"] = (
-        atc.isin(NMBA_CISATRACURIUM)
-        | (atc.isin(ROCURONIUM) & is_infusion)
-    )
-    df["_nmba_bolus"] = (
-        atc.isin(NMBA_BOLUS_AGENTS) & ~df["_nmba_infusion"]
-    )
+    df["_etomidate"] = atc.isin(ETOMIDATE)
+    df["_nmba"] = atc.isin(NMBA_ALL)
 
     # --- Coagulation ---
     is_lmwh = atc.isin(LMWH_ALL)
@@ -313,11 +303,10 @@ def _aggregate_signals(tagged_df: pd.DataFrame) -> pd.DataFrame:
         "_amiodarone": "any",
         "_ward_sed": "any",
         "_icu_light_sed": "any",
-        "_propofol_sedation": "any",
-        "_propofol_surgical": "any",
+        "_propofol": "any",
         "_deep_benzo": "any",
-        "_nmba_bolus": "any",
-        "_nmba_infusion": "any",
+        "_etomidate": "any",
+        "_nmba": "any",
         "_prophylactic_lmwh": "any",
         "_therapeutic_anticoag": "any",
         "_txa": "any",
@@ -394,14 +383,28 @@ def _derive_composite_tiers(s: pd.DataFrame) -> pd.DataFrame:
     ] = 3
 
     # ---- Feature 4: sedation_tier ----
-    has_deep_sedation = s["_propofol_sedation"] | s["_deep_benzo"]
-
+    # Co-occurrence-based: depth inferred from which agents share a bin
     s["sedation_tier"] = 0
     s.loc[s["_ward_sed"], "sedation_tier"] = 1
     s.loc[s["_icu_light_sed"], "sedation_tier"] = 2
-    s.loc[has_deep_sedation, "sedation_tier"] = 3
-    s.loc[has_deep_sedation & s["_nmba_bolus"], "sedation_tier"] = 4
-    s.loc[has_deep_sedation & s["_nmba_infusion"], "sedation_tier"] = 5
+    esketamine_alone = (
+        s["_esketamine"] & ~s["_volatile"] & ~s["_nmba"] & ~s["_propofol"]
+    )
+    s.loc[esketamine_alone, "sedation_tier"] = 2
+    propofol_alone = s["_propofol"] & ~s["_volatile"] & ~s["_nmba"]
+    s.loc[propofol_alone | s["_deep_benzo"], "sedation_tier"] = 3
+    tier4 = (
+        s["_volatile"]
+        | s["_thiopental"]
+        | s["_etomidate"]
+        | (s["_propofol"] & s["_nmba"])
+        | (s["_propofol"] & s["_volatile"])
+        | (s["_esketamine"] & s["_nmba"])
+        | (s["_esketamine"] & s["_volatile"])
+        | (s["_esketamine"] & s["_propofol"])
+    )
+    s.loc[tier4, "sedation_tier"] = 4
+    s.loc[tier4 & s["_nmba"], "sedation_tier"] = 5
 
     # ---- Feature 5: coagulation_tier ----
     s["coagulation_tier"] = 0
@@ -474,16 +477,13 @@ def _derive_composite_tiers(s: pd.DataFrame) -> pd.DataFrame:
     s.loc[s["_strong_icu_atc"] >= 2, "opioid_tier"] = 3
 
     # ---- Feature 8: surgical_tier ----
-    has_propofol_any = s["_propofol_sedation"] | s["_propofol_surgical"]
-
     s["surgical_tier"] = 0
     s.loc[s["_regional"], "surgical_tier"] = 1
-    s.loc[
-        s["_esketamine"] | s["_propofol_surgical"]
-        | s["_volatile"]
-        | (s["_icu_opioid"] & has_propofol_any),
-        "surgical_tier",
-    ] = 2
+    surgical_ga = (
+        s["_volatile"]
+        | (s["_esketamine"] & s["_propofol"])
+    )
+    s.loc[surgical_ga, "surgical_tier"] = 2
     s.loc[s["_thiopental"], "surgical_tier"] = 3
 
     # ---- Feature 9: acute_deterioration ----
