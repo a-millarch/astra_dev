@@ -106,6 +106,7 @@ ESKETAMINE = frozenset({"N01AX14", "N01AX03"})
 THIOPENTAL = frozenset({"N01AF03"})
 VOLATILE_PREFIX = "N01AB"
 REGIONAL_PREFIX = "N01BB"
+ANESTHETIC_OPIOID = frozenset({"N01AH06", "N01AH02", "N01AH03"})
 
 # -- Acute deterioration --
 NALOXONE = frozenset({"V03AB15"})
@@ -257,6 +258,7 @@ def _tag_records(df: pd.DataFrame) -> pd.DataFrame:
     df["_esketamine"] = atc.isin(ESKETAMINE)
     df["_thiopental"] = atc.isin(THIOPENTAL)
     df["_volatile"] = atc.str.startswith(VOLATILE_PREFIX, na=False)
+    df["_anesthetic_opioid"] = atc.isin(ANESTHETIC_OPIOID)
 
     # --- Acute deterioration ---
     df["_naloxone"] = atc.isin(NALOXONE)
@@ -332,6 +334,7 @@ def _aggregate_signals(tagged_df: pd.DataFrame) -> pd.DataFrame:
         "_esketamine": "any",
         "_thiopental": "any",
         "_volatile": "any",
+        "_anesthetic_opioid": "any",
         "_naloxone": "any",
         "_flumazenil": "any",
         "_acetylcysteine": "any",
@@ -388,10 +391,14 @@ def _derive_composite_tiers(s: pd.DataFrame) -> pd.DataFrame:
     s.loc[s["_ward_sed"], "sedation_tier"] = 1
     s.loc[s["_icu_light_sed"], "sedation_tier"] = 2
     esketamine_alone = (
-        s["_esketamine"] & ~s["_volatile"] & ~s["_nmba"] & ~s["_propofol"]
+        s["_esketamine"] & ~s["_volatile"] & ~s["_nmba"]
+        & ~s["_propofol"] & ~s["_anesthetic_opioid"]
     )
     s.loc[esketamine_alone, "sedation_tier"] = 2
-    propofol_alone = s["_propofol"] & ~s["_volatile"] & ~s["_nmba"]
+    propofol_alone = (
+        s["_propofol"] & ~s["_volatile"] & ~s["_nmba"]
+        & ~s["_anesthetic_opioid"]
+    )
     s.loc[propofol_alone | s["_deep_benzo"], "sedation_tier"] = 3
     tier4 = (
         s["_volatile"]
@@ -399,9 +406,11 @@ def _derive_composite_tiers(s: pd.DataFrame) -> pd.DataFrame:
         | s["_etomidate"]
         | (s["_propofol"] & s["_nmba"])
         | (s["_propofol"] & s["_volatile"])
+        | (s["_propofol"] & s["_anesthetic_opioid"])
         | (s["_esketamine"] & s["_nmba"])
         | (s["_esketamine"] & s["_volatile"])
         | (s["_esketamine"] & s["_propofol"])
+        | (s["_esketamine"] & s["_anesthetic_opioid"])
     )
     s.loc[tier4, "sedation_tier"] = 4
     s.loc[tier4 & s["_nmba"], "sedation_tier"] = 5
@@ -482,6 +491,7 @@ def _derive_composite_tiers(s: pd.DataFrame) -> pd.DataFrame:
     surgical_ga = (
         s["_volatile"]
         | (s["_esketamine"] & s["_propofol"])
+        | (s["_propofol"] & s["_anesthetic_opioid"])
     )
     s.loc[surgical_ga, "surgical_tier"] = 2
     s.loc[s["_thiopental"], "surgical_tier"] = 3
