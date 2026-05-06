@@ -245,6 +245,78 @@ def load_data_cache(cfg, cache_dir='data/cache'):
     return data
 
 
+def load_data_cache_from_path(cache_path: str, bs: int = 64):
+    """Load a data cache from an explicit file path, bypassing cache key validation."""
+    logger.info(f"Loading data cache from explicit path: {cache_path}")
+
+    with open(cache_path, 'rb') as f:
+        cache_data = pickle.load(f)
+
+    logger.info("Recreating dataloaders from cached data...")
+
+    trainval_dataset = AstraMixedDataset(
+        X_ts=cache_data['X'],
+        x_cat=cache_data['trainval_x_cat'],
+        x_cont=cache_data['trainval_x_cont'],
+        X_ts_cat=cache_data['X_multi_hot'],
+        y=cache_data['y'],
+        trajectory_lengths=cache_data['trajectory_lengths'],
+    )
+    mixed_dls = AstraMixedDataLoader(
+        trainval_dataset, splits=None, bs=bs, shuffle_train=False,
+    )
+
+    holdout_dataset = AstraMixedDataset(
+        X_ts=cache_data['tX'],
+        x_cat=cache_data['holdout_x_cat'],
+        x_cont=cache_data['holdout_x_cont'],
+        X_ts_cat=cache_data['tX_multi_hot'],
+        y=cache_data['ty'],
+        trajectory_lengths=cache_data['holdout_trajectory_lengths'],
+    )
+    holdout_mixed_dls = AstraMixedDataLoader(
+        holdout_dataset, splits=None, bs=bs, shuffle_train=False,
+    )
+
+    data = {
+        "base": cache_data['base'],
+        "trainval": cache_data['trainval'],
+        "holdout": cache_data['holdout'],
+        "X": cache_data['X'],
+        "X_raw": cache_data['X_raw'],
+        "X_multi_hot": cache_data['X_multi_hot'],
+        "y": cache_data['y'],
+        "tX": cache_data['tX'],
+        "tX_raw": cache_data['tX_raw'],
+        "tX_multi_hot": cache_data['tX_multi_hot'],
+        "ty": cache_data['ty'],
+        "cat_cols": cache_data['cat_cols'],
+        "num_cols": cache_data['num_cols'],
+        "classes": cache_data['classes'],
+        "mixed_dls": mixed_dls,
+        "holdout_mixed_dls": holdout_mixed_dls,
+        "encoding_info": cache_data['encoding_info'],
+        "cat_encoder": cache_data['cat_encoder'],
+        "tab_encoder": cache_data['tab_encoder'],
+        "ts_scaler": cache_data['ts_scaler'],
+        "tab_scaler": cache_data['tab_scaler'],
+        "ts_feature_names": cache_data['ts_feature_names'],
+        "ts_channel_names": cache_data['ts_channel_names'],
+        "trajectory_lengths": cache_data['trajectory_lengths'],
+        "holdout_trajectory_lengths": cache_data['holdout_trajectory_lengths'],
+        "ebm_channel_idx": cache_data.get('ebm_channel_idx'),
+        "temporal_channel_idx": cache_data.get('temporal_channel_idx'),
+        "exclude_channel_indices": cache_data.get('exclude_channel_indices'),
+        "c_in": cache_data['c_in'],
+        "seq_len": cache_data['seq_len'],
+        "ts_cat_dims": cache_data['ts_cat_dims'],
+        "cfg": cache_data.get('cfg'),
+    }
+
+    logger.info("Data loaded from explicit cache path successfully")
+    return data
+
+
 def prepare_data_and_dls_cached(cfg, use_cache=True, cache_dir='data/cache', force_refresh=False):
     """
     Wrapper for prepare_data_and_dls with caching support.

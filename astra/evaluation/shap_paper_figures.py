@@ -31,7 +31,6 @@ from astra.evaluation.behavior import (
     calculate_shap_from_dataloaders,
     classify_channels,
     create_channel_mapping,
-    extract_data_from_dataloader,
     get_category_names_from_encoding_info,
     get_holdout_pids,
     get_static_cat_names_from_classes,
@@ -1348,158 +1347,91 @@ def figure_shap_summary_panel(
 # Post-hoc density renormalization
 # ============================================================================
 
-def renormalize_cat_ts_from_pickle(
+def recompute_cat_ts_shap(
     pickle_path: str,
+    config_name: str,
     save_dir: str,
-    data_cache_path: Optional[str] = None,
-    csv_path: Optional[str] = None,
+    data_cache_path: str | None = None,
 ) -> None:
-    """Re-normalize categorical TS SHAP importance from an existing pickle.
+    """Recompute cat TS SHAP for the same patients and patch the old pickle.
 
-    Loads per-patient SHAP arrays, retrieves multi-hot input from the cached
-    data object, applies density normalization, re-aggregates, saves a new
-    pickle, and regenerates the summary panel.
-
-    Args:
-        data_cache_path: Path to data_cache_*.pkl file. Required when the
-            pickle's per-patient cat_ts_data doesn't align with SHAP shapes.
+    Loads the old pickle to get the patient list, runs TemporalSHAPAnalyzer
+    on the current branch (raw multi-hot SHAP + density normalization), then
+    patches the old pickle with ONLY the new cat_ts values. All other panels
+    (continuous TS, statics) remain bit-identical.
     """
     import pickle as pkl
-
-    print(f"Loading pickle: {pickle_path}")
-    with open(pickle_path, 'rb') as f:
-        results = pkl.load(f)
-
-    if not results.patient_results:
-        print("ERROR: Pickle has no patient_results — cannot renormalize post-hoc.")
-        print("Re-run TemporalSHAPAnalyzer with density_normalize=True instead.")
-        return
-
-    n_patients = len(results.patient_results)
-    pr0 = results.patient_results[0]
-    tf0 = next(iter(pr0.timeframe_results))
-    tfr0 = pr0.timeframe_results[tf0]
-    print(f"Pickle has {n_patients} patients, timeframes: {list(pr0.timeframe_results.keys())}")
-
-    cat_shap0 = getattr(tfr0, 'cat_ts_shap_per_category', None)
-    cat_data0 = getattr(tfr0, 'cat_ts_data', None)
-    print(f"  cat_ts_shap_per_category: {cat_shap0.shape if cat_shap0 is not None else 'None'}")
-    print(f"  cat_ts_data: {cat_data0.shape if cat_data0 is not None else 'None'}")
-
-    # Squeeze trailing singleton from GradientExplainer if present
-    for pr in results.patient_results:
-        for tf, tfr in pr.timeframe_results.items():
-            s = getattr(tfr, 'cat_ts_shap_per_category', None)
-            if s is not None and s.ndim == 3 and s.shape[-1] == 1:
-                tfr.cat_ts_shap_per_category = s.squeeze(-1)
-
-    cat_shap0 = tfr0.cat_ts_shap_per_category
-    if cat_shap0 is not None:
-        print(f"  After squeeze: cat_ts_shap_per_category {cat_shap0.shape}")
-
-    # Load multi-hot input from data cache if shapes don't align
-    holdout_ts_cat = None
-    need_data = (cat_shap0 is not None and cat_data0 is not None
-                 and cat_shap0.shape[0] != cat_data0.shape[0])
-    if need_data or cat_data0 is None:
-        if not data_cache_path:
-            print("ERROR: Pickle cat_ts shapes are misaligned — need --data-cache "
-                  "to load multi-hot input.")
-            if cat_shap0 is not None and cat_data0 is not None:
-                print(f"  SHAP categories={cat_shap0.shape[0]}, "
-                      f"data categories={cat_data0.shape[0]}")
-            return
-        print(f"Loading data cache: {data_cache_path}")
-        with open(data_cache_path, 'rb') as f:
-            cache_data = pkl.load(f)
-        # Cache stores holdout multi-hot as 'tX_multi_hot'
-        tX_mh = cache_data.get("tX_multi_hot")
-        if tX_mh is None:
-            print(f"ERROR: No tX_multi_hot in data cache. "
-                  f"Available keys: {sorted(cache_data.keys())}")
-            return
-        holdout_ts_cat = np.array(tX_mh) if not isinstance(tX_mh, np.ndarray) else tX_mh
-        print(f"  Holdout multi-hot shape: {holdout_ts_cat.shape}")
-
-    cat_names = (
-        getattr(results, 'cat_ts_category_names', [])
-        or (get_category_names_from_encoding_info(results.encoding_info)
-            if results.encoding_info else [])
+    import torch
+    from astra.evaluation.behavior import (
+        TemporalSHAPAnalyzer,
+        get_holdout_pids,
     )
-    print(f"  cat_ts_category_names: {len(cat_names)} categories")
 
-    n_patched = 0
-    n_skipped = 0
-    skip_reasons = {}
-    for pr in results.patient_results:
-        for tf, tfr in pr.timeframe_results.items():
-            cat_shap = getattr(tfr, 'cat_ts_shap_per_category', None)
-            if cat_shap is None or cat_shap.ndim != 2:
-                skip_reasons['no shap or wrong ndim'] = skip_reasons.get('no shap or wrong ndim', 0) + 1
-                n_skipped += 1
-                continue
+    print(f"Loading old pickle: {pickle_path}")
+    with open(pickle_path, 'rb') as f:
+        old_results = pkl.load(f)
 
-            # Get multi-hot input: prefer data cache, fall back to stored cat_ts_data
-            if holdout_ts_cat is not None:
-                cat_input = holdout_ts_cat[pr.sample_idx]
-            else:
-                cat_input = getattr(tfr, 'cat_ts_data', None)
-            if cat_input is None:
-                skip_reasons['no input data'] = skip_reasons.get('no input data', 0) + 1
-                n_skipped += 1
-                continue
+    old_pids = old_results.pids
+    print(f"  {len(old_pids)} patients, timeframes: "
+          f"{old_results.get_available_timeframes()}")
 
-            # Align: both should be [n_categories, seq_len]
-            if cat_shap.shape[0] != cat_input.shape[0]:
-                skip_reasons['shape mismatch'] = skip_reasons.get('shape mismatch', 0) + 1
-                n_skipped += 1
-                continue
+    # Load data + model via config
+    import astra.utils as _utils
+    from astra.utils import setup_logging
+    setup_logging(logging.INFO)
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / config_name)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
 
-            eff = tfr.effective_steps
-            if eff <= 0:
-                skip_reasons['eff<=0'] = skip_reasons.get('eff<=0', 0) + 1
-                n_skipped += 1
-                continue
+    if data_cache_path:
+        from astra.data.caching import load_data_cache_from_path
+        print(f"Loading data from explicit cache: {data_cache_path}")
+        data = load_data_cache_from_path(data_cache_path)
+    else:
+        print(f"Loading data via config ({config_name})...")
+        data = prepare_data_and_dls_cached(cfg)
 
-            shap_eff = np.abs(cat_shap[:, :eff])
-            cat_measured = cat_input[:, :eff] != 0.0
-            cat_denom = cat_measured.sum(axis=1).clip(1)
-            importance = (shap_eff * cat_measured).sum(axis=1) / cat_denom
-            tfr.cat_ts_category_importance = importance
-            n_patched += 1
+    print("Loading model...")
+    model, device = prepare_model(data, cfg)
+    model.eval()
 
-    print(f"Patched {n_patched} timeframe results, skipped {n_skipped}")
-    if skip_reasons:
-        print(f"  Skip reasons: {skip_reasons}")
+    # Run TemporalSHAPAnalyzer for the same PIDs
+    analyzer = TemporalSHAPAnalyzer(
+        model, data, data["mixed_dls"].train,
+        device, max_background_samples=200,
+        active_only=True, density_normalize=True,
+    )
 
-    if n_patched == 0:
-        print("ERROR: No timeframe results could be patched — aborting.")
+    all_holdout_pids = get_holdout_pids(data)
+    # Filter to only the PIDs from the old pickle, in dataloader order
+    old_pid_set = set(old_pids)
+    ordered_pids = [p for p in all_holdout_pids if p in old_pid_set]
+    print(f"  Matched {len(ordered_pids)}/{len(old_pids)} PIDs in holdout set")
+
+    if len(ordered_pids) == 0:
+        print("ERROR: No matching PIDs found in holdout set.")
         return
 
-    # Re-aggregate cohort-level cat_ts_per_category_importance
-    from collections import OrderedDict
-    tfs = list(results.cat_ts_per_category_importance.keys()) if results.cat_ts_per_category_importance else []
-    if not tfs:
-        tfs = list({tf for pr in results.patient_results for tf in pr.timeframe_results})
-        tfs.sort(key=lambda t: _TF_ORDER.index(t) if t in _TF_ORDER else 999)
+    print(f"Recomputing SHAP for {len(ordered_pids)} patients...")
+    new_results = analyzer.analyze_cohort(
+        data["holdout_mixed_dls"].train, ordered_pids,
+        max_patients=len(ordered_pids),
+        verbose=True,
+    )
 
-    new_cat_imp = OrderedDict()
-    for tf in tfs:
-        arrays = []
-        for pr in results.patient_results:
-            tfr = pr.timeframe_results.get(tf)
-            if tfr is None:
-                continue
-            imp = getattr(tfr, 'cat_ts_category_importance', None)
-            if imp is not None:
-                arrays.append(imp)
-        new_cat_imp[tf] = np.mean(arrays, axis=0) if arrays else None
-        print(f"  {tf}: {len(arrays)} patients aggregated")
+    # Patch: take ONLY cat_ts fields from new results into old results
+    old_results.cat_ts_per_category_importance = new_results.cat_ts_per_category_importance
+    old_results.cat_ts_category_names = new_results.cat_ts_category_names
+    old_results.cat_ts_gate_values = getattr(new_results, 'cat_ts_gate_values', None)
+    old_results.density_normalize = True
 
-    results.cat_ts_per_category_importance = new_cat_imp
-    results.density_normalize = True
+    print(f"Patched cat_ts_per_category_importance: "
+          f"{len(old_results.cat_ts_per_category_importance)} timeframes")
+    for tf, imp in old_results.cat_ts_per_category_importance.items():
+        n = len(imp) if imp is not None else 0
+        print(f"  {tf}: {n} categories")
 
-    # Save new pickle (avoid double-suffixing if _dn already in name)
+    # Save patched pickle
     base = Path(pickle_path)
     if base.stem.endswith('_dn'):
         new_stem = f"{base.stem}_v2"
@@ -1508,14 +1440,13 @@ def renormalize_cat_ts_from_pickle(
     new_path = str(base.parent / f"{new_stem}{base.suffix}")
     ensure_parent_dir(new_path)
     with open(new_path, 'wb') as f:
-        pkl.dump(results, f)
-    print(f"Saved density-normalized pickle: {new_path}")
+        pkl.dump(old_results, f)
+    print(f"Saved patched pickle: {new_path}")
 
     # Regenerate summary panel
-    if csv_path is None:
-        csv_path = str(base.parent / base.name.replace(
-            'cohort_temporal_shap_results', 'cohort_shap_all_features'
-        ).replace('.pkl', '.csv'))
+    csv_path = str(base.parent / base.name.replace(
+        'cohort_temporal_shap_results', 'cohort_shap_all_features'
+    ).replace('.pkl', '.csv'))
     figure_shap_summary_panel(
         csv_path=csv_path,
         save_dir=save_dir,
@@ -1551,19 +1482,21 @@ def main():
         help='Enable DEBUG logging'
     )
     parser.add_argument(
-        '--renormalize-cat-ts', action='store_true',
-        help='Re-normalize categorical TS SHAP from an existing pickle '
-             '(no data/model needed). Requires --pickle-path.',
+        '--recompute-cat-ts', action='store_true',
+        help='Recompute categorical TS SHAP with density normalization '
+             'for the same patients in an existing pickle. Patches only '
+             'cat TS fields; all other panels remain bit-identical. '
+             'Requires --pickle-path and loads data/model via --config.',
     )
     parser.add_argument(
         '--pickle-path', type=str, default=None,
         help='Path to cohort_temporal_shap_results*.pkl '
-             '(required for --renormalize-cat-ts)',
+             '(required for --recompute-cat-ts)',
     )
     parser.add_argument(
         '--data-cache', type=str, default=None,
-        help='Path to data_cache_*.pkl for multi-hot input '
-             '(for --renormalize-cat-ts when pickle shapes are misaligned)',
+        help='Explicit path to data_cache_*.pkl to bypass cache key '
+             'lookup (use when config has changed since the cache was built)',
     )
     args = parser.parse_args()
 
@@ -1571,12 +1504,14 @@ def main():
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
 
-    # Fast path: renormalize-only (no data/model loading)
-    if args.renormalize_cat_ts:
+    # Fast path: recompute cat TS SHAP only (loads data/model, but only
+    # recomputes categorical TS — all other panels stay bit-identical)
+    if args.recompute_cat_ts:
         if not args.pickle_path:
-            parser.error("--renormalize-cat-ts requires --pickle-path")
-        renormalize_cat_ts_from_pickle(
+            parser.error("--recompute-cat-ts requires --pickle-path")
+        recompute_cat_ts_shap(
             pickle_path=args.pickle_path,
+            config_name=args.config,
             save_dir=OUTPUT_DIR,
             data_cache_path=args.data_cache,
         )
