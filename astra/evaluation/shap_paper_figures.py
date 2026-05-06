@@ -31,6 +31,7 @@ from astra.evaluation.behavior import (
     calculate_shap_from_dataloaders,
     classify_channels,
     create_channel_mapping,
+    extract_data_from_dataloader,
     get_category_names_from_encoding_info,
     get_holdout_pids,
     get_static_cat_names_from_classes,
@@ -1350,13 +1351,19 @@ def figure_shap_summary_panel(
 def renormalize_cat_ts_from_pickle(
     pickle_path: str,
     save_dir: str,
+    config_name: Optional[str] = None,
     csv_path: Optional[str] = None,
 ) -> None:
     """Re-normalize categorical TS SHAP importance from an existing pickle.
 
-    Loads per-patient raw SHAP arrays and input data stored in the pickle,
-    applies density normalization (mean |SHAP| per active event), re-aggregates,
-    saves a new pickle with ``_dn`` suffix, and regenerates the summary panel.
+    Loads per-patient SHAP arrays, retrieves multi-hot input from the cached
+    data object, applies density normalization, re-aggregates, saves a new
+    pickle, and regenerates the summary panel.
+
+    Args:
+        config_name: Config YAML filename (e.g. 'defaults.yaml') to load the
+            cached data object for multi-hot input tensors. Required when the
+            pickle doesn't store aligned cat_ts_data per patient.
     """
     import pickle as pkl
 
@@ -1374,13 +1381,48 @@ def renormalize_cat_ts_from_pickle(
     tf0 = next(iter(pr0.timeframe_results))
     tfr0 = pr0.timeframe_results[tf0]
     print(f"Pickle has {n_patients} patients, timeframes: {list(pr0.timeframe_results.keys())}")
-    print(f"  Sample patient fields — cat_ts_shap_per_category: "
-          f"{type(getattr(tfr0, 'cat_ts_shap_per_category', 'MISSING'))}, "
-          f"cat_ts_data: {type(getattr(tfr0, 'cat_ts_data', 'MISSING'))}")
-    if getattr(tfr0, 'cat_ts_shap_per_category', None) is not None:
-        print(f"  cat_ts_shap_per_category shape: {tfr0.cat_ts_shap_per_category.shape}")
-    if getattr(tfr0, 'cat_ts_data', None) is not None:
-        print(f"  cat_ts_data shape: {tfr0.cat_ts_data.shape}")
+
+    cat_shap0 = getattr(tfr0, 'cat_ts_shap_per_category', None)
+    cat_data0 = getattr(tfr0, 'cat_ts_data', None)
+    print(f"  cat_ts_shap_per_category: {cat_shap0.shape if cat_shap0 is not None else 'None'}")
+    print(f"  cat_ts_data: {cat_data0.shape if cat_data0 is not None else 'None'}")
+
+    # Squeeze trailing singleton from GradientExplainer if present
+    for pr in results.patient_results:
+        for tf, tfr in pr.timeframe_results.items():
+            s = getattr(tfr, 'cat_ts_shap_per_category', None)
+            if s is not None and s.ndim == 3 and s.shape[-1] == 1:
+                tfr.cat_ts_shap_per_category = s.squeeze(-1)
+
+    cat_shap0 = tfr0.cat_ts_shap_per_category
+    if cat_shap0 is not None:
+        print(f"  After squeeze: cat_ts_shap_per_category {cat_shap0.shape}")
+
+    # Load multi-hot input from data cache if shapes don't align
+    holdout_ts_cat = None
+    need_data = (cat_shap0 is not None and cat_data0 is not None
+                 and cat_shap0.shape[0] != cat_data0.shape[0])
+    if need_data or cat_data0 is None:
+        if not config_name:
+            print("ERROR: Pickle cat_ts shapes are misaligned — need --config to load "
+                  "multi-hot input from data cache.")
+            if cat_shap0 is not None and cat_data0 is not None:
+                print(f"  SHAP categories={cat_shap0.shape[0]}, "
+                      f"data categories={cat_data0.shape[0]}")
+            return
+        print(f"Loading data cache (config={config_name}) for multi-hot input...")
+        import astra.utils as _utils
+        _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / config_name)
+        _utils.cfg.clear()
+        _utils.cfg.update(_cfg)
+        data = prepare_data_and_dls_cached(cfg)
+        holdout_dl = data.get("holdout_mixed_dls")
+        if holdout_dl is None:
+            print("ERROR: No holdout_mixed_dls in data cache.")
+            return
+        _, x_ts_cat_full, _, _, _, _ = extract_data_from_dataloader(holdout_dl)
+        holdout_ts_cat = x_ts_cat_full.numpy()
+        print(f"  Holdout multi-hot shape: {holdout_ts_cat.shape}")
 
     cat_names = (
         getattr(results, 'cat_ts_category_names', [])
@@ -1388,9 +1430,6 @@ def renormalize_cat_ts_from_pickle(
             if results.encoding_info else [])
     )
     print(f"  cat_ts_category_names: {len(cat_names)} categories")
-    print(f"  encoding_info: {'present' if results.encoding_info else 'MISSING'}")
-    print(f"  existing cat_ts_per_category_importance: "
-          f"{len(getattr(results, 'cat_ts_per_category_importance', {}) or {})} timeframes")
 
     n_patched = 0
     n_skipped = 0
@@ -1398,23 +1437,35 @@ def renormalize_cat_ts_from_pickle(
     for pr in results.patient_results:
         for tf, tfr in pr.timeframe_results.items():
             cat_shap = getattr(tfr, 'cat_ts_shap_per_category', None)
-            cat_data = getattr(tfr, 'cat_ts_data', None)
-            if cat_shap is None:
-                skip_reasons['cat_ts_shap_per_category=None'] = skip_reasons.get('cat_ts_shap_per_category=None', 0) + 1
+            if cat_shap is None or cat_shap.ndim != 2:
+                skip_reasons['no shap or wrong ndim'] = skip_reasons.get('no shap or wrong ndim', 0) + 1
                 n_skipped += 1
                 continue
-            if cat_data is None:
-                skip_reasons['cat_ts_data=None'] = skip_reasons.get('cat_ts_data=None', 0) + 1
+
+            # Get multi-hot input: prefer data cache, fall back to stored cat_ts_data
+            if holdout_ts_cat is not None:
+                cat_input = holdout_ts_cat[pr.sample_idx]
+            else:
+                cat_input = getattr(tfr, 'cat_ts_data', None)
+            if cat_input is None:
+                skip_reasons['no input data'] = skip_reasons.get('no input data', 0) + 1
                 n_skipped += 1
                 continue
+
+            # Align: both should be [n_categories, seq_len]
+            if cat_shap.shape[0] != cat_input.shape[0]:
+                skip_reasons['shape mismatch'] = skip_reasons.get('shape mismatch', 0) + 1
+                n_skipped += 1
+                continue
+
             eff = tfr.effective_steps
-            if eff <= 0 or cat_shap.ndim != 2:
-                skip_reasons['eff<=0 or wrong ndim'] = skip_reasons.get('eff<=0 or wrong ndim', 0) + 1
+            if eff <= 0:
+                skip_reasons['eff<=0'] = skip_reasons.get('eff<=0', 0) + 1
                 n_skipped += 1
                 continue
 
             shap_eff = np.abs(cat_shap[:, :eff])
-            cat_measured = cat_data[:, :eff] != 0.0
+            cat_measured = cat_input[:, :eff] != 0.0
             cat_denom = cat_measured.sum(axis=1).clip(1)
             importance = (shap_eff * cat_measured).sum(axis=1) / cat_denom
             tfr.cat_ts_category_importance = importance
@@ -1426,9 +1477,6 @@ def renormalize_cat_ts_from_pickle(
 
     if n_patched == 0:
         print("ERROR: No timeframe results could be patched — aborting.")
-        print("The pickle does not contain the per-patient raw data needed for "
-              "post-hoc renormalization. Re-run TemporalSHAPAnalyzer with "
-              "density_normalize=True on the current branch instead.")
         return
 
     # Re-aggregate cohort-level cat_ts_per_category_importance
@@ -1464,7 +1512,7 @@ def renormalize_cat_ts_from_pickle(
     ensure_parent_dir(new_path)
     with open(new_path, 'wb') as f:
         pkl.dump(results, f)
-    logger.info(f"Saved density-normalized pickle: {new_path}")
+    print(f"Saved density-normalized pickle: {new_path}")
 
     # Regenerate summary panel
     if csv_path is None:
@@ -1528,6 +1576,7 @@ def main():
         renormalize_cat_ts_from_pickle(
             pickle_path=args.pickle_path,
             save_dir=OUTPUT_DIR,
+            config_name=args.config,
         )
         return
 
