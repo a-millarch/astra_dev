@@ -1131,7 +1131,7 @@ def figure_shap_summary_panel(
     # Figure setup: 3x2 grid
     # ========================================================================
     fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(3, 2, hspace=0.50, wspace=0.30,
+    gs = fig.add_gridspec(3, 2, hspace=0.50, wspace=0.45,
                           height_ratios=[1, 1.2, 1])
 
     # ========================================================================
