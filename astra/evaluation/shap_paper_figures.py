@@ -3,10 +3,13 @@ SHAP analysis figures for JMIR paper submission.
 
 Usage:
     python -m astra.evaluation.shap_paper_figures [--recompute] [--figures-only]
+    python -m astra.evaluation.shap_paper_figures --renormalize-cat-ts --pickle-path <path>
 
 Flags:
-    --recompute    Force recomputation of SHAP values (default: load cached if available)
-    --figures-only  Skip SHAP computation, only regenerate figures from cached results
+    --recompute           Force recomputation of SHAP values
+    --figures-only        Skip SHAP computation, regenerate figures from cache
+    --renormalize-cat-ts  Re-normalize categorical TS SHAP from existing pickle (no data/model needed)
+    --pickle-path         Path to cohort_temporal_shap_results*.pkl (for --renormalize-cat-ts)
 """
 
 import argparse
@@ -1057,6 +1060,7 @@ def figure_shap_summary_panel(
     save_dir: str,
     pickle_path: Optional[str] = None,
     max_display: int = 15,
+    save_suffix: str = "",
 ) -> None:
     """Paper-quality 3x2 SHAP summary panel.
 
@@ -1334,8 +1338,109 @@ def figure_shap_summary_panel(
     # Save
     # ========================================================================
     plt.tight_layout()
-    _save_shap_figure(fig, save_dir, 'figure_shap_summary_panel')
-    logger.info(f"Summary panel figure saved to {save_dir}")
+    stem = f'figure_shap_summary_panel{save_suffix}'
+    _save_shap_figure(fig, save_dir, stem)
+    logger.info(f"Summary panel figure saved to {save_dir}/{stem}")
+
+
+# ============================================================================
+# Post-hoc density renormalization
+# ============================================================================
+
+def renormalize_cat_ts_from_pickle(
+    pickle_path: str,
+    save_dir: str,
+    csv_path: Optional[str] = None,
+) -> None:
+    """Re-normalize categorical TS SHAP importance from an existing pickle.
+
+    Loads per-patient raw SHAP arrays and input data stored in the pickle,
+    applies density normalization (mean |SHAP| per active event), re-aggregates,
+    saves a new pickle with ``_dn`` suffix, and regenerates the summary panel.
+    """
+    import pickle as pkl
+
+    logger.info(f"Loading pickle: {pickle_path}")
+    with open(pickle_path, 'rb') as f:
+        results = pkl.load(f)
+
+    if not results.patient_results:
+        logger.error(
+            "Pickle has no patient_results — cannot renormalize post-hoc. "
+            "Re-run TemporalSHAPAnalyzer with density_normalize=True instead."
+        )
+        return
+
+    cat_names = (
+        getattr(results, 'cat_ts_category_names', [])
+        or (get_category_names_from_encoding_info(results.encoding_info)
+            if results.encoding_info else [])
+    )
+
+    n_patched = 0
+    n_skipped = 0
+    for pr in results.patient_results:
+        for tf, tfr in pr.timeframe_results.items():
+            cat_shap = getattr(tfr, 'cat_ts_shap_per_category', None)
+            cat_data = getattr(tfr, 'cat_ts_data', None)
+            if cat_shap is None or cat_data is None:
+                n_skipped += 1
+                continue
+            eff = tfr.effective_steps
+            if eff <= 0 or cat_shap.ndim != 2:
+                n_skipped += 1
+                continue
+
+            shap_eff = np.abs(cat_shap[:, :eff])
+            cat_measured = cat_data[:, :eff] != 0.0
+            cat_denom = cat_measured.sum(axis=1).clip(1)
+            importance = (shap_eff * cat_measured).sum(axis=1) / cat_denom
+            tfr.cat_ts_category_importance = importance
+            n_patched += 1
+
+    logger.info(f"Patched {n_patched} timeframe results ({n_skipped} skipped)")
+
+    # Re-aggregate cohort-level cat_ts_per_category_importance
+    from collections import OrderedDict
+    tfs = list(results.cat_ts_per_category_importance.keys()) if results.cat_ts_per_category_importance else []
+    if not tfs:
+        tfs = list({tf for pr in results.patient_results for tf in pr.timeframe_results})
+        tfs.sort(key=lambda t: _TF_ORDER.index(t) if t in _TF_ORDER else 999)
+
+    new_cat_imp = OrderedDict()
+    for tf in tfs:
+        arrays = []
+        for pr in results.patient_results:
+            tfr = pr.timeframe_results.get(tf)
+            if tfr is None:
+                continue
+            imp = getattr(tfr, 'cat_ts_category_importance', None)
+            if imp is not None:
+                arrays.append(imp)
+        new_cat_imp[tf] = np.mean(arrays, axis=0) if arrays else None
+
+    results.cat_ts_per_category_importance = new_cat_imp
+    results.density_normalize = True
+
+    # Save new pickle
+    base = Path(pickle_path)
+    new_path = str(base.parent / f"{base.stem}_dn{base.suffix}")
+    ensure_parent_dir(new_path)
+    with open(new_path, 'wb') as f:
+        pkl.dump(results, f)
+    logger.info(f"Saved density-normalized pickle: {new_path}")
+
+    # Regenerate summary panel
+    if csv_path is None:
+        csv_path = str(base.parent / base.name.replace(
+            'cohort_temporal_shap_results', 'cohort_shap_all_features'
+        ).replace('.pkl', '.csv'))
+    figure_shap_summary_panel(
+        csv_path=csv_path,
+        save_dir=save_dir,
+        pickle_path=new_path,
+        save_suffix='_dn',
+    )
 
 
 # ============================================================================
@@ -1364,11 +1469,31 @@ def main():
         '--verbose', action='store_true',
         help='Enable DEBUG logging'
     )
+    parser.add_argument(
+        '--renormalize-cat-ts', action='store_true',
+        help='Re-normalize categorical TS SHAP from an existing pickle '
+             '(no data/model needed). Requires --pickle-path.',
+    )
+    parser.add_argument(
+        '--pickle-path', type=str, default=None,
+        help='Path to cohort_temporal_shap_results*.pkl '
+             '(required for --renormalize-cat-ts)',
+    )
     args = parser.parse_args()
 
     # Logging setup
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+
+    # Fast path: renormalize-only (no data/model loading)
+    if args.renormalize_cat_ts:
+        if not args.pickle_path:
+            parser.error("--renormalize-cat-ts requires --pickle-path")
+        renormalize_cat_ts_from_pickle(
+            pickle_path=args.pickle_path,
+            save_dir=OUTPUT_DIR,
+        )
+        return
 
     # Load config from configs/ dir (mutate in place so imported references stay valid)
     import astra.utils as _utils
