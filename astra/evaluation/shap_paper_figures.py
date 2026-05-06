@@ -1351,7 +1351,7 @@ def figure_shap_summary_panel(
 def renormalize_cat_ts_from_pickle(
     pickle_path: str,
     save_dir: str,
-    config_name: Optional[str] = None,
+    data_cache_path: Optional[str] = None,
     csv_path: Optional[str] = None,
 ) -> None:
     """Re-normalize categorical TS SHAP importance from an existing pickle.
@@ -1361,9 +1361,8 @@ def renormalize_cat_ts_from_pickle(
     pickle, and regenerates the summary panel.
 
     Args:
-        config_name: Config YAML filename (e.g. 'defaults.yaml') to load the
-            cached data object for multi-hot input tensors. Required when the
-            pickle doesn't store aligned cat_ts_data per patient.
+        data_cache_path: Path to data_cache_*.pkl file. Required when the
+            pickle's per-patient cat_ts_data doesn't align with SHAP shapes.
     """
     import pickle as pkl
 
@@ -1403,19 +1402,16 @@ def renormalize_cat_ts_from_pickle(
     need_data = (cat_shap0 is not None and cat_data0 is not None
                  and cat_shap0.shape[0] != cat_data0.shape[0])
     if need_data or cat_data0 is None:
-        if not config_name:
-            print("ERROR: Pickle cat_ts shapes are misaligned — need --config to load "
-                  "multi-hot input from data cache.")
+        if not data_cache_path:
+            print("ERROR: Pickle cat_ts shapes are misaligned — need --data-cache "
+                  "to load multi-hot input.")
             if cat_shap0 is not None and cat_data0 is not None:
                 print(f"  SHAP categories={cat_shap0.shape[0]}, "
                       f"data categories={cat_data0.shape[0]}")
             return
-        print(f"Loading data cache (config={config_name}) for multi-hot input...")
-        import astra.utils as _utils
-        _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / config_name)
-        _utils.cfg.clear()
-        _utils.cfg.update(_cfg)
-        data = prepare_data_and_dls_cached(cfg)
+        print(f"Loading data cache: {data_cache_path}")
+        with open(data_cache_path, 'rb') as f:
+            data = pkl.load(f)
         holdout_dl = data.get("holdout_mixed_dls")
         if holdout_dl is None:
             print("ERROR: No holdout_mixed_dls in data cache.")
@@ -1563,6 +1559,11 @@ def main():
         help='Path to cohort_temporal_shap_results*.pkl '
              '(required for --renormalize-cat-ts)',
     )
+    parser.add_argument(
+        '--data-cache', type=str, default=None,
+        help='Path to data_cache_*.pkl for multi-hot input '
+             '(for --renormalize-cat-ts when pickle shapes are misaligned)',
+    )
     args = parser.parse_args()
 
     # Logging setup
@@ -1576,7 +1577,7 @@ def main():
         renormalize_cat_ts_from_pickle(
             pickle_path=args.pickle_path,
             save_dir=OUTPUT_DIR,
-            config_name=args.config,
+            data_cache_path=args.data_cache,
         )
         return
 
