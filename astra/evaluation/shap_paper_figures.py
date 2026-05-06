@@ -1360,34 +1360,56 @@ def renormalize_cat_ts_from_pickle(
     """
     import pickle as pkl
 
-    logger.info(f"Loading pickle: {pickle_path}")
+    print(f"Loading pickle: {pickle_path}")
     with open(pickle_path, 'rb') as f:
         results = pkl.load(f)
 
     if not results.patient_results:
-        logger.error(
-            "Pickle has no patient_results — cannot renormalize post-hoc. "
-            "Re-run TemporalSHAPAnalyzer with density_normalize=True instead."
-        )
+        print("ERROR: Pickle has no patient_results — cannot renormalize post-hoc.")
+        print("Re-run TemporalSHAPAnalyzer with density_normalize=True instead.")
         return
+
+    n_patients = len(results.patient_results)
+    pr0 = results.patient_results[0]
+    tf0 = next(iter(pr0.timeframe_results))
+    tfr0 = pr0.timeframe_results[tf0]
+    print(f"Pickle has {n_patients} patients, timeframes: {list(pr0.timeframe_results.keys())}")
+    print(f"  Sample patient fields — cat_ts_shap_per_category: "
+          f"{type(getattr(tfr0, 'cat_ts_shap_per_category', 'MISSING'))}, "
+          f"cat_ts_data: {type(getattr(tfr0, 'cat_ts_data', 'MISSING'))}")
+    if getattr(tfr0, 'cat_ts_shap_per_category', None) is not None:
+        print(f"  cat_ts_shap_per_category shape: {tfr0.cat_ts_shap_per_category.shape}")
+    if getattr(tfr0, 'cat_ts_data', None) is not None:
+        print(f"  cat_ts_data shape: {tfr0.cat_ts_data.shape}")
 
     cat_names = (
         getattr(results, 'cat_ts_category_names', [])
         or (get_category_names_from_encoding_info(results.encoding_info)
             if results.encoding_info else [])
     )
+    print(f"  cat_ts_category_names: {len(cat_names)} categories")
+    print(f"  encoding_info: {'present' if results.encoding_info else 'MISSING'}")
+    print(f"  existing cat_ts_per_category_importance: "
+          f"{len(getattr(results, 'cat_ts_per_category_importance', {}) or {})} timeframes")
 
     n_patched = 0
     n_skipped = 0
+    skip_reasons = {}
     for pr in results.patient_results:
         for tf, tfr in pr.timeframe_results.items():
             cat_shap = getattr(tfr, 'cat_ts_shap_per_category', None)
             cat_data = getattr(tfr, 'cat_ts_data', None)
-            if cat_shap is None or cat_data is None:
+            if cat_shap is None:
+                skip_reasons['cat_ts_shap_per_category=None'] = skip_reasons.get('cat_ts_shap_per_category=None', 0) + 1
+                n_skipped += 1
+                continue
+            if cat_data is None:
+                skip_reasons['cat_ts_data=None'] = skip_reasons.get('cat_ts_data=None', 0) + 1
                 n_skipped += 1
                 continue
             eff = tfr.effective_steps
             if eff <= 0 or cat_shap.ndim != 2:
+                skip_reasons['eff<=0 or wrong ndim'] = skip_reasons.get('eff<=0 or wrong ndim', 0) + 1
                 n_skipped += 1
                 continue
 
@@ -1398,7 +1420,16 @@ def renormalize_cat_ts_from_pickle(
             tfr.cat_ts_category_importance = importance
             n_patched += 1
 
-    logger.info(f"Patched {n_patched} timeframe results ({n_skipped} skipped)")
+    print(f"Patched {n_patched} timeframe results, skipped {n_skipped}")
+    if skip_reasons:
+        print(f"  Skip reasons: {skip_reasons}")
+
+    if n_patched == 0:
+        print("ERROR: No timeframe results could be patched — aborting.")
+        print("The pickle does not contain the per-patient raw data needed for "
+              "post-hoc renormalization. Re-run TemporalSHAPAnalyzer with "
+              "density_normalize=True on the current branch instead.")
+        return
 
     # Re-aggregate cohort-level cat_ts_per_category_importance
     from collections import OrderedDict
@@ -1418,6 +1449,7 @@ def renormalize_cat_ts_from_pickle(
             if imp is not None:
                 arrays.append(imp)
         new_cat_imp[tf] = np.mean(arrays, axis=0) if arrays else None
+        print(f"  {tf}: {len(arrays)} patients aggregated")
 
     results.cat_ts_per_category_importance = new_cat_imp
     results.density_normalize = True
