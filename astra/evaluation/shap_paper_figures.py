@@ -1422,9 +1422,13 @@ def renormalize_cat_ts_from_pickle(
     results.cat_ts_per_category_importance = new_cat_imp
     results.density_normalize = True
 
-    # Save new pickle
+    # Save new pickle (avoid double-suffixing if _dn already in name)
     base = Path(pickle_path)
-    new_path = str(base.parent / f"{base.stem}_dn{base.suffix}")
+    if base.stem.endswith('_dn'):
+        new_stem = f"{base.stem}_v2"
+    else:
+        new_stem = f"{base.stem}_dn"
+    new_path = str(base.parent / f"{new_stem}{base.suffix}")
     ensure_parent_dir(new_path)
     with open(new_path, 'wb') as f:
         pkl.dump(results, f)
@@ -1439,7 +1443,7 @@ def renormalize_cat_ts_from_pickle(
         csv_path=csv_path,
         save_dir=save_dir,
         pickle_path=new_path,
-        save_suffix='_dn',
+        save_suffix='_v2',
     )
 
 
