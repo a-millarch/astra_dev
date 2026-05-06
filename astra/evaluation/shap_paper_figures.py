@@ -1128,7 +1128,7 @@ def figure_shap_summary_panel(
     # Figure setup: 3x2 grid
     # ========================================================================
     fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(3, 2, hspace=0.40, wspace=0.30,
+    gs = fig.add_gridspec(3, 2, hspace=0.50, wspace=0.30,
                           height_ratios=[1, 1.2, 1])
 
     # ========================================================================
@@ -1202,7 +1202,7 @@ def figure_shap_summary_panel(
         elif row['source'] == 'categorical':
             bar_colors.append('#00d4aa')
         else:
-            bar_colors.append('#008bfb')
+            bar_colors.append('#ff0051')
 
     y_pos = range(len(combined))
     channel_display_names = _clean_feature_names(list(combined['name']))
@@ -1216,7 +1216,7 @@ def figure_shap_summary_panel(
 
     # Legend for feature types
     from matplotlib.patches import Patch
-    legend_handles = [Patch(facecolor='#008bfb', alpha=0.7, label='Continuous TS')]
+    legend_handles = [Patch(facecolor='#ff0051', alpha=0.7, label='Continuous TS')]
     if len(cat_ts) > 0 and (combined['source'] == 'categorical').any():
         legend_handles.append(Patch(facecolor='#00d4aa', alpha=0.7, label='Categorical TS'))
     ax_b.legend(handles=legend_handles, loc='lower right', fontsize=9)
