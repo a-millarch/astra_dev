@@ -814,10 +814,13 @@ _AGG_SUFFIXES = ('_max', '_min', '_mean', '_std', '_count')
 
 
 def _clean_feature_name(name: str) -> str:
-    """Strip aggregation suffixes (_max, _min, _mean, _std) for display."""
+    """Strip aggregation suffixes and shorten prefixes for display."""
     for suffix in _AGG_SUFFIXES:
         if name.endswith(suffix):
-            return name[:-len(suffix)]
+            name = name[:-len(suffix)]
+            break
+    if name.startswith('medication:'):
+        name = 'med:' + name[len('medication:'):]
     return name
 
 
