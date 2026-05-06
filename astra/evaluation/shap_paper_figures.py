@@ -1168,35 +1168,58 @@ def figure_shap_summary_panel(
     ax_a.grid(True, alpha=0.3)
 
     # ========================================================================
-    # Panel B: Top N Channels (bar chart)
+    # Panel B: Top N Features — combined continuous TS + categorical TS
     # ========================================================================
     ax_b = fig.add_subplot(gs[0, 1])
     _add_subplot_label(ax_b, 'B')
 
-    # Average importance across timeframes per channel
-    channel_avg = (clinical_temporal
-                   .groupby('feature')['mean_abs_shap']
-                   .mean()
-                   .sort_values(ascending=False)
-                   .head(max_display))
+    # Continuous TS: average importance across timeframes per channel
+    cont_avg = (clinical_temporal
+                .groupby('feature')['mean_abs_shap']
+                .mean())
+    cont_avg_df = cont_avg.reset_index()
+    cont_avg_df.columns = ['name', 'importance']
+    cont_avg_df['source'] = 'continuous'
 
-    # Color: EBM channels orange, clinical blue
+    # Categorical TS: average importance across timeframes per category
+    if len(cat_ts) > 0:
+        cat_avg_series = (cat_ts
+                          .groupby('display_name')['mean_abs_shap']
+                          .mean())
+        cat_avg_df = cat_avg_series.reset_index()
+        cat_avg_df.columns = ['name', 'importance']
+        cat_avg_df['source'] = 'categorical'
+        combined = pd.concat([cont_avg_df, cat_avg_df], ignore_index=True)
+    else:
+        combined = cont_avg_df
+
+    combined = combined.sort_values('importance', ascending=False).head(max_display)
+
     bar_colors = []
-    for feat in channel_avg.index:
-        if feat in _EBM_CHANNEL_NAMES:
+    for _, row in combined.iterrows():
+        if row['name'] in _EBM_CHANNEL_NAMES:
             bar_colors.append('#FF9800')
+        elif row['source'] == 'categorical':
+            bar_colors.append('#00d4aa')
         else:
             bar_colors.append('#008bfb')
 
-    y_pos = range(len(channel_avg))
-    channel_display_names = _clean_feature_names(list(channel_avg.index))
-    ax_b.barh(y_pos, channel_avg.values, color=bar_colors, alpha=0.7)
+    y_pos = range(len(combined))
+    channel_display_names = _clean_feature_names(list(combined['name']))
+    ax_b.barh(y_pos, combined['importance'].values, color=bar_colors, alpha=0.7)
     ax_b.set_yticks(y_pos)
     ax_b.set_yticklabels(channel_display_names)
     ax_b.set_xlabel(_shap_label)
-    ax_b.set_title(f'Top {len(channel_avg)} Channels{_dn_suffix}', fontweight='bold')
+    ax_b.set_title(f'Top {len(combined)} Features{_dn_suffix}', fontweight='bold')
     ax_b.grid(True, alpha=0.3, axis='x')
     ax_b.invert_yaxis()
+
+    # Legend for feature types
+    from matplotlib.patches import Patch
+    legend_handles = [Patch(facecolor='#008bfb', alpha=0.7, label='Continuous TS')]
+    if len(cat_ts) > 0 and (combined['source'] == 'categorical').any():
+        legend_handles.append(Patch(facecolor='#00d4aa', alpha=0.7, label='Categorical TS'))
+    ax_b.legend(handles=legend_handles, loc='lower right', fontsize=9)
 
     # ========================================================================
     # Panel C: Categorical TS |SHAP| Heatmap
@@ -1249,7 +1272,7 @@ def figure_shap_summary_panel(
     _add_subplot_label(ax_d, 'D')
 
     # Build matrix: channels x timeframes (top N by overall importance)
-    top_channels = channel_avg.head(max_display).index.tolist()
+    top_channels = cont_avg.sort_values(ascending=False).head(max_display).index.tolist()
 
     cont_matrix = np.zeros((len(top_channels), len(timeframes)))
     for col_idx, tf in enumerate(timeframes):
