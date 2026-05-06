@@ -1505,6 +1505,15 @@ def main():
         help='Enable DEBUG logging'
     )
     parser.add_argument(
+        '--summary-panel-only', action='store_true',
+        help='Regenerate summary panel figure from an existing pickle. '
+             'No SHAP computation or data loading. Requires --pickle-path.',
+    )
+    parser.add_argument(
+        '--save-suffix', type=str, default='',
+        help='Suffix for output filenames (e.g. "_v2")',
+    )
+    parser.add_argument(
         '--recompute-cat-ts', action='store_true',
         help='Recompute categorical TS SHAP with density normalization '
              'for the same patients in an existing pickle. Patches only '
@@ -1526,6 +1535,22 @@ def main():
     # Logging setup
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+
+    # Fast path: regenerate summary panel from existing pickle (no data/model)
+    if args.summary_panel_only:
+        if not args.pickle_path:
+            parser.error("--summary-panel-only requires --pickle-path")
+        base = Path(args.pickle_path)
+        csv_path = str(base.parent / base.name.replace(
+            'cohort_temporal_shap_results', 'cohort_shap_all_features'
+        ).replace('.pkl', '.csv'))
+        figure_shap_summary_panel(
+            csv_path=csv_path,
+            save_dir=OUTPUT_DIR,
+            pickle_path=args.pickle_path,
+            save_suffix=args.save_suffix,
+        )
+        return
 
     # Fast path: recompute cat TS SHAP only (loads data/model, but only
     # recomputes categorical TS — all other panels stay bit-identical)
