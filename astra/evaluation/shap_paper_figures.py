@@ -1411,13 +1411,14 @@ def renormalize_cat_ts_from_pickle(
             return
         print(f"Loading data cache: {data_cache_path}")
         with open(data_cache_path, 'rb') as f:
-            data = pkl.load(f)
-        holdout_dl = data.get("holdout_mixed_dls")
-        if holdout_dl is None:
-            print("ERROR: No holdout_mixed_dls in data cache.")
+            cache_data = pkl.load(f)
+        # Cache stores holdout multi-hot as 'tX_multi_hot'
+        tX_mh = cache_data.get("tX_multi_hot")
+        if tX_mh is None:
+            print(f"ERROR: No tX_multi_hot in data cache. "
+                  f"Available keys: {sorted(cache_data.keys())}")
             return
-        _, x_ts_cat_full, _, _, _, _ = extract_data_from_dataloader(holdout_dl)
-        holdout_ts_cat = x_ts_cat_full.numpy()
+        holdout_ts_cat = np.array(tX_mh) if not isinstance(tX_mh, np.ndarray) else tX_mh
         print(f"  Holdout multi-hot shape: {holdout_ts_cat.shape}")
 
     cat_names = (
