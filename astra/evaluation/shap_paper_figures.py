@@ -1370,6 +1370,69 @@ def figure_shap_summary_panel(
 
 
 # ============================================================================
+# CSV export from pickle
+# ============================================================================
+
+def export_csv_from_pickle(pickle_path: str, output_path: str) -> None:
+    """Regenerate cohort_shap_all_features CSV from a pickle."""
+    import pickle as pkl
+
+    print(f"Loading pickle: {pickle_path}")
+    with open(pickle_path, 'rb') as f:
+        results = pkl.load(f)
+
+    rows = []
+    for tf in results.get_available_timeframes():
+        ch_imp = results.channel_importance[tf]
+        ch_std = results.channel_importance_std[tf]
+        for i in range(len(ch_imp)):
+            rows.append({
+                'timeframe': tf,
+                'channel_idx': i,
+                'feature': results.channel2feature.get(int(i), f'Ch{i}'),
+                'mean_abs_shap': float(ch_imp[i]),
+                'std_abs_shap': float(ch_std[i]),
+                'n_patients': results.patient_counts[tf],
+            })
+        cat_imp = results.static_cat_importance.get(tf)
+        if cat_imp is not None:
+            for j, name in enumerate(results.static_cat_names):
+                if j < len(cat_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cat:{name}',
+                        'mean_abs_shap': float(cat_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        cont_imp = results.static_cont_importance.get(tf)
+        if cont_imp is not None:
+            for j, name in enumerate(results.static_cont_names):
+                if j < len(cont_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cont:{name}',
+                        'mean_abs_shap': float(cont_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        cat_ts_imp = results.cat_ts_per_category_importance.get(tf)
+        if cat_ts_imp is not None:
+            for j, name in enumerate(results.cat_ts_category_names):
+                if j < len(cat_ts_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'cat_ts:{name}',
+                        'mean_abs_shap': float(np.mean(cat_ts_imp[j])),
+                        'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+
+    df = pd.DataFrame(rows)
+    ensure_parent_dir(output_path)
+    df.to_csv(output_path, index=False)
+    print(f"Exported {len(df)} rows to {output_path}")
+
+
+# ============================================================================
 # Post-hoc density renormalization
 # ============================================================================
 
@@ -1539,7 +1602,7 @@ def main():
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
 
-    # Fast path: regenerate summary panel from existing pickle (no data/model)
+    # Fast path: regenerate summary panel + CSV from existing pickle (no data/model)
     if args.summary_panel_only:
         if not args.pickle_path:
             parser.error("--summary-panel-only requires --pickle-path")
@@ -1547,6 +1610,7 @@ def main():
         csv_path = str(base.parent / base.name.replace(
             'cohort_temporal_shap_results', 'cohort_shap_all_features'
         ).replace('.pkl', '.csv'))
+        export_csv_from_pickle(args.pickle_path, csv_path)
         figure_shap_summary_panel(
             csv_path=csv_path,
             save_dir=OUTPUT_DIR,
