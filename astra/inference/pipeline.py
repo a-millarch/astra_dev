@@ -345,13 +345,30 @@ class InferenceSession:
     # ------------------------------------------------------------------
 
     def _calibrate(self, prob, step=None):
-        """Apply posthoc calibration to a probability or array of probabilities."""
-        if self._calibrators is None and self._global_calibrator is None:
-            return prob
-        from astra.evaluation.posthoc_calibration import apply_calibrator
+        """Apply posthoc calibration to a probability or array of probabilities.
+
+        Supports three calibrator types (checked in priority order):
+        1. ``TemporalCalibrator`` — per-window calibration, preferred for
+           temporal models.
+        2. Per-step dict of sklearn calibrators (legacy).
+        3. Global sklearn calibrator fallback.
+        """
+        from astra.evaluation.posthoc_calibration import TemporalCalibrator
 
         is_scalar = isinstance(prob, (float, np.floating))
         arr = np.atleast_1d(np.asarray(prob, dtype=np.float64))
+
+        # Prefer TemporalCalibrator if available
+        if isinstance(self._calibrators, TemporalCalibrator):
+            if step is not None:
+                calibrated = self._calibrators.transform_at_step(arr, step)
+            else:
+                calibrated = arr
+            return float(calibrated[0]) if is_scalar else calibrated
+
+        if self._calibrators is None and self._global_calibrator is None:
+            return prob
+        from astra.evaluation.posthoc_calibration import apply_calibrator
 
         cal = None
         if step is not None and self._calibrators and step in self._calibrators:

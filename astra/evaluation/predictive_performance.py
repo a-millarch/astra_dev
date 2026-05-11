@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from astra.utils import save_figure
+from astra.utils import save_figure, ensure_parent_dir
 from astra.data.dataloader import normalize_with_padding_mask
 from astra.data.mixed_dataloader import (
     AstraMixedDataset,
@@ -767,16 +767,19 @@ class TemporalEvaluator:
     """
 
     def __init__(self, data: dict, model: torch.nn.Module, cfg: dict,
-                 device: str = 'cuda', active_only: bool = False):
+                 device: str = 'cuda', active_only: bool = False,
+                 calibrator=None):
         self.data = data
         self.model = model
         self.cfg = cfg
         self.device = device
         self.active_only = active_only
         self.survival_mode = cfg.get("model", {}).get("survival_mode", False)
+        self.calibrator = calibrator
         self.model.eval()
 
         self._holdout_preds = None
+        self._holdout_preds_calibrated = None
         self._holdout_survival = None  # [N, seq_len] survival probs S(t)
         self._holdout_traj_lengths = np.array(
             data.get("holdout_trajectory_lengths",
@@ -786,36 +789,47 @@ class TemporalEvaluator:
 
         mode_str = " (active-only mode)" if active_only else ""
         surv_str = " [survival]" if self.survival_mode else ""
-        logger.info(f"TemporalEvaluator initialized{mode_str}{surv_str}")
+        cal_str = " [calibrated]" if calibrator is not None else ""
+        logger.info(f"TemporalEvaluator initialized{mode_str}{surv_str}{cal_str}")
 
-    def _get_all_predictions(self) -> np.ndarray:
+    def _get_all_predictions(self, calibrated: bool = True) -> np.ndarray:
         """Get per-timestep predictions.
 
         For classification: sigmoid probabilities [N, seq_len].
         For survival: cumulative incidence 1-S(t) [N, seq_len].
+
+        Args:
+            calibrated: If True and a calibrator is set, return calibrated
+                probabilities.  Raw predictions are always cached separately.
         """
-        if self._holdout_preds is not None:
-            return self._holdout_preds
+        if self._holdout_preds is None:
+            holdout_dls = self.data["holdout_mixed_dls"]
+            all_logits = []
 
-        holdout_dls = self.data["holdout_mixed_dls"]
-        all_logits = []
+            with torch.no_grad():
+                for batch in holdout_dls.train:
+                    inputs, targets = batch
+                    inputs = _to_device(inputs, self.device)
+                    logits = self.model(inputs)
+                    all_logits.append(logits.cpu())
 
-        with torch.no_grad():
-            for batch in holdout_dls.train:
-                inputs, targets = batch
-                inputs = _to_device(inputs, self.device)
-                logits = self.model(inputs)
-                all_logits.append(logits.cpu())
+            all_logits_cat = torch.cat(all_logits, dim=0)  # [N, seq_len]
 
-        all_logits_cat = torch.cat(all_logits, dim=0)  # [N, seq_len]
+            if self.survival_mode:
+                from astra.training.utils import hazards_to_survival
+                survival_probs = hazards_to_survival(all_logits_cat).numpy()
+                self._holdout_survival = survival_probs
+                self._holdout_preds = 1.0 - survival_probs
+            else:
+                self._holdout_preds = torch.sigmoid(all_logits_cat).numpy()
 
-        if self.survival_mode:
-            from astra.training.utils import hazards_to_survival
-            survival_probs = hazards_to_survival(all_logits_cat).numpy()
-            self._holdout_survival = survival_probs
-            self._holdout_preds = 1.0 - survival_probs  # cumulative incidence
-        else:
-            self._holdout_preds = torch.sigmoid(all_logits_cat).numpy()
+        if calibrated and self.calibrator is not None:
+            if self._holdout_preds_calibrated is None:
+                traj = self._holdout_traj_lengths if len(self._holdout_traj_lengths) > 0 else None
+                self._holdout_preds_calibrated = self.calibrator.transform(
+                    self._holdout_preds, traj
+                )
+            return self._holdout_preds_calibrated
 
         return self._holdout_preds
 
@@ -2340,43 +2354,60 @@ def run_eval(data, cfg: dict, multicurve: bool = True, comprehensive_eval: bool 
                     save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)
         logger.info("Baseline decision curve saved")
 
-        # Confusion matrices at F-beta optimised thresholds (calibrated)
-        # 1. Get trainval baseline predictions
-        from astra.evaluation.posthoc_calibration import fit_calibrators, apply_calibrator
-        logger.info("Computing calibrated F-beta thresholds (temporal)...")
-        trainval_dls = data["mixed_dls"]
-        tv_preds_all = []
-        tv_targets_all = []
-        with torch.no_grad():
-            for batch in trainval_dls.train:
-                inputs, targets_batch = batch
-                inputs = _to_device(inputs, device)
-                logits = model(inputs)
-                tv_preds_all.append(torch.sigmoid(logits).cpu())
-                tv_targets_all.append(targets_batch)
-        tv_preds_cat = torch.cat(tv_preds_all, dim=0).numpy()  # [N, seq_len]
-        tv_targs = torch.cat(tv_targets_all, dim=0).numpy()
-        tv_traj = np.array(data.get("trajectory_lengths", []))
+        # Confusion matrices at F-beta optimised thresholds (per-timestep calibrated)
+        from astra.evaluation.posthoc_calibration import (
+            fit_temporal_calibrator, TemporalCalibrator,
+        )
+        logger.info("Fitting per-timestep temporal calibrator on trainval...")
+        temporal_calibrator = fit_temporal_calibrator(
+            data, model, cfg, device=device, method='isotonic',
+            save_path=f'models/calibrators/{model_name}/temporal_calibrator.pkl',
+        )
+
+        # Calibrate holdout predictions at each patient's last step
+        ho_traj = temporal_eval._holdout_traj_lengths
+        ho_cal_baseline = np.empty_like(baseline_preds)
+        for step_val in np.unique(last_steps):
+            mask = last_steps == step_val
+            ho_cal_baseline[mask] = temporal_calibrator.transform_at_step(
+                baseline_preds[mask], int(step_val)
+            )
+
+        # Calibrate trainval last-step predictions for threshold finding
+        from astra.evaluation.posthoc_calibration import _TrainvalTemporalEvaluator
+        _tv_eval = _TrainvalTemporalEvaluator(data, model, cfg, device)
+        tv_preds_cat = _tv_eval._get_all_predictions()
+        tv_targs = _tv_eval._y
+        tv_traj = _tv_eval._traj_lengths
         if len(tv_traj) > 0:
             tv_last = np.minimum(tv_preds_cat.shape[1] - 1, tv_traj - 1).astype(int)
             tv_last = np.maximum(tv_last, 0)
         else:
             tv_last = np.full(len(tv_preds_cat), tv_preds_cat.shape[1] - 1, dtype=int)
         tv_baseline_preds = tv_preds_cat[np.arange(len(tv_preds_cat)), tv_last]
+        tv_cal = np.empty_like(tv_baseline_preds)
+        for step_val in np.unique(tv_last):
+            mask = tv_last == step_val
+            tv_cal[mask] = temporal_calibrator.transform_at_step(
+                tv_baseline_preds[mask], int(step_val)
+            )
+        logger.info("Per-timestep calibrator fitted and applied")
 
-        # 2. Fit isotonic calibrator on trainval, apply to both
-        calibrators = fit_calibrators(tv_targs, tv_baseline_preds, methods=['isotonic'])
-        iso_cal = calibrators['isotonic']
-        tv_cal = apply_calibrator(iso_cal, tv_baseline_preds, 'isotonic')
-        ho_cal = apply_calibrator(iso_cal, baseline_preds, 'isotonic')
-        logger.info("Isotonic calibrator fit on trainval, applied to holdout")
+        # Evaluate calibration quality per window
+        cal_eval_df = temporal_calibrator.evaluate(
+            preds_all, targs, ho_traj if len(ho_traj) > 0 else None
+        )
+        cal_csv = f'reports/eval/{model_name}/calibration/temporal_calibration_eval.csv'
+        ensure_parent_dir(cal_csv)
+        cal_eval_df.to_csv(cal_csv, index=False)
+        logger.info(f"Per-window calibration evaluation:\n{cal_eval_df.to_string(index=False)}")
 
-        # 3. Find thresholds on calibrated trainval, evaluate on calibrated holdout
+        # Find thresholds on calibrated trainval, evaluate on calibrated holdout
         for beta, label in [(1, "F1"), (5, "F5")]:
             thr, score = find_optimal_fbeta_threshold(tv_targs, tv_cal, beta=beta)
             logger.info(f"  {label} optimal threshold={thr:.4f} (score={score:.4f}) on calibrated trainval")
             fig_cm, _, _ = evaluate_detection_rate(
-                ho_cal, targs, threshold=thr, label=label
+                ho_cal_baseline, targs, threshold=thr, label=label
             )
             save_figure(fig_cm, f"cm_{label}_{model_name}",
                         save_dir=f'reports/eval/{model_name}', **_SUBMISSION_KW)

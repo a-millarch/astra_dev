@@ -909,6 +909,318 @@ def _plot_per_timepoint_vs_global(
 
 
 # ============================================================================
+# TEMPORAL CALIBRATOR — per-window calibration for temporal prediction models
+# ============================================================================
+
+class TemporalCalibrator:
+    """Per-window posthoc calibration for temporal prediction models.
+
+    A single global calibrator systematically miscalibrates early vs late
+    predictions because base rate, active cohort composition, and prediction
+    distribution all shift over time.  This class fits one calibrator per
+    time-window (aligned to bin-interval phase boundaries by default) on
+    trainval data, then transforms holdout predictions step-by-step using the
+    appropriate window's calibrator.
+
+    Typical usage::
+
+        tc = TemporalCalibrator(method='isotonic')
+        tc.fit(tv_preds_all, tv_y, tv_traj)          # [N_tv, seq_len]
+        ho_calibrated = tc.transform(ho_preds_all, ho_traj)  # [N_ho, seq_len]
+        # or single-step:
+        cal_probs = tc.transform_at_step(raw_probs, step=42)
+    """
+
+    def __init__(self, method: str = 'isotonic', window_hours: Optional[float] = None,
+                 min_samples: int = 50):
+        """
+        Args:
+            method: 'isotonic' or 'platt'.
+            window_hours: Fixed window width in hours.  *None* (default) uses
+                bin-interval phase boundaries from config (recommended).
+            min_samples: Minimum prediction–label pairs per window to fit a
+                calibrator.  Windows below this threshold are merged with the
+                next window.
+        """
+        self.method = method
+        self.window_hours = window_hours
+        self.min_samples = min_samples
+        self._calibrators: Dict[int, object] = {}
+        self._step_to_window: Dict[int, int] = {}
+        self._window_boundaries: List[Tuple[int, int]] = []
+        self._fitted = False
+
+    # ── public API ──────────────────────────────────────────────────────
+
+    def fit(self, preds_all: np.ndarray, y_true: np.ndarray,
+            traj_lengths: Optional[np.ndarray] = None) -> 'TemporalCalibrator':
+        """Fit per-window calibrators on trainval predictions.
+
+        Args:
+            preds_all: ``[N, seq_len]`` sigmoid probabilities.
+            y_true: ``[N]`` binary labels.
+            traj_lengths: ``[N]`` trajectory lengths (active-only filtering).
+        """
+        _N, seq_len = preds_all.shape
+
+        windows = self._compute_windows(seq_len)
+        self._window_boundaries = windows
+
+        for w_idx, (start, end) in enumerate(windows):
+            for step in range(start, end):
+                self._step_to_window[step] = w_idx
+
+        for w_idx, (start, end) in enumerate(windows):
+            y_probs_w: List[np.ndarray] = []
+            y_true_w: List[np.ndarray] = []
+
+            for step in range(start, end):
+                if traj_lengths is not None:
+                    active = traj_lengths > step
+                    if active.sum() < 2:
+                        continue
+                    y_probs_w.append(preds_all[active, step])
+                    y_true_w.append(y_true[active])
+                else:
+                    y_probs_w.append(preds_all[:, step])
+                    y_true_w.append(y_true)
+
+            if not y_probs_w:
+                continue
+
+            y_prob_pooled = np.concatenate(y_probs_w)
+            y_true_pooled = np.concatenate(y_true_w)
+
+            if len(np.unique(y_true_pooled)) < 2:
+                continue
+            if len(y_prob_pooled) < self.min_samples:
+                continue
+
+            cal = fit_calibrators(y_true_pooled, y_prob_pooled, [self.method])
+            self._calibrators[w_idx] = cal[self.method]
+
+        self._fitted = True
+        window_desc = ", ".join(
+            f"[{s}-{e})" for s, e in self._window_boundaries
+        )
+        logger.info(
+            f"TemporalCalibrator fitted: {len(self._calibrators)}/{len(windows)} "
+            f"windows, method={self.method}, windows={window_desc}"
+        )
+        return self
+
+    def transform(self, preds_all: np.ndarray,
+                  traj_lengths: Optional[np.ndarray] = None) -> np.ndarray:
+        """Transform a full ``[N, seq_len]`` prediction matrix.
+
+        Returns a copy with each step calibrated by its window's calibrator.
+        Steps without a fitted calibrator are left unchanged.
+        """
+        if not self._fitted:
+            raise RuntimeError("TemporalCalibrator.fit() must be called first")
+
+        calibrated = preds_all.copy()
+        _N, seq_len = preds_all.shape
+
+        for step in range(seq_len):
+            w_idx = self._step_to_window.get(step)
+            if w_idx is None or w_idx not in self._calibrators:
+                continue
+
+            cal = self._calibrators[w_idx]
+
+            if traj_lengths is not None:
+                active = traj_lengths > step
+                if active.sum() == 0:
+                    continue
+                calibrated[active, step] = apply_calibrator(
+                    cal, preds_all[active, step], self.method
+                )
+            else:
+                calibrated[:, step] = apply_calibrator(
+                    cal, preds_all[:, step], self.method
+                )
+
+        return calibrated
+
+    def transform_at_step(self, y_prob: np.ndarray, step: int) -> np.ndarray:
+        """Calibrate predictions at a single timestep.
+
+        Args:
+            y_prob: ``[N]`` raw probabilities at *step*.
+            step: timestep index.
+
+        Returns:
+            ``[N]`` calibrated probabilities (unchanged if no calibrator).
+        """
+        if not self._fitted:
+            raise RuntimeError("TemporalCalibrator.fit() must be called first")
+
+        w_idx = self._step_to_window.get(step)
+        if w_idx is None or w_idx not in self._calibrators:
+            return y_prob
+        return apply_calibrator(self._calibrators[w_idx], y_prob, self.method)
+
+    # ── persistence ─────────────────────────────────────────────────────
+
+    def save(self, path: str) -> None:
+        """Pickle the entire calibrator to *path*."""
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'wb') as f:
+            pickle.dump(self, f)
+        logger.info(f"TemporalCalibrator saved to {path}")
+
+    @staticmethod
+    def load(path: str) -> 'TemporalCalibrator':
+        """Load a previously saved ``TemporalCalibrator``."""
+        with open(path, 'rb') as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, TemporalCalibrator):
+            raise TypeError(f"Expected TemporalCalibrator, got {type(obj)}")
+        logger.info(f"TemporalCalibrator loaded from {path} "
+                     f"({len(obj._calibrators)} windows, method={obj.method})")
+        return obj
+
+    # ── diagnostics ─────────────────────────────────────────────────────
+
+    def evaluate(self, preds_all: np.ndarray, y_true: np.ndarray,
+                 traj_lengths: Optional[np.ndarray] = None,
+                 n_bins: int = 4) -> pd.DataFrame:
+        """Evaluate calibration quality per window: raw vs calibrated ECE/Brier.
+
+        Returns a DataFrame with one row per window.
+        """
+        calibrated = self.transform(preds_all, traj_lengths)
+        rows = []
+
+        for w_idx, (start, end) in enumerate(self._window_boundaries):
+            y_prob_raw_w: List[np.ndarray] = []
+            y_prob_cal_w: List[np.ndarray] = []
+            y_true_w: List[np.ndarray] = []
+
+            for step in range(start, end):
+                if traj_lengths is not None:
+                    active = traj_lengths > step
+                    if active.sum() < 2:
+                        continue
+                    y_prob_raw_w.append(preds_all[active, step])
+                    y_prob_cal_w.append(calibrated[active, step])
+                    y_true_w.append(y_true[active])
+                else:
+                    y_prob_raw_w.append(preds_all[:, step])
+                    y_prob_cal_w.append(calibrated[:, step])
+                    y_true_w.append(y_true)
+
+            if not y_true_w:
+                continue
+
+            yt = np.concatenate(y_true_w)
+            yr = np.concatenate(y_prob_raw_w)
+            yc = np.concatenate(y_prob_cal_w)
+
+            if len(np.unique(yt)) < 2:
+                continue
+
+            ece_raw, _ = calculate_ece(yt, yr, n_bins=n_bins)
+            ece_cal, _ = calculate_ece(yt, yc, n_bins=n_bins)
+            brier_raw = brier_score_loss(yt, yr)
+            brier_cal = brier_score_loss(yt, yc)
+
+            start_h = step_to_time(start)
+            end_h = step_to_time(min(end - 1, preds_all.shape[1] - 1))
+            start_h = start_h / 60 if start_h else 0
+            end_h = end_h / 60 if end_h else 0
+
+            rows.append({
+                'window': w_idx,
+                'steps': f'{start}-{end}',
+                'time_range': f'{start_h:.0f}h-{end_h:.0f}h',
+                'n_pairs': len(yt),
+                'prevalence': yt.mean(),
+                'ece_raw': ece_raw,
+                'ece_cal': ece_cal,
+                'ece_reduction': ece_raw - ece_cal,
+                'brier_raw': brier_raw,
+                'brier_cal': brier_cal,
+                'brier_reduction': brier_raw - brier_cal,
+            })
+
+        return pd.DataFrame(rows)
+
+    # ── internals ───────────────────────────────────────────────────────
+
+    def _compute_windows(self, seq_len: int) -> List[Tuple[int, int]]:
+        """Compute window boundaries aligned to bin-interval phases."""
+        from astra.evaluation.utils import _get_intervals_from_cfg
+
+        if self.window_hours is not None:
+            windows: List[Tuple[int, int]] = []
+            start = 0
+            while start < seq_len:
+                start_time = step_to_time(start) or 0
+                end_time_min = start_time + self.window_hours * 60
+                end_step = start + 1
+                while end_step < seq_len:
+                    t = step_to_time(end_step)
+                    if t is not None and t >= end_time_min:
+                        break
+                    end_step += 1
+                windows.append((start, min(end_step, seq_len)))
+                start = end_step
+            return windows
+
+        # Default: use bin-interval phase boundaries from config
+        intervals = _get_intervals_from_cfg()
+        windows = []
+        cum_steps = 0
+
+        for start_min, end_min, bin_min in intervals:
+            if end_min is not None:
+                n_steps = (end_min - start_min) // bin_min
+            else:
+                n_steps = seq_len - cum_steps
+            if n_steps <= 0:
+                continue
+            w_start = cum_steps
+            w_end = min(cum_steps + n_steps, seq_len)
+            if w_start < w_end:
+                windows.append((w_start, w_end))
+            cum_steps += n_steps
+
+        if not windows:
+            windows = [(0, seq_len)]
+
+        return windows
+
+
+def fit_temporal_calibrator(
+    data: dict,
+    model: torch.nn.Module,
+    cfg: dict,
+    device: str = 'cuda',
+    method: str = 'isotonic',
+    save_path: Optional[str] = None,
+) -> TemporalCalibrator:
+    """Convenience: fit a ``TemporalCalibrator`` on trainval predictions.
+
+    Creates a ``_TrainvalTemporalEvaluator``, runs a single forward pass, and
+    fits the calibrator.  Optionally saves to *save_path*.
+    """
+    tv_eval = _TrainvalTemporalEvaluator(data, model, cfg, device)
+    preds_all = tv_eval._get_all_predictions()
+    y_true = tv_eval._y
+    traj_lengths = tv_eval._traj_lengths if len(tv_eval._traj_lengths) > 0 else None
+
+    tc = TemporalCalibrator(method=method)
+    tc.fit(preds_all, y_true, traj_lengths)
+
+    if save_path:
+        tc.save(save_path)
+
+    return tc
+
+
+# ============================================================================
 # CALIBRATOR PERSISTENCE
 # ============================================================================
 
