@@ -516,6 +516,13 @@ def encode_categorical_ts(df_wide, y, cfg, encoder=None):
         feat_name: end - start
         for feat_name, (start, end) in encoding_info['feature_ranges'].items()
     }
+
+    zero_feats = [k for k, v in ts_cat_dims.items() if v == 0]
+    if zero_feats:
+        logger.warning(
+            f"Categorical TS features with 0 classes (no observed codes): {zero_feats}"
+        )
+
     return X_multi_hot, encoding_info, ts_cat_dims, encoder
 
 

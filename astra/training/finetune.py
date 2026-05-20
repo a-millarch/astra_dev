@@ -335,7 +335,8 @@ def _apply_progressive_time_masking(
     x_ts: torch.Tensor,
     min_timesteps: int = 2,
     max_timesteps: Optional[int] = None,
-) -> torch.Tensor:
+    return_mask: bool = False,
+):
     """
     Randomly truncate time series by zeroing out future timesteps.
 
@@ -345,13 +346,13 @@ def _apply_progressive_time_masking(
         x_ts: Continuous TS tensor [batch, c_in, seq_len] (TSAI format).
         min_timesteps: Minimum timesteps to keep.
         max_timesteps: Maximum timesteps (None = use full sequence length).
+        return_mask: If True, return (masked_tensor, mask) so the caller
+            can apply the same cutoffs to other tensors (e.g. categorical TS).
 
     Returns:
-        Masked tensor with same shape.
+        Masked tensor, or (masked_tensor, mask) when return_mask=True.
+        Mask shape: [batch, 1, seq_len] (float, 1.0 = kept).
     """
-    # Detect shape: model expects [batch, c_in, seq_len] from TSAI
-    # but callbacks used [batch, seq_len, features]
-    # The TSAI mixed_dls outputs [batch, c_in, seq_len]
     batch_size, c_in, seq_len = x_ts.shape
     if max_timesteps is None:
         max_timesteps = seq_len
@@ -367,7 +368,10 @@ def _apply_progressive_time_masking(
     timestep_indices = torch.arange(seq_len, device=x_ts.device).expand(batch_size, -1)
     mask = (timestep_indices < cutoffs.unsqueeze(1)).unsqueeze(1).float()
 
-    return x_ts * mask
+    masked = x_ts * mask
+    if return_mask:
+        return masked, mask
+    return masked
 
 
 def _compute_weighted_loss(
@@ -750,8 +754,14 @@ def train_one_epoch(
         # Optionally apply progressive time masking (Phase 4)
         if enable_masking and torch.rand(1).item() < masking_prob:
             x_ts = inputs[0]
-            x_ts = _apply_progressive_time_masking(x_ts, min_timesteps=min_timesteps)
-            inputs = [x_ts] + inputs[1:]
+            x_ts, time_mask = _apply_progressive_time_masking(
+                x_ts, min_timesteps=min_timesteps, return_mask=True,
+            )
+            inputs = list(inputs)
+            inputs[0] = x_ts
+            # Mask categorical TS at the same future timesteps
+            if len(inputs) >= 3 and inputs[2] is not None:
+                inputs[2] = inputs[2] * time_mask
 
         optimizer.zero_grad()
         logits = model(inputs)

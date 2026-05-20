@@ -478,6 +478,17 @@ class TSTabFusionTransformerMultiHot(nn.Module):
         # === MULTI-HOT CATEGORICAL TIME SERIES (NEW) ===
         # Initialize this FIRST to determine W_P size
         if ts_cat_dims is not None:
+            zero_feats = [k for k, v in ts_cat_dims.items() if v == 0]
+            if zero_feats:
+                logger.warning(
+                    f"Filtering {len(zero_feats)} categorical TS features "
+                    f"with 0 classes: {zero_feats}"
+                )
+                ts_cat_dims = {k: v for k, v in ts_cat_dims.items() if v > 0}
+            if not ts_cat_dims:
+                ts_cat_dims = None
+
+        if ts_cat_dims is not None:
             self.ts_cat_names = list(ts_cat_dims.keys())
             self.n_ts_cat = len(ts_cat_dims)
             

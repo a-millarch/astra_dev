@@ -100,8 +100,8 @@ class TSTabFusionMLM(nn.Module):
         if backbone.n_ts_cat > 0:
             self.cat_ts_heads = nn.ModuleDict()
             for feat_name, n_classes in backbone.ts_cat_dims.items():
-                # Reconstruction head outputs logits for each class
-                # Multi-label: use sigmoid activation (not softmax)
+                if n_classes == 0:
+                    continue
                 self.cat_ts_heads[feat_name] = nn.Sequential(
                     nn.Linear(d_model, d_model),
                     nn.GELU(),
@@ -554,23 +554,26 @@ class TSTabFusionMLM(nn.Module):
         if ts_cat_mask is not None and ts_cat_mask.any() and self.cat_ts_heads is not None:
             cat_ts_losses = []
             dim_offset = 0
-            
+
             for feat_name, n_classes in self.backbone.ts_cat_dims.items():
-                # Get predictions for this feature
+                if n_classes == 0:
+                    continue
+
                 feat_pred = self.cat_ts_heads[feat_name](ts_output)  # [bs, seq_len, n_classes]
                 feat_pred = feat_pred.transpose(1, 2)  # [bs, n_classes, seq_len]
-                
-                # Get target multi-hot vectors
+
                 feat_target = original_ts_cat[:, dim_offset:dim_offset+n_classes, :]
-                
-                # Multi-label BCE loss (not cross-entropy!)
-                feat_loss = F.binary_cross_entropy_with_logits(
-                    feat_pred[ts_cat_mask.unsqueeze(1).expand_as(feat_pred)],
-                    feat_target[ts_cat_mask.unsqueeze(1).expand_as(feat_target)]
-                )
-                cat_ts_losses.append(feat_loss)
+
+                mask_expanded = ts_cat_mask.unsqueeze(1).expand_as(feat_pred)
+                masked_pred = feat_pred[mask_expanded]
+                masked_target = feat_target[mask_expanded]
+
+                if masked_pred.numel() > 0:
+                    feat_loss = F.binary_cross_entropy_with_logits(masked_pred, masked_target)
+                    cat_ts_losses.append(feat_loss)
+
                 dim_offset += n_classes
-            
+
             if cat_ts_losses:
                 losses['cat_ts_loss'] = torch.stack(cat_ts_losses).mean() * self.config.cat_ts_loss_weight
         

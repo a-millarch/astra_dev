@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(findstr /R /N \"complete_cat.*concat\\\\|pd.concat.*cat_concepts\" astra/data/dataloader.py)"
     ]
   }
 }
