@@ -1,5 +1,7 @@
 import logging
 import os
+from pathlib import Path
+
 import numpy as np
 from tqdm.auto import tqdm
 
@@ -239,7 +241,11 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
     logger.info("="*80)
     logger.info("PRETRAINING COMPLETE")
     logger.info("="*80)
-    logger.info('Pretrained model saved')
+    checkpoint_dir = Path(pretrain_cfg.checkpoint_dir)
+    if (checkpoint_dir / 'best_model.pt').exists():
+        logger.info(f"Pretrained model saved to {checkpoint_dir / 'best_model.pt'}")
+    else:
+        logger.error(f"WARNING: best_model.pt not found in {checkpoint_dir}!")
 
     logger.info("\nExpected loss ranges (with normalization):")
     logger.info("  Total loss: 5-50 (not 1000s!)")

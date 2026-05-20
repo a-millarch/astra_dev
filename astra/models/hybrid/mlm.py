@@ -622,10 +622,11 @@ class TSTabFusionMLM(nn.Module):
         if contrastive_loss is not None:
             losses['contrastive_loss'] = contrastive_loss * self.config.contrastive_weight
         
-        # Total loss
-        total_loss = sum(losses.values()) if losses else torch.tensor(0.0, device=x_ts.device)
+        # Total loss (skip NaN components to prevent poisoning the sum)
+        finite_losses = [v for v in losses.values() if torch.isfinite(v)]
+        total_loss = sum(finite_losses) if finite_losses else torch.tensor(0.0, device=x_ts.device)
         losses['total_loss'] = total_loss
-        
+
         return losses
 
 
@@ -722,10 +723,11 @@ def pretrain_mlm_enhanced(
         'train_loss': [],
         'val_loss': [],
         'ts_loss': [],
-        'cat_ts_loss': [],      # NEW
+        'cat_ts_loss': [],
         'cat_loss': [],
         'cont_loss': [],
         'contrastive_loss': [],
+        'profile_loss': [],
         'lr': []
     }
     
@@ -777,13 +779,22 @@ def pretrain_mlm_enhanced(
             scheduler.step()
             
             # Update meters
-            meters['total']['sum'] += loss.item()
-            meters['total']['count'] += 1
+            total_val = loss.item()
+            if np.isfinite(total_val):
+                meters['total']['sum'] += total_val
+                meters['total']['count'] += 1
+            else:
+                logger.warning(f"NaN/Inf total_loss at batch — check component losses: "
+                               f"{', '.join(f'{k}={v.item():.4f}' for k, v in losses.items() if k != 'total_loss')}")
             
-            for loss_name in ['ts_loss', 'cat_ts_loss', 'cat_loss', 'cont_loss', 'contrastive_loss']:
+            for loss_name in ['ts_loss', 'cat_ts_loss', 'cat_loss', 'cont_loss', 'contrastive_loss', 'profile_loss']:
                 if loss_name in losses:
-                    meters[loss_name]['sum'] += losses[loss_name].item()
-                    meters[loss_name]['count'] += 1
+                    val = losses[loss_name].item()
+                    if np.isfinite(val):
+                        meters[loss_name]['sum'] += val
+                        meters[loss_name]['count'] += 1
+                    else:
+                        logger.warning(f"NaN/Inf in {loss_name} at batch — skipping")
             
             # Update progress bar
             postfix = {
@@ -805,23 +816,14 @@ def pretrain_mlm_enhanced(
             pbar.set_postfix(postfix)
         
         # Record training metrics
-        avg_train_loss = meters['total']['sum'] / meters['total']['count']
+        avg_train_loss = (meters['total']['sum'] / meters['total']['count']
+                          if meters['total']['count'] > 0 else float('nan'))
         history['train_loss'].append(avg_train_loss)
-        history['ts_loss'].append(
-            meters['ts_loss']['sum'] / meters['ts_loss']['count'] if meters['ts_loss']['count'] > 0 else 0
-        )
-        history['cat_ts_loss'].append(
-            meters['cat_ts_loss']['sum'] / meters['cat_ts_loss']['count'] if meters['cat_ts_loss']['count'] > 0 else 0
-        )
-        history['cat_loss'].append(
-            meters['cat_loss']['sum'] / meters['cat_loss']['count'] if meters['cat_loss']['count'] > 0 else 0
-        )
-        history['cont_loss'].append(
-            meters['cont_loss']['sum'] / meters['cont_loss']['count'] if meters['cont_loss']['count'] > 0 else 0
-        )
-        history['contrastive_loss'].append(
-            meters['contrastive_loss']['sum'] / meters['contrastive_loss']['count'] if meters['contrastive_loss']['count'] > 0 else 0
-        )
+        for loss_name in ['ts_loss', 'cat_ts_loss', 'cat_loss', 'cont_loss', 'contrastive_loss', 'profile_loss']:
+            history[loss_name].append(
+                meters[loss_name]['sum'] / meters[loss_name]['count']
+                if meters[loss_name]['count'] > 0 else 0
+            )
         history['lr'].append(scheduler.get_last_lr()[0])
         
         # === VALIDATION ===
@@ -853,14 +855,17 @@ def pretrain_mlm_enhanced(
                         x_ts_cat_profiles=x_profiles,
                     )
                     
-                    val_meters['total']['sum'] += losses['total_loss'].item()
-                    val_meters['total']['count'] += 1
-            
-            val_loss = val_meters['total']['sum'] / val_meters['total']['count']
+                    val_total = losses['total_loss'].item()
+                    if np.isfinite(val_total):
+                        val_meters['total']['sum'] += val_total
+                        val_meters['total']['count'] += 1
+
+            val_loss = (val_meters['total']['sum'] / val_meters['total']['count']
+                        if val_meters['total']['count'] > 0 else float('nan'))
             history['val_loss'].append(val_loss)
-            
+
             # Save best model
-            if config.save_best and val_loss < best_val_loss:
+            if config.save_best and np.isfinite(val_loss) and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save({
                     'epoch': epoch,
@@ -881,9 +886,24 @@ def pretrain_mlm_enhanced(
         if val_loss is not None:
             logger.info(f"  Val Loss: {val_loss:.4f}")
     
+    # Always save final model state (fallback if best_model.pt was never written)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_loss': val_loss,
+        'config': config
+    }, checkpoint_dir / 'last_model.pt')
+
+    if not (checkpoint_dir / 'best_model.pt').exists():
+        logger.warning("No best_model.pt was saved during training (val_loss may have been NaN). "
+                        "Copying last_model.pt as best_model.pt.")
+        torch.save(torch.load(checkpoint_dir / 'last_model.pt', weights_only=False),
+                    checkpoint_dir / 'best_model.pt')
+
     # Plot training curves
     plot_training_curves(history, save_path=checkpoint_dir / 'training_curves.png')
-    
+
     return history
 
 
@@ -891,34 +911,42 @@ def plot_training_curves(history, save_path='training_curves.png'):
     """Plot training curves with multi-hot categorical TS loss."""
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
     
+    def _finite(data):
+        """Filter NaN/Inf for safe plotting."""
+        arr = np.array(data, dtype=float)
+        return np.where(np.isfinite(arr), arr, np.nan)
+
     # 1. Total loss
-    axes[0, 0].plot(history['train_loss'], label='Train Loss', linewidth=2)
+    train_loss = _finite(history['train_loss'])
+    n_epochs = len(train_loss)
+    if n_epochs > 0:
+        axes[0, 0].plot(range(n_epochs), train_loss, label='Train Loss', linewidth=2)
     if history['val_loss']:
-        val_epochs = np.linspace(0, len(history['train_loss'])-1, len(history['val_loss']))
-        axes[0, 0].plot(val_epochs, history['val_loss'], label='Val Loss', linewidth=2, linestyle='--')
+        val_loss = _finite(history['val_loss'])
+        val_epochs = np.linspace(0, max(n_epochs - 1, 0), len(val_loss))
+        axes[0, 0].plot(val_epochs, val_loss, label='Val Loss', linewidth=2, linestyle='--')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].set_ylabel('Loss')
     axes[0, 0].set_title('Total Loss')
     axes[0, 0].legend()
     axes[0, 0].grid(True, alpha=0.3)
-    
+
     # 2. Component losses
-    if any(history['ts_loss']):
-        axes[0, 1].plot(history['ts_loss'], label='TS Loss')
-    if any(history['cat_ts_loss']):
-        axes[0, 1].plot(history['cat_ts_loss'], label='Cat TS Loss', linewidth=2)  # NEW
-    if any(history['cat_loss']):
-        axes[0, 1].plot(history['cat_loss'], label='Static Cat Loss')
-    if any(history['cont_loss']):
-        axes[0, 1].plot(history['cont_loss'], label='Static Cont Loss')
-    if any(history['contrastive_loss']):
-        axes[0, 1].plot(history['contrastive_loss'], label='Contrastive Loss')
+    component_labels = [
+        ('ts_loss', 'TS Loss'), ('cat_ts_loss', 'Cat TS Loss'),
+        ('cat_loss', 'Static Cat Loss'), ('cont_loss', 'Static Cont Loss'),
+        ('contrastive_loss', 'Contrastive Loss'), ('profile_loss', 'Profile Loss'),
+    ]
+    for key, label in component_labels:
+        data = history.get(key, [])
+        if data and any(v != 0 for v in data):
+            axes[0, 1].plot(data, label=label)
     axes[0, 1].set_xlabel('Epoch')
     axes[0, 1].set_ylabel('Loss')
     axes[0, 1].set_title('Component Losses')
     axes[0, 1].legend()
     axes[0, 1].grid(True, alpha=0.3)
-    
+
     # 3. Learning rate
     axes[1, 0].plot(history['lr'], linewidth=2)
     axes[1, 0].set_xlabel('Epoch')
@@ -926,21 +954,21 @@ def plot_training_curves(history, save_path='training_curves.png'):
     axes[1, 0].set_title('Learning Rate Schedule')
     axes[1, 0].set_yscale('log')
     axes[1, 0].grid(True, alpha=0.3)
-    
-    # 4. Loss ratios
-    if any(history['ts_loss']) and any(history['cat_ts_loss']):
-        ts_cat_ts_ratio = np.array(history['ts_loss']) / (np.array(history['cat_ts_loss']) + 1e-8)
-        axes[1, 1].plot(ts_cat_ts_ratio, label='TS/CatTS Ratio')
-    if any(history['cat_ts_loss']) and any(history['cat_loss']):
-        cat_ts_cat_ratio = np.array(history['cat_ts_loss']) / (np.array(history['cat_loss']) + 1e-8)
-        axes[1, 1].plot(cat_ts_cat_ratio, label='CatTS/StaticCat Ratio')
+
+    # 4. Train vs Val loss detail (more useful than ratios that require cat_ts > 0)
+    if n_epochs > 0:
+        axes[1, 1].plot(range(n_epochs), train_loss, label='Train Loss', linewidth=2)
+    if history['val_loss']:
+        val_loss = _finite(history['val_loss'])
+        val_epochs = np.linspace(0, max(n_epochs - 1, 0), len(val_loss))
+        axes[1, 1].plot(val_epochs, val_loss, label='Val Loss', linewidth=2, linestyle='--')
     axes[1, 1].set_xlabel('Epoch')
-    axes[1, 1].set_ylabel('Loss Ratio')
-    axes[1, 1].set_title('Loss Component Ratios')
+    axes[1, 1].set_ylabel('Loss')
+    axes[1, 1].set_title('Train vs Val Loss')
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.show()
+    plt.close(fig)
 
