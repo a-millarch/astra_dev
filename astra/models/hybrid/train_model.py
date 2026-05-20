@@ -1,7 +1,7 @@
 import argparse
 import logging
 
-from astra.utils import cfg
+from astra.utils import cfg, PROJECT_ROOT
 from astra.evaluation.predictive_performance import run_eval
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.data.dataloader import save_normalization_artifacts, save_deployment_bundle
@@ -36,7 +36,7 @@ def main():
     args = parse_args()
     data = prepare_data_and_dls_cached(cfg)
     pretrain_params = dict(cfg["pretrain"])
-    pretrain_params["checkpoint_dir"] = f'{pretrain_params.get("checkpoint_dir", "./pretrain_checkpoints")}/{cfg["model_name"]}'
+    pretrain_params["checkpoint_dir"] = str(PROJECT_ROOT / pretrain_params.get("checkpoint_dir", "pretrain_checkpoints") / cfg["model_name"])
     pretrain_cfg = MLMConfig(**pretrain_params)
 
     if args.pretrain:

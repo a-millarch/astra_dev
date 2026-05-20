@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from astra.utils import cfg, clear_mem
+from astra.utils import cfg, clear_mem, PROJECT_ROOT
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig
 from astra.models.hybrid.training import get_backbone
@@ -204,7 +204,7 @@ def load_pretrained_backbone(
     )
 
     if checkpoint_dir is None:
-        checkpoint_dir = f'./pretrain_checkpoints/{cfg_dict["model_name"]}'
+        checkpoint_dir = str(PROJECT_ROOT / 'pretrain_checkpoints' / cfg_dict["model_name"])
 
     checkpoint_path = os.path.join(checkpoint_dir, "best_model.pt")
     if not os.path.exists(checkpoint_path):

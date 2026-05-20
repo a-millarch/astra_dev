@@ -28,7 +28,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from astra.utils import cfg, get_cfg, setup_logging
+from astra.utils import cfg, get_cfg, setup_logging, PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 from astra.data.caching import prepare_data_and_dls_cached
@@ -133,7 +133,7 @@ def _get_pretrain_cfg() -> MLMConfig:
         temperature=pc["temperature"],
         patience=pc["patience"],
         save_best=pc["save_best"],
-        checkpoint_dir=f'{pc["checkpoint_dir"]}/{cfg["model_name"]}',
+        checkpoint_dir=str(PROJECT_ROOT / pc["checkpoint_dir"] / cfg["model_name"]),
     )
 
 

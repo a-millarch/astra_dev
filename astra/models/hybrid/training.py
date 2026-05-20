@@ -5,7 +5,7 @@ from tqdm.auto import tqdm
 
 import torch
 
-from astra.utils import cfg, clear_mem
+from astra.utils import cfg, clear_mem, PROJECT_ROOT
 from astra.models.hybrid.mlm import TSTabFusionMLM, MLMConfig, pretrain_mlm_enhanced
 from astra.models.hybrid.model import TSTabFusionTransformerMultiHot
 from astra.data.mixed_dataloader import (
@@ -89,7 +89,7 @@ def run_pretrain(data, pretrain_cfg=None, device='cuda'):
             temperature=pc["temperature"],
             patience=pc["patience"],
             save_best=pc["save_best"],
-            checkpoint_dir=f'{pc["checkpoint_dir"]}/{cfg["model_name"]}',
+            checkpoint_dir=str(PROJECT_ROOT / pc["checkpoint_dir"] / cfg["model_name"]),
             sparse_aware_masking=pc.get("sparse_aware_masking", False),
             mask_prob_ts_data=pc.get("mask_prob_ts_data", 0.30),
             mask_prob_ts_empty=pc.get("mask_prob_ts_empty", 0.05),

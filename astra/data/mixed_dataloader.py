@@ -12,6 +12,7 @@ Provides:
 
 import logging
 import os
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -371,6 +372,8 @@ def get_stratified_splits(
 
 def save_model(model: torch.nn.Module, model_name: str, save_dir: str = 'models'):
     """Save model state dict in plain PyTorch format."""
+    from astra.utils import PROJECT_ROOT
+    save_dir = str(PROJECT_ROOT / save_dir) if not os.path.isabs(save_dir) else save_dir
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f'{model_name}.pth')
     torch.save({'model': model.state_dict()}, path)
@@ -388,6 +391,8 @@ def load_model_state(model_name: str, save_dir: str = 'models') -> dict:
     Returns:
         state_dict: OrderedDict of parameter tensors
     """
+    from astra.utils import PROJECT_ROOT
+    save_dir = str(PROJECT_ROOT / save_dir) if not os.path.isabs(save_dir) else save_dir
     path = os.path.join(save_dir, f'{model_name}.pth')
     checkpoint = torch.load(path, map_location='cpu', weights_only=False)
     if isinstance(checkpoint, dict) and 'model' in checkpoint:
