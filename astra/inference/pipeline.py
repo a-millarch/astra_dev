@@ -970,8 +970,11 @@ class InferenceSession:
         if t1_hours > t2_hours:
             t1_hours, t2_hours = t2_hours, t1_hours
 
-        step_t1 = time_to_step(t1_hours, 'h')
-        step_t2 = time_to_step(t2_hours, 'h')
+        # Use the bundle's bin config — the local YAML may have diverged
+        # from the grid this model was trained on.
+        data_config = self.bundle.get('data_config')
+        step_t1 = time_to_step(t1_hours, 'h', data_config=data_config)
+        step_t2 = time_to_step(t2_hours, 'h', data_config=data_config)
 
         logger.info("Differential SHAP: pid=%s T1=%.1fh (step %d) → T2=%.1fh (step %d)",
                      context.pid, t1_hours, step_t1, t2_hours, step_t2)

@@ -126,7 +126,7 @@ def _plot_nontemporal_trajectory(ctx, save_path, model_name):
         }
         cohort_pid = pid_map.get(str(ctx.pid))
     except Exception:
-        pass
+        logger.debug("Could not map inference PID to cohort PID; falling back to direct PID match")
 
     # Look up by resolved cohort PID, falling back to direct ctx.pid match
     if cohort_pid is not None:
@@ -180,3 +180,105 @@ def _finalize(fig, save_path):
         logger.info("Saved trajectory plot to %s", save_path)
     plt.show()
     return fig
+
+
+def default_session_plot(session, prediction_curve=None, interactive=False):
+    """Render the standard inspection plots for ``session.ctx``.
+
+    Used interactively (notebooks, ``SimulationRunner.inspect``) after a
+    session has a context attached: prediction trajectory, individual SHAP
+    panel and data completeness.
+
+    Args:
+        session: An :class:`~astra.inference.pipeline.InferenceSession` with
+            ``session.ctx`` set (e.g. by ``SimulationRunner.setup``).
+        prediction_curve: Optional simulation curve ``[seq_len]`` — lets
+            non-temporal models show per-timestep predictions without a
+            pre-computed evaluation CSV.
+        interactive: Use the interactive plotly SHAP panels (plus EBM
+            explanations when available) instead of matplotlib.
+    """
+    from astra.evaluation.behavior import (
+        visualize_shap_individual,
+        visualize_shap_individual_interactive,
+        visualize_data_completeness,
+    )
+    from astra.evaluation.utils import time_to_step
+
+    ctx = session.ctx
+    result = session.predict_from_context(ctx)
+
+    # If a simulation prediction curve is available, use it for trajectory
+    # plotting (enables non-temporal models to show per-timestep predictions
+    # from the simulation step-through without needing a pre-computed CSV).
+    if prediction_curve is not None and result.predictions_over_time is None:
+        from astra.inference.pipeline import InferenceResult
+        plot_result = InferenceResult(
+            pid=result.pid,
+            probability=result.probability,
+            trajectory_length=result.trajectory_length,
+            censor_step=result.censor_step,
+            predictions_over_time=prediction_curve,
+        )
+    else:
+        plot_result = result
+
+    plot_prediction_trajectory(
+        plot_result, ctx,
+        save_path=None,
+        model_name=session.bundle.get('model_name'),
+    )
+
+    logger.info("Computing SHAP explanation...")
+    shap_result = session.explain_from_context(ctx)
+
+    shap_dict, channel2feature, feature_names_cat, feature_names_cont = (
+        session.shap_to_viz_dict(
+            shap_result,
+            x_ts=ctx.x_ts,
+            x_ts_cat=ctx.x_ts_cat,
+            tab_df=ctx.tab_df,
+        )
+    )
+
+    # Inject inhospital boundary info for SHAP plots (prehospital patients)
+    ihs_time = ctx.demographics.get('inhospital_start')
+    if ihs_time is not None:
+        ihs_ts = pd.Timestamp(ihs_time)
+        if pd.notna(ihs_ts):
+            delta_min = (ihs_ts - ctx.admission_time).total_seconds() / 60
+            ihs_step = time_to_step(
+                delta_min, 'min',
+                data_config=session.bundle.get('data_config'),
+            )
+            if ihs_step is not None:
+                shap_dict['test_data']['inhospital_start_steps'] = np.array([ihs_step])
+
+    if interactive:
+        ebm_explanations = None
+        if '_ebm_pred' in session.bundle.get('ts_channel_names', []):
+            logger.info("Computing EBM feature importance...")
+            ebm_explanations = session.explain_ebm(ctx, save_path=None)
+
+        visualize_shap_individual_interactive(
+            shap_dict,
+            sample_idx=0,
+            channel2feature=channel2feature,
+            feature_names_cat=feature_names_cat,
+            feature_names_cont=feature_names_cont,
+            ebm_explanations=ebm_explanations,
+        )
+    else:
+        visualize_shap_individual(
+            shap_dict,
+            sample_idx=0,
+            channel2feature=channel2feature,
+            feature_names_cat=feature_names_cat,
+            feature_names_cont=feature_names_cont,
+        )
+
+    visualize_data_completeness(
+        shap_dict,
+        channel2feature=channel2feature,
+        save_path=None,
+    )

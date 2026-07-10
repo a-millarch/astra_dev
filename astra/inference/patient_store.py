@@ -30,6 +30,33 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Pluggable data source (see astra/inference/datasource.py)
+#
+# When a PatientDataSource is registered, load_patient_csv() serves every
+# concept read from it instead of the filesystem — the seam that lets
+# deployments feed data from SQL/parquet/memory without touching the pipeline.
+# One source per process; the reference service serializes requests.
+# ---------------------------------------------------------------------------
+_DATA_SOURCE = None
+
+
+def set_data_source(source):
+    """Register a process-global :class:`PatientDataSource` (or ``None`` to clear)."""
+    global _DATA_SOURCE
+    _DATA_SOURCE = source
+    logger.info("Patient data source set to %r", source)
+
+
+def get_data_source():
+    """Return the registered :class:`PatientDataSource`, or ``None``."""
+    return _DATA_SOURCE
+
+
+def clear_data_source():
+    """Remove the registered data source (revert to file-based loading)."""
+    set_data_source(None)
+
 # All concept CSVs + supporting files that should be split per-patient.
 # metadata.csv is excluded (small config file, not per-patient).
 DEFAULT_SPLIT_FILENAMES = [
@@ -55,13 +82,19 @@ def load_patient_csv(
     data_dir: str = 'data/raw',
     patient_dir: str = 'data/patients',
     cache: bool = True,
+    _bypass_source: bool = False,
     **read_csv_kwargs,
 ) -> pd.DataFrame:
-    """Load a CSV filtered to a single patient.
+    """Load one patient's rows for a concept.
 
-    Checks ``{patient_dir}/{cpr_hash}/{filename}.csv`` first.  If the
-    per-patient file exists it is read directly (typically KB-sized).
-    Otherwise falls back to the full population CSV at
+    If a :class:`PatientDataSource` is registered (see :func:`set_data_source`),
+    it is authoritative: data comes from ``source.fetch(cpr_hash, filename)``
+    and the file-system parameters (*data_dir*, *patient_dir*, *cache*,
+    ``read_csv_kwargs``) are ignored — those are CSV-serialization concerns.
+
+    Otherwise (default), checks ``{patient_dir}/{cpr_hash}/{filename}.csv``
+    first. If the per-patient file exists it is read directly (typically
+    KB-sized). Otherwise falls back to the full population CSV at
     ``{data_dir}/{filename}.csv`` and filters by ``CPR_hash``.
 
     When *cache* is True (default), a fallback load automatically saves the
@@ -69,19 +102,37 @@ def load_patient_csv(
 
     Args:
         cpr_hash: Patient identifier hash.
-        filename: CSV stem without extension (e.g. ``'VitaleVaerdier'``).
+        filename: Concept name / CSV stem (e.g. ``'VitaleVaerdier'``).
         data_dir: Directory containing population-level CSVs.
         patient_dir: Root directory for per-patient subdirectories.
         cache: If True, save filtered result to per-patient dir on fallback.
+        _bypass_source: Internal — force the file path even when a source is
+            registered (used by ``CSVDataSource.fetch`` to avoid recursion).
         **read_csv_kwargs: Passed to ``pd.read_csv()`` (e.g. ``index_col``,
-            ``low_memory``, ``dtype``).
+            ``low_memory``, ``dtype``). File path only.
 
     Returns:
         DataFrame containing only rows for *cpr_hash*.
 
     Raises:
-        FileNotFoundError: If neither per-patient nor population CSV exists.
+        FileNotFoundError: If the concept is unavailable — no data from the
+            registered source, or neither per-patient nor population CSV
+            exists. Callers treat this as "concept absent" and degrade.
     """
+    source = _DATA_SOURCE
+    if source is not None and not _bypass_source:
+        df = source.fetch(cpr_hash, filename)
+        if df is None or len(df) == 0:
+            raise FileNotFoundError(
+                f"Data source {source!r} has no '{filename}' data "
+                f"for patient {cpr_hash[:8]}..."
+            )
+        if 'CPR_hash' in df.columns:
+            df = df[df['CPR_hash'] == cpr_hash]
+        logger.debug("load_patient_csv: %s served by %r (%d rows)",
+                     filename, source, len(df))
+        return df
+
     patient_path = os.path.join(patient_dir, cpr_hash, f'{filename}.csv')
 
     if os.path.isfile(patient_path):

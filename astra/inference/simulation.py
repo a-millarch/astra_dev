@@ -425,7 +425,7 @@ class SimulationRunner:
         if self.context is None:
             raise RuntimeError("Call setup() before inspect()")
 
-        from astra.inference.run_inference import default_session_plot
+        from astra.visualize.inference import default_session_plot
         self.session.ctx = self.context
         default_session_plot(self.session, prediction_curve=self._prediction_curve)
 

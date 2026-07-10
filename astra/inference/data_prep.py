@@ -1900,8 +1900,40 @@ def _apply_prehospital_start(
     :func:`~astra.data.prehospital.run_prehospital_pipeline` on Azure)
     and copies ``prehospital_start`` + ABCD columns into the inference
     base_df.
+
+    External deployments have no cohort base_df; a registered
+    :class:`~astra.inference.datasource.PatientDataSource` may instead expose
+    ``fetch_prehospital(cpr_hash)`` returning ``{'prehospital_start': ts,
+    'A': …, 'B': …, 'C': …, 'D': …}`` (or ``None``), which takes precedence
+    here.
     """
     import os
+    from astra.inference.patient_store import get_data_source
+
+    source = get_data_source()
+    fetch_ph = getattr(source, 'fetch_prehospital', None) if source is not None else None
+    if fetch_ph is not None:
+        rec = fetch_ph(cpr_hash)
+        result["inhospital_start"] = result["start"].copy()
+        ph_start = rec.get("prehospital_start") if rec else None
+        result["prehospital_start"] = ph_start
+        if ph_start is not None and pd.notna(ph_start):
+            ph_start = pd.Timestamp(ph_start)
+            result["start"] = result["start"].apply(
+                lambda s: min(ph_start, pd.Timestamp(s))
+            )
+            logger.info(
+                f"Prehospital start from data source: {ph_start} "
+                f"(shifted bin grid by "
+                f"{(result['inhospital_start'].iloc[0] - ph_start).total_seconds() / 60:.0f} min)"
+            )
+        else:
+            logger.info("Data source has no prehospital record — start unchanged")
+        if rec:
+            for col in ['A', 'B', 'C', 'D']:
+                if col in rec:
+                    result[col] = rec[col]
+        return result
 
     batch_base_path = cfg.get("base_df_path", "data/interim/base_df.pkl")
     if not os.path.isfile(batch_base_path):
@@ -2146,6 +2178,34 @@ def _filter_concepts_for_patient(
 
         if concept == 'ISS_computed':
             filter_fn = collect_filter(concept)
+
+            # A registered data source is authoritative for ISS_computed
+            # (external deployments have no data/interim/ R output). Contract:
+            # fetch(cpr_hash, 'ISS_computed') returns a frame with a numeric
+            # 'VALUE' column (first valid value wins), or None when absent.
+            from astra.inference.patient_store import get_data_source
+            source = get_data_source()
+            if source is not None:
+                try:
+                    iss_src = source.fetch(patient_cpr, 'ISS_computed')
+                except Exception as e:
+                    iss_src = None
+                    logger.warning(f"Data source ISS_computed fetch failed: {e}")
+                if iss_src is not None and not iss_src.empty and 'VALUE' in iss_src.columns:
+                    iss_vals = pd.to_numeric(iss_src['VALUE'], errors='coerce').dropna()
+                    if not iss_vals.empty:
+                        iss_r = pd.DataFrame({
+                            'PID': [base_df['PID'].iloc[0]],
+                            'TIMESTAMP': [base_df['start'].iloc[0]],
+                            'FEATURE': ['ISS_computed'],
+                            'VALUE': [float(iss_vals.iloc[0])],
+                        })
+                        concept_filtered = filter_fn(iss_r)
+                        if not concept_filtered.empty:
+                            filtered[concept] = concept_filtered
+                            logger.info(f"ISS_computed (data source): {iss_vals.iloc[0]}")
+                continue
+
             iss_r_csv = "data/interim/computed_iss_df.csv"
             if os.path.exists(iss_r_csv):
                 try:
