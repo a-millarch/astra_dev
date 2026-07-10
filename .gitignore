@@ -1,4 +1,7 @@
-docs/
+# docs are local-only, except the external-team handoff guide
+# (docs/* rather than docs/ so the negation below can re-include a file)
+docs/*
+!docs/HANDOFF.md
 examples/
 notebooks/
 

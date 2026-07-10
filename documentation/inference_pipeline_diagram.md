@@ -87,6 +87,5 @@ graph TD
 |------|------|
 | `astra/inference/pipeline.py` | `InferenceSession`, `_SHAPModelWrapper`, result dataclasses |
 | `astra/data/dataloader.py` | `save_deployment_bundle()`, `load_deployment_bundle()`, `normalize_new_patient()` |
-| `astra/models/hybrid/train_model.py` | Calls `save_deployment_bundle()` after finetuning |
 | `astra/training/finetune.py` | Calls `save_deployment_bundle()` after v2 finetuning |
-| `astra/inference/test_inference.py` | End-to-end validation script |
+| `astra/inference/export_artifacts.py` | Export/validate the deployment artifact bundle (`validate` doubles as the end-to-end smoke test) |
