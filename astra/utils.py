@@ -93,6 +93,17 @@ def setup_logging(level=logging.INFO, log_dir=None):
         h.close()
 
     # --- Console handler (Rich for colored output) ---
+    # On narrow-encoding consoles (Windows cp1252), characters like '→' or
+    # '✓' in log messages make the stream's strict encoder raise, and Rich
+    # then dumps a "Logging error" traceback per record. Degrade unencodable
+    # characters to '?' instead.
+    import sys
+    try:
+        enc = (getattr(sys.stdout, 'encoding', '') or '').lower().replace('-', '')
+        if enc != 'utf8' and hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(errors='replace')
+    except (AttributeError, ValueError, OSError):
+        pass
     console = RichHandler(
         markup=True,
         show_time=False,
@@ -169,6 +180,7 @@ def _resolve_fit_dpi(fig, fit_long_side_px, dpi_floor=50, dpi_ceiling=1200,
     try:
         fig.canvas.draw()
     except Exception:
+        # best-effort: matplotlib draw may fail headless
         pass
     try:
         renderer = fig.canvas.get_renderer()
@@ -701,7 +713,8 @@ def get_concept(concept, cfg) -> dict:
         else:
             try:
                 df = df[~df.FEATURE.isin(drop_cols + [np.nan])]
-            except:
+            except Exception:
+                logger.debug(f"drop_features filter failed for {concept}; dropping NaN FEATUREs only")
                 df = df[~df.FEATURE.isin([np.nan])]
         df["VALUE"] = pd.to_numeric(df["VALUE"], errors="coerce")
         concept_dict[agg_func] = df
@@ -777,7 +790,8 @@ def convert_numeric_col(df, num_col, var_name, conv_factor, decimals):
     # df = df[pd.to_numeric(df[num_col], errors='coerce').notnull()]
     try:
         df.loc[:, var_name] = (df[num_col].astype(float) * conv_factor).round(decimals)
-    except:
+    except Exception:
+        logger.debug(f"Numeric conversion failed for {num_col}; using raw values for {var_name}")
         df.loc[:, var_name] = df[num_col]
     return df
 
@@ -893,7 +907,8 @@ def add_categorical_variable(
     try:
         # backup_df = df.copy(deep=True)
         df = df[df[filt_column].str.startswith(filt_val, na=False)]
-    except:
+    except Exception:
+        logger.debug(f"startswith filter failed for {filt_column}; falling back to equality match")
         df = df[df[filt_column] == filt_val]
 
     if df.empty:
@@ -977,7 +992,8 @@ def add_continous_variable(
     # filtering df. Try tuple else string
     try:
         df = df[df[filt_column].isin(filt_val)]
-    except:
+    except Exception:
+        logger.debug(f"isin filter failed for {filt_column}; falling back to equality match")
         df = df[df[filt_column] == filt_val]
 
     df[filt_date] = pd.to_datetime(df[filt_date])

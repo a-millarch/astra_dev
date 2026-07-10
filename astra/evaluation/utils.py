@@ -67,7 +67,7 @@ def _get_intervals_from_cfg():
 def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
     """Check that all bin intervals divide evenly (no partial last bins).
 
-    Prints a table of all active intervals and flags any that are not exact.
+    Logs a table of all active intervals and flags any that are not exact.
     Returns True if all intervals are aligned, False otherwise.
 
     Args:
@@ -112,17 +112,16 @@ def check_bin_alignment(bin_intervals=None, bin_freq_include=None):
         return f"{h/24:.4g}D"
 
     header = f"{'Start':>8}  {'End':>8}  {'Bin':>6}  {'Steps':>6}  Status"
-    print(header)
-    print("-" * len(header))
+    logger.info(header)
+    logger.info("-" * len(header))
     for start_min, end_min, bin_min, n_bins, status in rows:
-        print(f"{fmt(start_min):>8}  {fmt(end_min):>8}  {fmt(bin_min):>6}  {str(n_bins):>6}  {status}")
-    print("-" * len(header))
-    print(f"{'Total steps:':>{len(header) - 7}} {total_steps}")
-    print()
+        logger.info(f"{fmt(start_min):>8}  {fmt(end_min):>8}  {fmt(bin_min):>6}  {str(n_bins):>6}  {status}")
+    logger.info("-" * len(header))
+    logger.info(f"{'Total steps:':>{len(header) - 7}} {total_steps}")
     if all_ok:
-        print("All intervals aligned.")
+        logger.info("All intervals aligned.")
     else:
-        print("WARNING: partial bins detected — fix the interval boundaries in bin_intervals config.")
+        logger.warning("Partial bins detected — fix the interval boundaries in bin_intervals config.")
     return all_ok
 
 

@@ -10,8 +10,6 @@ import logging
 
 from astra.utils import  is_file_present, are_files_present, ensure_parent_dir
 from astra.utils import cfg, get_base_df
-#from src.common.log_config import setup_logging, clear_log
-#from src.data.downloader import download_to_local
 
 logger = logging.getLogger(__name__)
 
@@ -31,17 +29,16 @@ def download_to_local(FILES: list, LOCAL_DIR="data/dl"):
             pass
         else:
             try:
-                print("> ", fn)
+                logger.info(f"> {fn}")
                 ds = Dataset.File.from_files((datastore_sp, "CPMI_" + fn + ".parquet"))
-                print(">> Downloading...")
+                logger.info(">> Downloading...")
                 ds.download(LOCAL_DIR)
-                print(">> Done!")
+                logger.info(">> Done!")
                 f_status[fn] = True
-            except:
+            except Exception:
                 f_status[fn] = False
                 total_failed += 1
-                print(">> Failed!!!")
-                print(f"Could not load {fn}!", False)
+                logger.warning(f"Could not load {fn}!")
                 
 def collect_subsets(cfg, base=None):
     # First, load small files using population filter function
@@ -98,7 +95,7 @@ def chunk_filter_parquet(filename, base = None, chunk_size = 4000000):
     logger.info(f'>Initiating {num_chunks} chunks')
     for batch in parquet_file.iter_batches(batch_size=chunk_size):
         chunk_n = chunk_n +1
-        print(f">>{chunk_n} of {num_chunks}chunks", end='\r')
+        logger.debug("chunk %d of %d", chunk_n, num_chunks)
         chunk_df = batch.to_pandas() 
         chunk_df = chunk_df[chunk_df.CPR_hash.isin(poplist)]
         ensure_parent_dir(output_path)
@@ -118,7 +115,6 @@ def population_filter_parquet(filename, base =None, blobstore_uri=None):
     ds = Dataset.Tabular.from_parquet_files(path=path)
     df = ds.to_pandas_dataframe()
     # if single mode then use ds class to filter?
-    #import pdb; pdb.set_trace()
     df = df[df.CPR_hash.isin(base.CPR_hash)]
     logger.info(f'loaded {len(df)} rows. Saving file.')
 

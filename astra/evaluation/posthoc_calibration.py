@@ -667,7 +667,7 @@ def _plot_reliability_diagrams(
             ax.plot(mean_raw, frac_raw, 'o--', color='grey', linewidth=2.0,
                     markersize=5, alpha=0.7, label=f'Raw (Brier={brier_raw:.3f})')
         except Exception:
-            pass
+            logger.debug(f"Raw calibration curve failed at step {step}; skipping panel curve")
 
         # Calibrated curve
         if step in calibrated_preds and best_method in calibrated_preds[step]:
@@ -680,7 +680,7 @@ def _plot_reliability_diagrams(
                 ax.plot(mean_cal, frac_cal, 'o-', color='#2E86AB', linewidth=2.5,
                         markersize=7, label=f'{best_method.capitalize()} (Brier={brier_cal:.3f})')
             except Exception:
-                pass
+                logger.debug(f"Calibrated ({best_method}) curve failed at step {step}; skipping panel curve")
 
         ax.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5)
         ax.set_title(format_step_label(step), fontsize=_FIG_STYLE['title'], fontweight='bold')

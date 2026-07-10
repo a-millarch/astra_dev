@@ -19,13 +19,13 @@ import logging
 import pickle
 from pathlib import Path
 
-from astra.utils import cfg, setup_logging, ensure_parent_dir, save_base64
+from astra.utils import cfg, ensure_parent_dir, save_base64
 from astra.models.hybrid.training import get_backbone
 from astra.data.caching import prepare_data_and_dls_cached
 from astra.evaluation.utils import prepare_model, step_to_time, time_to_step, time_to_hours, get_total_steps
 from astra.training.finetune import _infer_trajectory_lengths_from_batch
 
-logger = setup_logging()
+logger = logging.getLogger(__name__)
 
 
 def _seed_shap(seed):
@@ -1284,25 +1284,25 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
                                 mean the patient has no prehospital data. Stored in
                                 ``shap_results['test_data']`` for visualization.
     """
-    print("Extracting background data...")
+    logger.info("Extracting background data...")
     import torch
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
   
     bg_ts, bg_ts_cat, bg_cat, bg_cont, bg_y, bg_traj = extract_data_from_dataloader(
         background_loader, max_samples=max_background_samples, device=device)
     
-    print(f"  Background samples: {bg_ts.shape[0]}")
-    print(f"    Continuous TS: {bg_ts.shape}")
-    print(f"    Categorical TS: {bg_ts_cat.shape}")
-    print(f"    Static categorical: {bg_cat.shape}")
-    print(f"    Static continuous: {bg_cont.shape}")
+    logger.info("  Background samples: %s", bg_ts.shape[0])
+    logger.debug("    Continuous TS: %s", bg_ts.shape)
+    logger.debug("    Categorical TS: %s", bg_ts_cat.shape)
+    logger.debug("    Static categorical: %s", bg_cat.shape)
+    logger.debug("    Static continuous: %s", bg_cont.shape)
     
-    print("Extracting test data...")
+    logger.info("Extracting test data...")
     # If specific_pids provided, extract enough samples to include them all
     extraction_max = None if specific_pids is not None else max_test_samples
     test_ts, test_ts_cat, test_cat, test_cont, test_y, test_traj = extract_data_from_dataloader(
         test_loader, max_samples=extraction_max, device=device)
-    print(f"  Test samples extracted: {test_ts.shape[0]}")
+    logger.info("  Test samples extracted: %s", test_ts.shape[0])
 
     # Filter to specific PIDs if provided
     if specific_pids is not None and all_pids is not None:
@@ -1321,16 +1321,16 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         test_traj = test_traj[pid_indices]
         if inhospital_start_steps is not None:
             inhospital_start_steps = inhospital_start_steps[pid_indices.cpu().numpy()]
-        print(f"  Filtered to {len(pid_indices)} specific PIDs")
+        logger.info("  Filtered to %s specific PIDs", len(pid_indices))
 
-    print(f"  Final test samples: {test_ts.shape[0]}")
+    logger.info("  Final test samples: %s", test_ts.shape[0])
 
     model.eval()
     model = model.to(device)
     
-    print(f"\nModel has {len(model.embeds)} static categorical embeddings")
+    logger.info("Model has %s static categorical embeddings", len(model.embeds))
     for i, emb in enumerate(model.embeds):
-        print(f"  Embed {i}: {emb.num_embeddings} classes -> {emb.embedding_dim} dim")
+        logger.debug("  Embed %s: %s classes -> %s dim", i, emb.num_embeddings, emb.embedding_dim)
     
     has_cat_ts = model.n_ts_cat > 0 and bg_ts_cat is not None and bg_ts_cat.numel() > 0
     n_static_cat = bg_cat.shape[1]
@@ -1343,18 +1343,18 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     if model.temporal_head_enabled:
         if eval_timestep == -1:
             eval_timestep = 'mean'
-            print(f"  Temporal head detected: auto-switching eval_timestep to 'mean' "
-                  f"(padding-aware average across valid timesteps)")
+            logger.info("  Temporal head detected: auto-switching eval_timestep to 'mean' "
+                        "(padding-aware average across valid timesteps)")
         else:
-            print(f"  Temporal head: eval_timestep={eval_timestep}")
+            logger.info("  Temporal head: eval_timestep=%s", eval_timestep)
 
     has_static_cat = bg_cat_onehot is not None
     has_cont = bg_cont.shape[1] > 0
 
     if has_static_cat:
-        print(f"  Static categorical one-hot: {bg_cat_onehot.shape}")
+        logger.debug("  Static categorical one-hot: %s", bg_cat_onehot.shape)
 
-    print(f"\n  Using SHAPModelWrapper (raw cat TS + one-hot static cats)")
+    logger.info("  Using SHAPModelWrapper (raw cat TS + one-hot static cats)")
     wrapped_model = SHAPModelWrapper(
         model, has_cat_ts=has_cat_ts,
         has_static_cat=has_static_cat, has_cont=has_cont,
@@ -1375,13 +1375,13 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
     
     shap_seed = cfg.get("evaluation", {}).get("shap_seed", 42)
     shap_nsamples = cfg.get("evaluation", {}).get("shap_nsamples", 200)
-    print("\nCreating SHAP GradientExplainer...")
+    logger.info("Creating SHAP GradientExplainer...")
     explainer = shap.GradientExplainer(wrapped_model, bg_inputs)
 
-    print("Calculating SHAP values...")
+    logger.info("Calculating SHAP values...")
     _seed_shap(shap_seed)
     shap_values = explainer.shap_values(test_inputs, nsamples=shap_nsamples)
-    print("SHAP calculation complete!")
+    logger.info("SHAP calculation complete!")
 
     # For multi-output models (e.g. 2-class), GradientExplainer returns
     # [[sv_per_input_class0], [sv_per_input_class1]].
@@ -1390,7 +1390,7 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
         if isinstance(shap_values[0], list):
             n_classes = len(shap_values)
             selected_class = min(1, n_classes - 1)  # class 1 if available
-            print(f"  Multi-output model: {n_classes} classes, selecting class {selected_class}")
+            logger.info("  Multi-output model: %s classes, selecting class %s", n_classes, selected_class)
             shap_values = shap_values[selected_class]
 
     # Strip trailing singleton class dim (GradientExplainer format b)
@@ -1400,9 +1400,9 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
             else sv for sv in shap_values
         ]
 
-    print("\nSHAP value shapes:")
+    logger.debug("SHAP value shapes:")
     for i, sv in enumerate(shap_values):
-        print(f"  shap_values[{i}]: {sv.shape}")
+        logger.debug("  shap_values[%s]: %s", i, sv.shape)
     
     # Parse SHAP values
     idx = 0
@@ -1413,19 +1413,19 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
 
     if has_cat_ts:
         cat_ts_shap_per_category = shap_values[idx]
-        print(f"  cat_ts_shap_per_category: {cat_ts_shap_per_category.shape}")
+        logger.debug("  cat_ts_shap_per_category: %s", cat_ts_shap_per_category.shape)
         cat_ts_shap = np.abs(cat_ts_shap_per_category).mean(axis=1)
         idx += 1
 
     cat_shap, cat_shap_onehot = None, None
     if has_static_cat:
         cat_shap_onehot = shap_values[idx]
-        print(f"  cat_shap_onehot shape (one-hot SHAP): {cat_shap_onehot.shape}")
+        logger.debug("  cat_shap_onehot shape (one-hot SHAP): %s", cat_shap_onehot.shape)
         # cat_shap_onehot is [n_samples, n_cat, max_classes]
         # Aggregate over the one-hot class dimension: sum absolute value per feature
         # This gives overall feature importance (sum of all class probabilities' contribution)
         cat_shap = np.abs(cat_shap_onehot).sum(axis=2)  # [n_samples, n_cat]
-        print(f"  cat_shap after sum(|one_hot|): {cat_shap.shape}")
+        logger.debug("  cat_shap after sum(|one_hot|): %s", cat_shap.shape)
         idx += 1
     
     cont_shap = shap_values[idx] if has_cont else None
@@ -1477,56 +1477,56 @@ def calculate_shap_from_dataloaders(model, background_loader, test_loader, encod
 
 def debug_shap_data(shap_results, feature_names_cat=None, feature_names_cont=None):
     """Debug function to identify data shape mismatches."""
-    print("=" * 60)
-    print("SHAP RESULTS DEBUG")
-    print("=" * 60)
+    logger.debug("=" * 60)
+    logger.debug("SHAP RESULTS DEBUG")
+    logger.debug("=" * 60)
     
-    print("\n1. Time Series SHAP:")
-    print(f"   ts_shap shape: {shap_results['ts_shap'].shape}")
+    logger.debug("1. Time Series SHAP:")
+    logger.debug("   ts_shap shape: %s", shap_results['ts_shap'].shape)
     
-    print("\n2. Categorical TS SHAP:")
+    logger.debug("2. Categorical TS SHAP:")
     if shap_results['cat_ts_shap'] is not None:
-        print(f"   cat_ts_shap shape: {shap_results['cat_ts_shap'].shape}")
+        logger.debug("   cat_ts_shap shape: %s", shap_results['cat_ts_shap'].shape)
     else:
-        print("   cat_ts_shap: None")
+        logger.debug("   cat_ts_shap: None")
     
-    print("\n3. Static Categorical SHAP:")
+    logger.debug("3. Static Categorical SHAP:")
     if shap_results['cat_shap'] is not None:
-        print(f"   cat_shap shape: {shap_results['cat_shap'].shape}")
+        logger.debug("   cat_shap shape: %s", shap_results['cat_shap'].shape)
         n_from_shap = shap_results['cat_shap'].shape[1]
-        print(f"   Number of static cat features (from SHAP): {n_from_shap}")
+        logger.debug("   Number of static cat features (from SHAP): %s", n_from_shap)
     else:
-        print("   cat_shap: None")
+        logger.debug("   cat_shap: None")
         n_from_shap = 0
     
-    print(f"\n   feature_names_cat provided: {feature_names_cat}")
+    logger.debug("   feature_names_cat provided: %s", feature_names_cat)
     n_from_names = len(feature_names_cat) if feature_names_cat else 0
-    print(f"   Number of names provided: {n_from_names}")
+    logger.debug("   Number of names provided: %s", n_from_names)
     
     if n_from_shap != n_from_names:
-        print(f"\n   ⚠️  MISMATCH! SHAP has {n_from_shap} features but {n_from_names} names provided")
-        print(f"   TIP: Use get_static_cat_names_from_classes(data['classes']) to get all names")
+        logger.warning("   ⚠️  MISMATCH! SHAP has %s features but %s names provided", n_from_shap, n_from_names)
+        logger.warning("   TIP: Use get_static_cat_names_from_classes(data['classes']) to get all names")
     
-    print("\n4. Static Continuous SHAP:")
+    logger.debug("4. Static Continuous SHAP:")
     if shap_results['cont_shap'] is not None:
-        print(f"   cont_shap shape: {shap_results['cont_shap'].shape}")
+        logger.debug("   cont_shap shape: %s", shap_results['cont_shap'].shape)
     
-    print("\n5. Test Data Shapes:")
-    print(f"   cat: {shap_results['test_data']['cat'].shape}")
-    print(f"   cont: {shap_results['test_data']['cont'].shape}")
+    logger.debug("5. Test Data Shapes:")
+    logger.debug("   cat: %s", shap_results['test_data']['cat'].shape)
+    logger.debug("   cont: %s", shap_results['test_data']['cont'].shape)
     
-    print("\n6. Encoding Info (Categorical TS):")
+    logger.debug("6. Encoding Info (Categorical TS):")
     enc = shap_results.get('encoding_info', {})
-    print(f"   Keys: {list(enc.keys())}")
+    logger.debug("   Keys: %s", list(enc.keys()))
     if 'feature_ranges' in enc:
-        print(f"   feature_ranges:")
+        logger.debug("   feature_ranges:")
         for feat, (start, end) in enc['feature_ranges'].items():
-            print(f"      {feat}: indices {start}-{end} ({end-start} categories)")
+            logger.debug("      %s: indices %s-%s (%s categories)", feat, start, end, end-start)
     if 'category_labels' in enc:
-        print(f"   category_labels:")
+        logger.debug("   category_labels:")
         for feat, labels in enc['category_labels'].items():
-            print(f"      {feat}: {len(labels)} labels - {labels[:3]}..." if len(labels) > 3 else f"      {feat}: {labels}")
-    print("=" * 60)
+            logger.debug(f"      {feat}: {len(labels)} labels - {labels[:3]}..." if len(labels) > 3 else f"      {feat}: {labels}")
+    logger.debug("=" * 60)
 
 
 def get_category_names_from_encoding_info(encoding_info: Dict) -> List[str]:
@@ -1597,10 +1597,10 @@ def visualize_shap_individual(shap_results: Dict, sample_idx: int = None,
             available_pids = holdout_pids[:10]
             raise ValueError(f"PID {pid} not found in holdout data. "
                            f"First 10 available PIDs: {available_pids}...")
-        print(f"Found PID {pid} at sample index {sample_idx}")
+        logger.info("Found PID %s at sample index %s", pid, sample_idx)
     elif sample_idx is None:
         sample_idx = 0
-        print(f"No sample_idx or pid provided, using sample_idx=0")
+        logger.info("No sample_idx or pid provided, using sample_idx=0")
     
     # Get PID for title if available
     display_pid = None
@@ -2670,11 +2670,11 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
     if specific_pids is not None:
         missing_pids = [pid for pid in specific_pids if pid not in all_holdout_pids]
         if missing_pids:
-            print(f"Warning: PIDs not found in holdout set: {missing_pids}")
+            logger.warning("PIDs not found in holdout set: %s", missing_pids)
         specific_pids = [pid for pid in specific_pids if pid in all_holdout_pids]
         if not specific_pids:
             raise ValueError("None of the specified PIDs were found in holdout set")
-        print(f"Analyzing {len(specific_pids)} specific PIDs: {specific_pids}")
+        logger.info("Analyzing %s specific PIDs: %s", len(specific_pids), specific_pids)
 
     shap_results = calculate_shap_from_dataloaders(
         model=model,
@@ -2693,12 +2693,12 @@ def shap_analysis(data=None, model=None, model_name='13012025', compute_per_cate
 
     # Get holdout PIDs for individual plots (filtered if specific_pids provided)
     holdout_pids = get_holdout_pids(data, max_samples=max_test_samples, specific_pids=specific_pids)
-    print(f"\nExtracted {len(holdout_pids)} holdout PIDs")
-    print(f"First 5 PIDs: {holdout_pids[:5]}")
+    logger.info("Extracted %s holdout PIDs", len(holdout_pids))
+    logger.debug("First 5 PIDs: %s", holdout_pids[:5])
     
     # Get static categorical names from classes (includes _na columns)
     static_cat_names = get_static_cat_names_from_classes(data["classes"])
-    print(f"Static categorical features: {static_cat_names}")
+    logger.info("Static categorical features: %s", static_cat_names)
     
     # Debug output
     debug_shap_data(shap_results, 
@@ -2925,8 +2925,8 @@ class TemporalSHAPAnalyzer:
         if active_only: mode_parts.append("active-only")
         if density_normalize: mode_parts.append("density-norm")
         mode_str = f" ({', '.join(mode_parts)})" if mode_parts else ""
-        print(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
-              f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
+        logger.info(f"TemporalSHAPAnalyzer{mode_str}: {len(self.channel2feature)} channels, "
+                    f"cat_ts={self.has_cat_ts}, bg_samples={max_background_samples}")
         if self.cat_ts_gate_values is not None:
             logger.info(f"Categorical TS gate values (sigmoid): {self.cat_ts_gate_values}")
             logger.info(f"Gate suppression factor: mean={self.cat_ts_gate_values.mean():.3f} "
@@ -2940,7 +2940,7 @@ class TemporalSHAPAnalyzer:
         if self._bg_data is not None:
             return self._bg_data
 
-        print("Extracting background data...")
+        logger.info("Extracting background data...")
         all_ts, all_ts_cat, all_cat, all_cont, all_traj = [], [], [], [], []
         n = 0
         for batch in self.background_loader:
@@ -2983,7 +2983,7 @@ class TemporalSHAPAnalyzer:
         n_active = int(mask.sum())
         if n_active < 2:
             # Fall back to full background to avoid degenerate SHAP
-            print(f"  WARNING: only {n_active} active bg samples at step {censor_step}, using all")
+            logger.warning("  Only %s active bg samples at step %s, using all", n_active, censor_step)
             return bg, bg['ts'].shape[0]
 
         return {k: v[mask] for k, v in bg.items()}, n_active
@@ -3140,7 +3140,7 @@ class TemporalSHAPAnalyzer:
             if holdout_pids is None:
                 raise ValueError("holdout_pids required with pid")
             sample_idx = holdout_pids.index(pid)
-            if verbose: print(f"PID {pid} -> sample {sample_idx}")
+            if verbose: logger.debug("PID %s -> sample %s", pid, sample_idx)
         elif sample_idx is None:
             sample_idx = 0
         
@@ -3160,11 +3160,12 @@ class TemporalSHAPAnalyzer:
             if ihs_steps is not None and ihs_steps[0] is not None:
                 ihs_step = int(ihs_steps[0])
         except Exception:
-            pass  # base_df may not have the columns
+            # base_df may not have the columns
+            logger.debug("Could not compute inhospital start step for patient %s; leaving unset", display_pid)
 
         if verbose:
             ihs_info = f", inhospital at step {ihs_step}" if ihs_step is not None else ""
-            print(f"Patient {display_pid}: {actual_steps} steps ({actual_hours:.1f}h){ihs_info}")
+            logger.info(f"Patient {display_pid}: {actual_steps} steps ({actual_hours:.1f}h){ihs_info}")
         
         timeframes = timeframes or list(DEFAULT_TIMEFRAMES.keys())
         
@@ -3179,7 +3180,7 @@ class TemporalSHAPAnalyzer:
             else:
                 skipped_any = True
                 if verbose:
-                    print(f"  Skip {tf} (need {tf_h}h, have {actual_hours:.1f}h)")
+                    logger.warning("  Skip %s (need %sh, have %.1fh)", tf, tf_h, actual_hours)
         
         # If we skipped some timeframes, add 'max' which uses actual data length
         # This replaces 'full' behavior with a named timeframe showing actual hours
@@ -3191,7 +3192,7 @@ class TemporalSHAPAnalyzer:
             valid_tfs = [tf if tf != 'full' else max_label for tf in valid_tfs]
             local_timeframes[max_label] = None  # None means full/no censoring
         
-        if verbose: print(f"Analyzing: {valid_tfs}")
+        if verbose: logger.info("Analyzing: %s", valid_tfs)
         
         results = {}
         t0 = time.time()
@@ -3199,7 +3200,7 @@ class TemporalSHAPAnalyzer:
         for i, tf in enumerate(valid_tfs):
             tf_h = local_timeframes.get(tf)
             censor = None if tf_h is None else time_to_step(tf_h, 'h')
-            if verbose: print(f"  [{i+1}/{len(valid_tfs)}] {tf}...", end=" ", flush=True)
+            if verbose: logger.info("  [%s/%s] %s...", i+1, len(valid_tfs), tf)
             
             t1 = time.time()
             shap_res = self._compute_shap_for_sample(
@@ -3208,7 +3209,7 @@ class TemporalSHAPAnalyzer:
             n_active_bg = shap_res['n_active_background']
             if verbose:
                 active_str = f", bg={n_active_bg}" if self.active_only else ""
-                print(f"done ({time.time()-t1:.1f}s{active_str})")
+                logger.info(f"done ({time.time()-t1:.1f}s{active_str})")
 
             ts_shap = shap_res['ts_shap']
             if ts_shap.ndim == 3:
@@ -3274,7 +3275,7 @@ class TemporalSHAPAnalyzer:
                 n_active_background=n_active_bg,
             )
         
-        if verbose: print(f"Total: {time.time()-t0:.1f}s")
+        if verbose: logger.info("Total: %.1fs", time.time()-t0)
         
         out = TemporalSHAPResults(
             pid=display_pid, sample_idx=sample_idx,
@@ -3699,7 +3700,7 @@ class TemporalSHAPAnalyzer:
         fig.suptitle(f'Temporal SHAP - PID: {results.pid} ({results.actual_data_length_hours:.1f}h data){active_label}{dn_label}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
-        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
+        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); logger.info("Saved: %s", save_path)
         return fig
 
     def plot_stability_heatmap(self, results: TemporalSHAPResults, figsize=(24, 20), save_path=None):
@@ -3714,7 +3715,7 @@ class TemporalSHAPAnalyzer:
         - Row 5: Overall combined stability
         """
         if not results.stability_metrics:
-            print("No stability metrics"); return None
+            logger.warning("No stability metrics"); return None
         
         m = results.stability_metrics
         tfs = m['timeframes']
@@ -3864,7 +3865,7 @@ class TemporalSHAPAnalyzer:
         if save_path:
             ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved: {save_path}")
+            logger.info("Saved: %s", save_path)
         return fig
 
     def plot_correlation_analysis(self, results: TemporalSHAPResults, reference='full',
@@ -3886,7 +3887,7 @@ class TemporalSHAPAnalyzer:
         
         others = [t for t in tfs if t != reference]
         if not others:
-            print("Need 2+ timeframes"); return None
+            logger.warning("Need 2+ timeframes"); return None
         
         ref_result = results.timeframe_results[reference]
         
@@ -4086,7 +4087,7 @@ class TemporalSHAPAnalyzer:
         if save_path:
             ensure_parent_dir(save_path)
             plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Saved: {save_path}")
+            logger.info("Saved: %s", save_path)
         return fig
 
     def plot_feature_trajectory(self, results: TemporalSHAPResults, feature_names=None,
@@ -4128,7 +4129,7 @@ class TemporalSHAPAnalyzer:
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left'); ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); print(f"Saved: {save_path}")
+        if save_path: ensure_parent_dir(save_path); plt.savefig(save_path, dpi=150, bbox_inches='tight'); logger.info("Saved: %s", save_path)
         return fig
 
     def generate_summary_report(self, results: TemporalSHAPResults) -> pd.DataFrame:
@@ -5640,7 +5641,9 @@ def plot_static_features_plotly(shap_results, sample_idx=0, feature_names_cat=No
         labels = []
         for i in range(n):
             try: labels.append(f"{nms[i]} (val={int(cat_data[i])})" if i < len(cat_data) else nms[i])
-            except: labels.append(nms[i])
+            except Exception:
+                logger.debug("Label formatting failed for static categorical feature %s; using name only", nms[i])
+                labels.append(nms[i])
         colors = ['#ff0051' if v > 0 else '#008bfb' for v in cat_shap]
         hover = [f"<b>{labels[i]}</b><br>SHAP: {cat_shap[i]:.5f}" for i in range(n)]
         fig.add_trace(go.Bar(x=cat_shap, y=labels, orientation='h', marker_color=colors,
@@ -5657,7 +5660,9 @@ def plot_static_features_plotly(shap_results, sample_idx=0, feature_names_cat=No
         labels = []
         for i in range(n):
             try: labels.append(f"{nms[i]} (val={float(cont_data[i]):.2f})" if i < len(cont_data) else nms[i])
-            except: labels.append(nms[i])
+            except Exception:
+                logger.debug("Label formatting failed for static continuous feature %s; using name only", nms[i])
+                labels.append(nms[i])
         colors = ['#ff0051' if v > 0 else '#008bfb' for v in cont_shap]
         hover = [f"<b>{labels[i]}</b><br>SHAP: {cont_shap[i]:.5f}" for i in range(n)]
         fig.add_trace(go.Bar(x=cont_shap, y=labels, orientation='h', marker_color=colors,
@@ -5703,7 +5708,7 @@ def plot_prediction_trajectory_plotly(
             }
             cohort_pid = pid_map.get(str(ctx.pid))
         except Exception:
-            pass
+            logger.debug("Could not map inference PID %s to cohort PID; falling back to ctx.pid", ctx.pid)
         if cohort_pid is not None:
             patient_df = preds_df[preds_df["PID"] == cohort_pid].sort_values("time_hours")
         else:

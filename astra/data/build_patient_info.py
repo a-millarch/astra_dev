@@ -898,7 +898,7 @@ def _mask_mortality(df):
         return df
     
     duration_hours = (df["end"] - df["start"]).dt.total_seconds() / 3600
-    print(duration_hours)
+    logger.debug("duration_hours=%s", duration_hours)
     # < 3 hour: minus 10 minutes
     cond1 = dod_mask & (duration_hours < 3)
     df.loc[cond1, "end"] = df.loc[cond1, "DOD"] - pd.Timedelta(minutes=10)

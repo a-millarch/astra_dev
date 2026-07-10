@@ -21,7 +21,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from astra.utils import cfg, get_base_df, is_file_present, setup_logging, ensure_parent_dir
+from astra.utils import cfg, get_base_df, is_file_present, ensure_parent_dir
 from astra.data.mappings import (
     PPJ_MONTH_DICT,
     PPJ_VITALS_MAP,
@@ -31,7 +31,7 @@ from astra.data.mappings import (
     ABCD_SEVERITY,
 )
 
-logger = setup_logging()
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -1176,23 +1176,18 @@ if __name__ == "__main__":
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
     # Verify logging works
-    print(f"[prehospital __main__] Logger handlers: {logging.getLogger('astra').handlers}")
-    print(f"[prehospital __main__] Logger level: {logging.getLogger('astra').level}")
-    print("[prehospital __main__] About to call run_prehospital_pipeline...")
-    import sys
-    sys.stdout.flush()
+    logger.debug(f"Logger handlers: {logging.getLogger('astra').handlers}")
+    logger.debug(f"Logger level: {logging.getLogger('astra').level}")
+    logger.info("About to call run_prehospital_pipeline...")
 
     try:
         cfg["prehospital"] = True  # force-enable for standalone run
-        print("[prehospital __main__] cfg set, calling pipeline now")
-        sys.stdout.flush()
+        logger.debug("cfg set, calling pipeline now")
         base = run_prehospital_pipeline(cfg)
-        print(f"[prehospital __main__] Pipeline returned, base shape: {base.shape}")
-        sys.stdout.flush()
+        logger.info(f"Pipeline returned, base shape: {base.shape}")
         ensure_parent_dir(cfg["base_df_path"])
         base.to_pickle(cfg["base_df_path"], protocol=4)
-        print(f"[prehospital __main__] Saved to {cfg['base_df_path']}")
+        logger.info(f"Saved to {cfg['base_df_path']}")
     except BaseException as e:
-        print(f"[prehospital __main__] FATAL ERROR ({type(e).__name__}): {e}")
+        logger.error(f"FATAL ERROR ({type(e).__name__}): {e}")
         traceback.print_exc()
-        sys.stdout.flush()

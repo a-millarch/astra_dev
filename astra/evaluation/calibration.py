@@ -281,11 +281,11 @@ def analyze_calibration_only(data, model_name: str):
 # ============================================================================
 
 if __name__ == "__main__":
-    print(__doc__)
-    print("\n" + "="*80)
-    print("USAGE")
-    print("="*80)
-    print("""
+    logger.info(__doc__)
+    logger.info("\n" + "="*80)
+    logger.info("USAGE")
+    logger.info("="*80)
+    logger.info("""
 # Option 1: Full evaluation with calibration (recommended)
 from evaluation_with_calibration import run_eval_with_calibration
 
@@ -571,7 +571,7 @@ def plot_calibration_curve(
     if save_path:
         ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Calibration plot saved to {save_path}")
+        logger.info(f"Calibration plot saved to {save_path}")
     
     return fig
 
@@ -643,7 +643,7 @@ def plot_calibration_comparison(
     if save_path:
         ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Calibration comparison saved to {save_path}")
+        logger.info(f"Calibration comparison saved to {save_path}")
     
     return fig
 
@@ -757,7 +757,7 @@ def plot_calibration_over_time(
     if save_path:
         ensure_parent_dir(save_path)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"Calibration over time plot saved to {save_path}")
+        logger.info(f"Calibration over time plot saved to {save_path}")
     
     return fig
 
@@ -839,7 +839,7 @@ def add_calibration_to_eval(
     import os
     os.makedirs(save_dir, exist_ok=True)
 
-    print("Generating calibration analysis...")
+    logger.info("Generating calibration analysis...")
 
     from astra.evaluation.predictive_performance import _get_predictions
     preds, targets = _get_predictions(model, holdout_mixed_dls.train, device)
@@ -851,8 +851,8 @@ def add_calibration_to_eval(
     ece, bin_data = calculate_ece(y_true, y_pred, n_bins=4)
     brier = brier_score_loss(y_true, y_pred)
     
-    print(f"Expected Calibration Error (ECE): {ece:.4f}")
-    print(f"Brier Score: {brier:.4f}")
+    logger.info(f"Expected Calibration Error (ECE): {ece:.4f}")
+    logger.info(f"Brier Score: {brier:.4f}")
     
     # Generate calibration plot
     fig = plot_calibration_curve(
@@ -865,12 +865,11 @@ def add_calibration_to_eval(
     
     # Generate summary table
     cal_table = calibration_summary_table(y_true, y_pred, n_bins=4)
-    print("\nCalibration Summary Table:")
-    print(cal_table.to_string(index=False))
-    
+    logger.debug("Calibration Summary Table:\n%s", cal_table.to_string(index=False))
+
     # Save table
     cal_table.to_csv(f"{save_dir}/calibration_table_{model_name}.csv", index=False)
-    print(f"\nCalibration table saved to {save_dir}/calibration_table_{model_name}.csv")
+    logger.info(f"Calibration table saved to {save_dir}/calibration_table_{model_name}.csv")
     
     return {
         'ece': ece,
@@ -941,11 +940,11 @@ def plot_survival_calibration(
 # ============================================================================
 
 if __name__ == "__main__":
-    print(__doc__)
-    print("\n" + "="*80)
-    print("USAGE EXAMPLES")
-    print("="*80)
-    print("""
+    logger.info(__doc__)
+    logger.info("\n" + "="*80)
+    logger.info("USAGE EXAMPLES")
+    logger.info("="*80)
+    logger.info("""
 # 1. Basic calibration plot
 from calibration_plots import plot_calibration_curve
 

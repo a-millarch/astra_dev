@@ -1171,7 +1171,8 @@ def _get_long_concept_df_single_label(
                 (~df.FEATURE.isin(cfg["drop_features"].get(concept, []))) &
                 (df.PID.isin(base_pids))
             ][["PID", "bin_counter", "FEATURE", "VALUE"]]
-        except:
+        except Exception:
+            logger.debug(f"drop_features filter failed for {concept}; filtering on PID only")
             df = df[
                 (df.PID.isin(base_pids))
             ][["PID", "bin_counter", "FEATURE", "VALUE"]]
@@ -1344,7 +1345,8 @@ def get_concept(concept: str, cfg: Dict, base_pids: set = None) -> Dict:
         else:
             try:
                 df = df[~df.FEATURE.isin(drop_cols + [np.nan])]
-            except:
+            except Exception:
+                logger.debug(f"drop_features filter failed for {concept}; dropping NaN FEATUREs only")
                 df = df[~df.FEATURE.isin([np.nan])]
 
         concept_dict[agg_func] = df

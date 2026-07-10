@@ -665,4 +665,4 @@ def report_sweep_results(study: optuna.Study) -> None:
             for k, v in importances.items():
                 logger.info(f"    {k}: {v:.3f}")
         except Exception:
-            pass
+            logger.debug("Could not compute Optuna parameter importances; skipping")
