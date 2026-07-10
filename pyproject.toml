@@ -10,6 +10,9 @@ authors = [
   { name = "Andreas Skov Millarch", email = "andreasmillarch@gmail.com" },
 ]
 
+[project.optional-dependencies]
+service = ["fastapi>=0.110", "uvicorn>=0.27", "httpx>=0.24"]
+
 
 [tool.setuptools]
 packages = ["astra"]

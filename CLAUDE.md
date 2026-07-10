@@ -48,7 +48,7 @@ Key flags: `--pretrain`, `--finetune/--no-finetune`, `--eval/--no-eval`, `--use-
 
 Note: `--skip-valid` (default) trains on full trainval without validation. `--no-skip-valid` creates an 80/20 split with early stopping.
 
-Legacy CLI (`astra/models/hybrid/train_model.py`) still works for basic pretrain/finetune/eval but lacks sweep and early-prediction support.
+The sole training entry point is `python -m astra.training.train` (the legacy `astra/models/hybrid/train_model.py` CLI has been removed).
 
 
 ## Architecture
@@ -117,7 +117,13 @@ Pretrained weights saved to `pretrain_checkpoints/{model_name}/`, finetuned mode
 
 ### Inference (`astra/inference/`)
 
-Single-patient real-time inference: `pipeline.py` orchestrates data preparation (`data_prep.py`), comorbidity scoring (`comorbidity.py`), optional EBM features (`ebm.py`), and patient context assembly (`patient_context.py`). Entry: `run_inference.py`.
+Single-patient real-time inference. The high-level entry point is `api.py` — `AstraPredictor.load(model_name, artifacts_dir)` then `.predict(patient_id, timestamp, service_date)` / `.explain(...)` / `.explain_differential(...)`, returning JSON-safe response objects (`responses.py`) that carry the probability-over-time curve, SHAP arrays and a `TimeAxis` (step ↔ elapsed-hours mapping from the bundle's bin config). Underneath: `pipeline.py` (`InferenceSession`), `data_prep.py`, `patient_context.py`, `simulation.py` (`SimulationRunner`, builds the curve for non-temporal models), `comorbidity.py`, `ebm.py`.
+
+Patient raw data flows through a pluggable seam: `datasource.py` defines `PatientDataSource` (per-concept DataFrames — SQL/parquet/memory adapters possible); `patient_store.set_data_source()` registers one; without registration, CSV loading from `data/raw` / `data/patients` is used unchanged. CLI: `python -m astra.inference.run_inference`. Artifact handoff: `python -m astra.inference.export_artifacts export|validate` (see `docs/HANDOFF.md` for the external-team data contract).
+
+### Service (`astra/service/`)
+
+Thin FastAPI reference wrapping `AstraPredictor` (`pip install -e .[service]`, `python -m astra.service`). Endpoints: `/health`, `/model/info`, `/predict`, `/explain`, `/explain/differential`, `/explain/ebm`. Single-worker; a global lock serializes inference.
 
 ### Key Concepts
 

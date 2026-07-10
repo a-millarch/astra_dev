@@ -61,7 +61,7 @@ Errors (defined in `astra/inference/api.py`) and the HTTP statuses the reference
 | `PatientNotFoundError` | No data resolvable for the patient (data source returned nothing for required concepts) | 404 |
 | `TimestampBeforeAdmissionError` | Requested timestamp precedes trajectory start | 422 |
 | `ArtifactError` | Model artifacts missing/unloadable | 503 |
-| `ValueError` | Unparseable timestamp / missing `service_date` | 400 |
+| `ValueError` | Unparseable timestamp / missing `service_date` | 422 |
 
 ### Temporal vs non-temporal models — curve cost
 

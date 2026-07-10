@@ -3,6 +3,7 @@
 
 As a part of the ASTRA project by CSTAR, an ML-driven risk assessment tool for trauma patients is developed for implementation in the Eletronic Health Record (EHR) system at the Copenhagen University Hospital. 
 
+> **Implementing ASTRA for inference?** Start with [docs/HANDOFF.md](docs/HANDOFF.md) — it covers the `AstraPredictor` Python API, the FastAPI reference service, the artifact bundle (`python -m astra.inference.export_artifacts`), and the normative per-concept data contract for wiring up your own EHR data feed.
 
 ### Single patient continious update process graph
 ```mermaid
