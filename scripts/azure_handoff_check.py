@@ -30,16 +30,20 @@ Exit code 0 only if every executed check passes.
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import subprocess
 import sys
 import tempfile
 import traceback
+import warnings
 
 import numpy as np
 import pandas as pd
 
-logger = logging.getLogger(__name__)
+# Under the 'astra' hierarchy so setup_logging()'s console + file handlers
+# apply (a bare __main__ logger has no handler and its messages vanish).
+logger = logging.getLogger('astra.scripts.handoff_check')
 
 ATOL = 1e-6
 SHAP_CORR_THRESHOLD = 0.95
@@ -238,6 +242,11 @@ def main():
     parser.add_argument('--skip-selftest', action='store_true')
     parser.add_argument('--skip-shap', action='store_true')
     parser.add_argument('--skip-cli', action='store_true')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Keep full INFO console output during parity '
+                             '(default: console quiets to WARNING for the '
+                             'stepping loops; everything still goes to the '
+                             'file log)')
     args = parser.parse_args()
 
     from astra.utils import setup_logging, get_cfg
@@ -284,7 +293,20 @@ def main():
             rows.append(('patient auto-pick', 'FAIL', _describe_exception(exc)))
             patients = []
 
+    # The simulation stepping logs one INFO line per bin (x patients) and
+    # pandas emits repeated FutureWarnings — enough to overflow terminals.
+    # Quiet the console; the file log (logging/astra.log) keeps full DEBUG.
+    if not args.verbose:
+        warnings.filterwarnings('ignore', category=FutureWarning)
+        for h in logging.getLogger('astra').handlers:
+            if not isinstance(h, logging.handlers.TimedRotatingFileHandler):
+                h.setLevel(logging.WARNING)
+        print('(console quieted for parity stepping — full detail in the '
+              'file log; use --verbose to keep it)')
+
     for cpr_hash, service_date in patients:
+        print(f'Parity: {str(cpr_hash)[:8]}... @ {args.hours:g}h '
+              f'(service_date={service_date}) ...')
         try:
             check_parity(model_name, args.config, cfg, cpr_hash, service_date,
                          args.hours, args.skip_shap, rows)
