@@ -350,6 +350,35 @@ class AstraPredictor:
             )
         return response
 
+    def explain_viz(self, patient_id: str, timestamp, service_date):
+        """SHAP explanation in the dashboard visualization format.
+
+        Returns exactly what ``InferenceSession.shap_to_viz_dict`` produces —
+        ``(shap_dict, channel2feature, feature_names_cat, feature_names_cont)``
+        — for drop-in use with the existing plotting helpers in
+        ``astra.evaluation.behavior``::
+
+            sd, ch2f, ncat, ncont = predictor.explain_viz(pid, ts, service_date)
+            visualize_shap_individual_interactive(sd, 0, channel2feature=ch2f,
+                feature_names_cat=ncat, feature_names_cont=ncont)
+
+        Use :meth:`explain` instead when you need the JSON-safe payload for a
+        frontend; this method is for notebooks/dashboards reusing the built-in
+        matplotlib/plotly panels.
+        """
+        ts = self._parse_timestamp(timestamp)
+        with self._lock:
+            entry = self._get_entry(patient_id, service_date, ts)
+            ctx = entry['ctx']
+            self._advance(entry, ts)
+            eval_step = self._eval_step(ctx, ts)
+            shap_result = self.session.explain_from_context(
+                ctx, censor_step=eval_step)
+            return self.session.shap_to_viz_dict(
+                shap_result, x_ts=ctx.x_ts, x_ts_cat=ctx.x_ts_cat,
+                tab_df=ctx.tab_df,
+            )
+
     def explain_ebm(self, patient_id: str, timestamp, service_date) -> Optional[dict]:
         """Local EBM feature contributions (only if the model uses `_ebm_pred`)."""
         if '_ebm_pred' not in self.bundle.get('ts_channel_names', []):

@@ -328,6 +328,17 @@ class TestConfigPlumbing:
         assert predictor._cfg["model_name"] == "cfg_model"
 
 
+class TestExplainViz:
+    def test_returns_dashboard_format(self, temporal_predictor):
+        ts = ADMISSION + pd.Timedelta(hours=1)
+        shap_dict, ch2f, ncat, ncont = temporal_predictor.explain_viz(
+            "pat1", ts, "2030-01-01")
+        assert shap_dict["ts_shap"].shape == (1, len(CHANNELS), SEQ_LEN)
+        assert ch2f == {i: c for i, c in enumerate(CHANNELS)}
+        assert ncat == ["SEX"] and ncont == ["AGE"]
+        assert "test_data" in shap_dict and "trajectory_length" in shap_dict
+
+
 class TestModelInfo:
     def test_json_safe_and_content(self, temporal_predictor):
         info = temporal_predictor.model_info()
