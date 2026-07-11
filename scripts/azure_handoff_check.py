@@ -34,6 +34,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -57,6 +58,17 @@ def _pick_patients(n, hours, cfg):
             f'No patients with trajectories >= {hours + 1.0:.0f}h in base_df')
     picks = eligible.head(n)
     return [(row['CPR_hash'], str(row['ServiceDate'])) for _, row in picks.iterrows()]
+
+
+def _describe_exception(exc) -> str:
+    """`TypeName(msg) at file:line (in func)` — enough to localize a crash
+    from the summary table alone (full traceback goes to the log)."""
+    tb = traceback.extract_tb(exc.__traceback__)
+    where = ''
+    if tb:
+        frame = tb[-1]
+        where = f' at {os.path.basename(frame.filename)}:{frame.lineno} (in {frame.name})'
+    return f'{type(exc).__name__}({exc}){where}'[:160]
 
 
 def _compare_curves(name, facade_probs, ref_probs, rows):
@@ -251,7 +263,7 @@ def main():
                      args.export_dir))
     except Exception as exc:
         logger.exception('Real-model export/validate crashed')
-        rows.append(('real-model export+validate', 'FAIL', str(exc)[:120]))
+        rows.append(('real-model export+validate', 'FAIL', _describe_exception(exc)))
 
     # 3. Golden-patient parity
     if args.cpr_hash:
@@ -263,7 +275,7 @@ def main():
             patients = _pick_patients(args.n_patients, args.hours, cfg)
         except Exception as exc:
             logger.exception('Patient auto-pick failed')
-            rows.append(('patient auto-pick', 'FAIL', str(exc)[:120]))
+            rows.append(('patient auto-pick', 'FAIL', _describe_exception(exc)))
             patients = []
 
     for cpr_hash, service_date in patients:
@@ -272,7 +284,8 @@ def main():
                          args.hours, args.skip_shap, rows)
         except Exception as exc:
             logger.exception('Parity check crashed for %s', str(cpr_hash)[:8])
-            rows.append((f'parity {str(cpr_hash)[:8]}', 'FAIL', str(exc)[:120]))
+            rows.append((f'parity {str(cpr_hash)[:8]}', 'FAIL',
+                         _describe_exception(exc)))
 
     # 4. CLI smoke (first patient)
     if not args.skip_cli and patients:
@@ -281,7 +294,7 @@ def main():
                       args.hours, rows)
         except Exception as exc:
             logger.exception('CLI smoke crashed')
-            rows.append(('CLI smoke', 'FAIL', str(exc)[:120]))
+            rows.append(('CLI smoke', 'FAIL', _describe_exception(exc)))
 
     return print_summary(rows)
 
