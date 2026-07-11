@@ -23,16 +23,6 @@ from astra.data.mapper import map_concept, map_concept_optimized
 from astra.data.caching import prepare_data_and_dls_cached
 
 
-def generate_base_df():
-    # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
-    
-    ensure_parent_dir('data/external/trauma_call.csv')
-    pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
-    'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv('data/external/trauma_call.csv')
-    
-   
-    # saved as pickle
-
 def proces_raw_concepts(cfg, base= None, reset=False): # move to construct data_sets?
     subsets_filenames = cfg["default_load_filenames"] + cfg["large_load_filenames"]
     if (

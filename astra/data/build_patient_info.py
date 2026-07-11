@@ -115,10 +115,20 @@ def define_historic_population(cfg=cfg):
                 len(traumepatienter), cfg["population_file_path"])
 
 def define_single_patient(cfg):
-    # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
+    """Write a placeholder single-patient seed file (used by
+    load_or_collect_population in single_patient_mode). Replace the
+    placeholder hash/date with the target patient before running."""
     ensure_parent_dir(cfg["trauma_call_file_path"])
-    pd.DataFrame.from_dict({'CPR_hash':['FFFB69AEF2D7DED6288C835FE45672455D6E68F1F725207109750F772EDC68C4'],
-    'ServiceDate':[np.datetime64('2023-08-20T15:21:00.000000000')]}, orient='columns').to_csv(cfg["trauma_call_file_path"])
+    pd.DataFrame.from_dict(
+        {'CPR_hash': ['0' * 64],  # placeholder — replace with a real CPR hash
+         'ServiceDate': [np.datetime64('2030-01-01T12:00:00.000000000')]},
+        orient='columns',
+    ).to_csv(cfg["trauma_call_file_path"])
+    logger.warning(
+        "Wrote PLACEHOLDER single-patient seed to %s — edit it with the "
+        "target patient's CPR_hash and ServiceDate.",
+        cfg["trauma_call_file_path"],
+    )
 
 def load_or_collect_population(cfg):
     if cfg["single_patient_mode"] is True:
