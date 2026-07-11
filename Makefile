@@ -16,23 +16,25 @@ PYTHON_INTERPRETER = python
 # COMMANDS                                                                      #
 #################################################################################
 
-## Set up python interpreter environment
+## Create the conda environment (CPU; use environment_gpu.yml on GPU machines)
 create_environment:
-	conda create --name $(PROJECT_NAME) python=$(PYTHON_VERSION) --no-default-packages -y
+	conda env create -f environment_cpu.yml
 
-## Install Python Dependencies
+## Create the conda environment (GPU)
+create_environment_gpu:
+	conda env create -f environment_gpu.yml
+
+## Install the package into the active environment (deps come from the conda env)
 requirements:
-	$(PYTHON_INTERPRETER) -m pip install -U pip setuptools wheel
-	$(PYTHON_INTERPRETER) -m pip install -r requirements.txt
 	$(PYTHON_INTERPRETER) -m pip install -e .
-	
+
 # Instal local project as package
 local:
 	$(PYTHON_INTERPRETER) -m pip install -e .
 
-## Install Developer Python Dependencies
-dev_requirements: requirements
-	$(PYTHON_INTERPRETER) -m pip install .["dev"]
+## Install with the REST-service extra (fastapi/uvicorn)
+service_requirements:
+	$(PYTHON_INTERPRETER) -m pip install -e .[service]
 
 ## Delete all compiled Python files
 clean:
@@ -103,11 +105,11 @@ tree:
 	tree /f
 
 ## Build documentation
-build_documentation: dev_requirements
+build_documentation:
 	mkdocs build --config-file docs/mkdocs.yaml --site-dir build
 
 ## Serve documentation
-serve_documentation: dev_requirements
+serve_documentation:
 	mkdocs serve --config-file docs/mkdocs.yaml
 
 #################################################################################

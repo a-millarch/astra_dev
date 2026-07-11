@@ -149,7 +149,8 @@ def setup_logging(level=logging.INFO, log_dir=None):
                 datefmt='%Y-%m-%d %H:%M:%S',
             ))
             root.addHandler(file_handler)
-            root.debug("File logging -> %s", log_path / 'astra.log')
+            root.info("File log: %s (rotating daily, 30-day retention; "
+                      "override with ASTRA_LOG_DIR)", log_path / 'astra.log')
         except OSError as e:
             root.warning("Could not set up file logging in %s (%s) — "
                          "console only. Set ASTRA_LOG_DIR to override.",

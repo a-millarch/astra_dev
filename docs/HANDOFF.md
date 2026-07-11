@@ -128,10 +128,11 @@ A `PASS` from `validate` is the agreed acceptance criterion for "artifacts arriv
 git clone <repo>   # or unpack the source archive shipped with the bundle
 cd astra
 
-# Option A: conda (CPU-only environment is sufficient)
-conda env create -f environment_cpu.yml && conda activate astra
+# The conda environment is the canonical dependency specification
+# (CPU-only is sufficient; environment_gpu.yml exists for GPU machines)
+conda env create -f environment_cpu.yml && conda activate astra_cpu
 
-# Option B: pip
+# Then install the package into it
 pip install -e .
 pip install -e .[service]        # extra: FastAPI/uvicorn for the REST service
 ```
@@ -151,6 +152,10 @@ REST service (section 7).
   - `data/patients/` — per-patient CSV cache (file-based mode only; writes are best-effort).
 - One `AstraPredictor` per process. The registered data source is process-global
   (`set_data_source`), and a `threading.RLock` serializes inference — see section 9.
+- **Log files.** Every entry point writes a rotating DEBUG log to `logging/astra.log`
+  (daily rotation, 30-day retention) in addition to console output. Override the location
+  with the `ASTRA_LOG_DIR` environment variable (set it empty to disable file logging);
+  an unwritable directory degrades to console-only with a warning.
 
 ---
 

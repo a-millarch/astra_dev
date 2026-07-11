@@ -5,6 +5,13 @@ docs/*
 examples/
 notebooks/
 
+# Local assistant/tooling files
+.claude/
+CLAUDE.md
+
+# R libraries installed at runtime by astra/R/*.r
+.r_libs/
+
 # Azure
 .amlignore
 .amlignore.amltmp

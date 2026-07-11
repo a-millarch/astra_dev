@@ -1,6 +1,10 @@
-install.packages('icdpicr', lib = '.')
-# Set the library path to the current directory
-.libPaths("./")
+# Installs into a gitignored local library (.r_libs) so the package is not
+# committed to the repository.
+dir.create('.r_libs', showWarnings = FALSE)
+.libPaths('.r_libs')
+if (!requireNamespace('icdpicr', quietly = TRUE)) {
+  install.packages('icdpicr', lib = '.r_libs', repos = 'https://cloud.r-project.org')
+}
 
 # Load the package
 library(icdpicr)
