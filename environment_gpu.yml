@@ -90,6 +90,7 @@ dependencies:
 
       # ── Plotting / Dash / CLI ───────────────────────────────────────────────────
       - plotly
+      - nbformat>=4.2.0    # required by plotly for notebook rendering
       - dash
       - dash-core-components
       - dash-html-components
