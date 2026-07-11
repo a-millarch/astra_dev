@@ -165,6 +165,7 @@ def check_cli(config_path, cpr_hash, service_date, hours, rows):
                '--patient-id', str(cpr_hash),
                '--service-date', str(service_date),
                '--timestamp', ts,
+               '--device', 'cpu',   # keep the whole check GPU-independent
                '--out', out_json]
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         if proc.returncode != 0:
