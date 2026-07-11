@@ -117,14 +117,19 @@ def _jsonable(obj):
     return obj
 
 
-def _print_shap_warning():
+def _print_shap_warning(sign_off=None):
+    if sign_off:
+        logger.info('shap_background sign-off recorded in manifest: %s', sign_off)
+        print(f'shap_background sign-off recorded: {sign_off}')
+        return
     lines = [
         '!' * 78,
         '!!  WARNING: PATIENT-DERIVED DATA IN BUNDLE',
         "!!  The deployment bundle's shap_background contains background tensors",
         '!!  derived from real patients. Data-protection sign-off is REQUIRED',
         '!!  before this bundle leaves the secure environment.',
-        "!!  Complete manifest.json -> shap_background.sign_off (currently null).",
+        "!!  Complete manifest.json -> shap_background.sign_off (currently null),",
+        "!!  or re-run export with --sign-off '<who approved, when, basis>'.",
         '!' * 78,
     ]
     banner = '\n'.join(lines)
@@ -173,7 +178,7 @@ def run_export(model_name, artifacts_dir='models', out_dir='handoff',
                config_path='configs/defaults.yaml',
                metadata_csv='data/external/metadata.csv',
                handoff_doc='docs/HANDOFF.md',
-               include_ebm=True, dry_run=False):
+               include_ebm=True, dry_run=False, sign_off=None):
     """Collect + fingerprint deployment artifacts into *out_dir*.
 
     Args:
@@ -187,6 +192,9 @@ def run_export(model_name, artifacts_dir='models', out_dir='handoff',
         handoff_doc: Shipped if present.
         include_ebm: Copy models/ebm/*.pkl when the model uses '_ebm_pred'.
         dry_run: Report the copy plan; write nothing.
+        sign_off: Data-protection approval to record in the manifest for the
+            patient-derived shap_background (who approved, when, on what
+            basis). When omitted the field is null and a warning is printed.
 
     Returns:
         The manifest dict (or a plan dict when ``dry_run=True``).
@@ -365,7 +373,7 @@ def run_export(model_name, artifacts_dir='models', out_dir='handoff',
         'shap_background': {
             'n_samples': n_bg,
             'note': SHAP_BG_NOTE,
-            'sign_off': None,
+            'sign_off': sign_off,
         },
         'files': file_entries,
     }
@@ -378,7 +386,7 @@ def run_export(model_name, artifacts_dir='models', out_dir='handoff',
     print(f'Exported {len(file_entries)} files ({total_bytes / 1e6:.2f} MB) '
           f'to {out_dir}')
     print(f'Manifest: {manifest_path}')
-    _print_shap_warning()
+    _print_shap_warning(sign_off)
     return manifest
 
 
@@ -639,6 +647,12 @@ def main(argv=None):
                      help='Skip EBM model files even if the model uses _ebm_pred.')
     exp.add_argument('--dry-run', action='store_true',
                      help='Report what would be copied; write nothing.')
+    exp.add_argument('--sign-off', default=None,
+                     help='Record data-protection approval for the patient-'
+                          'derived shap_background in manifest.json, e.g. '
+                          '"Approved <name> <date>: receiving team holds '
+                          'full data rights". Omitting it leaves sign_off '
+                          'null and prints a warning.')
 
     val = sub.add_parser(
         'validate', help='Acceptance test: hash check + model load + forward pass.')
@@ -663,6 +677,7 @@ def main(argv=None):
                 config_path=args.config,
                 include_ebm=not args.no_ebm,
                 dry_run=args.dry_run,
+                sign_off=args.sign_off,
             )
             return 0
         except Exception as exc:

@@ -114,8 +114,9 @@ A `PASS` from `validate` is the agreed acceptance criterion for "artifacts arriv
 > patient-derived, normalized input tensors** from the training cohort (see
 > `extract_shap_background()` in `astra/data/dataloader.py`). They are normalized and de-identified
 > but derived from real patients. The `sign_off` field in `manifest.json` **must be completed by the
-> data controller before the bundle leaves the secure environment.** Treat the bundle with the same
-> confidentiality as pseudonymized patient data.
+> data controller before the bundle leaves the secure environment** — record it at export time with
+> `export --sign-off "<who approved, when, basis>"` (e.g. *"receiving team holds full data rights"*).
+> Treat the bundle with the same confidentiality as pseudonymized patient data.
 
 ---
 
@@ -526,6 +527,10 @@ handles as below):
 | `ebm/` models dir, model expects `_ebm_pred` | Warning; `_ebm_pred` channel left empty; `explain_ebm` returns `None` | Medium — the model saw this channel in training |
 | `calibrators/<M>/` | Predictions served uncalibrated (`calibration_method: null` in responses) | Low–medium |
 
+> **Phase 1 note:** the first deployment phase does **not** use prehospital data — the shipped model
+> is trained with `prehospital: false`, so the `fetch_prehospital` row above does not apply. It
+> becomes relevant only if a later phase ships a prehospital-trained model.
+
 General rule: a missing measurement is **not** an error — the model was trained on ~80 % missingness
 and missing values are handled by design. A missing *systematic* source (whole concept) changes the
 input distribution and should be quantified against the owner's golden patients before go-live
@@ -761,19 +766,25 @@ admission (t=0). Frontends should always plot against `time_axis`, never assume 
 
 ### (a) Owner — pre-handoff, on the secure (Azure) environment
 
-- [ ] **Golden-patient parity.** For ≥ 3 known patients (incl. one deceased, one with prehospital
-  data), `AstraPredictor.predict/explain` outputs match the dashboard (`dashboard/app_shap.py`)
-  probabilities and SHAP panels at the same timestamps.
-- [ ] **Export + validate round-trip.** `python -m astra.inference.export_artifacts export
-  --model-name <M> --out handoff/` followed by `... validate --dir handoff/ --explain-smoke`
-  passes in a *fresh* checkout (empty `data/interim/`, no cohort data).
-- [ ] **CLI smoke.** `python -m astra.inference.run_inference --cpr-hash <HASH> --service-date ...
-  --current-time ... --model-name <M>` completes and writes the trajectory/SHAP figures.
-- [ ] **Prehospital degradation quantified.** If the model was trained with `prehospital: true`:
-  re-run the golden patients with prehospital data withheld (no `fetch_prehospital`) and record the
-  probability deltas. Sign off, or ship a model trained without prehospital.
-- [ ] **manifest sign-off.** `manifest.json` `sign_off` completed by the data controller
-  (`shap_background` leaves the secure environment — section 2).
+Most of this is automated by the driver script (run from the repo root):
+
+```bash
+python -m pytest tests/ -q                                        # synthetic suite (87 tests)
+python scripts/azure_handoff_check.py --model-name <M> --sign-off "<approval>"
+```
+
+The driver runs: the synthetic export self-test, a real-model export + validate round trip,
+golden-patient parity (facade vs `SimulationRunner`/`InferenceSession` on auto-picked holdout
+patients: probabilities and curves to 1e-6, SHAP exact-or-correlation ≥ 0.95), and a
+`run_inference` CLI smoke. Manual boxes:
+
+- [ ] **`azure_handoff_check.py` RESULT: PASS** (attach the summary to the handoff).
+- [ ] **Export + validate in a fresh checkout** (empty `data/interim/`, no cohort data) —
+  proves no hidden dependency on interim files.
+- [ ] **Prehospital degradation quantified** — only if a prehospital-trained model is ever shipped
+  (phase 1 ships `prehospital: false`, so this is N/A initially).
+- [ ] **manifest sign-off.** `sign_off` recorded (via `--sign-off` or by editing `manifest.json`)
+  before the bundle leaves the secure environment (section 2).
 
 ### (b) Team — acceptance, in your environment
 
