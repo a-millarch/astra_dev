@@ -3,9 +3,6 @@ single_patient_mode: False
 population_file_path: data/raw/trauma_call_historic_population.csv
 trauma_call_file_path: data/external/trauma_call.csv
 
-experiment_name: hpt
-run_name: highres
-
 model_name: '14042026'
 
 target: deceased_30d
@@ -61,7 +58,6 @@ ebm_feature:
   enabled: false
   save_dir: data/interim/ebm_features
   n_folds: 5
-  default_value: 0.0
   interval_schedule:  # EBM masking intervals: {boundary: step_size}
     30min: '10min'    # 0 → 30min: every 10min  (~3 intervals)
     4h: '1h'          # 30min → 4h: every 1h    (~4 intervals)
@@ -87,7 +83,6 @@ traumatext_config:
     - traumemodtagelse
     - traumecenter
 
-mapped_dir: data/interim/mapped
 concepts:
   - ITAOversigtsrapport
   - VitaleVaerdier
@@ -106,8 +101,6 @@ concepts:
 
 dataset:
   exclusion: study  # null = no exclusion, or profile name: "study", "lvl1tc", etc. study3
-  overwrite: True
-  max_duration_days: 365 #now cut off using bins
   min_bin_seq_len: 1
 
   id_col: PID
@@ -204,11 +197,9 @@ pretrain:
     mask_prob_cat_ts_empty: 0.03
 
 training:
-    folds: 5
-    epochs: 30
     bs: 32
-    
-  
+
+
 model:
   d_model: 192
   n_layers: 4
@@ -244,7 +235,7 @@ finetune:
   pos_weight_factor: 0.6000000000000001
   time_weighting: early
   temporal_loss_averaging: per_sample
-  eval_timeframe_weighting: 'true'
+  eval_timeframe_weighting: true
   eval_timeframe_weight: 1.5
   ranking_loss_weight: 0.15000000000000002
   temporal_crop_prob: 0.0
@@ -273,7 +264,7 @@ finetune:
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
-    n_trials: 350
+    # (trial count via the --n-trials CLI flag)
     study_patience: 12
     study_min_delta: 0.005   # minimum AUROC+AUPRC improvement to reset patience
     search_space:
@@ -311,10 +302,6 @@ sweep:
         val_auroc_weight: [0.1, 0.9]         # val_auprc_weight = 1 - val_auroc_weight
 
 evaluation:
-    max_f_beta: 10
-    f_beta: 4
-    threshold_mode: f1 #fbeta
-    mc_dropout_samples: 30  # MC Dropout forward passes for uncertainty (Fix 8)
     shap_seed: 42           # RNG seed for reproducible SHAP values (null to disable)
     shap_nsamples: 200      # Number of interpolation samples for GradientExplainer
 
@@ -402,23 +389,6 @@ agg_func: #also for datasets, split it up
   InvasiveMonitoring:
       - max
 
-# Mapping
-npartitions:
-  bin_df: 8
-  VitaleVaerdier: 16
-  ITAOversigtsrapport: 1
-  Diagnoser: 4
-  Labsvar: 4
-  Medicin: 4
-  EWS: 1
-  ISS_notes: 1
-  ISS_computed: 1
-  Events: 1
-  InvasiveMonitoring: 1
-
-mapping:
- Diagnoser: cat
- 
 drop_features:
   VitaleVaerdier:
     - nan
@@ -459,8 +429,3 @@ holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
 holdout_split_date: '2023-07-01'   # Temporal split cutoff: train <= date < test
 seed: 2024
-
-Medicin: 
-    ATC_keep_len: 3
- 
- 

@@ -4,6 +4,11 @@ Companion to [HANDOFF.md](HANDOFF.md) (inference integration). This document cov
 cycle the operating team runs when a new raw data dump arrives**: rebuild the datasets, retrain
 the model, evaluate it, and redeploy the artifact bundle for inference.
 
+Background reading in this folder: [training_pipeline.md](training_pipeline.md) (training
+architecture in depth), [inference_pipeline_diagram.md](inference_pipeline_diagram.md)
+(deployment-bundle mechanics), [medication_profiles.md](medication_profiles.md) (feature
+engineering rationale), [state.md](state.md) (pipeline state diagram).
+
 ```
 new raw dump ──▶ 1. data pipeline ──▶ 2. train (pretrain→finetune) ──▶ 3. evaluate + calibrate
                      make_data              astra.training.train            (same command)

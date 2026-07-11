@@ -3,8 +3,17 @@
 docs/*
 !docs/HANDOFF.md
 !docs/RETRAINING.md
+!docs/inference_pipeline_diagram.md
+!docs/training_pipeline.md
+!docs/medication_profiles.md
+!docs/state.md
 examples/
 notebooks/
+
+# only the canonical config + profiles ship; experiment configs stay local
+configs/*
+!configs/defaults.yaml
+!configs/profiles.yaml
 
 # Local assistant/tooling files
 .claude/
