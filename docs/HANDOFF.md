@@ -542,6 +542,12 @@ input distribution and should be quantified against the owner's golden patients 
 
 ## 6. Python quickstart
 
+> **Runnable version:** `python scripts/demo_api_usage.py` executes everything in
+> sections 6–7 end-to-end with **zero artifacts and zero patient data** — it builds a
+> tiny synthetic model and serves a synthetic patient through an `InMemoryDataSource`,
+> exercising the exact production code path (including the REST layer if
+> `fastapi` is installed). Start there.
+
 ```python
 from astra.inference.api import AstraPredictor
 

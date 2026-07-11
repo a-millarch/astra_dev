@@ -22,7 +22,13 @@ from astra.inference.pipeline import InferenceResult, SHAPResult
 SMALL_CONFIG = {
     "bin_intervals": {"1h": "10min", "3h": "30min", "end": "1h"},
     "bin_freq_include": ["10min", "30min", "1h"],
-    "channel_map": {"VitaleVaerdier": ["HR", "SBP"]},
+    # Real bundles store per-channel metadata (see _build_channel_map)
+    "channel_map": {
+        "HR": {"concept": "VitaleVaerdier", "feature": "HR",
+               "agg_func": "mean", "type": "continuous"},
+        "SBP": {"concept": "VitaleVaerdier", "feature": "SBP",
+                "agg_func": "mean", "type": "continuous"},
+    },
 }
 SEQ_LEN = get_total_steps(data_config=SMALL_CONFIG)   # 10
 ADMISSION = pd.Timestamp("2030-01-01 12:00:00")
@@ -262,7 +268,7 @@ class TestExplain:
         assert len(d["ts_shap"][0]) == SEQ_LEN
         assert d["ts_values"][0][0] == 82.0
         assert d["ts_values"][0][1] is None               # NaN → None
-        assert d["channel_map"] == {"VitaleVaerdier": ["HR", "SBP"]}
+        assert d["channel_map"]["HR"]["concept"] == "VitaleVaerdier"
         assert d["cat_ts"]["labels"] == ["ATC_A", "ATC_B"]
         assert d["static_cat"]["values"] == ["Male"]
         assert d["static_cont"]["values"] == [54.0]

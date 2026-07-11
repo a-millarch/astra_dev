@@ -975,6 +975,11 @@ class InferenceSession:
         data_config = self.bundle.get('data_config')
         step_t1 = time_to_step(t1_hours, 'h', data_config=data_config)
         step_t2 = time_to_step(t2_hours, 'h', data_config=data_config)
+        # time_to_step extends into the open-ended 'end' interval, so an
+        # hours value beyond the grid can map past the model's last step.
+        max_step = self.bundle['model_params']['seq_len'] - 1
+        step_t1 = min(step_t1, max_step)
+        step_t2 = min(step_t2, max_step)
 
         logger.info("Differential SHAP: pid=%s T1=%.1fh (step %d) → T2=%.1fh (step %d)",
                      context.pid, t1_hours, step_t1, t2_hours, step_t2)

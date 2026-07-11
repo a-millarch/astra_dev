@@ -252,9 +252,17 @@ def collapse_admissions(df: pd.DataFrame, time_gap_hours: int = 1) -> pd.DataFra
     df["end"] = pd.to_datetime(df["end"])
     df = df.sort_values(["CPR_hash", "start"]).reset_index(drop=True)
 
-    collapsed = df.groupby("CPR_hash").apply(
-        lambda group: _collapse_patient_admissions(group, time_gap_hours)
-    , include_groups=True).reset_index(drop=True)
+    # include_groups only exists in pandas >= 2.2; older versions forward
+    # unknown kwargs to the lambda and raise TypeError.
+    try:
+        collapsed = df.groupby("CPR_hash").apply(
+            lambda group: _collapse_patient_admissions(group, time_gap_hours),
+            include_groups=True,
+        ).reset_index(drop=True)
+    except TypeError:
+        collapsed = df.groupby("CPR_hash").apply(
+            lambda group: _collapse_patient_admissions(group, time_gap_hours)
+        ).reset_index(drop=True)
 
     return collapsed
 

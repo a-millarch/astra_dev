@@ -181,7 +181,10 @@ class ExplanationResponse(_JsonableMixin):
     channels: List[str]                         # continuous TS channel names, row order
     ts_shap: List[List[float]]                  # [n_channels, seq_len]
     ts_values: List[List[Optional[float]]]      # raw values, None = not measured
-    channel_map: Optional[Dict[str, List[str]]] = None  # concept → channel names
+    # Per-channel metadata from the bundle's data_config:
+    # {channel: {concept, feature, agg_func, type}} — group channels by
+    # source concept via entry['concept'].
+    channel_map: Optional[Dict[str, Any]] = None
     cat_ts: Optional[CategoricalTSBlock] = None
     static_cat: Optional[StaticFeatureBlock] = None
     static_cont: Optional[StaticFeatureBlock] = None

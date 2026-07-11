@@ -150,7 +150,9 @@ class ExplanationResponseModel(_ResponseModel):
     channels: List[str]
     ts_shap: FloatMatrix
     ts_values: FloatMatrix
-    channel_map: Optional[Dict[str, List[str]]] = None
+    # Per-channel metadata from the bundle:
+    # {channel: {concept, feature, agg_func, type}}
+    channel_map: Optional[Dict[str, Any]] = None
     cat_ts: Optional[CategoricalTSBlockModel] = None
     static_cat: Optional[StaticFeatureBlockModel] = None
     static_cont: Optional[StaticFeatureBlockModel] = None
