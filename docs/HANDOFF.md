@@ -81,10 +81,12 @@ Check which you have via `model_info()['is_temporal']`.
 
 ## 2. Artifact bundle
 
-The owner exports the bundle on the secure environment:
+The owner exports the bundle on the secure environment (config-first: the model
+name is read from the config's `model_name` key, and that same config file ships
+in the bundle; `--model-name` overrides it if needed):
 
 ```bash
-python -m astra.inference.export_artifacts export --model-name <MODEL> --out handoff/
+python -m astra.inference.export_artifacts export --config configs/<experiment>.yaml --out handoff/
 ```
 
 Contents (`<M>` = model name):
@@ -544,11 +546,12 @@ input distribution and should be quantified against the owner's golden patients 
 from astra.inference.api import AstraPredictor
 
 predictor = AstraPredictor.load(
-    "<MODEL>",                       # model name from manifest.json
+    config_path="handoff/configs/defaults.yaml",  # config-first: model_name + data-prep
     artifacts_dir="handoff",         # bundle root (contains deployment/, <MODEL>.pth, ...)
     device="cpu",
     data_source=MySQLDataSource(engine),   # your adapter — or omit for file-based mode
 )
+# ...or pass the model name explicitly: AstraPredictor.load("<MODEL>", artifacts_dir="handoff")
 
 print(predictor.model_info()["channels"])
 
@@ -600,7 +603,8 @@ The bundled reference service wraps `AstraPredictor` 1:1.
 ```bash
 pip install -e .[service]
 
-export ASTRA_MODEL_NAME=<MODEL>          # model to load (defaults to model_name in configs/defaults.yaml)
+export ASTRA_CONFIG=configs/<cfg>.yaml   # config-first: supplies model_name + data-prep settings
+export ASTRA_MODEL_NAME=<MODEL>          # optional override (default: model_name from ASTRA_CONFIG)
 export ASTRA_ARTIFACTS_DIR=handoff       # bundle root (default: models)
 export ASTRA_DATA_DIR=data/raw           # file-based mode only
 export ASTRA_PATIENT_DIR=data/patients   # file-based mode only
@@ -770,7 +774,7 @@ Most of this is automated by the driver script (run from the repo root):
 
 ```bash
 python -m pytest tests/ -q                                        # synthetic suite (87 tests)
-python scripts/azure_handoff_check.py --model-name <M> --sign-off "<approval>"
+python scripts/azure_handoff_check.py --config configs/<experiment>.yaml --sign-off "<approval>"
 ```
 
 The driver runs: the synthetic export self-test, a real-model export + validate round trip,

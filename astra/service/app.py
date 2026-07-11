@@ -141,6 +141,7 @@ def _load_predictor(settings: ServiceSettings):
         predictor = AstraPredictor.load(
             settings.model_name,
             settings.artifacts_dir,
+            config_path=settings.config_path,
             device=settings.device,
             data_dir=settings.data_dir,
             patient_dir=settings.patient_dir,

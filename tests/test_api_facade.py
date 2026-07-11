@@ -279,6 +279,49 @@ class TestExplain:
         assert all(0.0 <= v <= 1.0 for v in per.values())
 
 
+class TestConfigPlumbing:
+    def test_cfg_passed_to_from_csv(self, monkeypatch):
+        """A config given to the predictor must reach PatientContext.from_csv —
+        the global cfg is NOT updated by get_cfg(path), so explicit plumbing
+        is the only way a custom config takes effect."""
+        from astra.inference.patient_context import PatientContext
+
+        sentinel_cfg = {"model_name": "fake", "sentinel": True}
+        captured = {}
+
+        def fake_from_csv(**kwargs):
+            captured.update(kwargs)
+            return FakeCtx()
+
+        monkeypatch.setattr(PatientContext, "from_csv", staticmethod(fake_from_csv))
+        predictor = AstraPredictor(FakeSession(temporal=True), cfg=sentinel_cfg)
+        predictor.predict("pat1", ADMISSION + pd.Timedelta(hours=1), "2030-01-01")
+        assert captured["cfg"] is sentinel_cfg
+        assert captured["start_hours"] == 0.0
+
+    def test_load_requires_model_name_or_config(self):
+        with pytest.raises(ValueError, match="model_name is required"):
+            AstraPredictor.load(None, artifacts_dir="Z:/nowhere")
+
+    def test_load_reads_model_name_from_config(self, tmp_path, monkeypatch):
+        cfg_file = tmp_path / "exp.yaml"
+        cfg_file.write_text("model_name: cfg_model\n", encoding="utf-8")
+
+        captured = {}
+
+        def fake_session_load(model_name, device=None, bundle_dir=None,
+                              weights_dir=None):
+            captured["model_name"] = model_name
+            return FakeSession(temporal=True)
+
+        from astra.inference import pipeline
+        monkeypatch.setattr(pipeline.InferenceSession, "load",
+                            staticmethod(fake_session_load))
+        predictor = AstraPredictor.load(config_path=str(cfg_file))
+        assert captured["model_name"] == "cfg_model"
+        assert predictor._cfg["model_name"] == "cfg_model"
+
+
 class TestModelInfo:
     def test_json_safe_and_content(self, temporal_predictor):
         info = temporal_predictor.model_info()

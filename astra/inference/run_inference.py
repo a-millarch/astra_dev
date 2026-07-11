@@ -32,14 +32,19 @@ logger = logging.getLogger(__name__)
 
 
 def run(model_name, patient_id, service_date, timestamp, *,
-        artifacts_dir='models', data_dir='data/raw',
+        config_path=None, artifacts_dir='models', data_dir='data/raw',
         patient_dir='data/patients', device=None,
         explain=False, differential=None, ebm=False,
         out_path=None, plot=False, save_dir='reports/inference'):
-    """Execute one prediction (and optional explanations); return the payload dict."""
+    """Execute one prediction (and optional explanations); return the payload dict.
+
+    ``model_name`` may be None when ``config_path`` points to a YAML with a
+    ``model_name`` key (config-first, like the training CLI).
+    """
     predictor = AstraPredictor.load(
         model_name,
         artifacts_dir=artifacts_dir,
+        config_path=config_path,
         device=device,
         data_dir=data_dir,
         patient_dir=patient_dir,
@@ -126,7 +131,11 @@ def _plot_curve(prediction, save_dir):
 def main():
     parser = argparse.ArgumentParser(
         description="Single-patient inference: prediction + SHAP as JSON")
-    parser.add_argument("--model-name", required=True, help="Model name")
+    parser.add_argument("--config", default=None,
+                        help="Config YAML (config-first: model_name and data-prep "
+                             "settings come from here; default configs/defaults.yaml)")
+    parser.add_argument("--model-name", default=None,
+                        help="Model name (default: model_name from --config)")
     parser.add_argument("--patient-id", "--cpr-hash", dest="patient_id",
                         required=True, help="Patient CPR hash")
     parser.add_argument("--service-date", required=True,
@@ -159,11 +168,16 @@ def main():
     from astra.utils import setup_logging
     setup_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
+    if args.model_name is None and args.config is None:
+        # config-first default: derive model_name from configs/defaults.yaml
+        args.config = "configs/defaults.yaml"
+
     run(
         model_name=args.model_name,
         patient_id=args.patient_id,
         service_date=args.service_date,
         timestamp=args.timestamp,
+        config_path=args.config,
         artifacts_dir=args.artifacts_dir,
         data_dir=args.data_dir,
         patient_dir=args.patient_dir,

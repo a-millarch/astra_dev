@@ -80,9 +80,13 @@ class AstraPredictor:
 
     def __init__(self, session, *, data_dir='data/raw',
                  patient_dir='data/patients', ebm_models_dir='models/ebm',
-                 context_cache_size=8):
+                 context_cache_size=8, cfg=None):
         self.session = session
         self.bundle = session.bundle
+        # Project config governing data preparation (concepts, filters,
+        # prehospital toggle). None -> downstream defaults (configs/defaults.yaml).
+        # The bin grid always comes from the bundle's data_config, not from here.
+        self._cfg = cfg
         self.model_name = self.bundle.get('model_name', '?')
         self.is_temporal = session.is_temporal
         self.survival_mode = self.bundle.get('model_params', {}).get(
@@ -110,7 +114,9 @@ class AstraPredictor:
     # ------------------------------------------------------------------
 
     @classmethod
-    def load(cls, model_name: str, artifacts_dir: str = 'models', *,
+    def load(cls, model_name: Optional[str] = None,
+             artifacts_dir: str = 'models', *,
+             config_path: Optional[str] = None,
              device: Optional[str] = None,
              data_source=None,
              data_dir: str = 'data/raw',
@@ -119,12 +125,19 @@ class AstraPredictor:
         """Load model + deployment bundle and configure the data source.
 
         Args:
-            model_name: Name the model was trained/exported under.
+            model_name: Name the model was trained/exported under. May be
+                omitted when *config_path* is given — it is then read from the
+                config's ``model_name`` key (the config-first pattern used by
+                ``python -m astra.training.train --config ...``).
             artifacts_dir: Root artifacts directory containing
                 ``deployment/deployment_{model_name}.pkl``,
                 ``{model_name}.pth``, optional ``calibrators/{model_name}/``
                 and optional ``ebm/`` (the layout produced by training and by
                 ``python -m astra.inference.export_artifacts``).
+            config_path: Project config YAML governing data preparation
+                (concepts, filters, prehospital toggle). None -> the
+                pipeline's default ``configs/defaults.yaml``. The bin grid is
+                always taken from the deployment bundle, never from here.
             device: 'cuda', 'cpu' or None (auto-detect).
             data_source: A :class:`PatientDataSource` for non-file data feeds
                 (registered process-globally). Passing a
@@ -135,6 +148,19 @@ class AstraPredictor:
             context_cache_size: Number of patient contexts kept warm (LRU).
         """
         from astra.inference.pipeline import InferenceSession
+
+        cfg = None
+        if config_path is not None:
+            from astra.utils import get_cfg
+            cfg = get_cfg(config_path)
+            logger.info("Loaded config %s (model_name=%r)",
+                        config_path, cfg.get('model_name'))
+        if model_name is None:
+            model_name = (cfg or {}).get('model_name')
+            if not model_name:
+                raise ValueError(
+                    "model_name is required — pass it explicitly or provide "
+                    "config_path to a YAML with a 'model_name' key")
 
         bundle_dir = os.path.join(artifacts_dir, 'deployment')
         try:
@@ -163,6 +189,7 @@ class AstraPredictor:
             patient_dir=patient_dir,
             ebm_models_dir=os.path.join(artifacts_dir, 'ebm'),
             context_cache_size=context_cache_size,
+            cfg=cfg,
         )
 
     # ------------------------------------------------------------------
@@ -424,6 +451,7 @@ class AstraPredictor:
                     service_date=service_date,
                     current_time=pd.Timestamp(service_date),
                     bundle=self.bundle,
+                    cfg=self._cfg,
                     data_dir=self.data_dir,
                     patient_dir=self.patient_dir,
                     ebm_models_dir=self.ebm_models_dir,
@@ -436,6 +464,7 @@ class AstraPredictor:
             runner.setup(
                 cpr_hash=patient_id,
                 service_date=service_date,
+                cfg=self._cfg,
                 data_dir=self.data_dir,
                 patient_dir=self.patient_dir,
                 ebm_models_dir=self.ebm_models_dir,

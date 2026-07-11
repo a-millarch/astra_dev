@@ -4,10 +4,15 @@ Run from the repo root in the secure environment (real data + model
 artifacts present). Complements the synthetic checks that already run
 anywhere (`pytest tests/`, `export_artifacts validate --self-test`).
 
-    python scripts/azure_handoff_check.py --model-name <MODEL> \
+    python scripts/azure_handoff_check.py --config configs/defaults.yaml \
+        [--model-name <M>]                      # default: model_name from --config
         [--n-patients 3] [--hours 24] [--skip-shap] [--skip-selftest] \
         [--skip-cli] [--export-dir handoff_check] \
         [--cpr-hash HASH --service-date DATE]   # explicit patient instead of auto-pick
+
+Config-first: the chosen config supplies the model name, the base_df path for
+patient auto-picking, and the data-prep settings used when building patient
+contexts; the same config file is shipped in the exported bundle.
 
 Checks (each reported PASS/FAIL):
   1. self-test        — synthetic export/validate round trip (tiny model)
@@ -39,11 +44,11 @@ ATOL = 1e-6
 SHAP_CORR_THRESHOLD = 0.95
 
 
-def _pick_patients(n, hours):
+def _pick_patients(n, hours, cfg):
     """Most recent patients (holdout-ish) with trajectories longer than *hours*."""
     from astra.utils import get_base_df
 
-    base = get_base_df()
+    base = get_base_df(cfg.get('base_df_path'))
     dur_h = (pd.to_datetime(base['end']) - pd.to_datetime(base['start'])
              ).dt.total_seconds() / 3600.0
     eligible = base[dur_h >= hours + 1.0].sort_values('start', ascending=False)
@@ -93,7 +98,8 @@ def _compare_shap(name, facade_arr, ref_arr, rows):
                                f'(explainer sampling tolerance)'))
 
 
-def check_parity(model_name, cpr_hash, service_date, hours, skip_shap, rows):
+def check_parity(model_name, config_path, cfg, cpr_hash, service_date,
+                 hours, skip_shap, rows):
     """Facade vs direct InferenceSession/SimulationRunner on one patient."""
     from astra.inference import AstraPredictor, InferenceSession, SimulationRunner
 
@@ -103,13 +109,14 @@ def check_parity(model_name, cpr_hash, service_date, hours, skip_shap, rows):
     # --- Reference: the established dashboard path ---
     session = InferenceSession.load(model_name, device='cpu')
     runner = SimulationRunner(session)
-    runner.setup(cpr_hash=cpr_hash, service_date=service_date)
+    runner.setup(cpr_hash=cpr_hash, service_date=service_date, cfg=cfg)
     runner.advance_to(hours=hours)
     ctx_ref = runner.context
     ref = session.predict_from_context(ctx_ref)
 
     # --- Facade ---
-    predictor = AstraPredictor.load(model_name, device='cpu')
+    predictor = AstraPredictor.load(model_name, config_path=config_path,
+                                    device='cpu')
     ts = ctx_ref.admission_time + pd.Timedelta(hours=hours)
     resp = predictor.predict(cpr_hash, ts, service_date)
 
@@ -147,18 +154,14 @@ def check_parity(model_name, cpr_hash, service_date, hours, skip_shap, rows):
                      f'facade={got_steps} ref={ref_steps}'))
 
 
-def check_cli(model_name, cpr_hash, service_date, hours, rows):
-    from astra.inference import InferenceSession  # admission time needed
-    session = InferenceSession.load(model_name, device='cpu')
-    del session  # only imported to fail fast if artifacts are missing
-
+def check_cli(config_path, cpr_hash, service_date, hours, rows):
     with tempfile.TemporaryDirectory() as tmp:
         out_json = os.path.join(tmp, 'result.json')
         # Absolute timestamp not needed: service_date + hours margin is enough
         # for a smoke test; use service_date + hours as the eval time.
         ts = (pd.Timestamp(service_date) + pd.Timedelta(hours=hours)).isoformat()
         cmd = [sys.executable, '-m', 'astra.inference.run_inference',
-               '--model-name', model_name,
+               '--config', config_path,
                '--patient-id', str(cpr_hash),
                '--service-date', str(service_date),
                '--timestamp', ts,
@@ -196,7 +199,12 @@ def print_summary(rows):
 def main():
     parser = argparse.ArgumentParser(
         description='Azure-side validation of the handoff inference API.')
-    parser.add_argument('--model-name', required=True)
+    parser.add_argument('--config', default='configs/defaults.yaml',
+                        help='Config YAML — supplies model_name, base_df path '
+                             'and data-prep settings; shipped in the export '
+                             '(default: configs/defaults.yaml)')
+    parser.add_argument('--model-name', default=None,
+                        help='Override the model_name from --config')
     parser.add_argument('--n-patients', type=int, default=3,
                         help='Holdout patients to auto-pick for parity (default 3)')
     parser.add_argument('--hours', type=float, default=24.0,
@@ -213,8 +221,14 @@ def main():
     parser.add_argument('--skip-cli', action='store_true')
     args = parser.parse_args()
 
-    from astra.utils import setup_logging
+    from astra.utils import setup_logging, get_cfg
     setup_logging(level=logging.INFO)
+
+    cfg = get_cfg(args.config)
+    model_name = args.model_name or cfg.get('model_name')
+    if not model_name:
+        parser.error(f"{args.config} has no 'model_name' key — pass --model-name")
+    logger.info('Config: %s -> model_name=%r', args.config, model_name)
 
     rows = []
 
@@ -225,12 +239,12 @@ def main():
         rows.append(('export self-test', 'PASS' if rc == 0 else 'FAIL',
                      'synthetic round trip'))
 
-    # 2. Real-model export + validate round trip
+    # 2. Real-model export + validate round trip (ships the chosen config)
     try:
         from astra.inference.export_artifacts import run_export, run_validate
-        run_export(args.model_name, out_dir=args.export_dir,
-                   sign_off=args.sign_off)
-        rc = run_validate(args.export_dir, model_name=args.model_name,
+        run_export(model_name, out_dir=args.export_dir,
+                   config_path=args.config, sign_off=args.sign_off)
+        rc = run_validate(args.export_dir, model_name=model_name,
                           explain_smoke=not args.skip_shap)
         rows.append(('real-model export+validate', 'PASS' if rc == 0 else 'FAIL',
                      args.export_dir))
@@ -245,7 +259,7 @@ def main():
         patients = [(args.cpr_hash, args.service_date)]
     else:
         try:
-            patients = _pick_patients(args.n_patients, args.hours)
+            patients = _pick_patients(args.n_patients, args.hours, cfg)
         except Exception as exc:
             logger.exception('Patient auto-pick failed')
             rows.append(('patient auto-pick', 'FAIL', str(exc)[:120]))
@@ -253,7 +267,7 @@ def main():
 
     for cpr_hash, service_date in patients:
         try:
-            check_parity(args.model_name, cpr_hash, service_date,
+            check_parity(model_name, args.config, cfg, cpr_hash, service_date,
                          args.hours, args.skip_shap, rows)
         except Exception as exc:
             logger.exception('Parity check crashed for %s', str(cpr_hash)[:8])
@@ -262,7 +276,7 @@ def main():
     # 4. CLI smoke (first patient)
     if not args.skip_cli and patients:
         try:
-            check_cli(args.model_name, patients[0][0], patients[0][1],
+            check_cli(args.config, patients[0][0], patients[0][1],
                       args.hours, rows)
         except Exception as exc:
             logger.exception('CLI smoke crashed')

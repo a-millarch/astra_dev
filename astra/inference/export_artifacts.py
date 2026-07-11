@@ -626,6 +626,23 @@ def run_self_test(explain_smoke=False):
 # CLI
 # ---------------------------------------------------------------------------
 
+def _model_name_from_config(config_path):
+    """Resolve ``model_name`` from a config YAML (config-first CLI pattern)."""
+    import yaml
+    try:
+        with open(config_path, encoding='utf-8') as fh:
+            cfg = yaml.safe_load(fh) or {}
+    except OSError as exc:
+        raise SystemExit(
+            f'--model-name not given and config not readable: {config_path} ({exc})')
+    model_name = cfg.get('model_name')
+    if not model_name:
+        raise SystemExit(
+            f"--model-name not given and {config_path} has no 'model_name' key")
+    logger.info('Resolved model_name=%r from %s', model_name, config_path)
+    return str(model_name)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='python -m astra.inference.export_artifacts',
@@ -635,8 +652,8 @@ def main(argv=None):
 
     exp = sub.add_parser(
         'export', help='Collect + fingerprint artifacts into a handoff directory.')
-    exp.add_argument('--model-name', required=True,
-                     help='Model name (matches training save name).')
+    exp.add_argument('--model-name', default=None,
+                     help='Model name (default: model_name from --config).')
     exp.add_argument('--artifacts-dir', default='models',
                      help='Source artifacts directory (default: models).')
     exp.add_argument('--out', default='handoff',
@@ -670,8 +687,9 @@ def main(argv=None):
 
     if args.command == 'export':
         try:
+            model_name = args.model_name or _model_name_from_config(args.config)
             run_export(
-                args.model_name,
+                model_name,
                 artifacts_dir=args.artifacts_dir,
                 out_dir=args.out,
                 config_path=args.config,

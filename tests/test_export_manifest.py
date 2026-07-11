@@ -124,3 +124,27 @@ def test_validate_temporal_bundle(tmp_path):
     out_dir, _ = _export_tiny(tmp_path, model_name='tinytemp', temporal_head=True)
     rc = run_validate(str(out_dir))
     assert rc == 0
+
+
+class TestModelNameFromConfig:
+    """Config-first CLI: model_name resolvable from a config YAML."""
+
+    def test_resolves_from_yaml(self, tmp_path):
+        from astra.inference.export_artifacts import _model_name_from_config
+        cfg = tmp_path / "exp.yaml"
+        cfg.write_text("model_name: exp_model\nother: 1\n", encoding="utf-8")
+        assert _model_name_from_config(str(cfg)) == "exp_model"
+
+    def test_missing_key_exits(self, tmp_path):
+        import pytest
+        from astra.inference.export_artifacts import _model_name_from_config
+        cfg = tmp_path / "empty.yaml"
+        cfg.write_text("other: 1\n", encoding="utf-8")
+        with pytest.raises(SystemExit):
+            _model_name_from_config(str(cfg))
+
+    def test_unreadable_exits(self, tmp_path):
+        import pytest
+        from astra.inference.export_artifacts import _model_name_from_config
+        with pytest.raises(SystemExit):
+            _model_name_from_config(str(tmp_path / "missing.yaml"))
