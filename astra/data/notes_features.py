@@ -171,6 +171,11 @@ def build_iss_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
         .groupby(["PID", "Redigeringstidspunkt"], as_index=False)
         .agg({"Note": lambda x: "\n".join(x.astype(str))})
     )
+    # Empty grouped result (e.g. all timestamps NaT → dropped as group keys)
+    # can lose the key columns on some pandas versions.
+    if df.empty or "PID" not in df.columns:
+        logger.info("ISS: no notes with usable timestamps")
+        return pd.DataFrame(columns=["PID", "TIMESTAMP", "FEATURE", "VALUE"])
     df = df.sort_values(["PID", "Redigeringstidspunkt"]).reset_index(drop=True)
 
     records = []
@@ -250,6 +255,17 @@ def is_intubated(text: str) -> bool:
     return False
 
 
+def _empty_intubation_frame() -> pd.DataFrame:
+    """Typed empty result — 'intubated' MUST be bool dtype: an object-dtype
+    empty column makes ``df[df["intubated"]]`` degrade to column-label
+    indexing instead of row masking, dropping every column."""
+    return pd.DataFrame({
+        "PID": pd.Series(dtype=object),
+        "intubated": pd.Series(dtype=bool),
+        "Redigeringstidspunkt": pd.Series(dtype="datetime64[ns]"),
+    })
+
+
 def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFrame:
     """
     Return one row per patient with intubation status and timestamp.
@@ -257,15 +273,25 @@ def get_first_intubation_note(notes: pd.DataFrame, notetypes: set) -> pd.DataFra
     For others: first note of given type.
     """
     if notes.empty:
-        return pd.DataFrame(columns=["PID", "intubated", "Redigeringstidspunkt"])
+        return _empty_intubation_frame()
+
+    typed = notes[notes["Notetype"].isin(notetypes)]
+    if typed.empty:
+        # Patient has notes, but none of these notetypes.
+        return _empty_intubation_frame()
 
     subset = (
-        notes[notes["Notetype"].isin(notetypes)]
+        typed
         .fillna({"Note": ""})
         .groupby(["PID", "Redigeringstidspunkt", "Notetype"], as_index=False)
         .agg({"Note": lambda x: "\n".join(x.astype(str))})
-        .sort_values(["PID", "Redigeringstidspunkt"])
     )
+    # An empty grouped result (e.g. every Redigeringstidspunkt is NaT and
+    # dropped as a group key) loses the key columns on some pandas versions —
+    # bail out before PID is referenced.
+    if subset.empty or "PID" not in subset.columns:
+        return _empty_intubation_frame()
+    subset = subset.sort_values(["PID", "Redigeringstidspunkt"])
 
     subset["intubated"] = subset["Note"].apply(lambda t: is_intubated(t))
 
@@ -316,7 +342,9 @@ def build_intubation_from_notes(notater_df: pd.DataFrame) -> pd.DataFrame:
 
     # Supplement: check ALL non-intubated PIDs (including those without
     # primary/fallback notetypes) for specific patterns in other notetypes
-    pids_intubated = set(result[result["intubated"]]["PID"])
+    # (`== True` keeps this a boolean ROW mask even if concat degraded the
+    # dtype to object)
+    pids_intubated = set(result.loc[result["intubated"] == True, "PID"])  # noqa: E712
     all_pids = set(notes["PID"].unique())
     pids_to_check = all_pids - pids_intubated
     exclude = PRIMARY_NOTETYPES | FALLBACK_NOTETYPES
