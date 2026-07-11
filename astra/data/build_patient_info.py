@@ -77,14 +77,42 @@ def map_data(cfg):
                 map_concept(cfg, concept, agg_func, is_categorical, is_multi_label)
 
 def define_historic_population(cfg=cfg):
-    path = f'{cfg["raw_file_path"]}CPMI_Procedurer.parquet'
-    df_procedure = Dataset.Tabular.from_parquet_files(path=path)
-    dtr_procedure = df_procedure.to_pandas_dataframe()
+    """Derive the trauma cohort seed (CPR_hash, ServiceDate): every patient
+    with a BWST1F trauma-call procedure.
+
+    Reads the Azure ML parquet dataset when azureml is available; otherwise
+    falls back to the raw ``data/raw/Procedurer.csv`` dump so the cohort can
+    be (re)defined in non-Azure environments.
+    """
+    if Dataset is not None:
+        path = f'{cfg["raw_file_path"]}CPMI_Procedurer.parquet'
+        df_procedure = Dataset.Tabular.from_parquet_files(path=path)
+        dtr_procedure = df_procedure.to_pandas_dataframe()
+    else:
+        csv_path = "data/raw/Procedurer.csv"
+        if not is_file_present(csv_path):
+            raise FileNotFoundError(
+                f"Population seed {cfg['population_file_path']} is missing and "
+                f"cannot be derived: azureml is not installed and {csv_path} "
+                "does not exist. Either provide the seed file (columns: "
+                "CPR_hash, ServiceDate — one row per trauma call) or place "
+                "the raw Procedurer.csv dump in data/raw/."
+            )
+        logger.info("Deriving population from %s (ProcedureCode == 'BWST1F')",
+                    csv_path)
+        dtr_procedure = pd.read_csv(csv_path, low_memory=False)
+        if ("ServiceDate" not in dtr_procedure.columns
+                and "ServiceDatetime" in dtr_procedure.columns):
+            dtr_procedure = dtr_procedure.rename(
+                columns={"ServiceDatetime": "ServiceDate"})
+
     traumepatienter = dtr_procedure[dtr_procedure["ProcedureCode"] == "BWST1F"][
         ["CPR_hash", "ServiceDate"]
     ]
     ensure_parent_dir(cfg["population_file_path"])
     traumepatienter.to_csv(cfg["population_file_path"])
+    logger.info("Wrote population seed: %d trauma calls -> %s",
+                len(traumepatienter), cfg["population_file_path"])
 
 def define_single_patient(cfg):
     # JUST A TEMPORARY TESTER FUNCTION, used by load_or_collect_population
@@ -761,32 +789,44 @@ def create_elixhauser(base):
         ensure_parent_dir("data/interim/computed_elix_df.csv")
         output_df.to_csv("data/interim/computed_elix_df.csv")
 
-def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):    
+def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
     """ Check if elix_df is present, if not then compute it with prepare elix_df (requires data/raw/Diagnoser.csv)
+
+    If the R computation cannot produce the file (no R runtime / no CRAN
+    access), ASMT_ELIX degrades to 0.0 for all patients instead of retrying
+    forever (create_elixhauser uses subprocess.call, which does not raise
+    when Rscript is missing).
     """
-    while True:
+    for attempt in (1, 2):
         try:
             elix = pd.read_csv(
                 "data/interim/computed_elix_df.csv", low_memory=False
             )
-            logger.info("Elixhauser df dataframe found, continuing")
-            baselen = len(base)
-            # merge
-            elix=elix.rename(columns={'elixscore':'ASMT_ELIX'})
-            base = base.merge(
-                elix[["PID", ]+cols_to_add], how="left", on="PID"
-            )
-            assert baselen - len(base) == 0
-            n_missing = int(base["ASMT_ELIX"].isna().sum())
-            base["ASMT_ELIX"] = base["ASMT_ELIX"].fillna(0.0)
-            logger.info(f"Merged Elix onto base (filled {n_missing} missing ASMT_ELIX with 0.0)")
-            return base
-        # TODO: merge onto base
         except FileNotFoundError:
-            logger.info("DF missing.")
-            create_elixhauser(base)
-            continue
-        break
+            if attempt == 1:
+                logger.info("DF missing.")
+                create_elixhauser(base)
+                continue
+            logger.warning(
+                "computed_elix_df.csv still missing after R computation attempt "
+                "(R runtime or CRAN access unavailable?) — filling ASMT_ELIX "
+                "with 0.0 for all patients. Comorbidity signal will be absent."
+            )
+            base["ASMT_ELIX"] = 0.0
+            return base
+
+        logger.info("Elixhauser df dataframe found, continuing")
+        baselen = len(base)
+        # merge
+        elix=elix.rename(columns={'elixscore':'ASMT_ELIX'})
+        base = base.merge(
+            elix[["PID", ]+cols_to_add], how="left", on="PID"
+        )
+        assert baselen - len(base) == 0
+        n_missing = int(base["ASMT_ELIX"].isna().sum())
+        base["ASMT_ELIX"] = base["ASMT_ELIX"].fillna(0.0)
+        logger.info(f"Merged Elix onto base (filled {n_missing} missing ASMT_ELIX with 0.0)")
+        return base
         
 def mask_mortality(df, method='percentage', min_duration_hours=0.5):
     logger.info(f"Masking mortality using method: {method}")

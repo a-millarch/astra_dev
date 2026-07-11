@@ -10,6 +10,9 @@ probability-over-time and SHAP panels.
 **What you build:** an adapter implementing the `PatientDataSource` protocol (section 4) and a frontend
 that calls the Python API (section 6) or the bundled REST service (section 7).
 
+**Operating the full lifecycle** (new data dump → rebuild datasets → retrain → evaluate →
+redeploy) is covered separately in [RETRAINING.md](RETRAINING.md).
+
 ---
 
 ## 1. Overview & architecture

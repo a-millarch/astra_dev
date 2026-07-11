@@ -10,7 +10,13 @@ from astra.utils import is_file_present, are_files_present
 
 logger = logging.getLogger(__name__)
 
-from astra.data.collectors import collect_subsets
+# The Azure ML collector needs azureml/mltable; environments that receive the
+# raw dump as flat CSVs in data/raw/ (e.g. the external team) don't have or
+# need it.
+try:
+    from astra.data.collectors import collect_subsets
+except ImportError:
+    collect_subsets = None
 import astra.data.build_patient_info as bpi
 from astra.data.filters import filter_subsets_inhospital, mark_traumatext
 from astra.data.mapper import map_concept, map_concept_optimized
@@ -35,6 +41,15 @@ def proces_raw_concepts(cfg, base= None, reset=False): # move to construct data_
         ):
             logger.info("All subsets found, continuing")
     else:
+            if collect_subsets is None:
+                missing = [f for f in subsets_filenames
+                           if not is_file_present(os.path.join("data/raw", f"{f}.csv"))]
+                raise FileNotFoundError(
+                    "Raw concept CSVs are missing from data/raw/ and the Azure ML "
+                    "collector is unavailable (azureml/mltable not installed). "
+                    "Place the raw data dump in data/raw/ first. "
+                    f"Missing: {missing}"
+                )
             logger.info("Subsets missing, collecting missing")
             collect_subsets(cfg, base=base)
 

@@ -2,6 +2,7 @@
 # (docs/* rather than docs/ so the negation below can re-include a file)
 docs/*
 !docs/HANDOFF.md
+!docs/RETRAINING.md
 examples/
 notebooks/
 
