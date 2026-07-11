@@ -132,6 +132,51 @@ class TestInMemoryDataSource:
         assert src.fetch_prehospital("unknown") is None
 
 
+class TestComputedIssMatching:
+    """computed_iss_df.csv is keyed by cohort PIDs (sequential ints); the
+    inference PID is hash8+date — matching must go through CPR_hash."""
+
+    def _iss_df(self):
+        return pd.DataFrame({
+            "PID": [101, 102, 103],                    # cohort enumeration
+            "CPR_hash": [CPR, CPR, "other000"],        # CPR has two encounters
+            "start": ["2023-08-15 10:30:00", "2024-01-02 08:00:00",
+                      "2023-05-01 00:00:00"],
+            "riss": [17.0, 9.0, 25.0],
+            "niss": [22.0, 12.0, 30.0],
+        })
+
+    def test_matches_by_cpr_hash_not_pid(self):
+        from astra.inference.data_prep import _match_computed_iss
+        rows = _match_computed_iss(
+            self._iss_df(), CPR, "abcdef1220230815",
+            pd.Timestamp("2023-08-15 10:30:00"))
+        assert len(rows) == 1
+        assert rows["riss"].iloc[0] == 17.0
+
+    def test_picks_nearest_encounter(self):
+        from astra.inference.data_prep import _match_computed_iss
+        rows = _match_computed_iss(
+            self._iss_df(), CPR, "abcdef1220240102",
+            pd.Timestamp("2024-01-02 07:45:00"))
+        assert rows["riss"].iloc[0] == 9.0
+
+    def test_legacy_pid_fallback_without_cpr_column(self):
+        from astra.inference.data_prep import _match_computed_iss
+        df = self._iss_df().drop(columns=["CPR_hash"])
+        df.loc[0, "PID"] = "abcdef1220230815"          # regenerated with inference PIDs
+        rows = _match_computed_iss(
+            df, CPR, "abcdef1220230815", pd.Timestamp("2023-08-15"))
+        assert len(rows) == 1
+        assert rows["riss"].iloc[0] == 17.0
+
+    def test_unknown_patient_returns_empty(self):
+        from astra.inference.data_prep import _match_computed_iss
+        rows = _match_computed_iss(
+            self._iss_df(), "nobody", "nope", pd.Timestamp("2023-01-01"))
+        assert rows.empty
+
+
 class TestPrehospitalHook:
     def _base_df(self):
         start = pd.Timestamp("2023-08-15 10:30:00")

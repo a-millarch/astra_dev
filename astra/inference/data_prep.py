@@ -2097,6 +2097,33 @@ def _try_add_elixhauser(
 
 # ---- Phase 2: Filter concepts ----------------------------------------------
 
+def _match_computed_iss(iss_df, cpr_hash, inference_pid, inference_start):
+    """Find this patient's row(s) in the R-computed ISS frame.
+
+    ``computed_iss_df.csv`` is keyed by *cohort* PIDs (sequential integers
+    from the batch base_df), while the inference base_df carries the
+    deterministic ``make_inference_pid`` string — a direct PID match can
+    never succeed. Match by ``CPR_hash`` instead (the R output retains it),
+    picking the encounter whose trajectory ``start`` is nearest when the
+    patient has several. The direct-PID match is kept as a fallback for
+    frames regenerated with inference PIDs.
+    """
+    if 'CPR_hash' in iss_df.columns:
+        rows = iss_df[iss_df['CPR_hash'] == cpr_hash]
+        if len(rows) > 1 and 'start' in rows.columns:
+            starts = pd.to_datetime(rows['start'], errors='coerce')
+            deltas = (starts - pd.Timestamp(inference_start)).abs()
+            if deltas.notna().any():
+                rows = rows.loc[[deltas.idxmin()]]
+                logger.info(
+                    "ISS_computed: %d encounters for patient — picked the one "
+                    "with trajectory start nearest %s", len(deltas), inference_start,
+                )
+        if not rows.empty:
+            return rows
+    return iss_df[iss_df['PID'] == inference_pid]
+
+
 def _filter_concepts_for_patient(
     base_df: pd.DataFrame,
     cfg: dict,
@@ -2211,7 +2238,10 @@ def _filter_concepts_for_patient(
                 try:
                     iss_r_full = pd.read_csv(iss_r_csv, low_memory=False)
                     patient_pid = base_df['PID'].iloc[0]
-                    iss_r_patient = iss_r_full[iss_r_full['PID'] == patient_pid]
+                    iss_r_patient = _match_computed_iss(
+                        iss_r_full, patient_cpr, patient_pid,
+                        base_df['start'].iloc[0],
+                    )
                     if not iss_r_patient.empty:
                         riss = pd.to_numeric(iss_r_patient.get('riss'), errors='coerce').iloc[0]
                         niss = pd.to_numeric(iss_r_patient.get('niss'), errors='coerce').iloc[0]
