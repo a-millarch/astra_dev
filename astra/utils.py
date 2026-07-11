@@ -77,8 +77,13 @@ def setup_logging(level=logging.INFO, log_dir=None):
 
     Args:
         level: Console log level (``logging.INFO`` or ``logging.DEBUG``).
-        log_dir: Directory for log files.  If *None*, only console logging is
-            enabled.  In Azure pass e.g. ``Path(pm.workdir) / 'logging'``.
+        log_dir: Directory for the rotating DEBUG file log
+            (``<log_dir>/astra.log``, daily rotation, 30-day retention).
+            *None* (default) resolves to the ``ASTRA_LOG_DIR`` environment
+            variable if set, else ``PROJECT_ROOT / 'logging'``.  Pass
+            ``False`` (or set ``ASTRA_LOG_DIR=`` to empty) to disable file
+            logging. File-handler setup failures (read-only dirs) degrade to
+            console-only with a warning instead of crashing.
     """
     global _logging_initialized
     if _logging_initialized:
@@ -119,22 +124,36 @@ def setup_logging(level=logging.INFO, log_dir=None):
     root.addHandler(console)
 
     # --- File handler (TimedRotatingFileHandler) ---
-    if log_dir is not None:
-        log_path = Path(log_dir)
-        log_path.mkdir(parents=True, exist_ok=True)
-        file_handler = TimedRotatingFileHandler(
-            filename=str(log_path / 'astra.log'),
-            when='midnight',
-            interval=1,
-            backupCount=30,
-            encoding='utf-8',
-        )
-        file_handler.setLevel(logging.DEBUG)  # file always captures DEBUG
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(name)s.%(funcName)s:%(lineno)d | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-        ))
-        root.addHandler(file_handler)
+    # Default ON: no entry point ever passed log_dir, so the intended file
+    # log never materialized. None -> ASTRA_LOG_DIR env var -> PROJECT_ROOT/logging.
+    if log_dir is None:
+        env_dir = os.environ.get('ASTRA_LOG_DIR')
+        if env_dir is not None:
+            log_dir = env_dir or False       # empty string disables
+        else:
+            log_dir = PROJECT_ROOT / 'logging'
+    if log_dir:
+        try:
+            log_path = Path(log_dir)
+            log_path.mkdir(parents=True, exist_ok=True)
+            file_handler = TimedRotatingFileHandler(
+                filename=str(log_path / 'astra.log'),
+                when='midnight',
+                interval=1,
+                backupCount=30,
+                encoding='utf-8',
+            )
+            file_handler.setLevel(logging.DEBUG)  # file always captures DEBUG
+            file_handler.setFormatter(logging.Formatter(
+                '%(asctime)s | %(levelname)-8s | %(name)s.%(funcName)s:%(lineno)d | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S',
+            ))
+            root.addHandler(file_handler)
+            root.debug("File logging -> %s", log_path / 'astra.log')
+        except OSError as e:
+            root.warning("Could not set up file logging in %s (%s) — "
+                         "console only. Set ASTRA_LOG_DIR to override.",
+                         log_dir, e)
 
     # --- Suppress noisy third-party loggers ---
     for name in ('matplotlib', 'matplotlib.font_manager', 'optuna',

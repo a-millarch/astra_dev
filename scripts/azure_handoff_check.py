@@ -56,8 +56,14 @@ def _pick_patients(n, hours, cfg):
     if eligible.empty:
         raise RuntimeError(
             f'No patients with trajectories >= {hours + 1.0:.0f}h in base_df')
-    picks = eligible.head(n)
-    return [(row['CPR_hash'], str(row['ServiceDate'])) for _, row in picks.iterrows()]
+    picks = [(row['CPR_hash'], str(row['ServiceDate']))
+             for _, row in eligible.head(n).iterrows()]
+    # Full identifiers, so any patient can be re-targeted with
+    # --cpr-hash/--service-date (summary rows only show the 8-char prefix).
+    for cpr_hash, service_date in picks:
+        logger.info('Picked patient: --cpr-hash %s --service-date "%s"',
+                    cpr_hash, service_date)
+    return picks
 
 
 def _describe_exception(exc) -> str:
