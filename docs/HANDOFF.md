@@ -561,7 +561,8 @@ from astra.inference.api import AstraPredictor
 
 predictor = AstraPredictor.load(
     config_path="handoff/configs/defaults.yaml",  # config-first: model_name + data-prep
-    artifacts_dir="handoff",         # bundle root (contains deployment/, <MODEL>.pth, ...)
+    artifacts_dir="handoff",         # exported bundle root (artifacts under models/) —
+                                     # a training-layout root like "models" works too
     device="cpu",
     data_source=MySQLDataSource(engine),   # your adapter — or omit for file-based mode
 )

@@ -162,6 +162,19 @@ class AstraPredictor:
                     "model_name is required — pass it explicitly or provide "
                     "config_path to a YAML with a 'model_name' key")
 
+        # Accept both artifact layouts:
+        #   training root:   <dir>/deployment/deployment_<M>.pkl, <dir>/<M>.pth
+        #   handoff bundle:  <dir>/models/deployment/..., <dir>/models/<M>.pth
+        #     (the layout `export_artifacts export --out <dir>` produces —
+        #      pointing at the unzipped bundle directory just works)
+        bundle_name = f'deployment_{model_name}.pkl'
+        nested = os.path.join(artifacts_dir, 'models')
+        if (not os.path.isfile(os.path.join(artifacts_dir, 'deployment', bundle_name))
+                and os.path.isfile(os.path.join(nested, 'deployment', bundle_name))):
+            logger.info("Using nested artifacts root %s (handoff bundle layout)",
+                        nested)
+            artifacts_dir = nested
+
         bundle_dir = os.path.join(artifacts_dir, 'deployment')
         try:
             session = InferenceSession.load(

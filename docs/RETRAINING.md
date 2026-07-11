@@ -133,7 +133,7 @@ Then point the service at the new artifacts and restart:
 
 ```bash
 export ASTRA_CONFIG=handoff_<release>/configs/defaults.yaml    # supplies model_name
-export ASTRA_ARTIFACTS_DIR=handoff_<release>/models
+export ASTRA_ARTIFACTS_DIR=handoff_<release>                   # bundle root (nested models/ resolved automatically)
 python -m astra.service --port 8000
 # GET /model/info must show the new model_name and expected seq_len/channels
 ```

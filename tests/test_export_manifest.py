@@ -97,6 +97,21 @@ def test_validate_passes_on_intact_bundle(exported):
     assert rc == 0
 
 
+def test_predictor_loads_from_handoff_bundle_root(exported):
+    """Regression (Azure 2026-07-11): the HANDOFF quickstart points
+    AstraPredictor.load at the exported bundle root, whose artifacts live
+    under <root>/models/ — the facade must resolve the nested layout instead
+    of looking for <root>/deployment/."""
+    from astra.inference.api import AstraPredictor
+
+    predictor = AstraPredictor.load(
+        MODEL_NAME, artifacts_dir=str(exported['out_dir']), device='cpu')
+    info = predictor.model_info()
+    assert info['model_name'] == MODEL_NAME
+    assert info['seq_len'] == predictor.seq_len
+    assert len(info['channels']) > 0
+
+
 def test_validate_fails_on_corruption(exported, tmp_path):
     corrupted = tmp_path / 'handoff_corrupt'
     shutil.copytree(exported['out_dir'], corrupted)
