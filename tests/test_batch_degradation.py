@@ -54,6 +54,63 @@ class TestAddElixhauserDegradation:
         assert out.loc[out["PID"] == 2, "ASMT_ELIX"].iloc[0] == 0.0  # missing → 0
 
 
+class TestPythonElixhauser:
+    """Batch Elixhauser now uses the same Python implementation as inference
+    (train/serve consistency by construction); R is an env-gated escape hatch."""
+
+    def _cohort(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        os.makedirs("data/raw", exist_ok=True)
+        start = pd.Timestamp("2030-06-01 12:00")
+        base = pd.DataFrame({
+            "PID": [1, 2],
+            "CPR_hash": ["pat_a", "pat_b"],
+            "AGE": [60, 40],
+            "start": [start, start],
+            "end": [start + pd.Timedelta(days=3)] * 2,
+        })
+        # pat_a: CHF (DI509 -> I50) + metastatic cancer (DC784 -> C78),
+        #        noted pre-admission, unresolved
+        # pat_b: diagnosis noted AFTER admission -> excluded by the window
+        pd.DataFrame({
+            "CPR_hash": ["pat_a", "pat_a", "pat_b"],
+            "Diagnosekode": ["DI509", "DC784", "DI509"],
+            "Noteret_dato": ["2029-01-01", "2029-06-01", "2030-06-02"],
+            "Løst_dato": [None, None, None],
+        }).to_csv("data/raw/Diagnoser.csv", index=False)
+        return base
+
+    def test_batch_score_equals_inference_scorer(self, tmp_path, monkeypatch):
+        from astra.inference.comorbidity import compute_elixhauser_vw
+
+        base = self._cohort(tmp_path, monkeypatch)
+        out = bpi.add_elixhauser(base)
+
+        expected = compute_elixhauser_vw(["I50", "C78"])   # same codes, post-strip
+        assert expected != 0.0                              # sanity: categories matched
+        assert out.loc[out["PID"] == 1, "ASMT_ELIX"].iloc[0] == expected
+        # pat_b's diagnosis is post-admission -> no qualifying codes -> 0.0
+        assert out.loc[out["PID"] == 2, "ASMT_ELIX"].iloc[0] == 0.0
+
+    def test_missing_diagnoser_degrades(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)                        # no Diagnoser.csv at all
+        base = pd.DataFrame({
+            "PID": [1], "CPR_hash": ["x"], "AGE": [50],
+            "start": [pd.Timestamp("2030-01-01")],
+            "end": [pd.Timestamp("2030-01-02")],
+        })
+        out = bpi.add_elixhauser(base)
+        assert (out["ASMT_ELIX"] == 0.0).all()
+
+    def test_env_var_routes_to_r_path(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("ASTRA_ELIX_USE_R", "1")
+        called = {}
+        monkeypatch.setattr(bpi, "create_elixhauser_r",
+                            lambda base: called.setdefault("r", True))
+        bpi.create_elixhauser(pd.DataFrame())
+        assert called.get("r") is True
+
+
 class TestDefineHistoricPopulationFallback:
     def _cfg(self, tmp_path):
         return {"population_file_path": str(tmp_path / "seed.csv"),

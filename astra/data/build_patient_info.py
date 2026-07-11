@@ -769,33 +769,83 @@ def prepare_elix_df(base):
 
 
 def create_elixhauser(base):
+    """Compute cohort Elixhauser scores → ``data/interim/computed_elix_df.csv``.
+
+    Uses the pure-Python implementation shared with inference
+    (``astra/inference/comorbidity.py`` — Quan ICD-10 mapping, van Walraven
+    weights), so training and inference score comorbidity identically by
+    construction. Set ``ASTRA_ELIX_USE_R=1`` to fall back to the original R
+    ``comorbidity`` package (``astra/R/elixhauser.r``).
+    """
+    import os
+    if os.environ.get("ASTRA_ELIX_USE_R"):
+        return create_elixhauser_r(base)
+    return create_elixhauser_python(base)
+
+
+def create_elixhauser_python(base):
+    """Cohort version of the inference Elixhauser scorer (single source of truth)."""
+    from astra.inference.comorbidity import compute_elixhauser_vw
+
     pre_elix_path = "data/interim/pre_elix_df.csv"
     if is_file_present(pre_elix_path):
         logger.info("Elixhauser diagnose df dataframe found, continuing")
-            
     else:
         logger.info("No Elixhauser diagnose file, creating.")
         prepare_elix_df(base)
-        
+
+    pre = pd.read_csv(pre_elix_path, index_col=0)
+    pre = pre.dropna(subset=["Diagnosekode"])
+    if len(pre) == 0:
+        logger.info(">No prior diagnoses, elixscore is null")
+        output_df = base[["CPR_hash", "PID"]].copy(deep=True)
+        output_df["elixscore"] = np.nan
+    else:
+        logger.info(
+            "Computing Elixhauser (van Walraven, Python) for %d patients",
+            pre["PID"].nunique(),
+        )
+        scores = (
+            pre.groupby("PID")["Diagnosekode"]
+            .apply(lambda codes: compute_elixhauser_vw(list(codes.astype(str))))
+        )
+        output_df = scores.rename("elixscore").reset_index()
+
+    ensure_parent_dir("data/interim/computed_elix_df.csv")
+    output_df.to_csv("data/interim/computed_elix_df.csv")
+    logger.info("Saved computed_elix_df.csv (%d rows, Python implementation)",
+                len(output_df))
+
+
+def create_elixhauser_r(base):
+    """Original R path (``comorbidity`` package) — kept as an escape hatch."""
+    pre_elix_path = "data/interim/pre_elix_df.csv"
+    if is_file_present(pre_elix_path):
+        logger.info("Elixhauser diagnose df dataframe found, continuing")
+
+    else:
+        logger.info("No Elixhauser diagnose file, creating.")
+        prepare_elix_df(base)
+
     if count_csv_rows(pre_elix_path) > 0:
         logger.info(">Calling R script to create Elixhauser df at data/interim/")
         subprocess.call("Rscript astra/R/elixhauser.r", shell=True)
         logger.info("R subprocess finished")
-    else: 
+    else:
         logger.info(">No prior diagnoses, elixscore is null")
         output_df=base[['CPR_hash',"PID"]].copy(deep=True) #also CPR_hash?
         output_df["elixscore"] = np.nan
-        
+
         ensure_parent_dir("data/interim/computed_elix_df.csv")
         output_df.to_csv("data/interim/computed_elix_df.csv")
 
 def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
     """ Check if elix_df is present, if not then compute it with prepare elix_df (requires data/raw/Diagnoser.csv)
 
-    If the R computation cannot produce the file (no R runtime / no CRAN
-    access), ASMT_ELIX degrades to 0.0 for all patients instead of retrying
-    forever (create_elixhauser uses subprocess.call, which does not raise
-    when Rscript is missing).
+    If the score computation cannot produce the file (missing
+    data/raw/Diagnoser.csv; or, on the R escape-hatch path, no R runtime /
+    CRAN access — subprocess.call does not raise when Rscript is missing),
+    ASMT_ELIX degrades to 0.0 for all patients instead of retrying forever.
     """
     for attempt in (1, 2):
         try:
@@ -805,12 +855,18 @@ def add_elixhauser(base, cols_to_add=["ASMT_ELIX", ]):
         except FileNotFoundError:
             if attempt == 1:
                 logger.info("DF missing.")
-                create_elixhauser(base)
+                try:
+                    create_elixhauser(base)
+                except Exception:
+                    logger.warning(
+                        "Elixhauser computation failed (missing "
+                        "data/raw/Diagnoser.csv?)", exc_info=True,
+                    )
                 continue
             logger.warning(
-                "computed_elix_df.csv still missing after R computation attempt "
-                "(R runtime or CRAN access unavailable?) — filling ASMT_ELIX "
-                "with 0.0 for all patients. Comorbidity signal will be absent."
+                "computed_elix_df.csv could not be produced — filling "
+                "ASMT_ELIX with 0.0 for all patients. Comorbidity signal "
+                "will be absent."
             )
             base["ASMT_ELIX"] = 0.0
             return base

@@ -24,7 +24,7 @@ absent *and* `azureml`/`mltable` is installed).
 |---|---|
 | Conda env | `conda env create -f environment_cpu.yml` (CPU) or `environment_gpu.yml`. **Training is realistic on GPU only** — pretrain + 4-phase finetune on ~17k samples takes hours on GPU and is impractically slow on CPU. Inference/data processing are CPU-fine. |
 | `pip install -e .` | Package into the active env. |
-| R + internet (optional) | `Rscript` on PATH with CRAN access, used ONCE per data rebuild for two batch features: R-computed ISS (`icdpicr`) and the Elixhauser score (`comorbidity`). Both **degrade gracefully** if unavailable: `ISS_computed` channel stays empty, `ASMT_ELIX` fills with 0.0 (logged warnings). The R packages self-install into the gitignored `.r_libs/`. |
+| R + internet (optional) | `Rscript` on PATH with CRAN access, used ONCE per data rebuild for **one** batch feature: R-computed ISS (`icdpicr`; no Python equivalent). Degrades gracefully if unavailable: the `ISS_computed` channel stays empty (logged warning). The package self-installs into the gitignored `.r_libs/`. The Elixhauser score is computed in **Python** (same implementation as inference — `astra/inference/comorbidity.py`); set `ASTRA_ELIX_USE_R=1` to use the legacy R `comorbidity` package instead. |
 | Disk layout | Working directory = repo root. `data/`, `models/`, `pretrain_checkpoints/`, `reports/`, `logging/` are created/used relative to it. |
 
 ## 1. Place the new dump
@@ -76,7 +76,8 @@ data dict, but never touches `data/raw/`. Expect this to take on the order of **
 ~13k-patient cohort (mapping dominates). Sanity checks while it runs:
 
 - Cohort size logged after base_df creation — compare to the previous dump (should grow).
-- The R steps log clearly if they degrade (`ASMT_ELIX ... 0.0`, `skipping R-computed ISS`).
+- Degradations log clearly: `skipping R-computed ISS` (no R), `ASMT_ELIX ... 0.0` (no
+  `Diagnoser.csv`).
 - On completion, the dataloader warns if the cached `seq_len` disagrees with
   `get_total_steps()` — that warning means a stale cache, rerun with `--overwrite`.
 
@@ -142,7 +143,8 @@ nothing else to revert.
 |---|---|
 | `FileNotFoundError: Raw concept CSVs are missing ... collector unavailable` | The dump isn't in `data/raw/` (the Azure collector only exists on Azure ML). Place the CSVs. |
 | `Population seed ... cannot be derived` | No seed file and no `data/raw/Procedurer.csv`. Provide either. |
-| `ASMT_ELIX ... 0.0 for all patients` / `skipping R-computed ISS` | R or CRAN unavailable. Install R (`Rscript` on PATH) and rerun `make_data --overwrite` if these features are wanted. |
+| `skipping R-computed ISS` | R or CRAN unavailable (only affects the `ISS_computed` channel). Install R (`Rscript` on PATH) and rerun `make_data --overwrite` if wanted. |
+| `ASMT_ELIX ... 0.0 for all patients` | `data/raw/Diagnoser.csv` missing or unreadable (Elixhauser itself is pure Python and needs no R). |
 | `seq_len ... != get_total_steps()` warning | Stale cached data dict vs current bin config → rerun `python -m astra.make_data --overwrite`. |
 | `load_pretrained_backbone` size-mismatch errors at finetune | Grid/channel change since the checkpoint → run with `--pretrain` (fresh pretraining). |
 | Old values served for a patient after redeploy | Stale `data/patients/` per-patient cache from the previous dump — delete it (step 1.4). |
