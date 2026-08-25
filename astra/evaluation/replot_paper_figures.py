@@ -341,7 +341,8 @@ def _regen_trauma_and_delong(data, trauma_cfg, results_all, results_active,
 
 
 @_safe("calibration figures")
-def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
+def _regen_calibration(model_name, holdout_preds, out_dir, suffix,
+                       calibrator_dir=None, eval_dir=None):
     """Reload pickled calibrators, apply to holdout preds, replot the 4 calibration figures.
 
     The calibration plot helpers internally apply their own ``_SUBMISSION_KW``
@@ -358,7 +359,7 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
     )
     from astra.evaluation.utils import time_to_step, get_total_steps
 
-    calibrator_dir = f"models/calibrators/{model_name}"
+    calibrator_dir = calibrator_dir or f"models/calibrators/{model_name}"
     per_tp, globals_ = _load_calibrators(calibrator_dir)
     if per_tp is None:
         logger.warning("No calibrators on disk — skipping calibration figures")
@@ -396,7 +397,8 @@ def _regen_calibration(model_name, holdout_preds, out_dir, suffix):
 
     # Best method: fall back to first (calibration_summary CSV would tell us
     # definitively, but picking any present method still lets us replot)
-    summary_path = f"reports/eval/{model_name}/calibration/calibration_summary_{model_name}.csv"
+    _eval_root = eval_dir or f"reports/eval/{model_name}"
+    summary_path = f"{_eval_root}/calibration/calibration_summary_{model_name}.csv"
     best_method = methods[0]
     if os.path.exists(summary_path):
         try:
@@ -494,8 +496,11 @@ def replot(
     output_dir: Optional[str],
     skip_shap: bool,
     config: Optional[str] = None,
+    eval_dir: Optional[str] = None,
+    calibrator_dir: Optional[str] = None,
 ) -> None:
-    preds_dir = f"reports/eval/{model_name}/predictions"
+    eval_root = eval_dir or f"reports/eval/{model_name}"
+    preds_dir = f"{eval_root}/predictions"
     out_dir = output_dir or f"reports/eval/{model_name}/revision{suffix}"
     os.makedirs(out_dir, exist_ok=True)
 
@@ -559,7 +564,8 @@ def replot(
     # ── Calibration ─────────────────────────────────────────────────────
     if preds_df_active is not None:
         holdout_preds = _build_timepoint_preds(preds_df_active, holdout_y, holdout_pids)
-        _regen_calibration(model_name, holdout_preds, out_dir, suffix)
+        _regen_calibration(model_name, holdout_preds, out_dir, suffix,
+                           calibrator_dir=calibrator_dir, eval_dir=eval_dir)
 
     # ── SHAP ────────────────────────────────────────────────────────────
     _regen_shap(skip_shap, config)
@@ -608,6 +614,17 @@ def main():
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Override output dir; defaults to "
                              "reports/eval/<model>/revision<suffix>/")
+    parser.add_argument(
+        "--eval-dir", type=str, default=None,
+        help="Override the artifact ROOT to read from (default: reports/eval/<model>). "
+             "Expects <root>/predictions/*.csv and <root>/calibration/. Filenames "
+             "inside must still embed the model name, so a backup dir such as "
+             "reports/eval/<model>_BEFORERERUN works as-is. Use --output-dir for outputs.",
+    )
+    parser.add_argument(
+        "--calibrator-dir", type=str, default=None,
+        help="Override pickled-calibrator dir (default: models/calibrators/<model>).",
+    )
     parser.add_argument("--skip-shap", action="store_true",
                         help="Skip the SHAP replot subprocess.")
     parser.add_argument("--verbose", action="store_true")
@@ -629,6 +646,8 @@ def main():
         output_dir=args.output_dir,
         skip_shap=args.skip_shap,
         config=args.config,
+        eval_dir=args.eval_dir,
+        calibrator_dir=args.calibrator_dir,
     )
 
 
