@@ -52,6 +52,7 @@ def timed_stage(timing_dict: dict, stage_name: str):
 from astra.data.mappings import (
     VITALS_MAP, VITALS_BOUNDS, BP_TYPES, HEIGHT_WEIGHT_MAP, LABS_REVERSE_MAP, ICU_MAP, EWS_MAP,
     ATC_LVL3_REVERSE, ATC_LVL4_REVERSE,
+    INVASIVE_BP_TYPES, INVASIVE_VITALS_MAP,
     PROCEDURE_MAP, PROCEDURE_PREFIXES, SEX_MAP,
     classify_department, classify_atc, derive_first_hospital, parse_numeric,
 )
@@ -362,6 +363,170 @@ def _compute_temporal_features(
 
 
 # ============================================================================
+# Tier mapping features (antibiotic escalation tiers, etc.)
+# ============================================================================
+
+def _compute_tier_features_for_patient(
+    raw_data: dict,
+    bin_df: pd.DataFrame,
+    ts_channel_names: List[str],
+    bundle: dict,
+) -> Dict[str, np.ndarray]:
+    """Compute per-bin tier mapping features from raw medication events.
+
+    Checks whether any tier feature channels exist in the model's channel
+    list.  If so, classifies medication ATC codes into tiers and aggregates
+    per bin.
+
+    Returns:
+        Dict mapping feature name (e.g. ``'abx_max_level'``) to a 1-D array
+        of length ``len(bin_df)`` with per-bin values.  Empty dict if the
+        model has no tier feature channels.
+    """
+    data_config = bundle.get('data_config', {})
+    profile_cfg = data_config.get('categorical_profiles', {})
+    if not profile_cfg.get('enabled'):
+        return {}
+
+    # Load profiles config to find tier mapping categories
+    from astra.data.profiles import load_profiles_config
+    profiles = load_profiles_config({'categorical_profiles': profile_cfg})
+
+    # Check for composite mode in any concept
+    for concept_name, concept_cfg in profiles.items():
+        if not isinstance(concept_cfg, dict):
+            continue
+        if concept_cfg.get('composite_mode'):
+            from astra.data.composite_features import compute_composite_features_for_patient
+            med_events = raw_data.get(concept_name, [])
+            return compute_composite_features_for_patient(
+                med_events, bin_df, ts_channel_names,
+            )
+
+    # Collect tier mapping configs and expected channel names
+    tier_configs = []  # (cat_name, tm_cfg, concept_name)
+    for concept_name, concept_cfg in profiles.items():
+        if not isinstance(concept_cfg, dict):
+            continue
+        for cat_name, cat_cfg in concept_cfg.get('categories', {}).items():
+            tm = cat_cfg.get('tier_mapping')
+            if tm:
+                tier_configs.append((cat_name, tm, concept_name))
+
+    if not tier_configs:
+        return {}
+
+    # Check if any tier channels are in the model
+    channel_set = set(ts_channel_names)
+    has_any = False
+    for _cat, tm_cfg, _concept in tier_configs:
+        short = tm_cfg.get('short_name', _cat)
+        for feat in tm_cfg.get('features', []):
+            if f"{short}_{feat}" in channel_set:
+                has_any = True
+                break
+    if not has_any:
+        return {}
+
+    from astra.data.tier_mappings import get_mapping
+    from astra.data.mappings import ATC_LVL3_MAP, ATC_LVL4_MAP
+
+    n_positions = len(bin_df)
+    bin_starts = bin_df['bin_start'].values
+    bin_ends = bin_df['bin_end'].values
+    positions = bin_df['position'].values if 'position' in bin_df.columns else np.arange(n_positions)
+    result = {}
+
+    for cat_name, tm_cfg, concept_name in tier_configs:
+        mapping_name = tm_cfg.get('mapping')
+        short_name = tm_cfg.get('short_name', cat_name)
+        features = tm_cfg.get('features', ['max_level'])
+
+        # Resolve ATC prefixes: config > atc_codes > ATC map fallback
+        cat_prefixes = tm_cfg.get('atc_prefixes', [])
+        if not cat_prefixes:
+            cat_prefixes = tm_cfg.get('atc_codes', [])
+        if not cat_prefixes:
+            for source_map in [ATC_LVL3_MAP, ATC_LVL4_MAP]:
+                cat_prefixes.extend(source_map.get(cat_name, []))
+
+        # Resolve mapping (registered or auto-binary)
+        mapping = get_mapping(mapping_name) if mapping_name else None
+
+        # Collect medication events with ATC codes belonging to this category
+        med_events = raw_data.get(concept_name, [])
+        matched = []
+        for ev in med_events:
+            atc = ev.get('atc_code', '')
+            if not atc:
+                continue
+            if any(atc.startswith(pfx) for pfx in cat_prefixes):
+                if mapping is not None:
+                    tier = mapping.classify(atc)
+                    if tier is None:
+                        continue
+                else:
+                    tier = 1  # auto-binary
+                matched.append({
+                    'timestamp': pd.Timestamp(ev['timestamp']),
+                    'atc': atc,
+                    'tier': tier,
+                })
+
+        if not matched:
+            for feat in features:
+                feat_col = f"{short_name}_{feat}"
+                if feat_col in channel_set:
+                    result[feat_col] = np.zeros(n_positions)
+            continue
+
+        # Assign to bins
+        matched_df = pd.DataFrame(matched)
+
+        assigned_rows = []
+        for _, row in matched_df.iterrows():
+            ts = np.datetime64(row['timestamp'])
+            idx = np.searchsorted(bin_starts, ts, side='right') - 1
+            if 0 <= idx < n_positions and ts < bin_ends[idx]:
+                assigned_rows.append({
+                    'position': int(positions[idx]),
+                    'atc': row['atc'],
+                    'tier': row['tier'],
+                })
+
+        if not assigned_rows:
+            for feat in features:
+                feat_col = f"{short_name}_{feat}"
+                if feat_col in channel_set:
+                    result[feat_col] = np.zeros(n_positions)
+            continue
+
+        assigned_df = pd.DataFrame(assigned_rows)
+
+        for feat in features:
+            feat_col = f"{short_name}_{feat}"
+            if feat_col not in channel_set:
+                continue
+
+            values = np.zeros(n_positions)
+
+            if feat == 'max_level':
+                agg = assigned_df.groupby('position')['tier'].max()
+            elif feat == 'n_distinct':
+                agg = assigned_df.groupby('position')['atc'].nunique()
+            else:
+                continue
+
+            for pos, val in agg.items():
+                if 0 <= pos < n_positions:
+                    values[pos] = float(val)
+
+            result[feat_col] = values
+
+    return result
+
+
+# ============================================================================
 # Continuous time series
 # ============================================================================
 
@@ -445,7 +610,24 @@ def _build_continuous_ts(
     # Must happen BEFORE padding zeros are applied so the padding bins stay 0.0.
     # Auxiliary channels (elapsed_hours, bin_width_hours, _data_present, _ebm_pred) are
     # excluded from the presence check — only actual clinical measurements count.
+    # Compute tier mapping features (antibiotic escalation tiers, etc.)
+    tier_features = _compute_tier_features_for_patient(
+        raw_data, bin_df, ts_channel_names, bundle
+    )
+    for feat_name, values in tier_features.items():
+        if feat_name not in channel_to_idx:
+            continue
+        ch_idx = channel_to_idx[feat_name]
+        n = min(len(values), seq_len)
+        x_ts[ch_idx, :n] = values[:n]
+
+    # Compute _data_present indicator: 1.0 where any clinical channel has a measurement.
+    # Must happen BEFORE padding zeros are applied so the padding bins stay 0.0.
+    # Auxiliary channels (elapsed_hours, bin_width_hours, _data_present, _ebm_pred,
+    # and tier mapping features) are excluded — only actual clinical measurements count.
     _AUXILIARY = {'elapsed_hours', 'bin_width_hours', '_data_present', '_ebm_pred'}
+    _AUXILIARY |= set(tier_features.keys())
+
     if '_data_present' in channel_to_idx:
         dp_ch = channel_to_idx['_data_present']
         clinical_indices = [
@@ -911,6 +1093,7 @@ def _build_continuous_ts_incremental(
     trajectory_length: int,
     admission_time: pd.Timestamp = None,
     profiling: Optional[dict] = None,
+    raw_data: Optional[dict] = None,
 ) -> Tuple[np.ndarray, int]:
     """Incrementally update the continuous time series tensor.
 
@@ -933,7 +1116,11 @@ def _build_continuous_ts_incremental(
     n_channels = len(ts_channel_names)
     channel_to_idx = {name: i for i, name in enumerate(ts_channel_names)}
 
-    _AUXILIARY = {'elapsed_hours', 'bin_width_hours', '_data_present', '_ebm_pred'}
+    from astra.data.profiles import get_tier_feature_names
+    _AUXILIARY = (
+        {'elapsed_hours', 'bin_width_hours', '_data_present', '_ebm_pred'}
+        | get_tier_feature_names(data_config)
+    )
 
     if x_ts_existing is None:
         # First build — fall back to full
@@ -978,6 +1165,19 @@ def _build_continuous_ts_incremental(
             ch_idx = channel_to_idx[feat_name]
             n = min(len(values), seq_len)
             x_ts[ch_idx, :n] = values[:n]
+
+    # Recompute tier features from accumulated raw_data
+    if raw_data is not None:
+        with timed_stage(profiling, 'cts_tier_features') if profiling is not None else _nullcontext():
+            tier_features = _compute_tier_features_for_patient(
+                raw_data, bin_df, ts_channel_names, bundle,
+            )
+            for feat_name, values in tier_features.items():
+                if feat_name not in channel_to_idx:
+                    continue
+                ch_idx = channel_to_idx[feat_name]
+                n = min(len(values), seq_len)
+                x_ts[ch_idx, :n] = values[:n]
 
     # Update _data_present
     with timed_stage(profiling, 'cts_data_present') if profiling is not None else _nullcontext():
@@ -1250,6 +1450,22 @@ def _standardize_vitals(raw_vitals: List[dict]) -> List[dict]:
     return result
 
 
+def _extract_invasive_events(raw_vitals: List[dict]) -> List[dict]:
+    """Extract invasive monitoring events from raw vitals for categorical TS.
+
+    Returns list of {'timestamp': ..., 'value': 'arterial_bp'|'arterial_hr'|'invasive_temp'}.
+    """
+    result = []
+    for v in raw_vitals:
+        param = v.get('parameter', v.get('feature', ''))
+        ts = v['timestamp']
+        if param in INVASIVE_VITALS_MAP:
+            result.append({'timestamp': ts, 'value': INVASIVE_VITALS_MAP[param]})
+        elif param in INVASIVE_BP_TYPES:
+            result.append({'timestamp': ts, 'value': 'arterial_bp'})
+    return result
+
+
 def _standardize_labs(raw_labs: List[dict]) -> List[dict]:
     """Convert raw lab results to standardized format.
 
@@ -1318,8 +1534,9 @@ def _standardize_medications(raw_meds: List[dict], sub_code_level: int = 0) -> L
     """Convert raw ATC codes to medication category names.
 
     Input:  [{'timestamp': ..., 'atc_code': 'N02AB02'}, ...]
-    Output: [{'timestamp': ..., 'value': 'opiods'}, ...]
+    Output: [{'timestamp': ..., 'value': 'opiods', 'atc_code': 'N02AB02'}, ...]
 
+    Always preserves the full ``atc_code`` for tier mapping features.
     When *sub_code_level* > 0 (profiles enabled), also preserves a truncated
     ATC sub-code in each event dict for profile determination.
     """
@@ -1329,7 +1546,7 @@ def _standardize_medications(raw_meds: List[dict], sub_code_level: int = 0) -> L
         atc = str(med.get('atc_code', med.get('value', '')))
         category = classify_atc(atc)
         if category is not None:
-            entry = {'timestamp': ts, 'value': category}
+            entry = {'timestamp': ts, 'value': category, 'atc_code': atc}
             if sub_code_level > 0:
                 entry['sub_code'] = atc[:sub_code_level]
             result.append(entry)
@@ -1456,6 +1673,7 @@ def prepare_from_raw_ehr(
             'ASMT_ELIX': raw_ehr.get('elixhauser_score'),
         },
         'VitaleVaerdier': _standardize_vitals(raw_ehr.get('vitals', [])),
+        'InvasiveMonitoring': _extract_invasive_events(raw_ehr.get('vitals', [])),
         'Labsvar': _standardize_labs(raw_ehr.get('labs', [])),
         'ITAOversigtsrapport': _standardize_icu(raw_ehr.get('icu_scores', [])),
         'Medicin': _standardize_medications(
@@ -1955,6 +2173,25 @@ def _filter_concepts_for_patient(
                     logger.warning(f"Failed to load R-computed ISS: {e}")
             continue
 
+        if concept == 'InvasiveMonitoring':
+            # Derived from VitaleVaerdier — saved by filter_vitals() above
+            inv_pkl = "data/interim/concepts/InvasiveMonitoring.pkl"
+            if os.path.exists(inv_pkl):
+                concept_filtered = pd.read_pickle(inv_pkl)
+                patient_pid = base_df['PID'].iloc[0]
+                if 'PID' in concept_filtered.columns:
+                    concept_filtered = concept_filtered[
+                        concept_filtered['PID'] == patient_pid
+                    ]
+                if not concept_filtered.empty:
+                    filtered[concept] = concept_filtered
+                    logger.info(
+                        f"InvasiveMonitoring: {len(concept_filtered)} events"
+                    )
+            else:
+                logger.debug("InvasiveMonitoring pkl not found — skipping")
+            continue
+
         if concept == 'Events':
             # Cardiac arrest + intubation from notes (mirrors mapper.py)
             if notater_inhospital is not None and not notater_inhospital.empty:
@@ -2203,10 +2440,21 @@ def _filtered_dfs_to_raw_data(
             ]
         elif is_categorical:
             # Categorical point events (e.g. Medicin, Procedurer)
-            raw_data[concept] = [
-                {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
-                for _, r in df.iterrows()
-            ]
+            # Preserve ATC/dose/unit for Medicin (needed by composite features)
+            has_atc = 'ATC' in df.columns
+            has_dose = 'Administrationsdosis' in df.columns
+            has_unit = 'Dosisenhed' in df.columns
+            events = []
+            for _, r in df.iterrows():
+                ev = {'timestamp': r['TIMESTAMP'], 'value': r['VALUE']}
+                if has_atc:
+                    ev['atc_code'] = r.get('ATC', '')
+                if has_dose:
+                    ev['dose'] = r.get('Administrationsdosis')
+                if has_unit:
+                    ev['unit'] = r.get('Dosisenhed')
+                events.append(ev)
+            raw_data[concept] = events
         else:
             # Continuous concepts (e.g. VitaleVaerdier, Labsvar, EWS, etc.)
             raw_data[concept] = [

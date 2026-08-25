@@ -626,6 +626,30 @@ def prepare_data_and_dls(cfg):
             tsds.cont_concepts['_ebm'] = ebm_df
             tsds.complete = pd.concat(tsds.cont_concepts)  # NaN = missing measurement
 
+    # Inject tier mapping features from categorical profiles
+    from astra.data.profiles import profiles_enabled, load_profiles_config, CategoricalProfileEncoder
+    if profiles_enabled(cfg):
+        profiles_cfg = load_profiles_config(cfg)
+        for concept_name, concept_profile_cfg in profiles_cfg.items():
+            if concept_name in ('version',) or not isinstance(concept_profile_cfg, dict):
+                continue
+            encoder = CategoricalProfileEncoder(concept_profile_cfg)
+            if encoder.tier_categories:
+                concept_pkl = f"data/interim/concepts/{concept_name}.pkl"
+                logger.info(f"Injecting tier mapping features for {concept_name}...")
+                for tsds in [trainval, holdout]:
+                    tier_df = encoder.compute_tier_features(
+                        concept_pkl, tsds.base, cfg
+                    )
+                    if tier_df is not None:
+                        key = f'_tier_{concept_name.lower()}'
+                        tsds.cont_concepts[key] = tier_df
+                        tsds.complete = pd.concat(tsds.cont_concepts)
+                logger.info(
+                    f"Injected tier features for {concept_name}: "
+                    f"{list(encoder.tier_categories.keys())}"
+                )
+
     # Align continuous dataframes (string column names)
     trainval.complete, holdout.complete = align_dataframes(
         trainval.complete,
@@ -736,6 +760,13 @@ def prepare_data_and_dls(cfg):
         _tf_names = set(tf_cfg.get('features', []))
         for i, name in enumerate(ts_channel_names):
             if name in _tf_names:
+                traj_exclude_chs.append(i)
+    # Exclude tier mapping features from trajectory length detection
+    from astra.data.profiles import get_tier_feature_names
+    _tier_names = get_tier_feature_names(cfg)
+    if _tier_names:
+        for i, name in enumerate(ts_channel_names):
+            if name in _tier_names:
                 traj_exclude_chs.append(i)
     traj_exclude_chs = traj_exclude_chs or None
     traj_lengths = get_trajectory_lengths(X, padding_value=0.0, exclude_channels=traj_exclude_chs)

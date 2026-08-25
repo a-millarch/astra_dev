@@ -26,7 +26,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-logger = logging.getLogger(__name__)
+# Must live under the "astra" hierarchy: setup_logging() only attaches handlers
+# there, so a bare __name__ logger (== "__main__" under `python -m`) is silent.
+logger = logging.getLogger("astra.scripts.replot_shap_paper_figures")
 
 
 def main():
@@ -54,10 +56,20 @@ def main():
     logger.info(f"Loading {pkl} (this is a large file, be patient)")
     with open(pkl, "rb") as f:
         results = pickle.load(f)
-    logger.info(f"Loaded cohort results: n_patients={results.n_patients}, "
-                f"timeframes={results.get_available_timeframes()}, "
-                f"active_only={results.active_only}, "
-                f"density_normalize={results.density_normalize}")
+    # Printed, not just logged - this is the verification output the caller needs.
+    print()
+    print("=" * 62)
+    print("LOADED COHORT SHAP RESULTS  (check these against the paper)")
+    print("=" * 62)
+    print(f"  source            : {pkl}")
+    print(f"  n_patients        : {results.n_patients}")
+    print(f"  timeframes        : {results.get_available_timeframes()}")
+    print(f"  patient_counts    : {results.patient_counts}")
+    print(f"  active_only       : {results.active_only}")
+    print(f"  density_normalize : {results.density_normalize}")
+    print(f"  n_channels        : {len(results.channel2feature)}")
+    print("=" * 62)
+    print()
 
     # Both plotters are pure functions of `results` (zero `self.` references),
     # so they can be called unbound — no analyzer, no model, no data dict.
@@ -80,7 +92,8 @@ def main():
             logger.warning(f"CSV not found ({csv}); relying on pickle alone")
         figure_shap_summary_panel(csv_path=csv, save_dir=args.out_dir, pickle_path=pkl)
 
-    logger.info(f"Done. Output: {args.out_dir}")
+    print()
+    print(f"Done. Output written to: {os.path.abspath(args.out_dir)}")
 
 
 if __name__ == "__main__":

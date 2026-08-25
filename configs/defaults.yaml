@@ -91,6 +91,7 @@ mapped_dir: data/interim/mapped
 concepts:
   - ITAOversigtsrapport
   - VitaleVaerdier
+  - InvasiveMonitoring  # derived from VitaleVaerdier — must be listed after it
   - Labsvar
   - Medicin
   #- Procedurer
@@ -115,16 +116,19 @@ dataset:
       - Procedurer
       - ADTHaendelser
       - Events
+      - InvasiveMonitoring
   ts_categorical_multi_label:
       - Medicin
       - Procedurer
       - ADTHaendelser
       - Events
+      - InvasiveMonitoring
   cat_encoder_names:
       Medicin: medication
       Procedurer: procedures
       ADTHaendelser: ADT
       Events: event
+      InvasiveMonitoring: invasive_monitoring
 
   cat_cols:
       - SEX
@@ -395,6 +399,8 @@ agg_func: #also for datasets, split it up
       - max
   Events:
       - max
+  InvasiveMonitoring:
+      - max
 
 # Mapping
 npartitions:
@@ -408,6 +414,7 @@ npartitions:
   ISS_notes: 1
   ISS_computed: 1
   Events: 1
+  InvasiveMonitoring: 1
 
 mapping:
  Diagnoser: cat
@@ -443,6 +450,8 @@ drop_features:
   ISS_computed:
     - nan
   Events:
+    - nan
+  InvasiveMonitoring:
     - nan
 
 

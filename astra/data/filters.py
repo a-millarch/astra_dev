@@ -9,6 +9,7 @@ from astra.utils import ensure_datetime, is_file_present, inches_to_cm, ounces_t
 
 from astra.data.mappings import (
     VITALS_MAP, VITALS_BOUNDS, TEMP_FAHRENHEIT, BP_TYPES, HEIGHT_WEIGHT_MAP,
+    INVASIVE_BP_TYPES, INVASIVE_VITALS_MAP,
     EWS_TO_VITAL_PARAMETRE,
     LABS_FEATURE_MAP, LABS_REVERSE_MAP,
     ICU_MAP, EWS_MAP,
@@ -167,6 +168,12 @@ def filter_vitals(vit, ews=None):
     # Create a copy to avoid SettingWithCopyWarning
     vit = vit.copy()
 
+    # Tag invasive measurement sources before any processing
+    _inv_params = set(INVASIVE_VITALS_MAP.keys()) | INVASIVE_BP_TYPES
+    vit['_is_invasive'] = vit['Vital_parametre'].isin(_inv_params)
+    vit['_inv_category'] = vit['Vital_parametre'].map(INVASIVE_VITALS_MAP)
+    vit.loc[vit['Vital_parametre'].isin(INVASIVE_BP_TYPES), '_inv_category'] = 'arterial_bp'
+
     # Augment with vital measurements from EWS (if provided)
     if ews is not None:
         n_original = len(vit)
@@ -180,6 +187,7 @@ def filter_vitals(vit, ews=None):
             n_new = len(vit) - n_original
             n_dupes = len(ews_vitals) - n_new
             logger.info(f"Vitals without EWS: {n_original} | With EWS: {len(vit)} (+{n_new} new, {n_dupes} duplicates)")
+        vit['_is_invasive'] = vit['_is_invasive'].fillna(False).astype(bool)
 
     def fahrenheit_to_celsius(f):
         return (f - 32) * 5.0 / 9.0
@@ -195,7 +203,7 @@ def filter_vitals(vit, ews=None):
 
     # rename cols to standard and reduce
     vit.rename(columns={"Værdi":"VALUE", "Vital_parametre":"FEATURE", "Registreringstidspunkt":"TIMESTAMP"}, inplace=True)
-    vit = vit[["TIMESTAMP","PID", "FEATURE", "VALUE"]]
+    vit = vit[["TIMESTAMP", "PID", "FEATURE", "VALUE", "_is_invasive", "_inv_category"]]
 
     # split BP — uses BP_TYPES from mappings
     for bt in BP_TYPES:
@@ -256,6 +264,7 @@ def filter_vitals(vit, ews=None):
         logger.info("> Adding prehospital vitals")
         phv = pd.read_pickle("data/interim/prehospital_VitaleVaerdier.pkl")
         vit = pd.concat([vit, phv])
+        vit['_is_invasive'] = vit['_is_invasive'].fillna(False).astype(bool)
         vit = vit.sort_values(["PID", "TIMESTAMP"]).reset_index(drop=True)
         logger.info(f">> Vitals after prehospital merge: {len(vit)} rows")
         
@@ -264,6 +273,24 @@ def filter_vitals(vit, ews=None):
         subset=["PID", "TIMESTAMP", "FEATURE", "VALUE"],
         keep="first"
     ).reset_index(drop=True)
+
+    # Extract and save InvasiveMonitoring categorical concept
+    if 'InvasiveMonitoring' in cfg.get('concepts', []):
+        inv_mask = vit['_is_invasive']
+        if inv_mask.any():
+            inv_df = vit.loc[inv_mask, ['PID', 'TIMESTAMP', '_inv_category']].copy()
+            inv_df.rename(columns={'_inv_category': 'VALUE'}, inplace=True)
+            inv_df['FEATURE'] = 'invasive_monitoring'
+            inv_df = inv_df[['PID', 'TIMESTAMP', 'FEATURE', 'VALUE']].drop_duplicates().reset_index(drop=True)
+            ensure_parent_dir("data/interim/concepts/InvasiveMonitoring.pkl")
+            inv_df.to_pickle("data/interim/concepts/InvasiveMonitoring.pkl", protocol=4)
+            logger.info(f"InvasiveMonitoring: saved {len(inv_df)} events from {inv_df['PID'].nunique()} patients")
+            for cat, cnt in inv_df['VALUE'].value_counts().items():
+                logger.info(f"  {cat}: {cnt} events")
+        else:
+            logger.info("InvasiveMonitoring: no invasive measurements found")
+
+    vit = vit.drop(columns=['_is_invasive', '_inv_category'])
 
     return vit
 
@@ -580,6 +607,11 @@ def extract_ews_vitals(ews):
 
 
 
+def filter_invasive_monitoring(df):
+    """Identity filter — InvasiveMonitoring is created by filter_vitals."""
+    return df
+
+
 def collect_filter(concept: str):
     filter_funcs = {
         "VitaleVaerdier": filter_vitals,
@@ -592,6 +624,7 @@ def collect_filter(concept: str):
         "ISS_notes": filter_iss_notes,
         "ISS_computed": filter_iss_computed,
         "Events": filter_events,
+        "InvasiveMonitoring": filter_invasive_monitoring,
     }
 
     return filter_funcs[concept]

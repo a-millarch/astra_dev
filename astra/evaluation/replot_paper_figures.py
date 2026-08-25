@@ -616,11 +616,10 @@ def main():
                              "reports/eval/<model>/revision<suffix>/")
     parser.add_argument(
         "--eval-dir", type=str, default=None,
-        help="Override the artifact ROOT to read from (default: "
-             "reports/eval/<model>). Expects <root>/predictions/*.csv and "
-             "<root>/calibration/. Filenames inside must still embed the model "
-             "name, e.g. a backup dir reports/eval/<model>_BEFORERUN works as-is. "
-             "Outputs are unaffected — use --output-dir for those.",
+        help="Override the artifact ROOT to read from (default: reports/eval/<model>). "
+             "Expects <root>/predictions/*.csv and <root>/calibration/. Filenames "
+             "inside must still embed the model name, so a backup dir such as "
+             "reports/eval/<model>_BEFORERERUN works as-is. Use --output-dir for outputs.",
     )
     parser.add_argument(
         "--calibrator-dir", type=str, default=None,

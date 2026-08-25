@@ -3,10 +3,13 @@ SHAP analysis figures for JMIR paper submission.
 
 Usage:
     python -m astra.evaluation.shap_paper_figures [--recompute] [--figures-only]
+    python -m astra.evaluation.shap_paper_figures --renormalize-cat-ts --pickle-path <path>
 
 Flags:
-    --recompute    Force recomputation of SHAP values (default: load cached if available)
-    --figures-only  Skip SHAP computation, only regenerate figures from cached results
+    --recompute           Force recomputation of SHAP values
+    --figures-only        Skip SHAP computation, regenerate figures from cache
+    --renormalize-cat-ts  Re-normalize categorical TS SHAP from existing pickle (no data/model needed)
+    --pickle-path         Path to cohort_temporal_shap_results*.pkl (for --renormalize-cat-ts)
 """
 
 import argparse
@@ -363,8 +366,7 @@ def compute_shap_per_timepoint(
 def _squeeze_shap_results(shap_results: Dict) -> None:
     """Squeeze trailing singleton dimensions from SHAP arrays in-place."""
     for key in ('ts_shap', 'cat_ts_shap', 'cat_ts_shap_per_category',
-                'cat_ts_shap_embedded', 'cat_shap', 'cat_shap_embedded',
-                'cont_shap'):
+                'cat_shap', 'cont_shap'):
         val = shap_results.get(key)
         if val is not None and isinstance(val, np.ndarray) and val.ndim > 1 and val.shape[-1] == 1:
             shap_results[key] = val.squeeze(-1)
@@ -486,7 +488,7 @@ def figure_a_topk_importance(
         ax.set_title(f'{label} (n={n_total}, {n_dec} deceased)', fontsize=9)
         ax.tick_params(axis='x', labelsize=7)
 
-    fig.suptitle('Top clinical feature importance by timepoint', fontsize=11, y=1.01)
+    fig.suptitle('Top Clinical Feature Importance by Timepoint', fontsize=11, y=1.01)
 
     _save_shap_figure(fig, save_dir, 'figure_a_topk_importance')
     logger.info(f"Figure A saved to {save_dir}")
@@ -570,8 +572,8 @@ def figure_b_heatmap(
         ax.axhline(y=len(row_labels) - 1, color='black', linewidth=2)
 
     ax.set_ylabel('')
-    ax.set_xlabel('Evaluation timepoint')
-    ax.set_title('Feature importance across patient trajectory', fontsize=11)
+    ax.set_xlabel('Evaluation Timepoint')
+    ax.set_title('Feature Importance Across Patient Trajectory', fontsize=11)
     ax.tick_params(axis='y', labelsize=8)
     ax.tick_params(axis='x', labelsize=9)
 
@@ -640,7 +642,7 @@ def figure_c_static_features(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(static_cat_names, fontsize=7)
         ax.set_xlabel('Mean SHAP (signed)')
-        ax.set_title('Static categorical', fontsize=10)
+        ax.set_title('Static Categorical', fontsize=10)
 
     # --- Static Continuous ---
     if has_cont:
@@ -667,9 +669,9 @@ def figure_c_static_features(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(static_cont_names, fontsize=7)
         ax.set_xlabel('Mean SHAP (signed)')
-        ax.set_title('Static continuous', fontsize=10)
+        ax.set_title('Static Continuous', fontsize=10)
 
-    fig.suptitle('Static feature importance', fontsize=11)
+    fig.suptitle('Static Feature Importance', fontsize=11)
 
     _save_shap_figure(fig, save_dir, 'figure_c_static_features')
     logger.info(f"Figure C saved to {save_dir}")
@@ -777,8 +779,8 @@ def figure_e_categorical_ts(
     )
 
     ax.set_ylabel('')
-    ax.set_xlabel('Evaluation timepoint')
-    ax.set_title('Categorical TS feature importance', fontsize=11)
+    ax.set_xlabel('Evaluation Timepoint')
+    ax.set_title('Categorical TS Feature Importance', fontsize=11)
     ax.tick_params(axis='y', labelsize=7)
     ax.tick_params(axis='x', labelsize=9)
 
@@ -812,10 +814,13 @@ _AGG_SUFFIXES = ('_max', '_min', '_mean', '_std', '_count')
 
 
 def _clean_feature_name(name: str) -> str:
-    """Strip aggregation suffixes (_max, _min, _mean, _std) for display."""
+    """Strip aggregation suffixes and shorten prefixes for display."""
     for suffix in _AGG_SUFFIXES:
         if name.endswith(suffix):
-            return name[:-len(suffix)]
+            name = name[:-len(suffix)]
+            break
+    if name.startswith('medication:'):
+        name = 'med:' + name[len('medication:'):]
     return name
 
 
@@ -923,7 +928,11 @@ def _load_cat_ts_from_pickle(pickle_path: str, timeframes: list) -> Optional[pd.
             for pr in results.patient_results:
                 norm_tf = 'full' if tf.startswith('max(') else tf
                 tfr = pr.timeframe_results.get(norm_tf) or pr.timeframe_results.get(tf)
-                if tfr and tfr.cat_ts_shap_per_category is not None and tfr.cat_ts_shap_per_category.size > 0:
+                if tfr is None:
+                    continue
+                if tfr.cat_ts_category_importance is not None:
+                    cat_arrays.append(tfr.cat_ts_category_importance)
+                elif tfr.cat_ts_shap_per_category is not None and tfr.cat_ts_shap_per_category.size > 0:
                     arr = tfr.cat_ts_shap_per_category
                     if arr.ndim == 2:
                         cat_arrays.append(np.abs(arr).mean(axis=1))
@@ -1023,7 +1032,7 @@ def _load_all_from_pickle(pickle_path: str, timeframes: list) -> Optional[dict]:
                         cat_ts_rows.append({
                             'timeframe': tf, 'feature': f'cat_ts:{name}',
                             'display_name': name,
-                            'mean_abs_shap': float(imp[j]),
+                            'mean_abs_shap': float(np.mean(imp[j])),
                         })
         if cat_ts_rows:
             cat_ts = pd.DataFrame(cat_ts_rows)
@@ -1045,6 +1054,7 @@ def _load_all_from_pickle(pickle_path: str, timeframes: list) -> Optional[dict]:
         'timeframes': timeframes,
         'density_normalize': density_normalize,
         'patient_counts': patient_counts,
+        'cat_ts_gate_values': getattr(results, 'cat_ts_gate_values', None),
     }
 
 
@@ -1053,6 +1063,7 @@ def figure_shap_summary_panel(
     save_dir: str,
     pickle_path: Optional[str] = None,
     max_display: int = 15,
+    save_suffix: str = "",
 ) -> None:
     """Paper-quality 3x2 SHAP summary panel.
 
@@ -1120,7 +1131,7 @@ def figure_shap_summary_panel(
     # Figure setup: 3x2 grid
     # ========================================================================
     fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(3, 2, hspace=0.40, wspace=0.30,
+    gs = fig.add_gridspec(3, 2, hspace=0.50, wspace=0.45,
                           height_ratios=[1, 1.2, 1])
 
     # ========================================================================
@@ -1160,35 +1171,58 @@ def figure_shap_summary_panel(
     ax_a.grid(True, alpha=0.3)
 
     # ========================================================================
-    # Panel B: Top N Channels (bar chart)
+    # Panel B: Top N Features — combined continuous TS + categorical TS
     # ========================================================================
     ax_b = fig.add_subplot(gs[0, 1])
     _add_subplot_label(ax_b, 'B')
 
-    # Average importance across timeframes per channel
-    channel_avg = (clinical_temporal
-                   .groupby('feature')['mean_abs_shap']
-                   .mean()
-                   .sort_values(ascending=False)
-                   .head(max_display))
+    # Continuous TS: average importance across timeframes per channel
+    cont_avg = (clinical_temporal
+                .groupby('feature')['mean_abs_shap']
+                .mean())
+    cont_avg_df = cont_avg.reset_index()
+    cont_avg_df.columns = ['name', 'importance']
+    cont_avg_df['source'] = 'continuous'
 
-    # Color: EBM channels orange, clinical blue
+    # Categorical TS: average importance across timeframes per category
+    if len(cat_ts) > 0:
+        cat_avg_series = (cat_ts
+                          .groupby('display_name')['mean_abs_shap']
+                          .mean())
+        cat_avg_df = cat_avg_series.reset_index()
+        cat_avg_df.columns = ['name', 'importance']
+        cat_avg_df['source'] = 'categorical'
+        combined = pd.concat([cont_avg_df, cat_avg_df], ignore_index=True)
+    else:
+        combined = cont_avg_df
+
+    combined = combined.sort_values('importance', ascending=False).head(max_display)
+
     bar_colors = []
-    for feat in channel_avg.index:
-        if feat in _EBM_CHANNEL_NAMES:
+    for _, row in combined.iterrows():
+        if row['name'] in _EBM_CHANNEL_NAMES:
             bar_colors.append('#FF9800')
+        elif row['source'] == 'categorical':
+            bar_colors.append('#00d4aa')
         else:
-            bar_colors.append('#008bfb')
+            bar_colors.append('#ff0051')
 
-    y_pos = range(len(channel_avg))
-    channel_display_names = _clean_feature_names(list(channel_avg.index))
-    ax_b.barh(y_pos, channel_avg.values, color=bar_colors, alpha=0.7)
+    y_pos = range(len(combined))
+    channel_display_names = _clean_feature_names(list(combined['name']))
+    ax_b.barh(y_pos, combined['importance'].values, color=bar_colors, alpha=0.7)
     ax_b.set_yticks(y_pos)
     ax_b.set_yticklabels(channel_display_names)
     ax_b.set_xlabel(_shap_label)
-    ax_b.set_title(f'Top {len(channel_avg)} channels{_dn_suffix}', fontweight='bold')
+    ax_b.set_title(f'Top {len(combined)} features{_dn_suffix}', fontweight='bold')
     ax_b.grid(True, alpha=0.3, axis='x')
     ax_b.invert_yaxis()
+
+    # Legend for feature types
+    from matplotlib.patches import Patch
+    legend_handles = [Patch(facecolor='#ff0051', alpha=0.7, label='Continuous TS')]
+    if len(cat_ts) > 0 and (combined['source'] == 'categorical').any():
+        legend_handles.append(Patch(facecolor='#00d4aa', alpha=0.7, label='Categorical TS'))
+    ax_b.legend(handles=legend_handles, loc='lower right', fontsize=9)
 
     # ========================================================================
     # Panel C: Categorical TS |SHAP| Heatmap
@@ -1220,9 +1254,15 @@ def figure_shap_summary_panel(
                     annot_kws={'fontsize': 10})
         ax_c.set_ylabel('')
         ax_c.set_xlabel('Time frame')
-        ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
+        _cat_dn_suffix = ' (per-event)' if density_normalize else ''
+        ax_c.set_title(f'Categorical TS |SHAP|{_cat_dn_suffix}', fontweight='bold')
         ax_c.tick_params(axis='y', labelsize=12)
         ax_c.tick_params(axis='x', labelsize=12)
+        cat_ts_gate_values = data.get('cat_ts_gate_values')
+        if cat_ts_gate_values is not None:
+            gate_mean = float(np.mean(cat_ts_gate_values))
+            ax_c.text(0.02, 0.02, f'Gate factor: {gate_mean:.2f}',
+                      transform=ax_c.transAxes, fontsize=8, style='italic', alpha=0.7)
     else:
         ax_c.text(0.5, 0.5, 'No categorical TS data available',
                   ha='center', va='center', transform=ax_c.transAxes, fontsize=12)
@@ -1235,7 +1275,7 @@ def figure_shap_summary_panel(
     _add_subplot_label(ax_d, 'D')
 
     # Build matrix: channels x timeframes (top N by overall importance)
-    top_channels = channel_avg.head(max_display).index.tolist()
+    top_channels = cont_avg.sort_values(ascending=False).head(max_display).index.tolist()
 
     cont_matrix = np.zeros((len(top_channels), len(timeframes)))
     for col_idx, tf in enumerate(timeframes):
@@ -1324,8 +1364,184 @@ def figure_shap_summary_panel(
     # Save
     # ========================================================================
     plt.tight_layout()
-    _save_shap_figure(fig, save_dir, 'figure_shap_summary_panel')
-    logger.info(f"Summary panel figure saved to {save_dir}")
+    stem = f'figure_shap_summary_panel{save_suffix}'
+    _save_shap_figure(fig, save_dir, stem)
+    logger.info(f"Summary panel figure saved to {save_dir}/{stem}")
+
+
+# ============================================================================
+# CSV export from pickle
+# ============================================================================
+
+def export_csv_from_pickle(pickle_path: str, output_path: str) -> None:
+    """Regenerate cohort_shap_all_features CSV from a pickle."""
+    import pickle as pkl
+
+    print(f"Loading pickle: {pickle_path}")
+    with open(pickle_path, 'rb') as f:
+        results = pkl.load(f)
+
+    rows = []
+    for tf in results.get_available_timeframes():
+        ch_imp = results.channel_importance[tf]
+        ch_std = results.channel_importance_std[tf]
+        for i in range(len(ch_imp)):
+            rows.append({
+                'timeframe': tf,
+                'channel_idx': i,
+                'feature': results.channel2feature.get(int(i), f'Ch{i}'),
+                'mean_abs_shap': float(ch_imp[i]),
+                'std_abs_shap': float(ch_std[i]),
+                'n_patients': results.patient_counts[tf],
+            })
+        cat_imp = results.static_cat_importance.get(tf)
+        if cat_imp is not None:
+            for j, name in enumerate(results.static_cat_names):
+                if j < len(cat_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cat:{name}',
+                        'mean_abs_shap': float(cat_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        cont_imp = results.static_cont_importance.get(tf)
+        if cont_imp is not None:
+            for j, name in enumerate(results.static_cont_names):
+                if j < len(cont_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'static_cont:{name}',
+                        'mean_abs_shap': float(cont_imp[j]), 'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+        cat_ts_imp = results.cat_ts_per_category_importance.get(tf)
+        if cat_ts_imp is not None:
+            for j, name in enumerate(results.cat_ts_category_names):
+                if j < len(cat_ts_imp):
+                    rows.append({
+                        'timeframe': tf, 'channel_idx': None,
+                        'feature': f'cat_ts:{name}',
+                        'mean_abs_shap': float(np.mean(cat_ts_imp[j])),
+                        'std_abs_shap': None,
+                        'n_patients': results.patient_counts[tf],
+                    })
+
+    df = pd.DataFrame(rows)
+    ensure_parent_dir(output_path)
+    df.to_csv(output_path, index=False)
+    print(f"Exported {len(df)} rows to {output_path}")
+
+
+# ============================================================================
+# Post-hoc density renormalization
+# ============================================================================
+
+def recompute_cat_ts_shap(
+    pickle_path: str,
+    config_name: str,
+    save_dir: str,
+    data_cache_path: str | None = None,
+) -> None:
+    """Recompute cat TS SHAP for the same patients and patch the old pickle.
+
+    Loads the old pickle to get the patient list, runs TemporalSHAPAnalyzer
+    on the current branch (raw multi-hot SHAP + density normalization), then
+    patches the old pickle with ONLY the new cat_ts values. All other panels
+    (continuous TS, statics) remain bit-identical.
+    """
+    import pickle as pkl
+    import torch
+    from astra.evaluation.behavior import (
+        TemporalSHAPAnalyzer,
+        get_holdout_pids,
+    )
+
+    print(f"Loading old pickle: {pickle_path}")
+    with open(pickle_path, 'rb') as f:
+        old_results = pkl.load(f)
+
+    old_pids = old_results.pids
+    print(f"  {len(old_pids)} patients, timeframes: "
+          f"{old_results.get_available_timeframes()}")
+
+    # Load data + model via config
+    import astra.utils as _utils
+    from astra.utils import setup_logging
+    setup_logging(logging.INFO)
+    _cfg = get_cfg(_utils.PROJECT_ROOT / "configs" / config_name)
+    _utils.cfg.clear()
+    _utils.cfg.update(_cfg)
+
+    if data_cache_path:
+        from astra.data.caching import load_data_cache_from_path
+        print(f"Loading data from explicit cache: {data_cache_path}")
+        data = load_data_cache_from_path(data_cache_path)
+    else:
+        print(f"Loading data via config ({config_name})...")
+        data = prepare_data_and_dls_cached(cfg)
+
+    print("Loading model...")
+    model, device = prepare_model(data, cfg)
+    model.eval()
+
+    # Run TemporalSHAPAnalyzer for the same PIDs
+    analyzer = TemporalSHAPAnalyzer(
+        model, data, data["mixed_dls"].train,
+        device, max_background_samples=200,
+        active_only=True, density_normalize=True,
+    )
+
+    all_holdout_pids = get_holdout_pids(data)
+    # Filter to only the PIDs from the old pickle, in dataloader order
+    old_pid_set = set(old_pids)
+    ordered_pids = [p for p in all_holdout_pids if p in old_pid_set]
+    print(f"  Matched {len(ordered_pids)}/{len(old_pids)} PIDs in holdout set")
+
+    if len(ordered_pids) == 0:
+        print("ERROR: No matching PIDs found in holdout set.")
+        return
+
+    print(f"Recomputing SHAP for {len(ordered_pids)} patients...")
+    new_results = analyzer.analyze_cohort(
+        data["holdout_mixed_dls"].train, ordered_pids,
+        max_patients=len(ordered_pids),
+        verbose=True,
+    )
+
+    # Patch: take ONLY cat_ts fields from new results into old results
+    old_results.cat_ts_per_category_importance = new_results.cat_ts_per_category_importance
+    old_results.cat_ts_category_names = new_results.cat_ts_category_names
+    old_results.cat_ts_gate_values = getattr(new_results, 'cat_ts_gate_values', None)
+    old_results.density_normalize = True
+
+    print(f"Patched cat_ts_per_category_importance: "
+          f"{len(old_results.cat_ts_per_category_importance)} timeframes")
+    for tf, imp in old_results.cat_ts_per_category_importance.items():
+        n = len(imp) if imp is not None else 0
+        print(f"  {tf}: {n} categories")
+
+    # Save patched pickle
+    base = Path(pickle_path)
+    if base.stem.endswith('_dn'):
+        new_stem = f"{base.stem}_v2"
+    else:
+        new_stem = f"{base.stem}_dn"
+    new_path = str(base.parent / f"{new_stem}{base.suffix}")
+    ensure_parent_dir(new_path)
+    with open(new_path, 'wb') as f:
+        pkl.dump(old_results, f)
+    print(f"Saved patched pickle: {new_path}")
+
+    # Regenerate summary panel
+    csv_path = str(base.parent / base.name.replace(
+        'cohort_temporal_shap_results', 'cohort_shap_all_features'
+    ).replace('.pkl', '.csv'))
+    figure_shap_summary_panel(
+        csv_path=csv_path,
+        save_dir=save_dir,
+        pickle_path=new_path,
+        save_suffix='_v2',
+    )
 
 
 # ============================================================================
@@ -1354,11 +1570,67 @@ def main():
         '--verbose', action='store_true',
         help='Enable DEBUG logging'
     )
+    parser.add_argument(
+        '--summary-panel-only', action='store_true',
+        help='Regenerate summary panel figure from an existing pickle. '
+             'No SHAP computation or data loading. Requires --pickle-path.',
+    )
+    parser.add_argument(
+        '--save-suffix', type=str, default='',
+        help='Suffix for output filenames (e.g. "_v2")',
+    )
+    parser.add_argument(
+        '--recompute-cat-ts', action='store_true',
+        help='Recompute categorical TS SHAP with density normalization '
+             'for the same patients in an existing pickle. Patches only '
+             'cat TS fields; all other panels remain bit-identical. '
+             'Requires --pickle-path and loads data/model via --config.',
+    )
+    parser.add_argument(
+        '--pickle-path', type=str, default=None,
+        help='Path to cohort_temporal_shap_results*.pkl '
+             '(required for --recompute-cat-ts)',
+    )
+    parser.add_argument(
+        '--data-cache', type=str, default=None,
+        help='Explicit path to data_cache_*.pkl to bypass cache key '
+             'lookup (use when config has changed since the cache was built)',
+    )
     args = parser.parse_args()
 
     # Logging setup
     from astra.utils import setup_logging
     setup_logging(logging.DEBUG if args.verbose else logging.INFO)
+
+    # Fast path: regenerate summary panel + CSV from existing pickle (no data/model)
+    if args.summary_panel_only:
+        if not args.pickle_path:
+            parser.error("--summary-panel-only requires --pickle-path")
+        base = Path(args.pickle_path)
+        csv_path = str(base.parent / base.name.replace(
+            'cohort_temporal_shap_results', 'cohort_shap_all_features'
+        ).replace('.pkl', '.csv'))
+        export_csv_from_pickle(args.pickle_path, csv_path)
+        figure_shap_summary_panel(
+            csv_path=csv_path,
+            save_dir=OUTPUT_DIR,
+            pickle_path=args.pickle_path,
+            save_suffix=args.save_suffix,
+        )
+        return
+
+    # Fast path: recompute cat TS SHAP only (loads data/model, but only
+    # recomputes categorical TS — all other panels stay bit-identical)
+    if args.recompute_cat_ts:
+        if not args.pickle_path:
+            parser.error("--recompute-cat-ts requires --pickle-path")
+        recompute_cat_ts_shap(
+            pickle_path=args.pickle_path,
+            config_name=args.config,
+            save_dir=OUTPUT_DIR,
+            data_cache_path=args.data_cache,
+        )
+        return
 
     # Load config from configs/ dir (mutate in place so imported references stay valid)
     import astra.utils as _utils
