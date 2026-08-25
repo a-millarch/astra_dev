@@ -612,14 +612,14 @@ def _plot_calibration_metrics_over_time(
                      color=color, linewidth=2, marker='o', markersize=4,
                      label=f'{method.capitalize()} calibrated')
 
-    axes[0].set_ylabel('Expected Calibration Error (ECE)', fontsize=_FIG_STYLE['axis_label'])
-    axes[0].set_title('Calibration Metrics Over Time: Raw vs Calibrated', fontsize=_FIG_STYLE['title'], fontweight='bold')
+    axes[0].set_ylabel('Expected calibration error (ECE)', fontsize=_FIG_STYLE['axis_label'])
+    axes[0].set_title('Calibration metrics over time: raw vs calibrated', fontsize=_FIG_STYLE['title'], fontweight='bold')
     axes[0].legend(fontsize=_FIG_STYLE['legend'])
     axes[0].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[0].grid(True, alpha=0.3)
 
     axes[1].set_xlabel('Time (hours)', fontsize=_FIG_STYLE['axis_label'])
-    axes[1].set_ylabel('Brier Score', fontsize=_FIG_STYLE['axis_label'])
+    axes[1].set_ylabel('Brier score', fontsize=_FIG_STYLE['axis_label'])
     axes[1].legend(fontsize=_FIG_STYLE['legend'])
     axes[1].tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     axes[1].grid(True, alpha=0.3)
@@ -700,7 +700,7 @@ def _plot_reliability_diagrams(
         row, col = divmod(idx, ncols)
         axes[row, col].set_visible(False)
 
-    fig.suptitle(f'Reliability Diagrams: Raw vs {best_method.capitalize()} Calibrated',
+    fig.suptitle(f'Reliability diagrams: raw vs {best_method} calibrated',
                  fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     save_figure(fig, f"reliability_diagrams_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
@@ -745,7 +745,7 @@ def _plot_dca_comparison(
 
         ax.plot(thresholds, nb_raw, color='grey', linewidth=1.5, alpha=0.7, label='Raw')
         ax.plot(thresholds, np.clip(nb_all, ymin, None),
-                color='black', linewidth=1, linestyle=':', alpha=0.5, label='Treat All')
+                color='black', linewidth=1, linestyle=':', alpha=0.5, label='Treat all')
         ax.axhline(0, color='black', linewidth=0.5, alpha=0.3)
 
         if step in calibrated_preds and best_method in calibrated_preds[step]:
@@ -765,13 +765,13 @@ def _plot_dca_comparison(
         if row == nrows - 1:
             ax.set_xlabel('Threshold', fontsize=_FIG_STYLE['axis_label'])
         if col == 0:
-            ax.set_ylabel('Net Benefit', fontsize=_FIG_STYLE['axis_label'])
+            ax.set_ylabel('Net benefit', fontsize=_FIG_STYLE['axis_label'])
 
     for idx in range(n, nrows * ncols):
         row, col = divmod(idx, ncols)
         axes[row, col].set_visible(False)
 
-    fig.suptitle(f'Decision Curve Analysis: Raw vs {best_method.capitalize()} Calibrated',
+    fig.suptitle(f'Decision curve analysis: raw vs {best_method} calibrated',
                  fontsize=_FIG_STYLE['suptitle'], fontweight='bold', y=1.02)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     save_figure(fig, f"dca_comparison_{model_name}", save_dir=save_dir, **_SUBMISSION_KW)
@@ -835,19 +835,19 @@ def _plot_dca_calibrated(
         nb_clipped = np.clip(nb_treat_all, ymin, None)
         ax.plot(thresholds, nb_clipped, color=color, linewidth=1.0,
                 linestyle='--', alpha=0.4,
-                label='Treat All' if first else None)
+                label='Treat all' if first else None)
         first = False
 
-    ax.axhline(y=0, color='black', linewidth=1, label='Treat None')
+    ax.axhline(y=0, color='black', linewidth=1, label='Treat none')
 
-    ax.set_xlabel("Threshold Probability", fontsize=_FIG_STYLE['axis_label'])
-    ax.set_ylabel("Net Benefit", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_xlabel("Threshold probability", fontsize=_FIG_STYLE['axis_label'])
+    ax.set_ylabel("Net benefit", fontsize=_FIG_STYLE['axis_label'])
     ax.set_title(
-        f"Decision Curves (Calibrated — {best_method.capitalize()})",
+        f"Decision curves (calibrated — {best_method})",
         fontsize=_FIG_STYLE['title'], fontweight='bold',
     )
     ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=_FIG_STYLE['legend'],
-              title="Time Available", title_fontsize=_FIG_STYLE['legend'])
+              title="Time available", title_fontsize=_FIG_STYLE['legend'])
     ax.tick_params(axis='both', labelsize=_FIG_STYLE['tick_label'])
     ax.grid(True, alpha=0.3)
     ax.set_xlim(0, max_threshold)
@@ -894,7 +894,7 @@ def _plot_per_timepoint_vs_global(
 
     ax.set_xlabel('Timepoint', fontsize=_FIG_STYLE['axis_label'])
     ax.set_ylabel('ECE', fontsize=_FIG_STYLE['axis_label'])
-    ax.set_title(f'ECE: Raw vs Per-Timepoint vs Global ({best_method.capitalize()})',
+    ax.set_title(f'ECE: raw vs per-timepoint vs global ({best_method})',
                  fontsize=_FIG_STYLE['title'], fontweight='bold')
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=_FIG_STYLE['tick_label'])
