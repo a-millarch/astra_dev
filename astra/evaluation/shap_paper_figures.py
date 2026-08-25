@@ -486,7 +486,7 @@ def figure_a_topk_importance(
         ax.set_title(f'{label} (n={n_total}, {n_dec} deceased)', fontsize=9)
         ax.tick_params(axis='x', labelsize=7)
 
-    fig.suptitle('Top Clinical Feature Importance by Timepoint', fontsize=11, y=1.01)
+    fig.suptitle('Top clinical feature importance by timepoint', fontsize=11, y=1.01)
 
     _save_shap_figure(fig, save_dir, 'figure_a_topk_importance')
     logger.info(f"Figure A saved to {save_dir}")
@@ -570,8 +570,8 @@ def figure_b_heatmap(
         ax.axhline(y=len(row_labels) - 1, color='black', linewidth=2)
 
     ax.set_ylabel('')
-    ax.set_xlabel('Evaluation Timepoint')
-    ax.set_title('Feature Importance Across Patient Trajectory', fontsize=11)
+    ax.set_xlabel('Evaluation timepoint')
+    ax.set_title('Feature importance across patient trajectory', fontsize=11)
     ax.tick_params(axis='y', labelsize=8)
     ax.tick_params(axis='x', labelsize=9)
 
@@ -640,7 +640,7 @@ def figure_c_static_features(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(static_cat_names, fontsize=7)
         ax.set_xlabel('Mean SHAP (signed)')
-        ax.set_title('Static Categorical', fontsize=10)
+        ax.set_title('Static categorical', fontsize=10)
 
     # --- Static Continuous ---
     if has_cont:
@@ -667,9 +667,9 @@ def figure_c_static_features(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(static_cont_names, fontsize=7)
         ax.set_xlabel('Mean SHAP (signed)')
-        ax.set_title('Static Continuous', fontsize=10)
+        ax.set_title('Static continuous', fontsize=10)
 
-    fig.suptitle('Static Feature Importance', fontsize=11)
+    fig.suptitle('Static feature importance', fontsize=11)
 
     _save_shap_figure(fig, save_dir, 'figure_c_static_features')
     logger.info(f"Figure C saved to {save_dir}")
@@ -777,8 +777,8 @@ def figure_e_categorical_ts(
     )
 
     ax.set_ylabel('')
-    ax.set_xlabel('Evaluation Timepoint')
-    ax.set_title('Categorical TS Feature Importance', fontsize=11)
+    ax.set_xlabel('Evaluation timepoint')
+    ax.set_title('Categorical TS feature importance', fontsize=11)
     ax.tick_params(axis='y', labelsize=7)
     ax.tick_params(axis='x', labelsize=9)
 
@@ -1152,10 +1152,10 @@ def figure_shap_summary_panel(
 
     ax_a.set_xticks(range(len(timeframes)))
     ax_a.set_xticklabels(timeframes, rotation=45, ha='right')
-    ax_a.set_xlabel('Timeframe')
+    ax_a.set_xlabel('Time frame')
     _shap_label_sum = 'Sum |SHAP| / measured cell' if density_normalize else 'Sum |SHAP|'
     ax_a.set_ylabel(_shap_label_sum)
-    ax_a.set_title(f'Total Feature Importance Over Time{_dn_suffix}', fontweight='bold')
+    ax_a.set_title(f'Total feature importance over time{_dn_suffix}', fontweight='bold')
     ax_a.legend()
     ax_a.grid(True, alpha=0.3)
 
@@ -1186,7 +1186,7 @@ def figure_shap_summary_panel(
     ax_b.set_yticks(y_pos)
     ax_b.set_yticklabels(channel_display_names)
     ax_b.set_xlabel(_shap_label)
-    ax_b.set_title(f'Top {len(channel_avg)} Channels{_dn_suffix}', fontweight='bold')
+    ax_b.set_title(f'Top {len(channel_avg)} channels{_dn_suffix}', fontweight='bold')
     ax_b.grid(True, alpha=0.3, axis='x')
     ax_b.invert_yaxis()
 
@@ -1219,7 +1219,7 @@ def figure_shap_summary_panel(
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
                     annot_kws={'fontsize': 10})
         ax_c.set_ylabel('')
-        ax_c.set_xlabel('Timeframe')
+        ax_c.set_xlabel('Time frame')
         ax_c.set_title('Categorical TS |SHAP|', fontweight='bold')
         ax_c.tick_params(axis='y', labelsize=12)
         ax_c.tick_params(axis='x', labelsize=12)
@@ -1252,7 +1252,7 @@ def figure_shap_summary_panel(
                 cbar_kws={'shrink': 0.8, 'label': _shap_label},
                 annot_kws={'fontsize': 10})
     ax_d.set_ylabel('')
-    ax_d.set_xlabel('Timeframe')
+    ax_d.set_xlabel('Time frame')
     ax_d.set_title(f'Continuous TS |SHAP|{_dn_suffix}', fontweight='bold')
     ax_d.tick_params(axis='y', labelsize=12)
     ax_d.tick_params(axis='x', labelsize=12)
@@ -1286,8 +1286,8 @@ def figure_shap_summary_panel(
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
                     annot_kws={'fontsize': 10})
         ax_e.set_ylabel('')
-        ax_e.set_xlabel('Timeframe')
-    ax_e.set_title('Static Categorical', fontweight='bold')
+        ax_e.set_xlabel('Time frame')
+    ax_e.set_title('Static categorical', fontweight='bold')
 
     # ========================================================================
     # Panel F: Static Continuous Heatmap (features × timeframes)
@@ -1317,8 +1317,8 @@ def figure_shap_summary_panel(
                     cbar_kws={'shrink': 0.8, 'label': _shap_label},
                     annot_kws={'fontsize': 10})
         ax_f.set_ylabel('')
-        ax_f.set_xlabel('Timeframe')
-    ax_f.set_title('Static Continuous', fontweight='bold')
+        ax_f.set_xlabel('Time frame')
+    ax_f.set_title('Static continuous', fontweight='bold')
 
     # ========================================================================
     # Save

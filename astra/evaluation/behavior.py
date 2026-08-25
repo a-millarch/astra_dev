@@ -4711,8 +4711,8 @@ class TemporalSHAPAnalyzer:
         tf_labels = [f'{tf}\nn={results.patient_counts[tf]}' for tf in tfs]
         ax_a.set_xticks(range(n_tf))
         ax_a.set_xticklabels(tf_labels, fontsize=9, ha='center')
-        ax_a.set_xlabel('Timeframe', fontsize=10)
-        ax_a.set_title('Channel Importance Across Timeframes', fontsize=12,
+        ax_a.set_xlabel('Time frame', fontsize=10)
+        ax_a.set_title('Channel importance across time frames', fontsize=12,
                        fontweight='bold')
         plt.colorbar(im_a, ax=ax_a, shrink=0.8, label=_shap_label)
         # Annotate cells with values when few enough to read
@@ -4768,18 +4768,18 @@ class TemporalSHAPAnalyzer:
             ax_b.set_yticklabels(static_names_sorted, fontsize=9)
             ax_b.set_xticks(range(n_tf))
             ax_b.set_xticklabels(tfs, fontsize=8, rotation=45, ha='right')
-            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+            ax_b.set_title('Static features', fontsize=12, fontweight='bold')
             plt.colorbar(im_b, ax=ax_b, shrink=0.8, label=_shap_label)
         else:
             ax_b.text(0.5, 0.5, 'No static features', ha='center',
                       va='center', transform=ax_b.transAxes, fontsize=12)
-            ax_b.set_title('Static Features', fontsize=12, fontweight='bold')
+            ax_b.set_title('Static features', fontsize=12, fontweight='bold')
 
         # ── Suptitle & save ──
         dn_label = " [density-norm]" if results.density_normalize else ""
         active_label = " [active-only]" if results.active_only else ""
         fig.suptitle(
-            f'Cohort Temporal SHAP (n={results.n_patients}){active_label}{dn_label}',
+            f'Cohort temporal SHAP (n={results.n_patients}){active_label}{dn_label}',
             fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         if save_path:
@@ -4833,13 +4833,13 @@ class TemporalSHAPAnalyzer:
 
         ax.set_xticks(range(len(tfs)))
         ax.set_xticklabels(tfs, rotation=45)
-        ax.set_xlabel('Timeframe')
+        ax.set_xlabel('Time frame')
         _dn = results.density_normalize
         ax.set_ylabel('Mean |SHAP| / measured cell' if _dn else 'Mean |SHAP|')
         active_label = " [active-only]" if results.active_only else ""
         dn_label = " [density-norm]" if _dn else ""
         ax.set_title(
-            f'Feature Trajectory — Cohort (n={results.n_patients}){active_label}{dn_label}',
+            f'Feature trajectory — cohort (n={results.n_patients}){active_label}{dn_label}',
             fontweight='bold')
         ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
         ax.grid(True, alpha=0.3)
