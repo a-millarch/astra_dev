@@ -498,6 +498,7 @@ def replot(
     config: Optional[str] = None,
     eval_dir: Optional[str] = None,
     calibrator_dir: Optional[str] = None,
+    data_cache: Optional[str] = None,
 ) -> None:
     eval_root = eval_dir or f"reports/eval/{model_name}"
     preds_dir = f"{eval_root}/predictions"
@@ -531,7 +532,15 @@ def replot(
         )
 
     logger.info("Loading data dict (cached; no model inference)")
-    data = prepare_data_and_dls_cached(cfg)
+    if data_cache:
+        # Bypass cache-key lookup. Needed when caching.py's _CACHE_VERSION or
+        # _get_cache_key fields changed since the cache was built: the key then
+        # differs even for an identical config, and the fallback would silently
+        # rebuild the data dict with newer pipeline code — changing the cohort.
+        from astra.data.caching import load_data_cache_from_path
+        data = load_data_cache_from_path(data_cache)
+    else:
+        data = prepare_data_and_dls_cached(cfg)
     holdout_pids = data["holdout"].base.PID.values
     holdout_y = np.array(data["ty"])
     target = cfg["target"]
@@ -625,6 +634,13 @@ def main():
         "--calibrator-dir", type=str, default=None,
         help="Override pickled-calibrator dir (default: models/calibrators/<model>).",
     )
+    parser.add_argument(
+        "--data-cache", type=str, default=None,
+        help="Explicit path to data_cache_*.pkl, bypassing the cache-key lookup. "
+             "Use when caching.py changed since the cache was built (_CACHE_VERSION "
+             "bump or new _get_cache_key field) — otherwise the key misses and the "
+             "data dict is silently rebuilt with newer pipeline code.",
+    )
     parser.add_argument("--skip-shap", action="store_true",
                         help="Skip the SHAP replot subprocess.")
     parser.add_argument("--verbose", action="store_true")
@@ -648,6 +664,7 @@ def main():
         config=args.config,
         eval_dir=args.eval_dir,
         calibrator_dir=args.calibrator_dir,
+        data_cache=args.data_cache,
     )
 
 
