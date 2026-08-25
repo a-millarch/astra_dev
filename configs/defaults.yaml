@@ -6,8 +6,7 @@ trauma_call_file_path: data/external/trauma_call.csv
 experiment_name: hpt
 run_name: highres
 
-model_name: '14042026'
-
+model_name: 'rev20260430' 
 target: deceased_30d
 
 # Pre-hospital (PPJ) data integration
@@ -22,13 +21,13 @@ prehospital_config:
         - data/raw/ppj/
       mapping_sep: ";"
       mapping_timestamp_format: sas      # 22FEB2018:13:40:02.2750
-    - name: RegSJ
-      ppj_mapping_path: data/raw/ppjsj_mapping.csv
-      ppj_data_paths:
-        - data/interim/ppjsj.csv         # Pre-filtered from raw_data_path
-      raw_data_path: data/dl/PPJ_RegSJ.csv  # Large unfiltered file, chunked pre-filter
-      mapping_sep: ","
-      mapping_timestamp_format: iso      # standard datetime
+ #   - name: RegSJ
+ #     ppj_mapping_path: data/raw/ppjsj_mapping.csv
+ #     ppj_data_paths:
+ #       - data/interim/ppjsj.csv         # Pre-filtered from raw_data_path
+ #     raw_data_path: data/dl/PPJ_RegSJ.csv  # Large unfiltered file, chunked pre-filter
+ #     mapping_sep: ","
+ #     mapping_timestamp_format: iso      # standard datetime
   max_hours_before_admission: 48
   event_descriptions_path: data/external/event_descriptions_modified.xlsx
   # Override event codes if event_descriptions not available:
@@ -48,29 +47,10 @@ temporal_features:
   #   sinusoidal – elapsed_hours drives sinusoidal positional encoding; both temporal
   #                features are excluded from W_P (Option B). W_P operates on clinical
   #                channels only (~N(0,1)), raw hours used for sin/cos encoding.
-  mode: sinusoidal
+  mode: channel #sinusoidal
   features:
     - elapsed_hours
     - bin_width_hours
-
-categorical_profiles:
-  enabled: false
-  config_file: configs/profiles.yaml     # path to profile definitions
-
-ebm_feature:
-  enabled: false
-  save_dir: data/interim/ebm_features
-  n_folds: 5
-  default_value: 0.0
-  interval_schedule:  # EBM masking intervals: {boundary: step_size}
-    30min: '10min'    # 0 → 30min: every 10min  (~3 intervals)
-    4h: '1h'          # 30min → 4h: every 1h    (~4 intervals)
-    24h: '4h'         # 4h → 24h: every 4h      (~5 intervals)
-    72h: '6h'         # 24h → 72h: every 6h     (~8 intervals)
-    6D: '12h'         # 72h → 6D: every 12h     (~6 intervals)
-    14D: '1D'         # 6D → 14D: every 1D      (~8 intervals)
-    30D: '3D'         # 14D → 30D: every 3D     (~5 intervals)
-    90D: '7D'         # 30D → 90D: every 7D     (~9 intervals)
 
 
 # Trauma text (clinical notes) keyword marking
@@ -91,7 +71,6 @@ mapped_dir: data/interim/mapped
 concepts:
   - ITAOversigtsrapport
   - VitaleVaerdier
-  - InvasiveMonitoring  # derived from VitaleVaerdier — must be listed after it
   - Labsvar
   - Medicin
   #- Procedurer
@@ -116,19 +95,16 @@ dataset:
       - Procedurer
       - ADTHaendelser
       - Events
-      - InvasiveMonitoring
   ts_categorical_multi_label:
       - Medicin
       - Procedurer
       - ADTHaendelser
       - Events
-      - InvasiveMonitoring
   cat_encoder_names:
       Medicin: medication
       Procedurer: procedures
       ADTHaendelser: ADT
       Events: event
-      InvasiveMonitoring: invasive_monitoring
 
   cat_cols:
       - SEX
@@ -196,19 +172,11 @@ pretrain:
     save_best: True
     checkpoint_dir: './pretrain_checkpoints'
 
-    # Sparse-aware masking (Fix 6): preferentially mask non-empty timesteps
-    sparse_aware_masking: true
-    mask_prob_ts_data: 0.30
-    mask_prob_ts_empty: 0.05
-    mask_prob_cat_ts_data: 0.40
-    mask_prob_cat_ts_empty: 0.03
-
 training:
     folds: 5
     epochs: 30
     bs: 32
-    
-  
+   
 model:
   d_model: 192
   n_layers: 4
@@ -223,14 +191,13 @@ model:
   temporal_head: true
   causal: true  # required for temporal_head
 
-  survival_mode: false  # true = discrete-time survival, false = binary classification
 
 finetune:
   phase1_epochs: 3
   phase1_lr: 0.002095169972417103
   phase2_epochs: 17
   phase2_lr: 0.0003896
-  phase2_unfreeze_from: transformer_2_3
+  phase2_unfreeze_from: transformer_4_5
   phase3_epochs: 9
   phase3_lr: 7.25e-05
   phase4_epochs: 10
@@ -244,9 +211,9 @@ finetune:
   pos_weight_factor: 0.6000000000000001
   time_weighting: early
   temporal_loss_averaging: per_sample
-  eval_timeframe_weighting: 'true'
-  eval_timeframe_weight: 1.5
-  ranking_loss_weight: 0.15000000000000002
+  eval_timeframe_weighting: false
+  eval_timeframe_weight: 3.0
+  ranking_loss_weight: 0.0
   temporal_crop_prob: 0.0
   temporal_crop_all_phases: false
   # ── End sweep results ──
@@ -267,15 +234,17 @@ finetune:
 
   # Temporal head
   early_weight_factor: 2.0
+
+
+  # Pairwise ranking loss
   ranking_loss_n_timeframes: 5
   ranking_loss_max_pairs: 10000
-
 
 sweep:
     # Joint architecture + training HP search (no pretraining during sweep)
     n_trials: 350
-    study_patience: 12
-    study_min_delta: 0.005   # minimum AUROC+AUPRC improvement to reset patience
+    study_patience: 8
+    study_min_delta: 0.01   # minimum AUROC+AUPRC improvement to reset patience
     search_space:
         # Architecture
         d_model: [64, 128, 192, 256]
@@ -314,9 +283,6 @@ evaluation:
     max_f_beta: 10
     f_beta: 4
     threshold_mode: f1 #fbeta
-    mc_dropout_samples: 30  # MC Dropout forward passes for uncertainty (Fix 8)
-    shap_seed: 42           # RNG seed for reproducible SHAP values (null to disable)
-    shap_nsamples: 200      # Number of interpolation samples for GradientExplainer
 
 normalization:
   ts_method: adaptive       # standard | quantile | power | robust | adaptive
@@ -399,8 +365,6 @@ agg_func: #also for datasets, split it up
       - max
   Events:
       - max
-  InvasiveMonitoring:
-      - max
 
 # Mapping
 npartitions:
@@ -414,7 +378,6 @@ npartitions:
   ISS_notes: 1
   ISS_computed: 1
   Events: 1
-  InvasiveMonitoring: 1
 
 mapping:
  Diagnoser: cat
@@ -451,16 +414,12 @@ drop_features:
     - nan
   Events:
     - nan
-  InvasiveMonitoring:
-    - nan
 
 
 holdout_fraction: 0.2
 holdout_type: temporal  # temporal or random
-holdout_split_date: '2023-07-01'   # Temporal split cutoff: train <= date < test
+holdout_split_date: '2023-06-01'   # Temporal split cutoff: train <= date < test
 seed: 2024
 
 Medicin: 
     ATC_keep_len: 3
- 
- 
